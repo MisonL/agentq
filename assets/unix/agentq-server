@@ -1,0 +1,4798 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+program=${0##*/}
+# 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
+agentq_default_failure_reason='protocol_error'
+group_name='agentq'
+startup_attempts=10
+platform=$(uname -s 2>/dev/null || printf '%s' unknown)
+script_directory=$(CDPATH=; cd -- "$(dirname -- "$0")" && pwd -P)
+
+resolve_windows_user_environment() {
+    local metadata=''
+
+    agentq_msystem=${MSYSTEM:-}
+    if [ -z "$agentq_msystem" ]; then
+        printf '%s: Git Bash did not provide MSYSTEM; cannot safely encode commands for the configured Bash shell\n' "$program" >&2
+        printf '%s: reason=protocol_error\n' "$program" >&2
+        exit 2
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        printf '%s: required command is missing: jq\n' "$program" >&2
+        printf '%s: reason=protocol_error\n' "$program" >&2
+        exit 2
+    fi
+
+    # shellcheck disable=SC2016
+    if ! metadata=$(powershell.exe \
+        -NoProfile \
+        -NonInteractive \
+        -Command '
+            $ErrorActionPreference = "Stop"
+            try {
+                $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+                if ($null -eq $identity -or $null -eq $identity.User) {
+                    [Console]::Error.WriteLine("reason=protocol_error")
+                    exit 2
+                }
+                $sid = $identity.User.Value
+                $accountName = $identity.Name
+                $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
+                $profile = (Get-ItemProperty -LiteralPath $profileKey -Name ProfileImagePath -ErrorAction Stop).ProfileImagePath
+                $profile = [Environment]::ExpandEnvironmentVariables([string]$profile)
+                function Test-NonReparseWindowsProfilePath {
+                    param([string]$Path)
+
+                    if ([string]::IsNullOrWhiteSpace($Path)) {
+                        return $false
+                    }
+
+                    try {
+                        $fullPath = [System.IO.Path]::GetFullPath($Path)
+                        $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+                    } catch {
+                        return $false
+                    }
+                    if (!$item.PSIsContainer -or (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                        return $false
+                    }
+
+                    $parent = [System.IO.Directory]::GetParent($fullPath)
+                    while ($null -ne $parent) {
+                        $parentItem = Get-Item -LiteralPath $parent.FullName -Force -ErrorAction SilentlyContinue
+                        if ($null -eq $parentItem -or !$parentItem.PSIsContainer -or
+                            (($parentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                            return $false
+                        }
+                        $parent = $parent.Parent
+                    }
+                    return $true
+                }
+                $profileItem = if ([string]::IsNullOrWhiteSpace($profile)) {
+                    $null
+                } else {
+                    Get-Item -LiteralPath $profile -Force -ErrorAction SilentlyContinue
+                }
+                if ([string]::IsNullOrWhiteSpace($profile) -or ($null -eq $profileItem) -or !$profileItem.PSIsContainer) {
+                    exit 2
+                }
+                if (!(Test-NonReparseWindowsProfilePath -Path $profile)) {
+                    exit 2
+                }
+                $acl = Get-Acl -LiteralPath $profile -ErrorAction Stop
+                $hasUserAccess = @($acl.Access | Where-Object {
+                    $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+                    (($_.IdentityReference.Value -eq $accountName) -or ($_.IdentityReference.Value -eq $sid)) -and
+                    (($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Modify) -ne 0)
+                }).Count -gt 0
+                if (!$hasUserAccess) {
+                    exit 2
+                }
+                $profile = [System.IO.Path]::GetFullPath($profile)
+                $userName = ($accountName -split "\\")[-1]
+                $appData = Join-Path $profile "AppData\Roaming"
+                $localAppData = Join-Path $profile "AppData\Local"
+                $temp = Join-Path $localAppData "Temp"
+                $systemRoot = [Environment]::GetEnvironmentVariable("SystemRoot", "Machine")
+                if ([string]::IsNullOrWhiteSpace($systemRoot)) {
+                    $systemRoot = [Environment]::GetEnvironmentVariable("windir", "Machine")
+                }
+                if ([string]::IsNullOrWhiteSpace($systemRoot)) {
+                    $systemRoot = "C:\Windows"
+                }
+                $systemRoot = [System.IO.Path]::GetFullPath($systemRoot)
+                $systemDrive = [System.IO.Path]::GetPathRoot($systemRoot).TrimEnd("\\")
+                if ([string]::IsNullOrWhiteSpace($systemDrive)) {
+                    $systemDrive = [System.IO.Path]::GetPathRoot($profile).TrimEnd("\\")
+                }
+                $homeDrive = [System.IO.Path]::GetPathRoot($profile).TrimEnd("\\")
+                $homePath = $profile.Substring($homeDrive.Length)
+                $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+                $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+                $pathParts = @(
+                    [Environment]::ExpandEnvironmentVariables([string]$userPath)
+                    [Environment]::ExpandEnvironmentVariables([string]$machinePath)
+                ) | Where-Object { ![string]::IsNullOrWhiteSpace($_) }
+                $windowsPath = [string]::Join(";", [string[]]$pathParts)
+                if ([string]::IsNullOrWhiteSpace($windowsPath)) {
+                    exit 2
+                }
+                $pathExt = [Environment]::GetEnvironmentVariable("PATHEXT", "User")
+                if ([string]::IsNullOrWhiteSpace($pathExt)) {
+                    $pathExt = [Environment]::GetEnvironmentVariable("PATHEXT", "Machine")
+                }
+                if ([string]::IsNullOrWhiteSpace($pathExt)) {
+                    $pathExt = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC"
+                }
+                $comSpec = [Environment]::GetEnvironmentVariable("ComSpec", "User")
+                if ([string]::IsNullOrWhiteSpace($comSpec)) {
+                    $comSpec = [Environment]::GetEnvironmentVariable("ComSpec", "Machine")
+                }
+                if ([string]::IsNullOrWhiteSpace($comSpec)) {
+                    $comSpec = Join-Path $systemRoot "System32\cmd.exe"
+                }
+                $result = [ordered]@{
+                    identity = $accountName
+                    user_name = $userName
+                    profile = $profile
+                    app_data = $appData
+                    local_app_data = $localAppData
+                    temp = $temp
+                    path = $windowsPath
+                    pathext = $pathExt
+                    comspec = $comSpec
+                    system_root = $systemRoot
+                    system_drive = $systemDrive
+                    windir = $systemRoot
+                    home_drive = $homeDrive
+                    home_path = $homePath
+                }
+                [Console]::Out.Write(($result | ConvertTo-Json -Compress))
+                exit 0
+            } catch {
+                exit 2
+            }
+        ' 2>/dev/null); then
+        printf '%s: unable to resolve the current Windows user profile from the process SID\n' "$program" >&2
+        printf '%s: reason=protocol_error\n' "$program" >&2
+        exit 2
+    fi
+
+    metadata=${metadata%$'\r'}
+    if ! jq -er '.identity | select(type == "string" and length > 0)' <<<"$metadata" >/dev/null ||
+        ! agentq_user=$(jq -er '.user_name' <<<"$metadata") ||
+        ! agentq_userprofile=$(jq -er '.profile' <<<"$metadata") ||
+        ! agentq_appdata=$(jq -er '.app_data' <<<"$metadata") ||
+        ! agentq_localappdata=$(jq -er '.local_app_data' <<<"$metadata") ||
+        ! agentq_temp=$(jq -er '.temp' <<<"$metadata") ||
+        ! agentq_windows_path=$(jq -er '.path' <<<"$metadata") ||
+        ! agentq_pathext=$(jq -er '.pathext' <<<"$metadata") ||
+        ! agentq_comspec=$(jq -er '.comspec' <<<"$metadata") ||
+        ! agentq_systemroot=$(jq -er '.system_root' <<<"$metadata") ||
+        ! agentq_systemdrive=$(jq -er '.system_drive' <<<"$metadata") ||
+        ! agentq_windir=$(jq -er '.windir' <<<"$metadata") ||
+        ! agentq_homedrive=$(jq -er '.home_drive' <<<"$metadata") ||
+        ! agentq_homepath=$(jq -er '.home_path' <<<"$metadata"); then
+        printf '%s: Windows user profile metadata is incomplete\n' "$program" >&2
+        printf '%s: reason=protocol_error\n' "$program" >&2
+        exit 2
+    fi
+
+    if ! agentq_home=$(cygpath -u -- "$agentq_userprofile"); then
+        printf '%s: cannot convert the Windows user profile to a Git Bash home path\n' "$program" >&2
+        printf '%s: reason=protocol_error\n' "$program" >&2
+        exit 2
+    fi
+    agentq_home=${agentq_home%$'\r'}
+    [ -n "$agentq_home" ] || {
+        printf '%s: Git Bash home path is empty\n' "$program" >&2
+        printf '%s: reason=protocol_error\n' "$program" >&2
+        exit 2
+    }
+}
+
+case "$platform" in
+    MINGW*|MSYS*|CYGWIN*)
+        platform_kind=windows
+        agentq_root=$script_directory
+        pueue_bin="$agentq_root/pueue.exe"
+        pueued_bin="$agentq_root/pueued.exe"
+        config_path="$agentq_root/config/pueue.yml"
+        startup_script="$agentq_root/agentq-start-daemon.ps1"
+        durable_move_helper="$agentq_root/agentq-durable-move.ps1"
+        pueue_config_path=$(cygpath -aw "$config_path")
+        startup_script_path=$(cygpath -aw "$startup_script")
+        pueued_path_windows=$(cygpath -aw "$pueued_bin")
+        resolve_windows_user_environment
+        agentq_tmp=$agentq_temp
+        # Preserve user arguments such as cmd /c when invoking Windows tools.
+        # JSON files are piped to jq below, so jq never needs MSYS path conversion.
+        export MSYS_NO_PATHCONV=1
+        unset MSYS2_ARG_CONV_EXCL
+        ;;
+    Linux*|Darwin*)
+        platform_kind=unix
+        agentq_root=$script_directory
+        pueue_bin="$agentq_root/pueue"
+        pueued_bin="$agentq_root/pueued"
+        config_path="$agentq_root/config/pueue.yml"
+        ;;
+    *)
+        printf '%s: unsupported platform: %s\n' "$program" "$platform" >&2
+        printf '%s: reason=protocol_error\n' "$program" >&2
+        exit 2
+        ;;
+esac
+
+data_directory="$agentq_root/data"
+task_log_directory="$data_directory/task_logs"
+cancellation_directory="$data_directory/agentq-cancellations"
+request_directory="$data_directory/agentq-requests"
+request_lock_directory="$request_directory/.locks"
+request_tombstone_directory="$request_directory/.tombstones"
+runtime_directory="$agentq_root/runtime"
+maintenance_lock_directory="${agentq_root}.maintenance.lock"
+operation_lock_directory="$runtime_directory/agentq-operation.lock"
+request_layout_marker="$runtime_directory/agentq-request-tombstones-v2"
+request_tombstone_prune_marker="$runtime_directory/agentq-request-tombstones-pruned-at"
+request_tombstone_retention_days=30
+request_tombstone_prune_interval=86400
+lock_acquire_attempts=30
+lock_retry_delay_seconds=1
+lock_empty_grace_seconds=5
+current_lock_pid=''
+current_lock_identity=''
+request_lock=''
+operation_lock=''
+request_records_file=''
+cancellation_markers_file=''
+request_records_jq_file=''
+cancellation_markers_jq_file=''
+jq_exact_integer_support=''
+jq_safe_integer_limit=9007199254740991
+stat_flavor=''
+compact_log_raw_file=''
+reconcile_raw_status_file=''
+group_raw_file=''
+
+usage() {
+    cat <<EOF
+Usage:
+  $program submit --workdir <directory> [--label <label>] --request-id <id> -- <command> [arguments...]
+  $program lookup <request-id>
+  $program status
+  $program logs <task-id> [--tail <lines>]
+  $program cancel <task-id>
+  $program wait <task-id>
+  $program remove <task-id>
+  $program doctor
+EOF
+}
+
+fail() {
+    local failure_reason=${2:-$agentq_default_failure_reason}
+    if [ -n "$group_raw_file" ]; then
+        if remove_runtime_temporary_file "$group_raw_file" 'group raw response file'; then
+            group_raw_file=''
+        else
+            printf '%s: failed to clean AgentQ group raw response temporary file: %s\n' \
+                "$program" "$group_raw_file" >&2
+        fi
+    fi
+    if [ -n "$reconcile_raw_status_file" ]; then
+        if remove_runtime_temporary_file "$reconcile_raw_status_file" 'reconciliation raw status file'; then
+            reconcile_raw_status_file=''
+        else
+            printf '%s: failed to clean AgentQ reconciliation raw status temporary file: %s\n' \
+                "$program" "$reconcile_raw_status_file" >&2
+        fi
+    fi
+    printf '%s: %s\n' "$program" "$1" >&2
+    # 机读通道：退出码 2 有三类互不相同的含义（参数错误 / 锁竞争 / 对已结束的
+    # 任务 cancel），此前只能靠 stderr 文本消歧。这里把类别显式带出来，退出码
+    # 与消息都不变，所以对现有调用方完全兼容；客户端与脚本可以读这一行，而不必
+    # 再去匹配人类可读的消息措辞。
+    printf '%s: reason=%s\n' "$program" "$failure_reason" >&2
+    exit 2
+}
+
+require_executable() {
+    [ -x "$1" ] || fail "required executable is missing: $1"
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || fail "required command is missing: $1"
+}
+
+ensure_runtime_dependencies() {
+    require_command jq
+    require_command base64
+    require_command date
+    require_command find
+    require_command grep
+    require_command mktemp
+    require_command stat
+    require_command tail
+    require_command tr
+
+    if [ "$platform_kind" = unix ]; then
+        require_command awk
+        require_command perl
+        require_command ps
+    fi
+
+    if [ "$platform_kind" = windows ]; then
+        require_command cygpath
+        require_command ps
+        require_command powershell.exe
+        [ -f "$durable_move_helper" ] && [ ! -L "$durable_move_helper" ] ||
+            fail "missing AgentQ Windows durable move helper: $durable_move_helper"
+    fi
+}
+
+is_task_id() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+canonical_task_id() {
+    local value=$1
+
+    while [ "${value#0}" != "$value" ]; do
+        value=${value#0}
+    done
+    [ -n "$value" ] || value=0
+    printf '%s\n' "$value"
+}
+
+task_id_exceeds_jq_safe_integer() {
+    local canonical
+
+    canonical=$(canonical_task_id "$1") || return 1
+    case "${#canonical}" in
+        1|2|3|4|5|6|7|8|9|10|11|12|13|14|15)
+            return 1
+            ;;
+        16)
+            [ "$canonical" -gt "${jq_safe_integer_limit:-9007199254740991}" ]
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+jq_preserves_integer_digits() {
+    if [ -z "${jq_exact_integer_support:-}" ]; then
+        if jq -n -e '((9007199254740993 | tostring) == "9007199254740993")' >/dev/null 2>&1; then
+            jq_exact_integer_support=true
+        else
+            jq_exact_integer_support=false
+        fi
+    fi
+    [ "$jq_exact_integer_support" = true ]
+}
+
+validate_task_id_precision() {
+    local task_id=$1
+
+    is_task_id "$task_id" || fail "invalid AgentQ task id: $task_id"
+    if ! jq_preserves_integer_digits && task_id_exceeds_jq_safe_integer "$task_id"; then
+        fail "task id exceeds the exact-integer range of the configured jq: $task_id"
+    fi
+}
+
+validate_task_id_precision_in_file() {
+    local json_path=$1
+    local task_id
+
+    if jq_preserves_integer_digits; then
+        return 0
+    fi
+    while IFS= read -r task_id; do
+        [ -n "$task_id" ] || continue
+        if task_id_exceeds_jq_safe_integer "$task_id"; then
+            fail "task id exceeds the exact-integer range of the configured jq: $task_id"
+        fi
+    done < <(
+        grep -Eo '"task_id"[[:space:]]*:[[:space:]]*[0-9]+' "$json_path" |
+            sed -E 's/.*:[[:space:]]*//'
+    )
+}
+
+validate_pueue_task_id_precision_in_file() {
+    local json_path=$1
+    local task_id
+
+    if jq_preserves_integer_digits; then
+        return 0
+    fi
+    while IFS= read -r task_id; do
+        [ -n "$task_id" ] || continue
+        if task_id_exceeds_jq_safe_integer "$task_id"; then
+            fail "Pueue task id exceeds the exact-integer range of the configured jq: $task_id"
+        fi
+    done < <(
+        grep -Eo '"id"[[:space:]]*:[[:space:]]*[0-9]+' "$json_path" |
+            sed -E 's/.*:[[:space:]]*//'
+    )
+}
+
+validate_pueue_task_id_precision_in_text() {
+    local json_text=$1
+    local task_id
+
+    if jq_preserves_integer_digits; then
+        return 0
+    fi
+    while IFS= read -r task_id; do
+        [ -n "$task_id" ] || continue
+        if task_id_exceeds_jq_safe_integer "$task_id"; then
+            fail "Pueue task id exceeds the exact-integer range of the configured jq: $task_id"
+        fi
+    done < <(
+        printf '%s\n' "$json_text" |
+            grep -Eo '"id"[[:space:]]*:[[:space:]]*[0-9]+' |
+            sed -E 's/.*:[[:space:]]*//'
+    )
+}
+
+pueue_task_shape_filter='
+def canonical_integer_string:
+    tostring
+    | sub("\\.0+$"; "")
+    | sub("^0+"; "")
+    | if . == "" then "0" else . end;
+def valid_task:
+    if (.value | type) != "object" then
+        false
+    elif (.value.id | type) != "number" then
+        false
+    else
+        (.value.id >= 0)
+        and ((.value.id | floor) == .value.id)
+        and (.key | test("^[0-9]+$"))
+        and (.key == (.value.id | canonical_integer_string))
+    end;
+if (.tasks | type) != "object" then
+    false
+else
+    (.tasks | to_entries | all(.[]; valid_task))
+end
+'
+
+validate_pueue_task_shape_in_file() {
+    local json_path=$1
+
+    # The path is fed on stdin rather than as a jq argument: jq is a native
+    # Windows binary here and this script exports MSYS_NO_PATHCONV=1, so a
+    # POSIX path passed as an argument reaches jq unconverted and cannot be
+    # opened.  Verified on Windows 10: `jq -e . /tmp/x.json` fails with
+    # "Could not open file" while the same read through stdin succeeds.
+    if ! jq -e "$pueue_task_shape_filter" < "$json_path" >/dev/null; then
+        fail 'Pueue returned an invalid task identity in status'
+    fi
+}
+
+validate_pueue_task_shape_in_text() {
+    local json_text=$1
+
+    if ! jq -e "$pueue_task_shape_filter" <<<"$json_text" >/dev/null; then
+        fail 'Pueue returned an invalid task identity in status'
+    fi
+}
+
+pueue_log_shape_filter='
+def canonical_integer_string:
+    tostring
+    | sub("\\.0+$"; "")
+    | sub("^0+"; "")
+    | if . == "" then "0" else . end;
+def valid_log:
+    if (.value | type) != "object" then
+        false
+    elif (.value.task | type) != "object" then
+        false
+    elif (.value.task.id | type) != "number" then
+        false
+    else
+        (.value.task.id >= 0)
+        and ((.value.task.id | floor) == .value.task.id)
+        and (.key | test("^[0-9]+$"))
+        and (.key == (.value.task.id | canonical_integer_string))
+    end;
+if type != "object" then
+    false
+else
+    (to_entries | all(.[]; valid_log))
+end
+'
+
+validate_pueue_log_shape_in_text() {
+    local json_text=$1
+
+    if ! jq -e "$pueue_log_shape_filter" <<<"$json_text" >/dev/null; then
+        fail 'Pueue returned an invalid task identity in logs'
+    fi
+}
+
+validate_pueue_log_shape_in_file() {
+    local json_path=$1
+
+    if ! jq -e "$pueue_log_shape_filter" < "$json_path" >/dev/null; then
+        fail 'Pueue returned an invalid task identity in logs'
+    fi
+}
+
+is_positive_integer() {
+    case "$1" in
+        ''|*[!0-9]*|0) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+is_request_id() {
+    case "$1" in
+        ''|*[!A-Za-z0-9._-]*|[!A-Za-z0-9]*) return 1 ;;
+    esac
+
+    [ "${#1}" -ge 16 ] && [ "${#1}" -le 128 ]
+}
+
+process_identity_state() {
+    local process_pid=$1
+    local process_probe=''
+    local observed_identity=''
+
+    is_positive_integer "$process_pid" || return 1
+
+    case "$platform_kind" in
+        unix)
+            if ! kill -0 "$process_pid" 2>/dev/null; then
+                printf '%s\n' dead
+                return 0
+            fi
+            observed_identity=$(LC_ALL=C ps -o lstart= -p "$process_pid" 2>/dev/null | awk '{$1 = $1; print}')
+            [ -n "$observed_identity" ] || return 1
+            printf 'alive:%s\n' "$observed_identity"
+            ;;
+        windows)
+            # shellcheck disable=SC2016
+            if process_probe=$(AGENTQ_LOCK_PID="$process_pid" powershell.exe \
+                -NoProfile \
+                -NonInteractive \
+                -Command '
+                    $ErrorActionPreference = "Stop"
+                    try {
+                        $process = Get-Process -Id ([int]$env:AGENTQ_LOCK_PID) -ErrorAction SilentlyContinue
+                        if ($null -eq $process) {
+                            [Console]::Out.Write("dead")
+                            exit 0
+                        }
+                        $identity = $process.StartTime.ToUniversalTime().Ticks
+                        if ($identity -le 0) {
+                            exit 2
+                        }
+                        [Console]::Out.Write("alive:$identity")
+                        exit 0
+                    } catch {
+                        exit 2
+                    }
+                ' 2>/dev/null); then
+                case "$process_probe" in
+                    dead|alive:*)
+                        printf '%s\n' "$process_probe"
+                        return 0
+                        ;;
+                esac
+            fi
+            return 1
+            ;;
+    esac
+}
+
+process_identity() {
+    local process_state
+
+    process_state=$(process_identity_state "$1") || return 1
+    case "$process_state" in
+        alive:*)
+            printf '%s\n' "${process_state#alive:}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+resolve_windows_process_id() {
+    local msys_pid=$1
+    local native_pid=''
+
+    is_positive_integer "$msys_pid" || return 1
+    native_pid=$(ps -W 2>/dev/null | while IFS=' ' read -r observed_msys_pid _ _ observed_native_pid _; do
+        if [ "$observed_msys_pid" = "$msys_pid" ]; then
+            printf '%s\n' "$observed_native_pid"
+            break
+        fi
+    done) || return 1
+    native_pid=${native_pid%$'\r'}
+    is_positive_integer "$native_pid" || return 1
+    printf '%s\n' "$native_pid"
+}
+
+set_current_process_lock_metadata() {
+    local native_pid
+
+    current_lock_pid=''
+    current_lock_identity=''
+
+    case "$platform_kind" in
+        unix)
+            current_lock_identity=$(process_identity "$$") || return 1
+            current_lock_pid=$$
+            ;;
+        windows)
+            # Git Bash exposes an MSYS PID. Map it to the stable native
+            # Windows PID instead of using a transient PowerShell parent.
+            native_pid=$(resolve_windows_process_id "$$") || return 1
+            current_lock_pid=$native_pid
+            current_lock_identity=$(process_identity "$native_pid") || return 1
+            ;;
+    esac
+}
+
+temporary_owner_token() {
+    case "$platform_kind" in
+        unix)
+            printf '%s\n' "$$"
+            ;;
+        windows)
+            if [ -z "$current_lock_pid" ]; then
+                set_current_process_lock_metadata || return 1
+            fi
+            is_positive_integer "$current_lock_pid" || return 1
+            printf '%s\n' "$current_lock_pid"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+temporary_file_is_safe() {
+    local temporary_path=$1
+    local temporary_parent=${temporary_path%/*}
+
+    [ -n "$temporary_path" ] || return 1
+    path_chain_is_safe "$temporary_path" || return 1
+    [ "$temporary_parent" != "$temporary_path" ] || temporary_parent=.
+    [ -f "$temporary_path" ] || return 1
+    [ ! -L "$temporary_path" ] || return 1
+    [ -d "$temporary_parent" ] || return 1
+    [ ! -L "$temporary_parent" ] || return 1
+}
+
+# The identity helpers below all want the same two things from stat, and every
+# call used to probe both flavors: GNU's `-c` (always fails on BSD) and BSD's
+# `-f`.  On a machine where a fork+exec costs ~15ms and one status call makes
+# dozens of them, that doubled the cost for no benefit.  Probe the flavor once
+# per process, then use only the form this platform actually supports.
+#
+# detect_stat_flavor() must run in the top-level shell: a command substitution
+# runs in a subshell, so a cache written from inside one would be discarded.
+detect_stat_flavor() {
+    if [ -n "$stat_flavor" ]; then
+        return 0
+    fi
+    if stat -c '%d:%i' -- "$script_directory" >/dev/null 2>&1; then
+        stat_flavor=gnu
+    elif stat -f '%d:%i' "$script_directory" >/dev/null 2>&1; then
+        stat_flavor=bsd
+    else
+        return 1
+    fi
+}
+
+# Emit `device:inode` for a path, or return non-zero.  Callers validate the
+# output exactly as before.  Falls back to probing when the cache is unset, so
+# this stays correct when called outside main().
+stat_device_inode() {
+    local path=$1
+    local identity=''
+
+    if [ -z "$stat_flavor" ]; then
+        detect_stat_flavor || return 1
+    fi
+    if [ "$stat_flavor" = gnu ]; then
+        identity=$(stat -c '%d:%i' -- "$path" 2>/dev/null) || return 1
+    else
+        identity=$(stat -f '%d:%i' "$path" 2>/dev/null) || return 1
+    fi
+    printf '%s\n' "$identity"
+}
+
+# Modification time as whole seconds; GNU spells it %Y, BSD spells it %m.
+stat_mtime() {
+    local path=$1
+    local mtime=''
+
+    if [ -z "$stat_flavor" ]; then
+        detect_stat_flavor || return 1
+    fi
+    if [ "$stat_flavor" = gnu ]; then
+        mtime=$(stat -c %Y "$path" 2>/dev/null) || return 1
+    else
+        mtime=$(stat -f %m "$path" 2>/dev/null) || return 1
+    fi
+    printf '%s\n' "$mtime"
+}
+
+temporary_file_identity() {
+    local temporary_path=$1
+    local temporary_identity=''
+
+    if temporary_identity=$(stat_device_inode "$temporary_path"); then
+        :
+    else
+        return 1
+    fi
+    case "$temporary_identity" in
+        ''|*[!0-9:]*|*:*:*) return 1 ;;
+    esac
+    printf '%s\n' "$temporary_identity"
+}
+
+temporary_file_identity_matches() {
+    local temporary_path=$1
+    local expected_identity=$2
+    local observed_identity
+
+    [ -n "$expected_identity" ] || return 1
+    observed_identity=$(temporary_file_identity "$temporary_path") || return 1
+    [ "$observed_identity" = "$expected_identity" ]
+}
+
+atomic_destination_parent_identity() {
+    local destination_parent=$1
+    local destination_parent_identity=''
+
+    if destination_parent_identity=$(stat_device_inode "$destination_parent"); then
+        :
+    else
+        return 1
+    fi
+    case "$destination_parent_identity" in
+        ''|*[!0-9:]*|*:*:*) return 1 ;;
+    esac
+    printf '%s\n' "$destination_parent_identity"
+}
+
+atomic_destination_parent_identity_matches() {
+    local destination_parent=$1
+    local expected_identity=$2
+    local observed_identity
+
+    [ -n "$expected_identity" ] || return 1
+    observed_identity=$(atomic_destination_parent_identity "$destination_parent") || return 1
+    [ "$observed_identity" = "$expected_identity" ]
+}
+
+request_metadata_file_is_safe() {
+    local metadata_path=$1
+    local metadata_parent=${metadata_path%/*}
+
+    [ -n "$metadata_path" ] || return 1
+    path_chain_is_safe "$metadata_path" || return 1
+    [ "$metadata_parent" != "$metadata_path" ] || metadata_parent=.
+    [ -f "$metadata_path" ] || return 1
+    [ ! -L "$metadata_path" ] || return 1
+    [ -d "$metadata_parent" ] || return 1
+    [ ! -L "$metadata_parent" ] || return 1
+}
+
+path_chain_is_safe() {
+    local candidate_path=$1
+    local current_path
+    local remaining_path
+    local path_component
+
+    [ -n "$candidate_path" ] || return 1
+    case "$candidate_path" in
+        /*)
+            current_path=/
+            remaining_path=${candidate_path#/}
+            ;;
+        *)
+            current_path=.
+            remaining_path=$candidate_path
+            ;;
+    esac
+
+    while [ -n "$remaining_path" ]; do
+        path_component=${remaining_path%%/*}
+        if [ "$path_component" = "$remaining_path" ]; then
+            remaining_path=
+        else
+            remaining_path=${remaining_path#*/}
+        fi
+        case "$path_component" in
+            ''|.)
+                continue
+                ;;
+            ..)
+                return 1
+                ;;
+        esac
+        if [ "$current_path" = / ]; then
+            current_path="/$path_component"
+        else
+            current_path="$current_path/$path_component"
+        fi
+        [ ! -L "$current_path" ] || return 1
+    done
+}
+
+config_file_is_safe() {
+    local config_file=$1
+    local config_parent=${config_file%/*}
+
+    [ -n "$config_file" ] || return 1
+    path_chain_is_safe "$config_file" || return 1
+    [ "$config_parent" != "$config_file" ] || config_parent=.
+    [ -f "$config_file" ] || return 1
+    [ ! -L "$config_file" ] || return 1
+    [ -d "$config_parent" ] || return 1
+    [ ! -L "$config_parent" ] || return 1
+}
+
+runtime_marker_file_is_safe() {
+    local marker_path=$1
+    local marker_parent=${marker_path%/*}
+
+    [ -n "$marker_path" ] || return 1
+    path_chain_is_safe "$marker_path" || return 1
+    [ "$marker_parent" != "$marker_path" ] || marker_parent=.
+    [ -f "$marker_path" ] || return 1
+    [ ! -L "$marker_path" ] || return 1
+    [ -d "$marker_parent" ] || return 1
+    [ ! -L "$marker_parent" ] || return 1
+}
+
+lock_metadata_file_is_safe() {
+    local lock_path=$1
+    local lock_directory
+    local lock_parent_directory
+
+    case "$lock_path" in
+        */*)
+            lock_directory=${lock_path%/*}
+            [ -n "$lock_directory" ] || lock_directory=/
+            ;;
+        *)
+            lock_directory=.
+            ;;
+    esac
+    case "$lock_directory" in
+        */*)
+            lock_parent_directory=${lock_directory%/*}
+            [ -n "$lock_parent_directory" ] || lock_parent_directory=/
+            ;;
+        *)
+            lock_parent_directory=.
+            ;;
+    esac
+    path_chain_is_safe "$lock_path" || return 1
+    [ ! -L "$lock_parent_directory" ] || return 1
+    [ ! -L "$lock_directory" ] || return 1
+    [ ! -L "$lock_path" ] || return 1
+    [ -f "$lock_path" ] || return 1
+    [ -r "$lock_path" ] || return 1
+}
+
+atomic_destination_is_safe() {
+    local destination=$1
+    local destination_parent=${destination%/*}
+
+    [ -n "$destination" ] || return 1
+    path_chain_is_safe "$destination" || return 1
+    [ "$destination_parent" != "$destination" ] || destination_parent=.
+    [ -d "$destination_parent" ] || return 1
+    [ ! -L "$destination_parent" ] || return 1
+    [ ! -L "$destination" ] || return 1
+    if [ -e "$destination" ] && [ ! -f "$destination" ]; then
+        return 1
+    fi
+}
+
+atomic_destination_identity() {
+    local destination=$1
+    local destination_identity=''
+
+    [ ! -L "$destination" ] || return 1
+    if [ -e "$destination" ]; then
+        [ -f "$destination" ] || return 1
+        if destination_identity=$(stat_device_inode "$destination"); then
+            :
+        else
+            return 1
+        fi
+        case "$destination_identity" in
+            ''|*[!0-9:]*|*:*:*) return 1 ;;
+        esac
+        printf 'present:%s\n' "$destination_identity"
+    else
+        printf '%s\n' absent
+    fi
+}
+
+atomic_destination_identity_matches() {
+    local destination=$1
+    local expected_identity=$2
+    local observed_identity
+
+    [ -n "$expected_identity" ] || return 1
+    if [ "$expected_identity" = absent ]; then
+        [ ! -e "$destination" ] && [ ! -L "$destination" ]
+        return
+    fi
+    observed_identity=$(atomic_destination_identity "$destination") || return 1
+    [ "$observed_identity" = "$expected_identity" ]
+}
+
+durable_sync_file() {
+    local path=$1
+
+    [ "$platform_kind" = unix ] || return 0
+    [ -n "$path" ] || return 1
+    temporary_file_is_safe "$path" || return 1
+    temporary_file_is_safe "$path" || return 1
+    AGENTQ_DURABLE_PATH=$path perl -MIO::Handle -MFcntl=:DEFAULT -e '
+        my $path = $ENV{AGENTQ_DURABLE_PATH};
+        my $ok = eval {
+            sysopen(my $handle, $path, O_RDONLY) or die;
+            $handle->sync() or die;
+            close($handle) or die;
+            1;
+        };
+        exit($ok ? 0 : 1);
+    ' >/dev/null 2>&1
+}
+
+durable_sync_directory_path_is_safe() {
+    local path=$1
+
+    [ -n "$path" ] || return 1
+    path_chain_is_safe "$path" || return 1
+    [ -d "$path" ] || return 1
+    [ ! -L "$path" ] || return 1
+}
+
+durable_sync_directory() {
+    local path=$1
+
+    [ "$platform_kind" = unix ] || return 0
+    [ -n "$path" ] || return 1
+    durable_sync_directory_path_is_safe "$path" || return 1
+    durable_sync_directory_path_is_safe "$path" || return 1
+    AGENTQ_DURABLE_PATH=$path perl -MIO::Handle -MFcntl=:DEFAULT -e '
+        my $path = $ENV{AGENTQ_DURABLE_PATH};
+        my $ok = eval {
+            sysopen(my $handle, $path, O_RDONLY) or die;
+            $handle->sync() or die;
+            close($handle) or die;
+            1;
+        };
+        exit($ok ? 0 : 1);
+    ' >/dev/null 2>&1
+}
+
+write_temporary_contents() {
+    local temporary_path=$1
+    local contents=$2
+
+    temporary_file_is_safe "$temporary_path" || return 1
+    temporary_file_is_safe "$temporary_path" || return 1
+    temporary_file_is_safe "$temporary_path" || return 1
+    require_runtime_temporary_file "$temporary_path" || return 1
+    (
+        umask 077
+        printf '%s\n' "$contents" > "$temporary_path"
+    ) || return 1
+    durable_sync_file "$temporary_path"
+}
+
+install_temporary_file() {
+    local temporary_path=$1
+    local destination=$2
+    local destination_parent=${destination%/*}
+    local temporary_identity
+    local destination_parent_identity
+    local destination_identity
+
+    [ "$destination_parent" != "$destination" ] || destination_parent=.
+
+    temporary_identity=$(temporary_file_identity "$temporary_path") || return 1
+    temporary_file_is_safe "$temporary_path" || return 1
+    temporary_file_identity_matches "$temporary_path" "$temporary_identity" || return 1
+    destination_parent_identity=$(atomic_destination_parent_identity "$destination_parent") || return 1
+    atomic_destination_is_safe "$destination" || return 1
+    destination_identity=$(atomic_destination_identity "$destination") || return 1
+    atomic_destination_parent_identity_matches "$destination_parent" "$destination_parent_identity" || return 1
+    atomic_destination_identity_matches "$destination" "$destination_identity" || return 1
+    if [ "$platform_kind" = windows ]; then
+        local helper_windows
+        local source_windows
+        local destination_windows
+        local parent_windows
+
+        [ -f "$durable_move_helper" ] && [ ! -L "$durable_move_helper" ] || return 1
+        source_windows=$(cygpath -aw -- "$temporary_path") || return 1
+        destination_windows=$(cygpath -aw -- "$destination") || return 1
+        parent_windows=$(cygpath -aw -- "$destination_parent") || return 1
+        helper_windows=$(cygpath -aw -- "$durable_move_helper") || return 1
+        temporary_file_identity_matches "$temporary_path" "$temporary_identity" || return 1
+        atomic_destination_parent_identity_matches "$destination_parent" "$destination_parent_identity" || return 1
+        atomic_destination_is_safe "$destination" || return 1
+        atomic_destination_identity_matches "$destination" "$destination_identity" || return 1
+        if ! powershell.exe \
+            -NoProfile \
+            -NonInteractive \
+            -ExecutionPolicy Bypass \
+            -File "$helper_windows" \
+            -SourcePath "$source_windows" \
+            -DestinationPath "$destination_windows" \
+            -DestinationDirectory "$parent_windows" \
+            >/dev/null 2>&1; then
+            return 1
+        fi
+    else
+        if ! mv -f -- "$temporary_path" "$destination"; then
+            return 1
+        fi
+        durable_sync_directory "$destination_parent" || return 1
+    fi
+    if [ -e "$temporary_path" ] || [ -L "$temporary_path" ] ||
+        [ ! -f "$destination" ] || [ -L "$destination" ] ||
+        ! atomic_destination_is_safe "$destination"; then
+        return 1
+    fi
+}
+
+runtime_temporary_path_is_safe() {
+    local temporary_path=$1
+    local temporary_parent=${temporary_path%/*}
+
+    [ -n "$temporary_path" ] || return 1
+    path_chain_is_safe "$temporary_path" || return 1
+    [ "$temporary_parent" != "$temporary_path" ] || temporary_parent=.
+    [ ! -L "$temporary_path" ] || return 1
+    [ -d "$temporary_parent" ] || return 1
+    [ ! -L "$temporary_parent" ] || return 1
+    if [ -e "$temporary_path" ] && [ ! -f "$temporary_path" ]; then
+        return 1
+    fi
+}
+
+require_runtime_temporary_file() {
+    local temporary_path=$1
+
+    runtime_temporary_path_is_safe "$temporary_path" && [ -f "$temporary_path" ] ||
+        fail "unsafe AgentQ runtime temporary file: $temporary_path"
+}
+
+remove_runtime_temporary_file() {
+    local temporary_path=$1
+    local description=${2:-runtime temporary file}
+
+    if runtime_temporary_path_is_safe "$temporary_path"; then
+        if ! rm -f -- "$temporary_path"; then
+            printf '%s: failed to remove AgentQ %s: %s\n' "$program" "$description" "$temporary_path" >&2
+            return 1
+        fi
+        if [ -e "$temporary_path" ] || [ -L "$temporary_path" ]; then
+            printf '%s: AgentQ %s remained after cleanup: %s\n' "$program" "$description" "$temporary_path" >&2
+            return 1
+        fi
+        return 0
+    fi
+    printf '%s: refusing to remove an unsafe AgentQ %s: %s\n' "$program" "$description" "$temporary_path" >&2
+    return 2
+}
+
+cleanup_temporary_file_after_make_failure() {
+    local temporary_path=$1
+
+    if temporary_file_is_safe "$temporary_path"; then
+        remove_runtime_temporary_file "$temporary_path" 'temporary file'
+        return $?
+    fi
+    printf '%s: refusing to remove an unsafe AgentQ temporary file: %s\n' "$program" "$temporary_path" >&2
+    return 2
+}
+
+make_temporary_file() {
+    local directory=$1
+    local prefix=$2
+    local suffix=${3:-}
+    local owner
+    local temporary
+    local temporary_identity
+    local directory_identity
+    local final_path
+
+    [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+    owner=$(temporary_owner_token) || return 1
+    temporary=$(mktemp "$directory/${prefix}.${owner}.XXXXXX") || return 1
+    if [ -n "$suffix" ]; then
+        final_path="${temporary}${suffix}"
+        temporary_identity=$(temporary_file_identity "$temporary") || {
+            cleanup_temporary_file_after_make_failure "$temporary" || return 1
+            return 1
+        }
+        directory_identity=$(atomic_destination_parent_identity "$directory") || {
+            cleanup_temporary_file_after_make_failure "$temporary" || return 1
+            return 1
+        }
+        if ! temporary_file_is_safe "$temporary" ||
+            ! atomic_destination_parent_identity_matches "$directory" "$directory_identity" ||
+            [ -e "$final_path" ] || [ -L "$final_path" ]; then
+            cleanup_temporary_file_after_make_failure "$temporary" || return 1
+            return 1
+        fi
+        temporary_file_identity_matches "$temporary" "$temporary_identity" || {
+            return 1
+        }
+        atomic_destination_parent_identity_matches "$directory" "$directory_identity" || {
+            return 1
+        }
+        if ! mv -f -- "$temporary" "$final_path"; then
+            cleanup_temporary_file_after_make_failure "$temporary" || return 1
+            return 1
+        fi
+        if ! temporary_file_is_safe "$final_path" ||
+            [ -e "$temporary" ] || [ -L "$temporary" ]; then
+            cleanup_temporary_file_after_make_failure "$final_path" || return 1
+            return 1
+        fi
+    else
+        final_path=$temporary
+    fi
+    if ! temporary_file_is_safe "$final_path"; then
+        return 1
+    fi
+    printf '%s\n' "$final_path"
+}
+
+process_is_confirmed_dead() {
+    local process_pid=$1
+    local expected_identity=${2:-}
+    local process_state
+    local observed_identity
+
+    process_state=$(process_identity_state "$process_pid") || return 1
+    case "$process_state" in
+        dead)
+            return 0
+            ;;
+        alive:*)
+            [ -n "$expected_identity" ] || return 1
+            observed_identity=${process_state#alive:}
+            [ "$observed_identity" != "$expected_identity" ]
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+read_lock_metadata() {
+    local lock_path=$1
+    local LC_ALL=C
+    local lock_contents=''
+    local lock_sample=''
+    local lock_read_status=0
+    local lock_metadata_limit=4096
+    local lock_directory
+    local lock_parent_directory
+
+    lock_pid=''
+    lock_identity=''
+    if declare -F lock_metadata_file_is_safe >/dev/null 2>&1; then
+        lock_metadata_file_is_safe "$lock_path" || return 1
+    else
+        case "$lock_path" in
+            */*)
+                lock_directory=${lock_path%/*}
+                [ -n "$lock_directory" ] || lock_directory=/
+                ;;
+            *)
+                lock_directory=.
+                ;;
+        esac
+        case "$lock_directory" in
+            */*)
+                lock_parent_directory=${lock_directory%/*}
+                [ -n "$lock_parent_directory" ] || lock_parent_directory=/
+                ;;
+            *)
+                lock_parent_directory=.
+                ;;
+        esac
+        path_chain_is_safe "$lock_path" || return 1
+        [ ! -L "$lock_parent_directory" ] || return 1
+        [ ! -L "$lock_directory" ] || return 1
+        [ ! -L "$lock_path" ] || return 1
+        [ -f "$lock_path" ] || return 1
+        [ -r "$lock_path" ] || return 1
+    fi
+    if declare -F lock_metadata_file_is_safe >/dev/null 2>&1; then
+        lock_metadata_file_is_safe "$lock_path" || return 1
+    else
+        path_chain_is_safe "$lock_path" || return 1
+        [ ! -L "$lock_parent_directory" ] || return 1
+        [ ! -L "$lock_directory" ] || return 1
+        [ ! -L "$lock_path" ] || return 1
+        [ -f "$lock_path" ] || return 1
+        [ -r "$lock_path" ] || return 1
+    fi
+    if lock_sample=$(
+        head -c "$((lock_metadata_limit + 1))" -- "$lock_path" 2>/dev/null
+        lock_read_status=$?
+        printf '\001'
+        exit "$lock_read_status"
+    ); then
+        case "$lock_sample" in
+            *$'\001')
+                lock_sample=${lock_sample%$'\001'}
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+        [ "${#lock_sample}" -le "$lock_metadata_limit" ] || return 1
+        lock_contents=$lock_sample
+    elif [ -e "$lock_path" ] || [ -L "$lock_path" ]; then
+        return 1
+    else
+        lock_contents=''
+    fi
+    IFS="$(printf '\t')" read -r lock_pid lock_identity <<EOF
+$lock_contents
+EOF
+    lock_pid=${lock_pid%$'\r'}
+    lock_identity=${lock_identity%$'\r'}
+}
+
+write_lock_metadata() {
+    local lock_path=$1
+    local lock_directory=''
+    local lock_parent_directory=''
+    local temporary_path=''
+
+    path_chain_is_safe "$lock_path" || return 1
+    if [ -z "$current_lock_pid" ] || [ -z "$current_lock_identity" ]; then
+        set_current_process_lock_metadata || return 1
+    fi
+
+    case "$lock_path" in
+        */*)
+            lock_directory=${lock_path%/*}
+            [ -n "$lock_directory" ] || lock_directory=/
+            ;;
+        *)
+            lock_directory=.
+            ;;
+    esac
+    case "$lock_directory" in
+        */*)
+            lock_parent_directory=${lock_directory%/*}
+            [ -n "$lock_parent_directory" ] || lock_parent_directory=/
+            ;;
+        *)
+            lock_parent_directory=.
+            ;;
+    esac
+    [ ! -L "$lock_parent_directory" ] || return 1
+    [ ! -L "$lock_directory" ] || return 1
+    [ ! -L "$lock_path" ] || return 1
+    [ -d "$lock_directory" ] || return 1
+    temporary_path=$(make_temporary_file "$lock_directory" '.agentq-lock-metadata') || return 1
+    if ! write_temporary_contents "$temporary_path" "$(printf '%s\t%s' "$current_lock_pid" "$current_lock_identity")" ||
+        ! install_temporary_file "$temporary_path" "$lock_path"; then
+        if ! remove_runtime_temporary_file "$temporary_path" 'lock metadata temporary file'; then
+            printf '%s: failed to clean AgentQ lock metadata temporary file: %s\n' "$program" "$lock_path" >&2
+            return 1
+        fi
+        return 1
+    fi
+}
+
+lock_directory_is_stale_empty() {
+    local lock_directory=$1
+    local lock_mtime=''
+    local current_epoch=''
+    local child=''
+
+    path_chain_is_safe "$lock_directory" || return 1
+    [ ! -L "$lock_directory" ] || return 1
+    [ -d "$lock_directory" ] || return 1
+    [ ! -e "$lock_directory/pid" ] && [ ! -L "$lock_directory/pid" ] || return 1
+    child=$(find "$lock_directory" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null) || return 1
+    [ -z "$child" ] || return 1
+    lock_mtime=$(stat_mtime "$lock_directory") || return 1
+    current_epoch=$(date +%s) || return 1
+    case "$lock_mtime" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    case "$current_epoch" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$current_epoch" -ge "$lock_mtime" ] || return 1
+    [ $((current_epoch - lock_mtime)) -ge "$lock_empty_grace_seconds" ]
+}
+
+lock_is_owned_by_current_process() {
+    local lock_path=$1
+
+    read_lock_metadata "$lock_path" || return 1
+    [ -n "$lock_identity" ] || return 1
+    set_current_process_lock_metadata || return 1
+    [ "$current_lock_pid" = "$lock_pid" ] && [ "$current_lock_identity" = "$lock_identity" ]
+}
+
+ensure_cancellation_directory() {
+    path_chain_is_safe "$cancellation_directory" || fail "invalid AgentQ cancellation directory path: $cancellation_directory"
+    [ ! -L "$cancellation_directory" ] || fail "invalid AgentQ cancellation directory path: $cancellation_directory"
+    [ -d "$cancellation_directory" ] || fail "missing AgentQ cancellation directory: $cancellation_directory"
+
+    if [ "$platform_kind" = unix ]; then
+        chmod 700 "$cancellation_directory" || fail "cannot secure cancellation directory: $cancellation_directory"
+    fi
+}
+
+ensure_data_directory() {
+    path_chain_is_safe "$agentq_root" || fail "invalid AgentQ root path: $agentq_root"
+    [ ! -L "$agentq_root" ] || fail "invalid AgentQ root path: $agentq_root"
+    [ -d "$agentq_root" ] || fail "missing AgentQ root directory: $agentq_root"
+    path_chain_is_safe "$data_directory" || fail "invalid AgentQ data directory path: $data_directory"
+    [ ! -L "$data_directory" ] || fail "invalid AgentQ data directory path: $data_directory"
+    [ -d "$data_directory" ] || fail "missing AgentQ data directory: $data_directory"
+}
+
+ensure_task_log_directory() {
+    path_chain_is_safe "$task_log_directory" || fail "invalid AgentQ task log directory path: $task_log_directory"
+    [ ! -L "$task_log_directory" ] || fail "invalid AgentQ task log directory path: $task_log_directory"
+    [ -d "$task_log_directory" ] || fail "missing AgentQ task log directory: $task_log_directory"
+}
+
+ensure_request_directory() {
+    path_chain_is_safe "$request_directory" || fail "invalid AgentQ request directory path: $request_directory"
+    path_chain_is_safe "$request_lock_directory" || fail "invalid AgentQ request lock directory path: $request_lock_directory"
+    path_chain_is_safe "$request_tombstone_directory" || fail "invalid AgentQ request tombstone directory path: $request_tombstone_directory"
+    [ ! -L "$request_directory" ] || fail "invalid AgentQ request directory path: $request_directory"
+    [ ! -L "$request_lock_directory" ] || fail "invalid AgentQ request lock directory path: $request_lock_directory"
+    [ ! -L "$request_tombstone_directory" ] || fail "invalid AgentQ request tombstone directory path: $request_tombstone_directory"
+    [ -d "$request_directory" ] || fail "missing AgentQ request directory: $request_directory"
+    [ -d "$request_lock_directory" ] || fail "missing AgentQ request lock directory: $request_lock_directory"
+    [ -d "$request_tombstone_directory" ] || fail "missing AgentQ request tombstone directory: $request_tombstone_directory"
+
+    if [ "$platform_kind" = unix ]; then
+        chmod 700 "$request_directory" "$request_lock_directory" "$request_tombstone_directory" || fail "cannot secure AgentQ request directory: $request_directory"
+    fi
+}
+
+ensure_runtime_directory() {
+    path_chain_is_safe "$runtime_directory" || fail "invalid AgentQ runtime directory path: $runtime_directory"
+    [ ! -L "$runtime_directory" ] || fail "invalid AgentQ runtime directory path: $runtime_directory"
+    [ -d "$runtime_directory" ] || fail "missing AgentQ runtime directory: $runtime_directory"
+
+    if [ "$platform_kind" = unix ]; then
+        chmod 700 "$runtime_directory" || fail "cannot secure AgentQ runtime directory: $runtime_directory"
+    fi
+}
+
+maintenance_lock_is_stale() {
+    local lock_pid=''
+    local lock_identity=''
+
+    case "$platform_kind" in
+        unix)
+            [ -d "$maintenance_lock_directory" ] || return 1
+            read_lock_metadata "$maintenance_lock_directory/pid" || return 1
+            ;;
+        windows)
+            [ -f "$maintenance_lock_directory" ] && [ ! -L "$maintenance_lock_directory" ] || return 1
+            read_lock_metadata "$maintenance_lock_directory" || return 1
+            ;;
+    esac
+
+    process_is_confirmed_dead "$lock_pid" "$lock_identity"
+}
+
+recover_stale_maintenance_lock() {
+    if ! path_chain_is_safe "$maintenance_lock_directory"; then
+        printf '%s: refusing to recover an unsafe AgentQ maintenance lock: %s\n' "$program" "$maintenance_lock_directory" >&2
+        return 2
+    fi
+    if maintenance_lock_is_stale; then
+        case "$platform_kind" in
+            unix)
+                if ! remove_runtime_temporary_file "$maintenance_lock_directory/pid" 'stale maintenance lock metadata'; then
+                    fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory"
+                fi
+                rmdir -- "$maintenance_lock_directory" 2>/dev/null || fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory"
+                ;;
+            windows)
+                if ! remove_runtime_temporary_file "$maintenance_lock_directory" 'stale maintenance lock'; then
+                    fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory"
+                fi
+                [ ! -e "$maintenance_lock_directory" ] && [ ! -L "$maintenance_lock_directory" ] || fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory"
+                ;;
+        esac
+    fi
+}
+
+ensure_not_in_maintenance() {
+    if [ -L "$maintenance_lock_directory" ]; then
+        fail "invalid AgentQ maintenance lock path: $maintenance_lock_directory"
+    fi
+    if [ -e "$maintenance_lock_directory" ]; then
+        case "$platform_kind" in
+            unix)
+                [ -d "$maintenance_lock_directory" ] || fail "invalid AgentQ maintenance lock path: $maintenance_lock_directory"
+                ;;
+            windows)
+                [ -f "$maintenance_lock_directory" ] || fail "invalid AgentQ maintenance lock path: $maintenance_lock_directory"
+                ;;
+        esac
+        recover_stale_maintenance_lock
+    fi
+    if [ -e "$maintenance_lock_directory" ]; then
+        fail "AgentQ maintenance is in progress; retry after the installer completes"
+    fi
+}
+
+release_owned_lock() {
+    local lock_path=$1
+    local lock_kind=$2
+    local pid_path
+    local remove_status
+
+    [ -n "$lock_path" ] || return 0
+    if ! path_chain_is_safe "$lock_path"; then
+        printf '%s: refusing to remove an unsafe AgentQ %s lock: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+        return 2
+    fi
+    if [ ! -e "$lock_path" ] && [ ! -L "$lock_path" ]; then
+        return 0
+    fi
+    if [ ! -d "$lock_path" ] || [ -L "$lock_path" ]; then
+        printf '%s: refusing to remove an unsafe AgentQ %s lock: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+        return 2
+    fi
+    pid_path="$lock_path/pid"
+    if runtime_temporary_path_is_safe "$pid_path"; then
+        :
+    else
+        printf '%s: refusing to remove an unsafe AgentQ lock metadata: %s\n' "$program" "$pid_path" >&2
+        return 2
+    fi
+    if lock_is_owned_by_current_process "$pid_path"; then
+        :
+    else
+        return 0
+    fi
+    if remove_runtime_temporary_file "$pid_path" 'lock metadata'; then
+        :
+    else
+        remove_status=$?
+        return "$remove_status"
+    fi
+    if ! rmdir -- "$lock_path"; then
+        printf '%s: failed to remove AgentQ %s lock directory: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+        return 1
+    fi
+    if [ -e "$lock_path" ] || [ -L "$lock_path" ]; then
+        printf '%s: AgentQ %s lock directory remained after cleanup: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+        return 1
+    fi
+    return 0
+}
+
+release_request_lock() {
+    local lock_path=$request_lock
+    local release_status
+
+    if release_owned_lock "$lock_path" request; then
+        request_lock=''
+        return 0
+    else
+        release_status=$?
+        return "$release_status"
+    fi
+}
+
+release_operation_lock() {
+    local lock_path=$operation_lock
+    local release_status
+
+    if release_owned_lock "$lock_path" operation; then
+        operation_lock=''
+        return 0
+    else
+        release_status=$?
+        return "$release_status"
+    fi
+}
+
+cleanup() {
+    local cleanup_status=0
+
+    if [ -n "$compact_log_raw_file" ]; then
+        remove_runtime_temporary_file "$compact_log_raw_file" 'compact log raw log file' || cleanup_status=1
+        compact_log_raw_file=''
+    fi
+    if [ -n "$reconcile_raw_status_file" ]; then
+        remove_runtime_temporary_file "$reconcile_raw_status_file" 'reconciliation raw status file' || cleanup_status=1
+        reconcile_raw_status_file=''
+    fi
+    if [ -n "$group_raw_file" ]; then
+        remove_runtime_temporary_file "$group_raw_file" 'group raw response file' || cleanup_status=1
+        group_raw_file=''
+    fi
+    release_request_metadata_files || cleanup_status=1
+    release_operation_lock || cleanup_status=1
+    release_request_lock || cleanup_status=1
+    return "$cleanup_status"
+}
+
+trap cleanup EXIT
+
+acquire_operation_lock() {
+    local candidate="$operation_lock_directory"
+    local candidate_parent
+    local attempt=0
+    local lock_pid=''
+    local lock_identity=''
+
+    case "$candidate" in
+        */*)
+            candidate_parent=${candidate%/*}
+            [ -n "$candidate_parent" ] || candidate_parent=/
+            ;;
+        *)
+            candidate_parent=.
+            ;;
+    esac
+
+    path_chain_is_safe "$candidate" || fail "invalid AgentQ operation lock path: $candidate"
+    [ -z "$operation_lock" ] || return 0
+    ensure_not_in_maintenance
+    set_current_process_lock_metadata || fail "cannot determine AgentQ operation lock owner"
+
+    while [ "$attempt" -lt "$lock_acquire_attempts" ]; do
+        [ ! -L "$candidate_parent" ] || fail "invalid AgentQ operation lock parent path: $candidate_parent"
+        [ ! -L "$candidate" ] || fail "invalid AgentQ operation lock path: $candidate"
+        if mkdir -- "$candidate" 2>/dev/null; then
+            if ! write_lock_metadata "$candidate/pid"; then
+                attempt=$((attempt + 1))
+                [ "$attempt" -lt "$lock_acquire_attempts" ] ||
+                    fail "cannot initialize AgentQ operation lock: $candidate"
+                sleep "$lock_retry_delay_seconds"
+                continue
+            fi
+            operation_lock=$candidate
+            if [ -e "$maintenance_lock_directory" ] || [ -L "$maintenance_lock_directory" ]; then
+                if ! release_operation_lock; then
+                    fail "cannot release AgentQ operation lock while maintenance lock is present: $candidate"
+                fi
+                ensure_not_in_maintenance
+                continue
+            fi
+            if ! ensure_request_record_layout; then
+                fail "cannot prepare AgentQ request record layout: $candidate"
+            fi
+            return 0
+        fi
+
+        [ ! -L "$candidate_parent" ] || fail "invalid AgentQ operation lock parent path: $candidate_parent"
+        [ ! -L "$candidate" ] || fail "invalid AgentQ operation lock path: $candidate"
+        if read_lock_metadata "$candidate/pid"; then
+            if process_is_confirmed_dead "$lock_pid" "$lock_identity"; then
+                if ! remove_stale_lock "$candidate" operation "$lock_pid" "$lock_identity"; then
+                    fail "cannot recover stale AgentQ operation lock: $candidate"
+                fi
+                continue
+            fi
+        elif lock_directory_is_stale_empty "$candidate"; then
+            if ! remove_stale_lock "$candidate" operation '' '' true; then
+                fail "cannot recover empty AgentQ operation lock: $candidate"
+            fi
+            continue
+        fi
+
+        attempt=$((attempt + 1))
+        sleep "$lock_retry_delay_seconds"
+    done
+
+    fail "AgentQ operation is already in progress: $candidate" lock_contention
+}
+
+operation_lock_is_held() {
+    [ -n "$operation_lock" ] && [ -d "$operation_lock" ]
+}
+
+with_operation_lock() {
+    local command_status
+    local release_status
+
+    if operation_lock_is_held; then
+        "$@"
+        return
+    fi
+
+    acquire_operation_lock
+    if "$@"; then
+        command_status=0
+    else
+        command_status=$?
+    fi
+    if release_operation_lock; then
+        :
+    else
+        release_status=$?
+        [ "$command_status" -ne 0 ] || command_status=$release_status
+    fi
+    return "$command_status"
+}
+
+remove_stale_lock() {
+    local lock_path=$1
+    local lock_kind=$2
+    local expected_pid=${3:-}
+    local expected_identity=${4:-}
+    local require_empty=${5:-false}
+    local pid_path
+    local remove_status
+
+    [ -n "$lock_path" ] || return 1
+    if ! path_chain_is_safe "$lock_path"; then
+        printf '%s: refusing to recover an unsafe AgentQ %s lock: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+        return 2
+    fi
+    if [ ! -d "$lock_path" ] || [ -L "$lock_path" ]; then
+        printf '%s: refusing to recover an unsafe AgentQ %s lock: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+        return 2
+    fi
+    pid_path="$lock_path/pid"
+    if [ "$require_empty" = true ]; then
+        if [ -e "$pid_path" ] || [ -L "$pid_path" ]; then
+            printf '%s: AgentQ %s lock changed while recovering its empty directory: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+            return 2
+        fi
+    elif [ -n "$expected_pid" ]; then
+        if ! read_lock_metadata "$pid_path" ||
+            [ "$lock_pid" != "$expected_pid" ] ||
+            [ "$lock_identity" != "$expected_identity" ]; then
+            printf '%s: AgentQ %s stale lock identity changed during recovery: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+            return 2
+        fi
+    fi
+    if [ -e "$pid_path" ] || [ -L "$pid_path" ]; then
+        if remove_runtime_temporary_file "$pid_path" 'stale lock metadata'; then
+            :
+        else
+            remove_status=$?
+            return "$remove_status"
+        fi
+    fi
+    if ! rmdir -- "$lock_path"; then
+        printf '%s: failed to remove AgentQ %s stale lock directory: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+        return 1
+    fi
+    if [ -e "$lock_path" ] || [ -L "$lock_path" ]; then
+        printf '%s: AgentQ %s stale lock directory remained after cleanup: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+        return 1
+    fi
+    return 0
+}
+
+run_pueue() {
+    case "$platform_kind" in
+        windows)
+            env -i \
+                HOME="$agentq_home" \
+                USER="$agentq_user" \
+                USERNAME="$agentq_user" \
+                USERPROFILE="$agentq_userprofile" \
+                APPDATA="$agentq_appdata" \
+                LOCALAPPDATA="$agentq_localappdata" \
+                HOMEDRIVE="$agentq_homedrive" \
+                HOMEPATH="$agentq_homepath" \
+                SystemRoot="$agentq_systemroot" \
+                SystemDrive="$agentq_systemdrive" \
+                WINDIR="$agentq_windir" \
+                ComSpec="$agentq_comspec" \
+                PATHEXT="$agentq_pathext" \
+                TEMP="$agentq_temp" \
+                TMP="$agentq_tmp" \
+                MSYSTEM="$agentq_msystem" \
+                MSYS_NO_PATHCONV=1 \
+                PATH="$agentq_windows_path" \
+                "$pueue_bin" --config "$pueue_config_path" "$@"
+            ;;
+        unix)
+            env -i \
+                HOME="$HOME" \
+                USER="${USER:-$(id -un)}" \
+                LOGNAME="${LOGNAME:-${USER:-$(id -un)}}" \
+                PATH="$PATH" \
+                SHELL="${SHELL:-/bin/sh}" \
+                LANG="${LANG:-C.UTF-8}" \
+                "$pueue_bin" --config "$config_path" "$@"
+            ;;
+    esac
+}
+
+managed_daemon_is_active() {
+    case "$platform_kind" in
+        windows)
+            command -v powershell.exe >/dev/null 2>&1 || return 1
+            # shellcheck disable=SC2016
+            AGENTQ_PUEUED_PATH="$pueued_path_windows" powershell.exe \
+                -NoProfile \
+                -NonInteractive \
+                -Command '
+                    $target = $env:AGENTQ_PUEUED_PATH
+                    foreach ($process in @(Get-Process -Name pueued -ErrorAction SilentlyContinue)) {
+                        try {
+                            if ($process.Path -ieq $target) {
+                                exit 0
+                            }
+                        } catch {
+                        }
+                    }
+                    exit 1
+                ' >/dev/null 2>&1
+            ;;
+        unix)
+            case "$platform" in
+                Linux*)
+                    command -v systemctl >/dev/null 2>&1 || return 1
+                    systemctl --user is-active --quiet agentq-pueued.service
+                    ;;
+                Darwin*)
+                    command -v launchctl >/dev/null 2>&1 || return 1
+                    macos_launch_service_target
+                    launchctl print "$macos_launch_service" 2>/dev/null \
+                        | grep -q 'state = running'
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+start_managed_daemon() {
+    case "$platform_kind" in
+        windows)
+            [ -r "$startup_script" ] || fail "missing AgentQ startup script: $startup_script"
+            command -v powershell.exe >/dev/null 2>&1 || fail 'powershell.exe is required to start Pueue on Windows'
+            if ! powershell.exe \
+                -NoProfile \
+                -NonInteractive \
+                -ExecutionPolicy Bypass \
+                -File "$startup_script_path" >/dev/null; then
+                fail 'failed to start the managed Windows Pueue daemon'
+            fi
+            ;;
+        unix)
+            case "$platform" in
+                Linux*)
+                    command -v systemctl >/dev/null 2>&1 || fail 'systemctl is required to start AgentQ on Linux'
+                    if ! systemctl --user start agentq-pueued.service; then
+                        fail 'failed to start systemd user service agentq-pueued.service'
+                    fi
+                    ;;
+                Darwin*)
+                    command -v launchctl >/dev/null 2>&1 || fail 'launchctl is required to start AgentQ on macOS'
+                    macos_launch_service_target
+                    case "$macos_launch_service" in
+                        system/*)
+                            fail 'system LaunchDaemon com.agentq.pueued is inactive; rerun the AgentQ installer in an interactive sudo session'
+                            ;;
+                    esac
+                    if ! launchctl kickstart "$macos_launch_service"; then
+                        fail 'failed to start launchd service com.agentq.pueued'
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+macos_launch_service_target() {
+    local macos_uid
+
+    macos_uid=$(id -u)
+    macos_launch_service="system/com.agentq.pueued"
+    if [ -f /Library/LaunchDaemons/com.agentq.pueued.plist ] || launchctl print "$macos_launch_service" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    macos_launch_service="gui/$macos_uid/com.agentq.pueued"
+    if launchctl print "$macos_launch_service" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    macos_launch_service="user/$macos_uid/com.agentq.pueued"
+    if launchctl print "$macos_launch_service" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    macos_launch_service="gui/$macos_uid/com.agentq.pueued"
+    if launchctl print "gui/$macos_uid" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    macos_launch_service="user/$macos_uid/com.agentq.pueued"
+}
+
+ensure_daemon() {
+    local attempt=0
+
+    ensure_not_in_maintenance
+
+    if run_pueue status --json >/dev/null 2>&1; then
+        recover_removing_requests || fail 'failed to recover removing AgentQ requests'
+        return 0
+    fi
+
+    if managed_daemon_is_active; then
+        while [ "$attempt" -lt "$startup_attempts" ]; do
+            if run_pueue status --json >/dev/null 2>&1; then
+                recover_removing_requests || fail 'failed to recover removing AgentQ requests'
+                return 0
+            fi
+            attempt=$((attempt + 1))
+            sleep 1
+        done
+
+        fail 'Pueue daemon service is active but unreachable; refusing to restart it because AgentQ tasks may still be running'
+    fi
+
+    ensure_not_in_maintenance
+    start_managed_daemon
+    attempt=0
+    while [ "$attempt" -lt "$startup_attempts" ]; do
+        if run_pueue status --json >/dev/null 2>&1; then
+            recover_removing_requests || fail 'failed to recover removing AgentQ requests'
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+
+    fail "Pueue daemon is unavailable after ${startup_attempts}s"
+}
+
+ensure_group() {
+    local group_file
+    local group_exists=false
+    local jq_status
+
+    group_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-group' '.json') ||
+        fail 'cannot allocate a group status temporary file'
+    group_raw_file=$group_file
+    require_runtime_temporary_file "$group_file"
+    require_runtime_temporary_file "$group_file"
+    require_runtime_temporary_file "$group_file"
+    require_runtime_temporary_file "$group_file"
+    if ! run_pueue group --json > "$group_file"; then
+        fail 'cannot inspect the AgentQ group'
+    fi
+    require_runtime_temporary_file "$group_file"
+    jq -e 'type == "object"' < "$group_file" >/dev/null ||
+        fail 'AgentQ group response is invalid JSON'
+    if jq -e --arg name "$group_name" 'has($name)' < "$group_file" >/dev/null; then
+        group_exists=true
+    else
+        jq_status=$?
+        case "$jq_status" in
+            1) ;;
+            *) fail 'cannot inspect the AgentQ group' ;;
+        esac
+    fi
+    remove_runtime_temporary_file "$group_file" 'group raw response file' ||
+        fail 'failed to clean AgentQ group raw response temporary file'
+    group_raw_file=''
+    if [ "$group_exists" = true ]; then
+        if ! run_pueue parallel --group "$group_name" 1 >/dev/null; then
+            return 1
+        fi
+    else
+        if ! run_pueue group add --parallel 1 "$group_name" >/dev/null; then
+            return 1
+        fi
+    fi
+}
+
+verify_group() {
+    local group_file
+
+    group_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-group' '.json') ||
+        fail 'cannot allocate a group status temporary file'
+    group_raw_file=$group_file
+    require_runtime_temporary_file "$group_file"
+    require_runtime_temporary_file "$group_file"
+    require_runtime_temporary_file "$group_file"
+    require_runtime_temporary_file "$group_file"
+    run_pueue group --json > "$group_file" || fail 'cannot inspect the AgentQ group'
+    require_runtime_temporary_file "$group_file"
+    jq -e --arg name "$group_name" '
+        (.[$name] | type) == "object"
+        and .[$name].parallel_tasks == 1
+    ' < "$group_file" >/dev/null || fail "AgentQ group is missing or has unexpected parallelism: $group_name"
+    remove_runtime_temporary_file "$group_file" 'group raw response file' || fail 'failed to clean AgentQ group raw response temporary file'
+    group_raw_file=''
+}
+
+normalize_workdir() {
+    local input=$1
+
+    case "$platform_kind" in
+        windows)
+            case "$input" in
+                /*|[A-Za-z]:[\\/]*|\\\\*) ;;
+                *) fail "working directory must be absolute: $input" ;;
+            esac
+            local unix_path
+            local windows_path
+            unix_path=$(cygpath -u "$input" 2>/dev/null) || fail "invalid working directory: $input"
+            [ -d "$unix_path" ] || fail "working directory does not exist: $input"
+            windows_path=$(cygpath -aw "$unix_path") || fail "cannot normalize working directory: $input"
+            printf '%s\n' "$windows_path"
+            ;;
+        unix)
+            case "$input" in
+                /*) ;;
+                *) fail "working directory must be absolute: $input" ;;
+            esac
+            [ -d "$input" ] || fail "working directory does not exist: $input"
+            (CDPATH=; cd -- "$input" && pwd -P)
+            ;;
+    esac
+}
+
+# shellcheck disable=SC2016
+compact_filter='
+def canonical_integer_string:
+    tostring
+    | sub("^0+"; "")
+    | if . == "" then "0" else . end;
+def same_task_id($left; $right):
+    ($left | canonical_integer_string) == ($right | canonical_integer_string);
+def lifecycle:
+    .status as $status
+    | if ($status | has("Running")) then $status.Running
+      elif ($status | has("Done")) then $status.Done
+      else {} end;
+def compact:
+    lifecycle as $lifecycle
+    | {
+        id,
+        label,
+        group,
+        path,
+        created_at,
+        start: ($lifecycle.start // null),
+        end: ($lifecycle.end // null),
+        status
+    };
+def decorate($markers; $requests):
+    . as $task
+    | ($markers | map(select(
+        same_task_id(.task_id; $task.id)
+        and (.created_at == $task.created_at)
+    )) | first) as $marker
+    | ($requests | map(select(
+        (.state == "accepted" or .state == "removing")
+        and same_task_id(.task_id; $task.id)
+        and (.task_created_at == $task.created_at)
+    )) | first) as $request
+    | if $request == null then . else
+        .label = $request.payload.label
+        | .agentq = ((.agentq // {}) + {
+            request_id: $request.request_id,
+            removal_pending: ($request.state == "removing")
+        })
+      end
+    | if $marker == null then .
+      elif $marker.state == "requested" then
+        .agentq = ((.agentq // {}) + {
+            cancellation_requested_at: $marker.requested_at,
+            cancellation_reason: $marker.reason
+        })
+      else
+        .agentq = ((.agentq // {}) + {
+            cancellation_pending_at: $marker.requested_at,
+            cancellation_reason: $marker.reason
+        })
+      end;
+'
+
+load_cancellation_markers() {
+    local marker_files=()
+    local marker_path
+    local marker_parent
+    local marker_task_id
+    local marker
+
+    shopt -s nullglob
+    marker_files=("$cancellation_directory"/*.json)
+    shopt -u nullglob
+
+    if [ "${#marker_files[@]}" -eq 0 ]; then
+        printf '%s\n' '[]'
+        return 0
+    fi
+
+    {
+        for marker_path in "${marker_files[@]}"; do
+            marker_task_id=${marker_path##*/}
+            marker_task_id=${marker_task_id%.json}
+            is_task_id "$marker_task_id" || fail "invalid AgentQ cancellation marker filename: $marker_path"
+            [ "$(canonical_task_id "$marker_task_id")" = "$marker_task_id" ] ||
+                fail "non-canonical AgentQ cancellation marker filename: $marker_path"
+            path_chain_is_safe "$marker_path" ||
+                fail "invalid AgentQ cancellation marker path: $marker_path"
+            marker_parent=${marker_path%/*}
+            [ -n "$marker_parent" ] || marker_parent=.
+            [ -d "$marker_parent" ] && [ ! -L "$marker_parent" ] ||
+                fail "invalid AgentQ cancellation marker path: $marker_path"
+            [ -f "$marker_path" ] && [ ! -L "$marker_path" ] ||
+                fail "invalid AgentQ cancellation marker path: $marker_path"
+            request_metadata_file_is_safe "$marker_path" ||
+                fail "invalid AgentQ cancellation marker path: $marker_path"
+            request_metadata_file_is_safe "$marker_path" ||
+                fail "invalid AgentQ cancellation marker path: $marker_path"
+            validate_task_id_precision "$marker_task_id"
+            marker=$(cancellation_marker_is_valid "$marker_path" "$marker_task_id") ||
+                fail "invalid AgentQ cancellation marker: $marker_path"
+            printf '%s\n' "$marker"
+        done
+    } | jq -cse '
+        def valid_task_id:
+            if type != "number" then
+                false
+            else
+                (. >= 0) and ((floor) == .)
+            end;
+        def valid_marker:
+            (.task_id | valid_task_id)
+            and (.created_at | type) == "string"
+            and (.created_at | length) > 0
+            and (.requested_at | type) == "string"
+            and (.requested_at | length) > 0
+            and (.reason | type) == "string"
+            and (.reason | length) > 0
+            and ((.state? == null) or .state == "pending" or .state == "requested");
+        if all(.[]; valid_marker) then
+            map(if .state? == null then . + {state: "requested"} else . end)
+        else error("invalid AgentQ cancellation marker")
+        end
+    '
+}
+
+request_record_path() {
+    local request_id=$1
+
+    is_request_id "$request_id" || fail "invalid AgentQ request record id: $request_id"
+    printf '%s/%s.json\n' "$request_directory" "$request_id"
+}
+
+request_tombstone_path() {
+    local request_id=$1
+
+    is_request_id "$request_id" || fail "invalid AgentQ request tombstone id: $request_id"
+    printf '%s/%s.json\n' "$request_tombstone_directory" "$request_id"
+}
+
+request_task_label() {
+    printf 'agentq:%s\n' "$1"
+}
+
+request_record_is_valid() {
+    local record_path=$1
+    local request_id=$2
+
+    request_metadata_file_is_safe "$record_path" ||
+        fail "invalid AgentQ request record path: $record_path"
+    validate_task_id_precision_in_file "$record_path"
+    request_metadata_file_is_safe "$record_path" ||
+        fail "invalid AgentQ request record path: $record_path"
+    jq -ce --arg request_id "$request_id" '
+        def valid_task_id:
+            if type != "number" then
+                false
+            else
+                (. >= 0) and ((floor) == .)
+            end;
+        if (
+            (.version == 1)
+            and (.request_id == $request_id)
+            and (.payload | type) == "object"
+            and (.payload.workdir | type) == "string"
+            and (.payload.label | type) == "string"
+            and (.payload.argv | type) == "array"
+            and all(.payload.argv[]; type == "string")
+            and (.task_label == ("agentq:" + .request_id))
+            and (.state == "prepared" or .state == "adding" or .state == "accepted" or .state == "removing" or .state == "removed")
+            and (
+                if .state == "prepared" or .state == "adding" then
+                    .task_id == null and .task_created_at == null
+                else
+                    (.task_id | valid_task_id)
+                    and (.task_created_at | type) == "string"
+                    and (.task_created_at | length) > 0
+                end
+            )
+            and (.created_at | type) == "string"
+            and (.created_at | length) > 0
+        ) then . else error("invalid AgentQ request record") end
+    ' < "$record_path"
+}
+
+request_tombstone_is_valid() {
+    local tombstone_path=$1
+    local request_id=$2
+
+    request_metadata_file_is_safe "$tombstone_path" ||
+        fail "invalid AgentQ request tombstone path: $tombstone_path"
+    validate_task_id_precision_in_file "$tombstone_path"
+    request_metadata_file_is_safe "$tombstone_path" ||
+        fail "invalid AgentQ request tombstone path: $tombstone_path"
+    jq -ce --arg request_id "$request_id" '
+        def valid_task_id:
+            if type != "number" then
+                false
+            else
+                (. >= 0) and ((floor) == .)
+            end;
+        if (
+            (.version == 1)
+            and (.request_id == $request_id)
+            and (.task_id | valid_task_id)
+            and (.task_created_at | type) == "string"
+            and (.task_created_at | length) > 0
+            and (.state == "removed")
+            and (.removed_at | type) == "string"
+            and (.removed_at | length) > 0
+        ) then .
+        else error("invalid AgentQ request tombstone")
+        end
+    ' < "$tombstone_path"
+}
+
+load_request_records() {
+    local record_files=()
+    local record_path
+    local record_parent
+    local request_id
+    local record
+
+    shopt -s nullglob
+    record_files=("$request_directory"/*.json)
+    shopt -u nullglob
+
+    if [ "${#record_files[@]}" -eq 0 ]; then
+        printf '%s\n' '[]'
+        return 0
+    fi
+
+    {
+    for record_path in "${record_files[@]}"; do
+        request_id=${record_path##*/}
+        request_id=${request_id%.json}
+        is_request_id "$request_id" || fail "invalid AgentQ request record filename: $record_path"
+        path_chain_is_safe "$record_path" ||
+            fail "invalid AgentQ request record path: $record_path"
+        record_parent=${record_path%/*}
+        [ -n "$record_parent" ] || record_parent=.
+        [ -d "$record_parent" ] && [ ! -L "$record_parent" ] ||
+            fail "invalid AgentQ request record path: $record_path"
+        [ -f "$record_path" ] && [ ! -L "$record_path" ] ||
+            fail "invalid AgentQ request record path: $record_path"
+        request_metadata_file_is_safe "$record_path" ||
+            fail "invalid AgentQ request record path: $record_path"
+        request_metadata_file_is_safe "$record_path" ||
+            fail "invalid AgentQ request record path: $record_path"
+        record=$(request_record_is_valid "$record_path" "$request_id") ||
+            fail "invalid AgentQ request record: $record_path"
+        printf '%s\n' "$record"
+        done
+    } | jq -cse '
+        def valid_task_id:
+            if type != "number" then
+                false
+            else
+                (. >= 0) and ((floor) == .)
+            end;
+        def valid_request:
+            (.version == 1)
+            and (.request_id | type) == "string"
+            and (.payload | type) == "object"
+            and (.payload.workdir | type) == "string"
+            and (.payload.label | type) == "string"
+            and (.payload.argv | type) == "array"
+            and all(.payload.argv[]; type == "string")
+            and (.task_label == ("agentq:" + .request_id))
+            and (.state == "prepared" or .state == "adding" or .state == "accepted" or .state == "removing")
+            and (
+                if .state == "prepared" or .state == "adding" then
+                    .task_id == null and .task_created_at == null
+                else
+                    (.task_id | valid_task_id)
+                    and (.task_created_at | type) == "string"
+                    and (.task_created_at | length) > 0
+                end
+            )
+            and (.created_at | type) == "string"
+            and (.created_at | length) > 0;
+        if all(.[]; valid_request) then .
+        else error("invalid AgentQ request record")
+        end
+    '
+}
+
+release_request_metadata_files() {
+    local cleanup_status=0
+
+    if [ -n "$request_records_file" ]; then
+        remove_runtime_temporary_file "$request_records_file" || cleanup_status=1
+        request_records_file=''
+    fi
+    if [ -n "$cancellation_markers_file" ]; then
+        remove_runtime_temporary_file "$cancellation_markers_file" || cleanup_status=1
+        cancellation_markers_file=''
+    fi
+    request_records_jq_file=''
+    cancellation_markers_jq_file=''
+    return "$cleanup_status"
+}
+
+cleanup_request_metadata_after_setup_failure() {
+    if ! release_request_metadata_files; then
+        printf '%s: failed to clean AgentQ request metadata temporary files after setup failure\n' "$program" >&2
+        return 1
+    fi
+}
+
+cleanup_task_identity_metadata_after_failure() {
+    if ! release_request_metadata_files; then
+        printf '%s: failed to clean AgentQ task identity metadata temporary files\n' "$program" >&2
+        return 1
+    fi
+}
+
+cleanup_compact_log_metadata_after_failure() {
+    if ! release_request_metadata_files; then
+        printf '%s: failed to clean AgentQ compact log metadata temporary files\n' "$program" >&2
+        return 1
+    fi
+}
+
+cleanup_compact_log_raw_file() {
+    if [ -n "$compact_log_raw_file" ]; then
+        if ! remove_runtime_temporary_file "$compact_log_raw_file" 'compact log raw log file'; then
+            printf '%s: failed to clean AgentQ compact log raw log temporary file\n' "$program" >&2
+            return 1
+        fi
+        compact_log_raw_file=''
+    fi
+    return 0
+}
+
+jq_file_argument() {
+    local path=$1
+
+    if [ "$platform_kind" = windows ]; then
+        cygpath -aw -- "$path"
+    else
+        printf '%s\n' "$path"
+    fi
+}
+
+prepare_request_metadata_files() {
+    release_request_metadata_files || return 1
+    request_records_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-request-records' '.json') || return 1
+    cancellation_markers_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-cancellation-markers' '.json') || {
+        cleanup_request_metadata_after_setup_failure || return 1
+        return 1
+    }
+
+    if ! require_runtime_temporary_file "$request_records_file" ||
+        ! require_runtime_temporary_file "$request_records_file" ||
+        ! require_runtime_temporary_file "$request_records_file" ||
+        ! require_runtime_temporary_file "$request_records_file" ||
+        ! load_request_records > "$request_records_file" ||
+        ! require_runtime_temporary_file "$cancellation_markers_file" ||
+        ! require_runtime_temporary_file "$cancellation_markers_file" ||
+        ! require_runtime_temporary_file "$cancellation_markers_file" ||
+        ! require_runtime_temporary_file "$cancellation_markers_file" ||
+        ! load_cancellation_markers > "$cancellation_markers_file" ||
+        ! require_runtime_temporary_file "$request_records_file" ||
+        ! require_runtime_temporary_file "$cancellation_markers_file"; then
+        release_request_metadata_files
+        return 1
+    fi
+    if ! request_records_jq_file=$(jq_file_argument "$request_records_file") ||
+        ! require_runtime_temporary_file "$request_records_file" ||
+        ! cancellation_markers_jq_file=$(jq_file_argument "$cancellation_markers_file") ||
+        ! require_runtime_temporary_file "$cancellation_markers_file"; then
+        release_request_metadata_files
+        return 1
+    fi
+}
+
+read_request_record() {
+    local request_id=$1
+    local record_path
+
+    is_request_id "$request_id" || fail "invalid AgentQ request record id: $request_id"
+    record_path=$(request_record_path "$request_id")
+    if [ ! -e "$record_path" ] && [ ! -L "$record_path" ]; then
+        return 1
+    fi
+    request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
+    request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
+
+    request_record_is_valid "$record_path" "$request_id" || fail "invalid AgentQ request record: $record_path"
+}
+
+read_request_tombstone() {
+    local request_id=$1
+    local tombstone_path
+
+    is_request_id "$request_id" || fail "invalid AgentQ request tombstone id: $request_id"
+    tombstone_path=$(request_tombstone_path "$request_id")
+    if [ ! -e "$tombstone_path" ] && [ ! -L "$tombstone_path" ]; then
+        return 1
+    fi
+    request_metadata_file_is_safe "$tombstone_path" || fail "invalid AgentQ request tombstone path: $tombstone_path"
+    request_metadata_file_is_safe "$tombstone_path" || fail "invalid AgentQ request tombstone path: $tombstone_path"
+
+    request_tombstone_is_valid "$tombstone_path" "$request_id" || fail "invalid AgentQ request tombstone: $tombstone_path"
+}
+
+prune_request_temporary_files_in_directory() {
+    local directory=$1
+    local kind=$2
+    local temporary_path
+    local temporary_name
+    local temporary_stem
+    local temporary_request_id
+    local temporary_pid
+    local temporary_random
+    local candidate_stem
+    local candidate_base
+    local candidate_request_id
+    local candidate_pid
+    local candidate_random
+    local candidate_valid
+
+    shopt -s nullglob
+    for temporary_path in "$directory"/.*.json; do
+        path_chain_is_safe "$temporary_path" ||
+            fail "invalid AgentQ $kind temporary record path: $temporary_path"
+        [ -f "$temporary_path" ] && [ ! -L "$temporary_path" ] ||
+            fail "invalid AgentQ $kind temporary record path: $temporary_path"
+        temporary_name=${temporary_path##*/}
+        temporary_stem=${temporary_name#.}
+        temporary_stem=${temporary_stem%.json}
+        temporary_request_id=''
+        temporary_pid=''
+        temporary_random=''
+        case "$temporary_name" in
+            .agentqtmp.*.json)
+                candidate_stem=${temporary_name#.agentqtmp.}
+                candidate_stem=${candidate_stem%.json}
+                candidate_random=${candidate_stem##*.}
+                candidate_base=${candidate_stem%.*}
+                candidate_request_id=${candidate_base%.*}
+                candidate_pid=${candidate_base##*.}
+                candidate_valid=true
+                case "$candidate_base" in
+                    *.*) ;;
+                    *) candidate_valid=false ;;
+                esac
+                case "$candidate_random" in
+                    ''|*[!A-Za-z0-9]*) candidate_valid=false ;;
+                esac
+                if [ "$candidate_valid" = true ] &&
+                    is_request_id "$candidate_request_id" &&
+                    is_positive_integer "$candidate_pid"; then
+                    temporary_request_id=$candidate_request_id
+                    temporary_pid=$candidate_pid
+                    temporary_random=$candidate_random
+                fi
+                ;;
+        esac
+        if [ -z "$temporary_request_id" ]; then
+            case "$temporary_stem" in
+                *.*) ;;
+                *) fail "invalid AgentQ $kind temporary process id: $temporary_path" ;;
+            esac
+            temporary_request_id=${temporary_stem%.*}
+            temporary_pid=${temporary_stem##*.}
+        fi
+        is_request_id "$temporary_request_id" ||
+            fail "invalid AgentQ $kind temporary request id: $temporary_path"
+        is_positive_integer "$temporary_pid" ||
+            fail "invalid AgentQ $kind temporary process id: $temporary_path"
+        rm -f -- "$temporary_path" ||
+            fail "cannot remove stale AgentQ $kind temporary record: $temporary_path"
+    done
+    shopt -u nullglob
+}
+
+prune_request_temporary_files() {
+    prune_request_temporary_files_in_directory "$request_directory" request
+    prune_request_temporary_files_in_directory "$request_tombstone_directory" tombstone
+}
+
+prune_cancellation_temporary_files() {
+    local temporary_path
+    local temporary_name
+    local temporary_stem
+    local temporary_task_id
+    local temporary_pid
+    local temporary_random
+
+    shopt -s nullglob
+    for temporary_path in "$cancellation_directory"/.*.json; do
+        path_chain_is_safe "$temporary_path" ||
+            fail "invalid AgentQ cancellation temporary file path: $temporary_path"
+        [ -f "$temporary_path" ] && [ ! -L "$temporary_path" ] ||
+            fail "invalid AgentQ cancellation temporary file path: $temporary_path"
+        temporary_name=${temporary_path##*/}
+        case "$temporary_name" in
+            .agentqcancel.*.json)
+                temporary_stem=${temporary_name#.agentqcancel.}
+                temporary_stem=${temporary_stem%.json}
+                temporary_random=${temporary_stem##*.}
+                temporary_stem=${temporary_stem%.*}
+                case "$temporary_random" in
+                    ''|*[!A-Za-z0-9]*) fail "invalid AgentQ cancellation temporary nonce: $temporary_path" ;;
+                esac
+                ;;
+            .*.*.json)
+                temporary_stem=${temporary_name#.}
+                temporary_stem=${temporary_stem%.json}
+                ;;
+            *)
+                fail "invalid AgentQ cancellation temporary task id: $temporary_path"
+                ;;
+        esac
+        case "$temporary_stem" in
+            *.*) ;;
+            *) fail "invalid AgentQ cancellation temporary process id: $temporary_path" ;;
+        esac
+        temporary_task_id=${temporary_stem%.*}
+        temporary_pid=${temporary_stem##*.}
+        is_task_id "$temporary_task_id" ||
+            fail "invalid AgentQ cancellation temporary task id: $temporary_path"
+        [ "$(canonical_task_id "$temporary_task_id")" = "$temporary_task_id" ] ||
+            fail "non-canonical AgentQ cancellation temporary task id: $temporary_path"
+        is_positive_integer "$temporary_pid" ||
+            fail "invalid AgentQ cancellation temporary process id: $temporary_path"
+        rm -f -- "$temporary_path" ||
+            fail "cannot remove stale AgentQ cancellation temporary file: $temporary_path"
+    done
+    shopt -u nullglob
+}
+
+prune_runtime_temporary_files() {
+    local temporary_path
+    local temporary_name
+    local temporary_stem
+    local temporary_pid
+
+    shopt -s nullglob
+    for temporary_path in \
+        "$runtime_directory"/.agentq-payload.* \
+        "$runtime_directory"/.agentq-status.*.json \
+        "$runtime_directory"/.agentq-task.*.json \
+        "$runtime_directory"/.agentq-request-records.*.json \
+        "$runtime_directory"/.agentq-cancellation-markers.*.json \
+        "$runtime_directory"/.agentq-request-tombstones-v2.*.new \
+        "$runtime_directory"/.agentq-request-tombstones-pruned-at.*.new; do
+        path_chain_is_safe "$temporary_path" ||
+            fail "invalid AgentQ runtime temporary file path: $temporary_path"
+        [ -f "$temporary_path" ] && [ ! -L "$temporary_path" ] ||
+            fail "invalid AgentQ runtime temporary file path: $temporary_path"
+        temporary_name=${temporary_path##*/}
+        case "$temporary_name" in
+            .agentq-payload.*)
+                temporary_stem=${temporary_name#.agentq-payload.}
+                temporary_pid=${temporary_stem%%.*}
+                [ "$temporary_stem" != "$temporary_pid" ] ||
+                    fail "invalid AgentQ runtime temporary process id: $temporary_path"
+                ;;
+            .agentq-status.*.json)
+                temporary_stem=${temporary_name#.agentq-status.}
+                temporary_stem=${temporary_stem%.json}
+                temporary_pid=${temporary_stem%%.*}
+                ;;
+            .agentq-task.*.json)
+                temporary_stem=${temporary_name#.agentq-task.}
+                temporary_stem=${temporary_stem%.json}
+                temporary_pid=${temporary_stem%%.*}
+                ;;
+            .agentq-request-records.*.json)
+                temporary_stem=${temporary_name#.agentq-request-records.}
+                temporary_stem=${temporary_stem%.json}
+                temporary_pid=${temporary_stem%%.*}
+                ;;
+            .agentq-cancellation-markers.*.json)
+                temporary_stem=${temporary_name#.agentq-cancellation-markers.}
+                temporary_stem=${temporary_stem%.json}
+                temporary_pid=${temporary_stem%%.*}
+                ;;
+            .agentq-request-tombstones-v2.*.new)
+                temporary_stem=${temporary_name#.agentq-request-tombstones-v2.}
+                temporary_stem=${temporary_stem%.new}
+                temporary_pid=${temporary_stem%%.*}
+                ;;
+            .agentq-request-tombstones-pruned-at.*.new)
+                temporary_stem=${temporary_name#.agentq-request-tombstones-pruned-at.}
+                temporary_stem=${temporary_stem%.new}
+                temporary_pid=${temporary_stem%%.*}
+                ;;
+            *)
+                fail "invalid AgentQ runtime temporary file path: $temporary_path"
+                ;;
+        esac
+        is_positive_integer "$temporary_pid" ||
+            fail "invalid AgentQ runtime temporary process id: $temporary_path"
+        if process_is_confirmed_dead "$temporary_pid"; then
+            remove_runtime_temporary_file "$temporary_path" ||
+                fail "cannot remove stale AgentQ runtime temporary file: $temporary_path"
+        fi
+    done
+    shopt -u nullglob
+}
+
+write_request_record() {
+    local request_id=$1
+    local record=$2
+    local record_path
+    local temporary
+
+    record_path=$(request_record_path "$request_id")
+    temporary=$(umask 077; make_temporary_file "$request_directory" ".agentqtmp.${request_id}" '.json') ||
+        fail "cannot create temporary AgentQ request record: $request_id"
+    if ! write_temporary_contents "$temporary" "$record" ||
+        ! install_temporary_file "$temporary" "$record_path"; then
+        if ! remove_runtime_temporary_file "$temporary" 'request record temporary file'; then
+            fail "cannot write AgentQ request record; temporary cleanup failed: $request_id"
+        fi
+        fail "cannot write AgentQ request record: $request_id"
+    fi
+}
+
+write_request_tombstone() {
+    local request_id=$1
+    local tombstone=$2
+    local tombstone_path
+    local temporary
+
+    tombstone_path=$(request_tombstone_path "$request_id")
+    temporary=$(umask 077; make_temporary_file "$request_tombstone_directory" ".agentqtmp.${request_id}" '.json') ||
+        fail "cannot create temporary AgentQ tombstone: $request_id"
+    if ! write_temporary_contents "$temporary" "$tombstone" ||
+        ! install_temporary_file "$temporary" "$tombstone_path"; then
+        if ! remove_runtime_temporary_file "$temporary" 'tombstone temporary file'; then
+            fail "cannot write AgentQ tombstone; temporary cleanup failed: $request_id"
+        fi
+        fail "cannot write AgentQ tombstone: $request_id"
+    fi
+}
+
+cleanup_request_payload_after_failure() {
+    local payload_file=$1
+
+    if ! remove_runtime_temporary_file "$payload_file" 'request payload file'; then
+        printf '%s: failed to clean AgentQ request payload temporary file: %s\n' "$program" "$payload_file" >&2
+        return 1
+    fi
+}
+
+cleanup_compact_status_raw_status_after_failure() {
+    local raw_status_file=$1
+
+    if ! remove_runtime_temporary_file "$raw_status_file" 'compact status raw status file'; then
+        printf '%s: failed to clean AgentQ compact status raw status temporary file: %s\n' "$program" "$raw_status_file" >&2
+        return 1
+    fi
+}
+
+cleanup_raw_compact_task_raw_status_after_failure() {
+    local raw_status_file=$1
+
+    if ! remove_runtime_temporary_file "$raw_status_file" 'raw compact task raw status file'; then
+        printf '%s: failed to clean AgentQ raw compact task raw status temporary file: %s\n' "$program" "$raw_status_file" >&2
+        return 1
+    fi
+}
+
+cleanup_compact_task_raw_task_after_failure() {
+    local raw_task_file=$1
+
+    if ! remove_runtime_temporary_file "$raw_task_file" 'compact task raw task file'; then
+        printf '%s: failed to clean AgentQ compact task raw task temporary file: %s\n' "$program" "$raw_task_file" >&2
+        return 1
+    fi
+}
+
+create_request_record() {
+    local request_id=$1
+    local payload=$2
+    local task_label=$3
+    local created_at
+    local payload_file
+    local payload_jq_file
+    local command_status
+
+    created_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    payload_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-payload') || return 1
+    if ! require_runtime_temporary_file "$payload_file" ||
+        ! require_runtime_temporary_file "$payload_file" ||
+        ! require_runtime_temporary_file "$payload_file" ||
+        ! printf '%s\n' "$payload" > "$payload_file" ||
+        ! require_runtime_temporary_file "$payload_file"; then
+        cleanup_request_payload_after_failure "$payload_file" || return 1
+        return 1
+    fi
+    if ! payload_jq_file=$(jq_file_argument "$payload_file") ||
+        ! require_runtime_temporary_file "$payload_file"; then
+        cleanup_request_payload_after_failure "$payload_file" || return 1
+        return 1
+    fi
+    require_runtime_temporary_file "$payload_file" || {
+        cleanup_request_payload_after_failure "$payload_file" || return 1
+        return 1
+    }
+    if jq -cn \
+        --arg request_id "$request_id" \
+        --slurpfile payload "$payload_jq_file" \
+        --arg task_label "$task_label" \
+        --arg created_at "$created_at" \
+        '{
+            version: 1,
+            request_id: $request_id,
+            payload: $payload[0],
+            task_label: $task_label,
+            state: "prepared",
+            task_id: null,
+            task_created_at: null,
+            created_at: $created_at
+        }'; then
+        command_status=0
+    else
+        command_status=$?
+    fi
+    if ! remove_runtime_temporary_file "$payload_file"; then
+        printf '%s: failed to remove the temporary request payload file\n' "$program" >&2
+        [ "$command_status" -ne 0 ] || command_status=1
+    fi
+    return "$command_status"
+}
+
+set_request_state() {
+    local record=$1
+    local state=$2
+    local task_id=${3:-null}
+    local task_created_at=${4:-null}
+
+    if [ "$task_id" != null ]; then
+        validate_task_id_precision "$task_id"
+    fi
+    jq -ce \
+        --arg state "$state" \
+        --argjson task_id "$task_id" \
+        --argjson task_created_at "$task_created_at" \
+        '.state = $state | .task_id = $task_id | .task_created_at = $task_created_at' \
+        <<<"$record"
+}
+
+make_request_tombstone() {
+    local record=$1
+    local removed_at=${2:-}
+
+    if [ -z "$removed_at" ]; then
+        removed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    fi
+
+    jq -ce --arg removed_at "$removed_at" '
+        if .state == "removed" then {
+            version,
+            request_id,
+            task_id,
+            task_created_at,
+            state,
+            removed_at: $removed_at
+        }
+        else error("cannot archive a non-removed AgentQ request")
+        end
+    ' <<<"$record"
+}
+
+request_tombstone_matches_record() {
+    local tombstone=$1
+    local record=$2
+    local request_id
+    local task_id
+    local task_created_at
+
+    request_id=$(jq -r '.request_id' <<<"$record")
+    task_id=$(jq -r '.task_id' <<<"$record")
+    task_created_at=$(jq -r '.task_created_at' <<<"$record")
+    jq -e \
+        --arg request_id "$request_id" \
+        --arg task_id "$task_id" \
+        --arg task_created_at "$task_created_at" '
+        def canonical_integer_string:
+            tostring
+            | sub("^0+"; "")
+            | if . == "" then "0" else . end;
+        .request_id == $request_id
+        and (.task_id | canonical_integer_string) == ($task_id | canonical_integer_string)
+        and .task_created_at == $task_created_at
+        and .state == "removed"
+    ' <<<"$tombstone" >/dev/null
+}
+
+archive_removed_request() {
+    local request_id=$1
+    local record=$2
+    local record_path
+    local tombstone_path
+    local tombstone
+    local existing_tombstone
+
+    [ "$(jq -r '.state' <<<"$record")" = removed ] || fail "cannot archive a non-removed AgentQ request: $request_id"
+    record_path=$(request_record_path "$request_id")
+    tombstone_path=$(request_tombstone_path "$request_id")
+    tombstone=$(make_request_tombstone "$record")
+
+    if [ -e "$tombstone_path" ]; then
+        existing_tombstone=$(read_request_tombstone "$request_id") || fail "invalid AgentQ request tombstone: $tombstone_path"
+        request_tombstone_matches_record "$existing_tombstone" "$record" || fail "AgentQ request tombstone conflicts with the active record: $request_id"
+        tombstone=$existing_tombstone
+    else
+        write_request_tombstone "$request_id" "$tombstone" || return 1
+    fi
+
+    remove_runtime_temporary_file "$record_path" 'request record' || return 1
+    remove_cancellation_marker_for_task \
+        "$(jq -r '.task_id' <<<"$record")" \
+        "$(jq -r '.task_created_at' <<<"$record")" || return 1
+    printf '%s\n' "$tombstone"
+}
+
+write_runtime_marker() {
+    local marker_path=$1
+    local value=$2
+    local marker_directory=${marker_path%/*}
+    local marker_name=${marker_path##*/}
+    local temporary
+
+    temporary=$(umask 077; make_temporary_file "$marker_directory" ".${marker_name}" '.new') ||
+        fail "cannot create temporary AgentQ runtime marker: $marker_path"
+
+    if ! write_temporary_contents "$temporary" "$value" ||
+        ! install_temporary_file "$temporary" "$marker_path"; then
+        if ! remove_runtime_temporary_file "$temporary" 'runtime marker temporary file'; then
+            fail "cannot write AgentQ runtime marker; temporary cleanup failed: $marker_path"
+        fi
+        fail "cannot write AgentQ runtime marker: $marker_path"
+    fi
+}
+
+repair_removed_request_records() {
+    local record_files=()
+    local record_path
+    local request_id
+    local record
+
+    shopt -s nullglob
+    record_files=("$request_directory"/*.json)
+    shopt -u nullglob
+    [ "${#record_files[@]}" -gt 0 ] || return 0
+    for record_path in "${record_files[@]}"; do
+        request_id=${record_path##*/}
+        request_id=${request_id%.json}
+        is_request_id "$request_id" || fail "invalid AgentQ request record filename: $record_path"
+        record=$(read_request_record "$request_id") || fail "missing AgentQ request record during recovery: $record_path"
+        if [ "$(jq -r '.state' <<<"$record")" = removed ]; then
+            if ! archive_removed_request "$request_id" "$record" >/dev/null; then
+                fail "cannot archive removed AgentQ request during repair: $request_id"
+            fi
+        fi
+    done
+}
+
+migrate_removed_request_records() {
+    local marker_value=''
+
+    if [ -e "$request_layout_marker" ] || [ -L "$request_layout_marker" ]; then
+        runtime_marker_file_is_safe "$request_layout_marker" || fail "invalid AgentQ request layout marker: $request_layout_marker"
+        runtime_marker_file_is_safe "$request_layout_marker" || fail "invalid AgentQ request layout marker: $request_layout_marker"
+        IFS= read -r marker_value < "$request_layout_marker" || marker_value=''
+        [ "$marker_value" = v2 ] || fail "unsupported AgentQ request layout marker: $request_layout_marker"
+    else
+        write_runtime_marker "$request_layout_marker" v2
+    fi
+
+    # A tombstone and its active record cannot be switched atomically. Recheck
+    # every layout load so a crash after writing the tombstone repairs itself.
+    repair_removed_request_records
+}
+
+request_tombstones_need_pruning() {
+    local current_epoch
+    local marker_epoch=''
+
+    if [ ! -e "$request_tombstone_prune_marker" ] && [ ! -L "$request_tombstone_prune_marker" ]; then
+        return 0
+    fi
+    runtime_marker_file_is_safe "$request_tombstone_prune_marker" || fail "invalid AgentQ tombstone prune marker: $request_tombstone_prune_marker"
+    runtime_marker_file_is_safe "$request_tombstone_prune_marker" || fail "invalid AgentQ tombstone prune marker: $request_tombstone_prune_marker"
+    IFS= read -r marker_epoch < "$request_tombstone_prune_marker" || marker_epoch=''
+    is_positive_integer "$marker_epoch" || return 0
+    current_epoch=$(date +%s)
+    is_positive_integer "$current_epoch" || fail 'cannot determine the current time for AgentQ tombstone pruning'
+    [ "$current_epoch" -lt "$marker_epoch" ] && return 1
+    [ $((current_epoch - marker_epoch)) -ge "$request_tombstone_prune_interval" ]
+}
+
+prune_request_tombstones() {
+    local current_epoch
+
+    request_tombstones_need_pruning || return 0
+    path_chain_is_safe "$request_tombstone_directory" ||
+        fail "invalid AgentQ request tombstone directory path: $request_tombstone_directory"
+    find "$request_tombstone_directory" -type f -name '*.json' -mtime +"$request_tombstone_retention_days" -exec rm -f -- {} + || fail 'failed to prune expired AgentQ request tombstones'
+    current_epoch=$(date +%s)
+    is_positive_integer "$current_epoch" || fail 'cannot determine the current time for AgentQ tombstone pruning'
+    write_runtime_marker "$request_tombstone_prune_marker" "$current_epoch"
+}
+
+ensure_request_record_layout() {
+    prune_runtime_temporary_files
+    prune_request_temporary_files
+    prune_cancellation_temporary_files
+    migrate_removed_request_records
+    prune_request_tombstones
+}
+
+request_payload() {
+    local workdir=$1
+    local label=$2
+    shift 2
+
+    jq -cn --arg workdir "$workdir" --arg label "$label" \
+        '{workdir: $workdir, label: $label, argv: $ARGS.positional}' \
+        --args -- "$@"
+}
+
+request_payload_matches() {
+    local record=$1
+    local payload=$2
+    local payload_file
+    local payload_jq_file
+    local command_status
+
+    payload_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-payload') || return 1
+    if ! require_runtime_temporary_file "$payload_file" ||
+        ! require_runtime_temporary_file "$payload_file" ||
+        ! require_runtime_temporary_file "$payload_file" ||
+        ! printf '%s\n' "$payload" > "$payload_file" ||
+        ! require_runtime_temporary_file "$payload_file"; then
+        cleanup_request_payload_after_failure "$payload_file" || return 1
+        return 1
+    fi
+    if ! payload_jq_file=$(jq_file_argument "$payload_file") ||
+        ! require_runtime_temporary_file "$payload_file"; then
+        cleanup_request_payload_after_failure "$payload_file" || return 1
+        return 1
+    fi
+    require_runtime_temporary_file "$payload_file" || {
+        cleanup_request_payload_after_failure "$payload_file" || return 1
+        return 1
+    }
+    if jq -e --slurpfile payload "$payload_jq_file" '.payload == $payload[0]' <<<"$record" >/dev/null; then
+        command_status=0
+    else
+        command_status=$?
+    fi
+    if ! remove_runtime_temporary_file "$payload_file"; then
+        printf '%s: failed to remove the temporary request payload file\n' "$program" >&2
+        [ "$command_status" -ne 0 ] || command_status=1
+    fi
+    return "$command_status"
+}
+
+acquire_request_lock() {
+    local request_id=$1
+    local candidate="$request_lock_directory/$request_id"
+    local candidate_parent
+    local attempt=0
+    local lock_pid=''
+    local lock_identity=''
+
+    case "$candidate" in
+        */*)
+            candidate_parent=${candidate%/*}
+            [ -n "$candidate_parent" ] || candidate_parent=/
+            ;;
+        *)
+            candidate_parent=.
+            ;;
+    esac
+
+    path_chain_is_safe "$candidate" || fail "invalid AgentQ request lock path: $candidate"
+    set_current_process_lock_metadata || fail "cannot determine AgentQ request lock owner"
+
+    while [ "$attempt" -lt "$lock_acquire_attempts" ]; do
+        [ ! -L "$candidate_parent" ] || fail "invalid AgentQ request lock parent path: $candidate_parent"
+        [ ! -L "$candidate" ] || fail "invalid AgentQ request lock path: $candidate"
+        if mkdir -- "$candidate" 2>/dev/null; then
+            if ! write_lock_metadata "$candidate/pid"; then
+                attempt=$((attempt + 1))
+                [ "$attempt" -lt "$lock_acquire_attempts" ] ||
+                    fail "cannot initialize AgentQ request lock: $candidate"
+                sleep "$lock_retry_delay_seconds"
+                continue
+            fi
+            request_lock=$candidate
+            return 0
+        fi
+
+        [ ! -L "$candidate_parent" ] || fail "invalid AgentQ request lock parent path: $candidate_parent"
+        [ ! -L "$candidate" ] || fail "invalid AgentQ request lock path: $candidate"
+        if read_lock_metadata "$candidate/pid"; then
+            if process_is_confirmed_dead "$lock_pid" "$lock_identity"; then
+                if ! remove_stale_lock "$candidate" request "$lock_pid" "$lock_identity"; then
+                    fail "cannot recover stale AgentQ request lock: $candidate"
+                fi
+                continue
+            fi
+        elif lock_directory_is_stale_empty "$candidate"; then
+            if ! remove_stale_lock "$candidate" request '' '' true; then
+                fail "cannot recover empty AgentQ request lock: $candidate"
+            fi
+            continue
+        fi
+
+        attempt=$((attempt + 1))
+        sleep "$lock_retry_delay_seconds"
+    done
+
+    fail "AgentQ request is already being submitted: $request_id" lock_contention
+}
+
+find_request_task() {
+    local task_label=$1
+    local raw_status_file
+    local matches
+    local match_count
+    local task
+
+    raw_status_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-reconcile-status' '.json') ||
+        fail 'cannot allocate a reconciliation status temporary file'
+    reconcile_raw_status_file=$raw_status_file
+    require_runtime_temporary_file "$raw_status_file"
+    require_runtime_temporary_file "$raw_status_file"
+    require_runtime_temporary_file "$raw_status_file"
+    require_runtime_temporary_file "$raw_status_file"
+    # A transient Pueue read failure must NOT be reported as "no matching task".
+    # `fail` is `exit 2`, and `exit` inside the `$( )` at every call site ends only
+    # the subshell: the caller then sees an empty string and a false condition,
+    # concludes the task is gone, and archives a LIVE request as `removed`.
+    # Return a distinct status instead; each caller raises the hard failure in its
+    # own shell (see the guard at the top of the matching `else`).
+    run_pueue status --json > "$raw_status_file" || {
+        remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file' || true
+        reconcile_raw_status_file=''
+        return 3
+    }
+    require_runtime_temporary_file "$raw_status_file"
+    validate_pueue_task_id_precision_in_file "$raw_status_file"
+    require_runtime_temporary_file "$raw_status_file"
+    validate_pueue_task_shape_in_file "$raw_status_file"
+    require_runtime_temporary_file "$raw_status_file"
+    matches=$(jq -ce --arg group "$group_name" --arg task_label "$task_label" '
+        [
+            .tasks[]
+            | select(.group == $group and .label == $task_label)
+            | {id, created_at}
+        ]
+    ' < "$raw_status_file") || {
+        remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file' || true
+        reconcile_raw_status_file=''
+        return 3
+    }
+    match_count=$(jq -r 'length' <<<"$matches")
+
+    case "$match_count" in
+        0)
+            remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file' || fail 'failed to clean AgentQ reconciliation raw status temporary file'
+            reconcile_raw_status_file=''
+            return 1
+            ;;
+        1)
+            task=$(jq -c '.[0]' <<<"$matches") || {
+                remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file' || fail 'failed to clean AgentQ reconciliation raw status temporary file'
+                reconcile_raw_status_file=''
+                fail 'cannot render the matching Pueue task while reconciling an AgentQ request'
+            }
+            remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file' || fail 'failed to clean AgentQ reconciliation raw status temporary file'
+            reconcile_raw_status_file=''
+            printf '%s\n' "$task"
+            ;;
+        *)
+            remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file' || true
+            reconcile_raw_status_file=''
+            return 4
+            ;;
+    esac
+}
+
+validate_visible_task_metadata() {
+    local task=$1
+
+    jq -e '
+        if type != "object" then
+            false
+        elif (.id | type) != "number" then
+            false
+        elif (.id < 0) or ((.id | floor) != .id) then
+            false
+        elif (.created_at | type) != "string" then
+            false
+        elif (.created_at | length) == 0 then
+            false
+        else
+            true
+        end
+    ' <<<"$task" >/dev/null ||
+        fail 'invalid visible Pueue task metadata while recovering an AgentQ submit'
+}
+
+reconcile_accepted_request() {
+    local request_id=$1
+    local record=$2
+    local task_label
+    local expected_task_id
+    local expected_task_created_at
+    local task
+    local observed_task_id
+    local observed_task_created_at
+
+    [ "$(jq -r '.state' <<<"$record")" = accepted ] || fail "cannot reconcile a non-accepted AgentQ request: $request_id"
+    task_label=$(jq -r '.task_label' <<<"$record")
+    expected_task_id=$(jq -r '.task_id' <<<"$record")
+    expected_task_created_at=$(jq -r '.task_created_at' <<<"$record")
+    is_task_id "$expected_task_id" || fail "invalid task id in AgentQ request record: $request_id"
+    validate_task_id_precision "$expected_task_id"
+
+    find_request_task_rc=0
+    task=$(find_request_task "$task_label") || find_request_task_rc=$?
+    if [ "$find_request_task_rc" -ne 0 ] && [ "$find_request_task_rc" -ne 1 ]; then
+        return "$find_request_task_rc"
+    fi
+    if [ "$find_request_task_rc" -eq 0 ]; then
+        if ! jq -e '
+            if type != "object" then
+                false
+            elif (.id | type) != "number" then
+                false
+            elif (.id < 0) or ((.id | floor) != .id) then
+                false
+            elif (.created_at | type) != "string" then
+                false
+            elif (.created_at | length) == 0 then
+                false
+            else
+                true
+            end
+        ' <<<"$task" >/dev/null; then
+            fail "invalid visible Pueue task metadata while reconciling AgentQ request: $request_id"
+        fi
+        observed_task_id=$(jq -r '.id' <<<"$task")
+        observed_task_created_at=$(jq -r '.created_at' <<<"$task")
+        validate_task_id_precision "$observed_task_id"
+        if [ "$observed_task_id" != "$expected_task_id" ] || [ "$observed_task_created_at" != "$expected_task_created_at" ]; then
+            fail "AgentQ request record does not match the visible Pueue task: $request_id"
+        fi
+        printf '%s\n' "$record"
+        return 0
+    fi
+
+    record=$(set_request_state "$record" removed "$expected_task_id" "$(jq -Rn --arg value "$expected_task_created_at" '$value')")
+    if ! record=$(archive_removed_request "$request_id" "$record"); then
+        printf '%s: failed to archive removed AgentQ request during recovery: %s\n' "$program" "$request_id" >&2
+        return 1
+    fi
+    printf '%s\n' "$record"
+    return 1
+}
+
+reconcile_removing_request() {
+    local request_id=$1
+    local record=$2
+    local task_label
+    local expected_task_id
+    local expected_task_created_at
+    local task
+    local observed_task_id
+    local observed_task_created_at
+
+    [ "$(jq -r '.state' <<<"$record")" = removing ] || fail "cannot reconcile a non-removing AgentQ request: $request_id"
+    task_label=$(jq -r '.task_label' <<<"$record")
+    expected_task_id=$(jq -r '.task_id' <<<"$record")
+    expected_task_created_at=$(jq -r '.task_created_at' <<<"$record")
+    is_task_id "$expected_task_id" || fail "invalid task id in AgentQ removing request: $request_id"
+    validate_task_id_precision "$expected_task_id"
+
+    find_request_task_rc=0
+    task=$(find_request_task "$task_label") || find_request_task_rc=$?
+    if [ "$find_request_task_rc" -ne 0 ] && [ "$find_request_task_rc" -ne 1 ]; then
+        return "$find_request_task_rc"
+    fi
+    if [ "$find_request_task_rc" -eq 0 ]; then
+        if ! jq -e '
+            if type != "object" then
+                false
+            elif (.id | type) != "number" then
+                false
+            elif (.id < 0) or ((.id | floor) != .id) then
+                false
+            elif (.created_at | type) != "string" then
+                false
+            elif (.created_at | length) == 0 then
+                false
+            else
+                true
+            end
+        ' <<<"$task" >/dev/null; then
+            fail "invalid visible Pueue task metadata while reconciling AgentQ removing request: $request_id"
+        fi
+        observed_task_id=$(jq -r '.id' <<<"$task")
+        observed_task_created_at=$(jq -r '.created_at' <<<"$task")
+        validate_task_id_precision "$observed_task_id"
+        if [ "$observed_task_id" != "$expected_task_id" ] || [ "$observed_task_created_at" != "$expected_task_created_at" ]; then
+            fail "AgentQ removing request does not match the visible Pueue task: $request_id"
+        fi
+        printf '%s\n' "$record"
+        return 1
+    fi
+
+    record=$(set_request_state "$record" removed "$expected_task_id" "$(jq -Rn --arg value "$expected_task_created_at" '$value')")
+    if ! record=$(archive_removed_request "$request_id" "$record"); then
+        printf '%s: failed to archive removed AgentQ request during recovery: %s\n' "$program" "$request_id" >&2
+        return 2
+    fi
+    printf '%s\n' "$record"
+}
+
+recover_removing_requests() {
+    local records
+    local record
+    local request_id
+    local reconcile_status
+
+    records=$(load_request_records)
+    while IFS= read -r record; do
+        [ -n "$record" ] || continue
+        request_id=$(jq -r '.request_id' <<<"$record")
+        if reconcile_removing_request "$request_id" "$record" >/dev/null; then
+            continue
+        else
+            reconcile_status=$?
+        fi
+        [ "$reconcile_status" -eq 1 ] ||
+            fail "cannot recover removing AgentQ request: $request_id"
+    done < <(jq -c '.[] | select(.state == "removing")' <<<"$records")
+}
+
+request_response() {
+    local request_id=$1
+    local task_id=$2
+    local reused=$3
+
+    validate_task_id_precision "$task_id"
+    jq -cn \
+        --arg request_id "$request_id" \
+        --argjson task_id "$task_id" \
+        --argjson reused "$reused" \
+        '{task_id: $task_id, request_id: $request_id, reused: $reused}'
+}
+
+request_id_from_task() {
+    local task=$1
+    local request_id
+    local metadata_request_id
+    local task_label
+
+    metadata_request_id=$(jq -r '.agentq.request_id // empty' <<<"$task")
+    task_label=$(jq -r '.label // empty' <<<"$task")
+    case "$task_label" in
+        agentq:*)
+            request_id=${task_label#agentq:}
+            if [ -n "$metadata_request_id" ] && [ "$metadata_request_id" != "$request_id" ]; then
+                fail 'AgentQ task metadata contains conflicting request identities'
+            fi
+            ;;
+        *)
+            request_id=$metadata_request_id
+            ;;
+    esac
+
+    printf '%s\n' "$request_id"
+}
+
+validate_task_removal() {
+    local task=$1
+    local request_id
+    local record
+    local task_id
+    local task_created_at
+
+    validate_visible_task_metadata "$task"
+    if request_id=$(request_id_from_task "$task"); then
+        :
+    else
+        return $?
+    fi
+    [ -n "$request_id" ] || return 0
+    is_request_id "$request_id" || fail "invalid request id attached to task removal: $request_id"
+
+    record=$(read_request_record "$request_id") || fail "missing AgentQ request record while removing task: $request_id"
+    task_id=$(jq -r '.id' <<<"$task")
+    task_created_at=$(jq -r '.created_at' <<<"$task")
+    case "$(jq -r '.state' <<<"$record")" in
+        accepted|removing) ;;
+        *) fail "AgentQ request is not accepted or removing while removing task: $request_id" ;;
+    esac
+    validate_task_id_precision "$task_id"
+    [ "$(jq -r '.task_id' <<<"$record")" = "$task_id" ] || fail "AgentQ request record does not match the task being removed: $request_id"
+    [ "$(jq -r '.task_created_at' <<<"$record")" = "$task_created_at" ] || fail "AgentQ request record does not match the task creation time being removed: $request_id"
+}
+
+mark_request_removing() {
+    local task=$1
+    local request_id
+    local record
+    local task_id
+    local task_created_at
+
+    if validate_task_removal "$task"; then
+        :
+    else
+        return $?
+    fi
+    if request_id=$(request_id_from_task "$task"); then
+        :
+    else
+        return $?
+    fi
+    [ -n "$request_id" ] || return 0
+
+    record=$(read_request_record "$request_id") || fail "missing AgentQ request record while preparing task removal: $request_id"
+    if [ "$(jq -r '.state' <<<"$record")" = accepted ]; then
+        task_id=$(jq -r '.id' <<<"$task")
+        task_created_at=$(jq -r '.created_at' <<<"$task")
+        record=$(set_request_state "$record" removing "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')")
+        if ! write_request_record "$request_id" "$record"; then
+            fail "cannot persist removing AgentQ request: $request_id"
+        fi
+    fi
+}
+
+mark_request_removed() {
+    local task=$1
+    local request_id
+    local record
+    local task_id
+    local task_created_at
+
+    if validate_task_removal "$task"; then
+        :
+    else
+        return $?
+    fi
+    if request_id=$(request_id_from_task "$task"); then
+        :
+    else
+        return $?
+    fi
+    [ -n "$request_id" ] || return 0
+
+    record=$(read_request_record "$request_id") || fail "missing AgentQ request record while removing task: $request_id"
+    [ "$(jq -r '.state' <<<"$record")" = removing ] || fail "AgentQ request removal was not prepared: $request_id"
+    task_id=$(jq -r '.id' <<<"$task")
+    task_created_at=$(jq -r '.created_at' <<<"$task")
+    record=$(set_request_state "$record" removed "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')")
+    if ! archive_removed_request "$request_id" "$record" >/dev/null; then
+        fail "cannot archive removed AgentQ request while removing task: $request_id"
+    fi
+}
+
+compact_status() {
+    local command_status
+    local raw_status_file
+
+    raw_status_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-status' '.json') || return 1
+
+    if ! prepare_request_metadata_files; then
+        cleanup_compact_status_raw_status_after_failure "$raw_status_file" || return 1
+        return 1
+    fi
+    if require_runtime_temporary_file "$raw_status_file" &&
+        require_runtime_temporary_file "$raw_status_file" &&
+        require_runtime_temporary_file "$raw_status_file" &&
+        require_runtime_temporary_file "$raw_status_file" &&
+        run_pueue status --json > "$raw_status_file" &&
+        require_runtime_temporary_file "$raw_status_file" &&
+        validate_pueue_task_id_precision_in_file "$raw_status_file" &&
+        require_runtime_temporary_file "$raw_status_file" &&
+        validate_pueue_task_shape_in_file "$raw_status_file" &&
+        require_runtime_temporary_file "$raw_status_file" &&
+        jq -c --arg group "$group_name" \
+        --slurpfile markers "$cancellation_markers_jq_file" \
+        --slurpfile requests "$request_records_jq_file" "
+        $compact_filter
+        {
+            tasks: (
+                .tasks
+                | with_entries(
+                    select(.value.group == \$group)
+                    | .value |= (
+                        compact
+                        | decorate(\$markers[0]; \$requests[0])
+                        | if ((type == \"object\")
+                              and ((.id | type) == \"number\")
+                              and (.id >= 0)
+                              and ((.id | floor) == .id)
+                              and ((.created_at | type) == \"string\")
+                              and ((.created_at | length) > 0)) then
+                            .
+                          else
+                            error(\"invalid visible Pueue task metadata\")
+                          end
+                    )
+                )
+            ),
+            group: (.groups[\$group] // null)
+        }
+    " < "$raw_status_file"; then
+        command_status=0
+    else
+        command_status=$?
+    fi
+    remove_runtime_temporary_file "$raw_status_file" || command_status=1
+    release_request_metadata_files || command_status=1
+    return "$command_status"
+}
+
+raw_compact_task() {
+    local task_id=$1
+    local raw_status_file
+
+    raw_status_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-status' '.json') || return 1
+
+    if ! require_runtime_temporary_file "$raw_status_file" ||
+        ! require_runtime_temporary_file "$raw_status_file" ||
+        ! require_runtime_temporary_file "$raw_status_file" ||
+        ! require_runtime_temporary_file "$raw_status_file" ||
+        ! run_pueue status --json > "$raw_status_file" ||
+        ! require_runtime_temporary_file "$raw_status_file"; then
+        cleanup_raw_compact_task_raw_status_after_failure "$raw_status_file" || return 1
+        return 1
+    fi
+    validate_pueue_task_id_precision_in_file "$raw_status_file"
+    require_runtime_temporary_file "$raw_status_file"
+    validate_pueue_task_shape_in_file "$raw_status_file"
+    require_runtime_temporary_file "$raw_status_file"
+    jq -ce --arg id "$task_id" --arg group "$group_name" "
+        $compact_filter
+        .tasks[\$id]
+        | select(.group == \$group)
+        | compact
+        | if ((type == \"object\")
+              and ((.id | type) == \"number\")
+              and (.id >= 0)
+              and ((.id | floor) == .id)
+              and ((.created_at | type) == \"string\")
+              and ((.created_at | length) > 0)) then
+            .
+          else
+            error(\"invalid visible Pueue task metadata\")
+          end
+    " < "$raw_status_file"
+    local command_status=$?
+    remove_runtime_temporary_file "$raw_status_file" || return 1
+    return "$command_status"
+}
+
+compact_task() {
+    local task_id=$1
+    local command_status
+    local raw_task_file
+
+    raw_task_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-task' '.json') || return 1
+
+    if ! prepare_request_metadata_files; then
+        cleanup_compact_task_raw_task_after_failure "$raw_task_file" || return 1
+        return 1
+    fi
+    if require_runtime_temporary_file "$raw_task_file" &&
+        require_runtime_temporary_file "$raw_task_file" &&
+        require_runtime_temporary_file "$raw_task_file" &&
+        require_runtime_temporary_file "$raw_task_file" &&
+        raw_compact_task "$task_id" > "$raw_task_file" &&
+        require_runtime_temporary_file "$raw_task_file" && jq -ce \
+        --slurpfile markers "$cancellation_markers_jq_file" \
+        --slurpfile requests "$request_records_jq_file" "
+        $compact_filter
+        decorate(\$markers[0]; \$requests[0])
+        | if ((type == \"object\")
+              and ((.id | type) == \"number\")
+              and (.id >= 0)
+              and ((.id | floor) == .id)
+              and ((.created_at | type) == \"string\")
+              and ((.created_at | length) > 0)) then
+            .
+          else
+            error(\"invalid visible Pueue task metadata\")
+          end
+    " < "$raw_task_file"; then
+        command_status=0
+    else
+        command_status=$?
+    fi
+    remove_runtime_temporary_file "$raw_task_file" || command_status=1
+    release_request_metadata_files || command_status=1
+    return "$command_status"
+}
+
+task_identity_is_unambiguous() {
+    local task=$1
+    local command_status
+
+    if ! prepare_request_metadata_files; then
+        return 1
+    fi
+    if ! require_runtime_temporary_file "$request_records_file" ||
+        ! require_runtime_temporary_file "$cancellation_markers_file"; then
+        cleanup_task_identity_metadata_after_failure || return 1
+        return 1
+    fi
+    if ! require_runtime_temporary_file "$request_records_file" ||
+        ! require_runtime_temporary_file "$cancellation_markers_file"; then
+        cleanup_task_identity_metadata_after_failure || return 1
+        return 1
+    fi
+    if jq -ne --slurpfile requests "$request_records_jq_file" --argjson task "$task" '
+        def canonical_integer_string:
+            tostring
+            | sub("^0+"; "")
+            | if . == "" then "0" else . end;
+        def same_task_id($left; $right):
+            ($left | canonical_integer_string) == ($right | canonical_integer_string);
+        [
+            $requests[0][]
+            | select(
+                (.state == "accepted" or .state == "removing")
+                and same_task_id(.task_id; $task.id)
+            )
+        ] as $matches
+        | if ($matches | length) == 0 then
+            true
+          elif ($matches | length) == 1 then
+            ($matches[0].task_created_at == $task.created_at)
+          else
+            false
+          end
+    ' >/dev/null; then
+        command_status=0
+    else
+        command_status=$?
+    fi
+    release_request_metadata_files || command_status=1
+    return "$command_status"
+}
+
+wait_reconcile_missing_task() {
+    local task_id=$1
+    local allow_untracked=${2:-false}
+    local tombstone_files=()
+    local record_files=()
+    local path
+    local request_id
+    local tombstone
+    local record
+    local record_state
+    local matched_request_id=''
+    local matched_record=''
+    local matched_tombstone_request_id=''
+    local matched_tombstone_created_at=''
+    local task_created_at
+    local raw_status_file
+
+    validate_task_id_precision "$task_id"
+    shopt -s nullglob
+    tombstone_files=("$request_tombstone_directory"/*.json)
+    record_files=("$request_directory"/*.json)
+    shopt -u nullglob
+
+    if [ "${#record_files[@]}" -gt 0 ]; then
+        for path in "${record_files[@]}"; do
+            request_id=${path##*/}
+            request_id=${request_id%.json}
+            is_request_id "$request_id" || fail "invalid AgentQ request record filename: $path"
+            record=$(read_request_record "$request_id") || fail "missing AgentQ request record during wait recovery: $path"
+            record_state=$(jq -r '.state' <<<"$record")
+            case "$record_state" in
+                accepted|removing)
+                    validate_task_id_precision "$(jq -r '.task_id' <<<"$record")"
+                    if [ "$(canonical_task_id "$(jq -r '.task_id' <<<"$record")")" = "$(canonical_task_id "$task_id")" ]; then
+                        [ -z "$matched_record" ] || fail "multiple AgentQ request records match task id: $task_id"
+                        matched_request_id=$request_id
+                        matched_record=$record
+                    fi
+                    ;;
+            esac
+        done
+    fi
+
+    if [ -z "$matched_record" ]; then
+        if [ "${#tombstone_files[@]}" -gt 0 ]; then
+            for path in "${tombstone_files[@]}"; do
+                request_id=${path##*/}
+                request_id=${request_id%.json}
+                is_request_id "$request_id" || fail "invalid AgentQ request tombstone filename: $path"
+                tombstone=$(read_request_tombstone "$request_id") || fail "missing AgentQ request tombstone during wait recovery: $path"
+                validate_task_id_precision "$(jq -r '.task_id' <<<"$tombstone")"
+                if [ "$(canonical_task_id "$(jq -r '.task_id' <<<"$tombstone")")" = "$(canonical_task_id "$task_id")" ]; then
+                    matched_tombstone_request_id=$request_id
+                    matched_tombstone_created_at=$(jq -r '.task_created_at' <<<"$tombstone")
+                    break
+                fi
+            done
+        fi
+        if [ -z "$matched_tombstone_request_id" ] && [ "$allow_untracked" != true ]; then
+            return 1
+        fi
+    fi
+
+    raw_status_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-reconcile-status' '.json') || {
+        jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+        printf '%s: cannot allocate a status temporary file before waiting for task %s; the final state is unavailable\n' "$program" "$task_id" >&2
+        return 6
+    }
+    reconcile_raw_status_file=$raw_status_file
+    require_runtime_temporary_file "$raw_status_file"
+    require_runtime_temporary_file "$raw_status_file"
+    require_runtime_temporary_file "$raw_status_file"
+    require_runtime_temporary_file "$raw_status_file"
+    if ! run_pueue status --json > "$raw_status_file"; then
+        if ! remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file'; then
+            printf '%s: failed to clean AgentQ reconciliation raw status temporary file: %s\n' "$program" "$raw_status_file" >&2
+        fi
+        reconcile_raw_status_file=''
+        jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+        printf '%s: cannot inspect task %s before wait; the final state is unavailable\n' "$program" "$task_id" >&2
+        return 6
+    fi
+    if ! require_runtime_temporary_file "$raw_status_file"; then
+        if ! remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file'; then
+            printf '%s: failed to clean AgentQ reconciliation raw status temporary file: %s\n' "$program" "$raw_status_file" >&2
+        fi
+        reconcile_raw_status_file=''
+        jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+        printf '%s: status temporary file became unavailable before wait reconciliation\n' "$program" >&2
+        return 6
+    fi
+    # This recovery path parses the raw status directly instead of going
+    # through raw_compact_task. Apply the same file-level precision guard
+    # before any jq operation so an unsupported parser cannot round an
+    # unrelated persisted task id while deciding whether this task vanished.
+    validate_pueue_task_id_precision_in_file "$raw_status_file"
+    require_runtime_temporary_file "$raw_status_file"
+    validate_pueue_task_shape_in_file "$raw_status_file"
+    if ! require_runtime_temporary_file "$raw_status_file"; then
+        if ! remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file'; then
+            printf '%s: failed to clean AgentQ reconciliation raw status temporary file: %s\n' "$program" "$raw_status_file" >&2
+        fi
+        reconcile_raw_status_file=''
+        jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+        printf '%s: status temporary file became unavailable before wait task lookup\n' "$program" >&2
+        return 6
+    fi
+    if ! jq -e '(.tasks | type) == "object"' < "$raw_status_file" >/dev/null; then
+        if remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file'; then
+            reconcile_raw_status_file=''
+        fi
+        jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+        printf '%s: Pueue returned an invalid status before waiting for task %s\n' "$program" "$task_id" >&2
+        return 6
+    fi
+    if jq -e --arg id "$task_id" '.tasks[$id] != null' < "$raw_status_file" >/dev/null; then
+        if remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file'; then
+            reconcile_raw_status_file=''
+        fi
+        jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+        printf '%s: task %s still exists but cannot be rendered before wait\n' "$program" "$task_id" >&2
+        return 6
+    fi
+
+    if ! remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file'; then
+        jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+        printf '%s: final state for task %s is unavailable because the status temporary file could not be cleaned\n' "$program" "$task_id" >&2
+        return 6
+    fi
+    reconcile_raw_status_file=''
+
+    if [ -n "$matched_record" ]; then
+        task_created_at=$(jq -r '.task_created_at' <<<"$matched_record")
+        record=$(set_request_state "$matched_record" removed "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')")
+        if ! archive_removed_request "$matched_request_id" "$record" >/dev/null; then
+            jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+            printf '%s: final state for task %s is unavailable because request archival failed\n' "$program" "$task_id" >&2
+            return 6
+        fi
+    elif [ -n "$matched_tombstone_request_id" ]; then
+        remove_cancellation_marker_for_task "$task_id" "$matched_tombstone_created_at" || {
+            jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+            printf '%s: final state for task %s is unavailable because the cancellation marker could not be cleaned\n' "$program" "$task_id" >&2
+            return 6
+        }
+    fi
+    jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "removed"}'
+    if [ "$allow_untracked" = true ]; then
+        printf '%s: task %s was removed while waiting\n' "$program" "$task_id" >&2
+    elif [ -n "$matched_record" ]; then
+        printf '%s: task %s was removed before wait\n' "$program" "$task_id" >&2
+    elif [ -n "$matched_tombstone_request_id" ]; then
+        printf '%s: task %s was already removed before wait\n' "$program" "$task_id" >&2
+    else
+        printf '%s: task %s was removed while waiting\n' "$program" "$task_id" >&2
+    fi
+    return 5
+}
+
+task_is_done() {
+    jq -e '.status | has("Done")' >/dev/null
+}
+
+task_is_queued() {
+    jq -e '.status | has("Queued")' >/dev/null
+}
+
+task_succeeded() {
+    jq -e '.status.Done.result == "Success"' >/dev/null
+}
+
+task_log_path() {
+    local task_id=$1
+
+    validate_task_id_precision "$task_id"
+    [ "$(canonical_task_id "$task_id")" = "$task_id" ] ||
+        fail "non-canonical AgentQ task id: $task_id"
+    printf '%s/%s.log\n' "$task_log_directory" "$task_id"
+}
+
+task_log_file_is_safe() {
+    local log_path=$1
+    local log_parent=${log_path%/*}
+
+    [ -n "$log_path" ] || return 1
+    path_chain_is_safe "$log_path" || return 1
+    [ "$log_parent" != "$log_path" ] || log_parent=.
+    [ -f "$log_path" ] || return 1
+    [ ! -L "$log_path" ] || return 1
+    [ -d "$log_parent" ] || return 1
+    [ ! -L "$log_parent" ] || return 1
+}
+
+require_task_log_file() {
+    local log_path=$1
+
+    task_log_file_is_safe "$log_path" || fail "unsafe AgentQ task log path: $log_path"
+}
+
+cancellation_marker_path() {
+    local task_id=$1
+
+    validate_task_id_precision "$task_id"
+    [ "$(canonical_task_id "$task_id")" = "$task_id" ] ||
+        fail "non-canonical AgentQ task id: $task_id"
+    printf '%s/%s.json\n' "$cancellation_directory" "$task_id"
+}
+
+cancellation_marker_is_valid() {
+    local marker_path=$1
+    local task_id=$2
+
+    # Validate the decimal text before jq parses it.  This direct helper is
+    # used by read_cancellation_marker(), so relying only on
+    # load_cancellation_markers() would let a low-precision jq round an
+    # unsafe persisted id on the single-marker path.
+    request_metadata_file_is_safe "$marker_path" ||
+        fail "invalid AgentQ cancellation marker path: $marker_path"
+    validate_task_id_precision_in_file "$marker_path"
+    request_metadata_file_is_safe "$marker_path" ||
+        fail "invalid AgentQ cancellation marker path: $marker_path"
+    jq -ce --arg task_id "$task_id" '
+        def valid_task_id:
+            if type != "number" then
+                false
+            else
+                (. >= 0) and ((floor) == .)
+            end;
+        def canonical_integer_string:
+            tostring
+            | sub("^0+"; "")
+            | if . == "" then "0" else . end;
+        if (
+            (.task_id | valid_task_id)
+            and (.task_id | canonical_integer_string) == ($task_id | canonical_integer_string)
+            and (.created_at | type) == "string"
+            and (.created_at | length) > 0
+            and (.requested_at | type) == "string"
+            and (.requested_at | length) > 0
+            and (.reason | type) == "string"
+            and (.reason | length) > 0
+            and ((.state? == null) or .state == "pending" or .state == "requested")
+        ) then
+            if .state? == null then . + {state: "requested"} else . end
+        else error("invalid AgentQ cancellation marker") end
+    ' < "$marker_path"
+}
+
+read_cancellation_marker() {
+    local task_id=$1
+    local marker_path
+
+    marker_path=$(cancellation_marker_path "$task_id")
+    if [ ! -e "$marker_path" ] && [ ! -L "$marker_path" ]; then
+        return 1
+    fi
+    request_metadata_file_is_safe "$marker_path" || fail "invalid AgentQ cancellation marker path: $marker_path"
+    request_metadata_file_is_safe "$marker_path" || fail "invalid AgentQ cancellation marker path: $marker_path"
+
+    cancellation_marker_is_valid "$marker_path" "$task_id" || fail "invalid AgentQ cancellation marker: $marker_path"
+}
+
+require_agentq_task() {
+    local task_id=$1
+
+    compact_task "$task_id" >/dev/null || fail "unknown AgentQ task id: $task_id"
+}
+
+write_cancellation_marker() {
+    local task_id=$1
+    local created_at=$2
+    local requested_at=$3
+    local state=$4
+    local marker
+    local temporary
+    local marker_contents
+
+    validate_task_id_precision "$task_id"
+    case "$state" in
+        pending|requested) ;;
+        *) fail "invalid AgentQ cancellation marker state: $state" ;;
+    esac
+
+    marker=$(cancellation_marker_path "$task_id")
+    temporary=$(umask 077; make_temporary_file "$cancellation_directory" ".agentqcancel.${task_id}" '.json') ||
+        fail "cannot create temporary AgentQ cancellation marker: $task_id"
+    marker_contents=$(jq -cn \
+        --argjson task_id "$task_id" \
+        --arg created_at "$created_at" \
+        --arg requested_at "$requested_at" \
+        --arg reason 'user_requested' \
+        --arg state "$state" \
+        '{task_id: $task_id, created_at: $created_at, requested_at: $requested_at, reason: $reason, state: $state}') || {
+        if ! remove_runtime_temporary_file "$temporary" 'cancellation marker temporary file'; then
+            fail "cannot encode AgentQ cancellation marker; temporary cleanup failed: $task_id"
+        fi
+        fail "cannot encode AgentQ cancellation marker: $task_id"
+    }
+    if ! write_temporary_contents "$temporary" "$marker_contents" ||
+        ! install_temporary_file "$temporary" "$marker"; then
+        if ! remove_runtime_temporary_file "$temporary" 'cancellation marker temporary file'; then
+            fail "cannot write AgentQ cancellation marker; temporary cleanup failed: $task_id"
+        fi
+        fail "cannot write AgentQ cancellation marker: $task_id"
+    fi
+}
+
+remove_cancellation_marker() {
+    local task_id=$1
+    local marker
+
+    marker=$(cancellation_marker_path "$task_id")
+    remove_runtime_temporary_file "$marker" 'cancellation marker'
+}
+
+remove_cancellation_marker_for_task() {
+    local task_id=$1
+    local expected_created_at=$2
+    local marker
+    local read_status
+
+    if marker=$(read_cancellation_marker "$task_id"); then
+        [ "$(jq -r '.created_at' <<<"$marker")" = "$expected_created_at" ] || return 0
+        remove_cancellation_marker "$task_id"
+    else
+        read_status=$?
+        [ "$read_status" -eq 1 ] || return "$read_status"
+    fi
+}
+
+wait_for_task() {
+    local task_id=$1
+    local task
+    local task_created_at
+    local wait_status=0
+    local reconcile_status=0
+
+    validate_task_id_precision "$task_id"
+    ensure_daemon
+    if task=$(compact_task "$task_id"); then
+        task_created_at=$(jq -er '.created_at | strings' <<<"$task") || fail "invalid creation time for AgentQ task: $task_id"
+        if ! task_identity_is_unambiguous "$task"; then
+            jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+            printf '%s: task %s has an ambiguous AgentQ identity; the final state is unavailable\n' "$program" "$task_id" >&2
+            return 6
+        fi
+    else
+        if wait_reconcile_missing_task "$task_id"; then
+            reconcile_status=0
+        else
+            reconcile_status=$?
+        fi
+        case "$reconcile_status" in
+            5|6)
+                return "$reconcile_status"
+                ;;
+            1)
+                fail "unknown AgentQ task id: $task_id"
+                ;;
+            *)
+                return "$reconcile_status"
+                ;;
+        esac
+    fi
+    if ! release_operation_lock; then
+        fail "cannot release AgentQ operation lock before waiting for task: $task_id"
+    fi
+    if run_pueue wait --quiet "$task_id"; then
+        :
+    else
+        wait_status=$?
+    fi
+
+    if ! task=$(compact_task "$task_id"); then
+        if wait_reconcile_missing_task "$task_id" true; then
+            reconcile_status=0
+        else
+            reconcile_status=$?
+        fi
+        case "$reconcile_status" in
+            5|6)
+                return "$reconcile_status"
+                ;;
+            *)
+                jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+                printf '%s: final state for task %s is unavailable after pueue wait\n' "$program" "$task_id" >&2
+                return 6
+                ;;
+        esac
+    fi
+    if ! jq -e --arg expected_id "$task_id" --arg expected_created_at "$task_created_at" \
+        'def canonical_integer_string:
+            tostring
+            | sub("^0+"; "")
+            | if . == "" then "0" else . end;
+        (.id | canonical_integer_string) == ($expected_id | canonical_integer_string)
+        and .created_at == $expected_created_at' <<<"$task" >/dev/null; then
+        jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+        printf '%s: task %s changed identity while waiting; the final state is unavailable\n' "$program" "$task_id" >&2
+        return 6
+    fi
+    if ! task_is_done <<<"$task"; then
+        printf '%s: pueue wait exited %s before task %s completed\n' "$program" "$wait_status" "$task_id" >&2
+        return 1
+    fi
+    if ! jq -e '
+        (.status | type) == "object"
+        and (.status.Done | type) == "object"
+        and (.status.Done | has("result"))
+        and (.status.Done.result | if type == "string" then length > 0
+            elif type == "object" then length > 0
+            else false
+            end)
+    ' <<<"$task" >/dev/null; then
+        jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+        printf '%s: task %s has an invalid Done.result; the final state is unavailable\n' "$program" "$task_id" >&2
+        return 6
+    fi
+
+    jq -cn --argjson task "$task" '{task: $task}'
+
+    if [ "$wait_status" -ne 0 ]; then
+        printf '%s: pueue wait exited %s for task %s\n' "$program" "$wait_status" "$task_id" >&2
+        return "$wait_status"
+    fi
+
+    task_succeeded <<<"$task"
+}
+
+compact_log() {
+    local task_id=$1
+    local tail_lines=$2
+    local task=${3:-}
+    local expected_created_at=${4:-}
+    local log_args=(log --json "$task_id")
+    local log_path
+    local command_status
+
+    log_path=$(task_log_path "$task_id")
+    if [ "$tail_lines" = all ]; then
+        log_args+=(--full)
+    else
+        log_args+=(--lines "$tail_lines")
+    fi
+
+    compact_log_raw_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-log' '.json') || return 1
+    if ! runtime_temporary_path_is_safe "$compact_log_raw_file"; then
+        fail "unsafe AgentQ runtime temporary file: $compact_log_raw_file"
+    fi
+    if ! runtime_temporary_path_is_safe "$compact_log_raw_file"; then
+        fail "unsafe AgentQ runtime temporary file: $compact_log_raw_file"
+    fi
+    require_runtime_temporary_file "$compact_log_raw_file"
+    if run_pueue "${log_args[@]}" > "$compact_log_raw_file"; then
+        :
+    else
+        command_status=$?
+        cleanup_compact_log_raw_file || command_status=1
+        return "$command_status"
+    fi
+    require_runtime_temporary_file "$compact_log_raw_file"
+    validate_pueue_task_id_precision_in_file "$compact_log_raw_file"
+    require_runtime_temporary_file "$compact_log_raw_file"
+    validate_pueue_log_shape_in_file "$compact_log_raw_file"
+
+    if [ -n "$expected_created_at" ] &&
+        ! require_runtime_temporary_file "$compact_log_raw_file"; then
+        cleanup_compact_log_raw_file || return 1
+        return 1
+    fi
+    if [ -n "$expected_created_at" ] && ! jq -e \
+        --arg id "$task_id" \
+        --arg expected_created_at "$expected_created_at" \
+        'def canonical_integer_string:
+            tostring
+            | sub("^0+"; "")
+            | if . == "" then "0" else . end;
+        (.[$id].task.id | canonical_integer_string) == ($id | canonical_integer_string)
+        and .[$id].task.created_at == $expected_created_at' \
+        < "$compact_log_raw_file" >/dev/null; then
+        jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+        printf '%s: task %s changed identity while reading logs; the log is unavailable\n' "$program" "$task_id" >&2
+        command_status=6
+        cleanup_compact_log_raw_file || command_status=1
+        return "$command_status"
+    fi
+
+    require_runtime_temporary_file "$compact_log_raw_file"
+    if jq -e --arg id "$task_id" '
+        (.[$id].output? | if type == "string" then . else "" end)
+        | contains("(Pueue error) Failed to read local log output file:")
+          and contains("stream did not contain valid UTF-8")
+    ' < "$compact_log_raw_file" >/dev/null; then
+        require_task_log_file "$log_path"
+        [ -r "$log_path" ] || fail "Pueue reported a non-UTF-8 task log, but the raw log is unavailable: $log_path"
+        command -v base64 >/dev/null 2>&1 || fail 'base64 is required to return a non-UTF-8 task log'
+        [ -n "$task" ] || task=$(compact_task "$task_id")
+        require_task_log_file "$log_path"
+
+        if {
+            if [ "$tail_lines" = all ]; then
+                base64 < "$log_path"
+            else
+                tail -n "$tail_lines" "$log_path" | base64
+            fi
+        } | tr -d '\r\n' | jq -Rsc --argjson task "$task" '
+                {
+                    task: $task,
+                    output: null,
+                    output_encoding: "base64",
+                    output_base64: .
+                }
+            '; then
+            command_status=0
+        else
+            command_status=$?
+        fi
+        cleanup_compact_log_raw_file || command_status=1
+        return "$command_status"
+    fi
+
+    if ! prepare_request_metadata_files; then
+        command_status=1
+        cleanup_compact_log_metadata_after_failure || command_status=1
+        cleanup_compact_log_raw_file || command_status=1
+        return "$command_status"
+    fi
+    if ! require_runtime_temporary_file "$request_records_file" ||
+        ! require_runtime_temporary_file "$cancellation_markers_file"; then
+        command_status=1
+        cleanup_compact_log_metadata_after_failure || command_status=1
+        cleanup_compact_log_raw_file || command_status=1
+        return "$command_status"
+    fi
+    require_runtime_temporary_file "$compact_log_raw_file"
+    if jq -ce --arg id "$task_id" \
+        --slurpfile markers "$cancellation_markers_jq_file" \
+        --slurpfile requests "$request_records_jq_file" "
+        $compact_filter
+        .[\$id]
+        | {
+            task: (
+                .task
+                | compact
+                | decorate(\$markers[0]; \$requests[0])
+                | if ((type == \"object\")
+                      and ((.id | type) == \"number\")
+                      and (.id >= 0)
+                      and ((.id | floor) == .id)
+                      and ((.created_at | type) == \"string\")
+                      and ((.created_at | length) > 0)) then
+                    .
+                  else
+                    error(\"invalid visible Pueue task metadata\")
+                  end
+            ),
+            output
+        }
+    " < "$compact_log_raw_file"; then
+        command_status=0
+    else
+        command_status=$?
+    fi
+    release_request_metadata_files || command_status=1
+    cleanup_compact_log_raw_file || command_status=1
+    return "$command_status"
+}
+
+submit() {
+    local workdir=''
+    local label='command'
+    local request_id=''
+    local normalized_workdir
+    local payload
+    local task_label
+    local record
+    local task
+    local task_id
+    local observed_task_id
+    local task_created_at
+    local record_state
+    local pueue_add_status=0
+    local recovered=false
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --workdir)
+                [ "$#" -ge 2 ] || fail '--workdir requires a directory'
+                workdir=$2
+                shift 2
+                ;;
+            --label)
+                [ "$#" -ge 2 ] || fail '--label requires a value'
+                label=$2
+                shift 2
+                ;;
+            --request-id)
+                [ "$#" -ge 2 ] || fail '--request-id requires a value'
+                request_id=$2
+                shift 2
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                fail "unknown submit option: $1"
+                ;;
+        esac
+    done
+
+    [ -n "$workdir" ] || fail '--workdir is required'
+    is_request_id "$request_id" || fail '--request-id must be 16-128 ASCII letters, numbers, dots, underscores, or hyphens and start with a letter or number'
+    [ "$#" -gt 0 ] || fail 'submit requires a command after --'
+
+    normalized_workdir=$(normalize_workdir "$workdir")
+    payload=$(request_payload "$normalized_workdir" "$label" "$@")
+    task_label=$(request_task_label "$request_id")
+
+    acquire_request_lock "$request_id"
+    acquire_operation_lock
+
+    if record=$(read_request_record "$request_id"); then
+        request_payload_matches "$record" "$payload" || fail "request id was already used with different submit arguments: $request_id"
+
+        record_state=$(jq -r '.state' <<<"$record")
+        if [ "$record_state" = removed ]; then
+            if ! archive_removed_request "$request_id" "$record" >/dev/null; then
+                fail "cannot archive removed AgentQ request while submitting: $request_id"
+            fi
+            fail "request id was already consumed by a task that has been removed: $request_id"
+        fi
+        if [ "$record_state" = accepted ]; then
+            ensure_daemon
+            if ! ensure_group; then
+                fail "cannot ensure AgentQ group while submitting: $request_id"
+            fi
+            reconcile_accepted_rc=0
+            record=$(reconcile_accepted_request "$request_id" "$record") || reconcile_accepted_rc=$?
+            if [ "$reconcile_accepted_rc" -ne 0 ] && [ "$reconcile_accepted_rc" -ne 1 ]; then
+                fail 'cannot inspect Pueue while reconciling an AgentQ request'
+            fi
+            if [ "$reconcile_accepted_rc" -eq 0 ]; then
+                task_id=$(jq -r '.task_id' <<<"$record")
+                request_response "$request_id" "$task_id" true
+                return 0
+            fi
+
+            fail "request id was already consumed by a task that is no longer available: $request_id"
+        fi
+        if [ "$record_state" = removing ]; then
+            ensure_daemon
+            if record=$(read_request_record "$request_id"); then
+                [ "$(jq -r '.state' <<<"$record")" = removing ] || fail "unexpected AgentQ request state after removal recovery: $request_id"
+                fail "request id has a pending removal; use lookup or retry remove before submitting again: $request_id"
+            elif read_request_tombstone "$request_id" >/dev/null; then
+                fail "request id was already consumed by a task that has been removed: $request_id"
+            else
+                fail "AgentQ request disappeared while recovering removal: $request_id"
+            fi
+        fi
+    elif read_request_tombstone "$request_id" >/dev/null; then
+        fail "request id was already consumed by a task that has been removed: $request_id"
+    else
+        record=$(create_request_record "$request_id" "$payload" "$task_label")
+        if ! write_request_record "$request_id" "$record"; then
+            fail "cannot persist prepared AgentQ request: $request_id"
+        fi
+    fi
+
+    ensure_daemon
+    if ! ensure_group; then
+        fail "cannot ensure AgentQ group while submitting: $request_id"
+    fi
+
+        find_request_task_rc=0
+        task=$(find_request_task "$task_label") || find_request_task_rc=$?
+        if [ "$find_request_task_rc" -ne 0 ] && [ "$find_request_task_rc" -ne 1 ]; then
+            fail 'cannot inspect Pueue while reconciling an AgentQ request'
+        fi
+        if [ "$find_request_task_rc" -eq 0 ]; then
+            validate_visible_task_metadata "$task"
+            task_id=$(jq -r '.id' <<<"$task")
+            task_created_at=$(jq -r '.created_at' <<<"$task")
+            validate_task_id_precision "$task_id"
+            recovered=true
+    else
+        record_state=$(jq -r '.state' <<<"$record")
+        if [ "$record_state" = adding ]; then
+            jq -cn --arg request_id "$request_id" '{request_id: $request_id, task_id: null, state: "ambiguous"}'
+            printf '%s: request may have reached Pueue but no matching task is visible; refusing to enqueue it again: %s\n' "$program" "$request_id" >&2
+            return 4
+        fi
+
+        [ "$record_state" = prepared ] || fail "invalid AgentQ request state: $record_state"
+        record=$(set_request_state "$record" adding)
+        if ! write_request_record "$request_id" "$record"; then
+            fail "cannot persist adding AgentQ request: $request_id"
+        fi
+
+        if task_id=$(run_pueue add \
+            --group "$group_name" \
+            --working-directory "$normalized_workdir" \
+            --label "$task_label" \
+            --print-task-id \
+            --escape \
+            -- \
+            "$@"); then
+            is_task_id "$task_id" || fail "Pueue returned an invalid task id: $task_id"
+            validate_task_id_precision "$task_id"
+
+            if task=$(raw_compact_task "$task_id"); then
+                validate_visible_task_metadata "$task"
+                observed_task_id=$(jq -er '.id' <<<"$task") || fail "Pueue returned a task without a valid id: $task_id"
+                validate_task_id_precision "$observed_task_id"
+                [ "$(canonical_task_id "$observed_task_id")" = "$(canonical_task_id "$task_id")" ] ||
+                    fail "Pueue returned a task with a mismatched id: $task_id"
+                task_created_at=$(jq -er '.created_at' <<<"$task")
+            else
+                find_request_task_rc=0
+                task=$(find_request_task "$task_label") || find_request_task_rc=$?
+                if [ "$find_request_task_rc" -ne 0 ] && [ "$find_request_task_rc" -ne 1 ]; then
+                    fail 'cannot inspect Pueue while reconciling an AgentQ request'
+                fi
+                if [ "$find_request_task_rc" -eq 0 ]; then
+                    validate_visible_task_metadata "$task"
+                    task_id=$(jq -r '.id' <<<"$task")
+                    task_created_at=$(jq -r '.created_at' <<<"$task")
+                    validate_task_id_precision "$task_id"
+                    recovered=true
+                else
+                    jq -cn --arg request_id "$request_id" '{request_id: $request_id, task_id: null, state: "ambiguous"}'
+                    printf '%s: Pueue accepted a request id but no matching task is visible; use lookup before any manual retry: %s\n' "$program" "$request_id" >&2
+                    return 4
+                fi
+            fi
+        else
+            pueue_add_status=$?
+            find_request_task_rc=0
+            task=$(find_request_task "$task_label") || find_request_task_rc=$?
+            if [ "$find_request_task_rc" -ne 0 ] && [ "$find_request_task_rc" -ne 1 ]; then
+                fail 'cannot inspect Pueue while reconciling an AgentQ request'
+            fi
+            if [ "$find_request_task_rc" -eq 0 ]; then
+                validate_visible_task_metadata "$task"
+                task_id=$(jq -r '.id' <<<"$task")
+                task_created_at=$(jq -r '.created_at' <<<"$task")
+                validate_task_id_precision "$task_id"
+                recovered=true
+            else
+                printf '%s: Pueue add exited %s and the request outcome is unresolved; use lookup before any manual retry: %s\n' \
+                    "$program" "$pueue_add_status" "$request_id" >&2
+                return "$pueue_add_status"
+            fi
+        fi
+    fi
+
+    is_task_id "$task_id" || fail "Pueue returned an invalid task id: $task_id"
+    validate_task_id_precision "$task_id"
+    [ -n "$task_created_at" ] || fail "Pueue returned a task without a creation time: $task_id"
+    record=$(set_request_state "$record" accepted "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')")
+    if ! write_request_record "$request_id" "$record"; then
+        fail "cannot persist accepted AgentQ request: $request_id"
+    fi
+    remove_cancellation_marker_for_task "$task_id" "$task_created_at" ||
+        fail "cannot remove stale AgentQ cancellation marker after submit: $task_id"
+    request_response "$request_id" "$task_id" "$recovered"
+}
+
+submit_with_operation_lock() {
+    with_operation_lock submit "$@"
+}
+
+lookup() {
+    [ "$#" -eq 1 ] || fail 'lookup requires one request id'
+    is_request_id "$1" || fail 'request id must be 16-128 ASCII letters, numbers, dots, underscores, or hyphens and start with a letter or number'
+
+    local request_id=$1
+    local record
+    local tombstone
+    local task
+    local task_id
+    local task_created_at
+    local record_state
+    local read_status
+
+    acquire_request_lock "$request_id"
+    acquire_operation_lock
+    if record=$(read_request_record "$request_id"); then
+        :
+    else
+        read_status=$?
+        [ "$read_status" -eq 1 ] || return "$read_status"
+        if tombstone=$(read_request_tombstone "$request_id"); then
+            task_id=$(jq -r '.task_id' <<<"$tombstone")
+            validate_task_id_precision "$task_id"
+            jq -cn --arg request_id "$request_id" --argjson task_id "$task_id" '{request_id: $request_id, task_id: $task_id, state: "removed"}'
+            return 5
+        else
+            read_status=$?
+            [ "$read_status" -eq 1 ] || return "$read_status"
+        fi
+        jq -cn --arg request_id "$request_id" '{request_id: $request_id, task_id: null, state: "not_found"}'
+        return 3
+    fi
+    if [ "$(jq -r '.state' <<<"$record")" = removed ]; then
+        if ! record=$(archive_removed_request "$request_id" "$record"); then
+            fail "cannot archive removed AgentQ request while looking up: $request_id"
+        fi
+        task_id=$(jq -r '.task_id' <<<"$record")
+        validate_task_id_precision "$task_id"
+        jq -cn --arg request_id "$request_id" --argjson task_id "$task_id" '{request_id: $request_id, task_id: $task_id, state: "removed"}'
+        return 5
+    fi
+
+    if [ "$(jq -r '.state' <<<"$record")" = removing ]; then
+        ensure_daemon
+        if record=$(read_request_record "$request_id"); then
+            [ "$(jq -r '.state' <<<"$record")" = removing ] || fail "unexpected AgentQ request state after removal recovery: $request_id"
+            task_id=$(jq -r '.task_id' <<<"$record")
+            validate_task_id_precision "$task_id"
+            jq -cn --arg request_id "$request_id" --argjson task_id "$task_id" '{request_id: $request_id, task_id: $task_id, state: "removing"}'
+            return 4
+        elif tombstone=$(read_request_tombstone "$request_id"); then
+            task_id=$(jq -r '.task_id' <<<"$tombstone")
+            validate_task_id_precision "$task_id"
+            jq -cn --arg request_id "$request_id" --argjson task_id "$task_id" '{request_id: $request_id, task_id: $task_id, state: "removed"}'
+            return 5
+        else
+            fail "AgentQ request disappeared while recovering removal: $request_id"
+        fi
+    fi
+
+    if [ "$(jq -r '.state' <<<"$record")" = accepted ]; then
+        ensure_daemon
+        verify_group
+        reconcile_accepted_rc=0
+        record=$(reconcile_accepted_request "$request_id" "$record") || reconcile_accepted_rc=$?
+        if [ "$reconcile_accepted_rc" -ne 0 ] && [ "$reconcile_accepted_rc" -ne 1 ]; then
+            fail 'cannot inspect Pueue while reconciling an AgentQ request'
+        fi
+        if [ "$reconcile_accepted_rc" -eq 0 ]; then
+            task_id=$(jq -r '.task_id' <<<"$record")
+            request_response "$request_id" "$task_id" true
+            return 0
+        fi
+
+        task_id=$(jq -r '.task_id' <<<"$record")
+        validate_task_id_precision "$task_id"
+        jq -cn --arg request_id "$request_id" --argjson task_id "$task_id" '{request_id: $request_id, task_id: $task_id, state: "removed"}'
+        return 5
+    fi
+
+    task_id=$(jq -r '.task_id // empty' <<<"$record")
+    if [ -z "$task_id" ]; then
+        ensure_daemon
+        verify_group
+        find_request_task_rc=0
+        task=$(find_request_task "$(jq -r '.task_label' <<<"$record")") || find_request_task_rc=$?
+        if [ "$find_request_task_rc" -ne 0 ] && [ "$find_request_task_rc" -ne 1 ]; then
+            fail 'cannot inspect Pueue while reconciling an AgentQ request'
+        fi
+        if [ "$find_request_task_rc" -eq 0 ]; then
+            if ! jq -e '
+                if type != "object" then
+                    false
+                elif (.id | type) != "number" then
+                    false
+                elif (.id < 0) or ((.id | floor) != .id) then
+                    false
+                elif (.created_at | type) != "string" then
+                    false
+                elif (.created_at | length) == 0 then
+                    false
+                else
+                    true
+                end
+            ' <<<"$task" >/dev/null; then
+                fail "invalid visible Pueue task metadata while looking up AgentQ request: $request_id"
+            fi
+            task_id=$(jq -r '.id' <<<"$task")
+            task_created_at=$(jq -r '.created_at' <<<"$task")
+            validate_task_id_precision "$task_id"
+            record=$(set_request_state "$record" accepted "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')")
+            if ! write_request_record "$request_id" "$record"; then
+                fail "cannot persist accepted AgentQ request while looking up: $request_id"
+            fi
+            request_response "$request_id" "$task_id" true
+            return 0
+        else
+            record_state=$(jq -r '.state' <<<"$record")
+            if [ "$record_state" = prepared ]; then
+                jq -cn --arg request_id "$request_id" '{request_id: $request_id, task_id: null, state: "not_started"}'
+                return 3
+            fi
+            jq -cn --arg request_id "$request_id" '{request_id: $request_id, task_id: null, state: "ambiguous"}'
+            return 4
+        fi
+    fi
+
+    fail "invalid AgentQ request state while looking up: $(jq -r '.state' <<<"$record")"
+}
+
+lookup_with_operation_lock() {
+    with_operation_lock lookup "$@"
+}
+
+logs() {
+    [ "$#" -ge 1 ] || fail 'logs requires one task id'
+    is_task_id "$1" || fail 'task id must be a non-negative integer'
+
+    local task_id=$1
+    local tail_lines=200
+    local task
+    local task_created_at
+    shift
+
+    if [ "$#" -gt 0 ]; then
+        [ "$#" -eq 2 ] && [ "$1" = --tail ] || fail 'logs accepts only --tail <lines>'
+        if [ "$2" = all ]; then
+            tail_lines=all
+        else
+            is_positive_integer "$2" || fail '--tail must be a positive integer or all'
+            tail_lines=$(canonical_task_id "$2")
+        fi
+    fi
+
+    ensure_daemon
+    task=$(compact_task "$task_id") || fail "unknown AgentQ task id: $task_id"
+    task_created_at=$(jq -er '.created_at | strings' <<<"$task") || fail "invalid creation time for AgentQ task: $task_id"
+    if ! task_identity_is_unambiguous "$task"; then
+        jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+        printf '%s: task %s has an ambiguous AgentQ identity; the log is unavailable\n' "$program" "$task_id" >&2
+        return 6
+    fi
+    if ! release_operation_lock; then
+        fail "cannot release AgentQ operation lock before reading logs: $task_id"
+    fi
+    compact_log "$task_id" "$tail_lines" "$task" "$task_created_at"
+}
+
+logs_with_operation_lock() {
+    with_operation_lock logs "$@"
+}
+
+status() {
+    ensure_daemon
+    verify_group
+    compact_status
+}
+
+status_with_operation_lock() {
+    with_operation_lock status
+}
+
+doctor() {
+    printf 'pueue=' >&2
+    "$pueue_bin" --version >&2
+    printf 'pueued=' >&2
+    "$pueued_bin" --version >&2
+
+    case "$platform_kind" in
+        windows)
+            printf 'scheduled_task=' >&2
+            if powershell.exe -NoProfile -NonInteractive -Command "Get-ScheduledTask -TaskName 'AgentQ Pueued' -ErrorAction Stop | Select-Object TaskName,State | ConvertTo-Json -Compress" >&2; then
+                :
+            else
+                printf '%s: scheduled startup task is unavailable; on-demand daemon startup remains available\n' "$program" >&2
+            fi
+            ;;
+        unix)
+            case "$platform" in
+                Linux*)
+                    printf 'systemd_user_service=' >&2
+                    systemctl --user is-active agentq-pueued.service >&2 || true
+                    printf 'systemd_linger=' >&2
+                    loginctl show-user "$(id -un)" -p Linger --value >&2 || true
+                    ;;
+                Darwin*)
+                    printf 'launchd_service=' >&2
+                    macos_launch_service_target
+                    launchctl print "$macos_launch_service" >/dev/null 2>&1 && printf '%s\n' active >&2 || printf '%s\n' inactive >&2
+                    printf 'launchd_domain=%s\n' "${macos_launch_service%/com.agentq.pueued}" >&2
+                    ;;
+            esac
+            ;;
+    esac
+
+    ensure_daemon
+    verify_group
+    compact_status
+}
+
+doctor_with_operation_lock() {
+    with_operation_lock doctor
+}
+
+# Replaying a cancel whose task has already left Pueue.
+#
+# A confirmed cancellation is recorded in the task's cancellation marker with
+# state "requested", and that marker outlives the task.  Once the task is gone
+# from Pueue, cancel_task can no longer read it, so without this the replay
+# falls through to "unknown AgentQ task id" and exits 2 -- the same code as an
+# argument error.  A caller told to retry a cancel must not see that.
+#
+# The marker is the right evidence: it is only ever written after Pueue
+# confirmed the cancel (kill or remove).  This path is reached only when no
+# task with this id is visible in Pueue, so a live task cannot be misreported
+# as a replay.
+# The creation time recorded for a task id in an AgentQ request record or
+# tombstone.  A record covers a task that is still tracked; a tombstone covers
+# one already removed.  Returns 1 when neither exists, i.e. this id was never
+# tracked by AgentQ.
+# Does any record or tombstone for this task id carry this exact creation time?
+#
+# This answers the question the replay guard actually asks: "is there evidence
+# that a task INSTANCE with this creation time held this id?".  It deliberately
+# does NOT return the first creation time found.  Pueue recycles numeric task
+# ids, so one id accumulates one record per instance that used it; returning the
+# first match compares the marker against whichever instance happens to sort
+# first, which for a reused id is an EARLIER one -- the guard then rejects a
+# valid replay and the caller is told (exit 2, "unknown AgentQ task id") that its
+# retry was malformed.  Measured on a real host: 7 records on one id, marker
+# naming the 7th instance, first match naming the 1st.
+task_instance_created_at_is_recorded() {
+    local task_id=$1
+    local expected_created_at=$2
+    local path request_id created_at
+    local records=()
+    local tombstones=()
+
+    shopt -s nullglob
+    records=("$request_directory"/*.json)
+    tombstones=("$request_tombstone_directory"/*.json)
+    shopt -u nullglob
+
+    # bash 3.2 (this project's macOS /bin/bash) treats an empty array
+    # expansion as an unbound variable under `set -u`, so each list is guarded
+    # by its length -- the same pattern the wait-recovery scan above uses.
+    if [ "${#records[@]}" -gt 0 ]; then
+        for path in "${records[@]}"; do
+            request_id=${path##*/}
+            request_id=${request_id%.json}
+            is_request_id "$request_id" || continue
+            created_at=$(jq -r --argjson id "$task_id" \
+                'select(.task_id == $id) | .task_created_at // empty' < "$path" 2>/dev/null) || continue
+            if [ "$created_at" = "$expected_created_at" ]; then
+                return 0
+            fi
+        done
+    fi
+    if [ "${#tombstones[@]}" -gt 0 ]; then
+        for path in "${tombstones[@]}"; do
+            request_id=${path##*/}
+            request_id=${request_id%.json}
+            is_request_id "$request_id" || continue
+            created_at=$(jq -r --argjson id "$task_id" \
+                'select(.task_id == $id) | .task_created_at // empty' < "$path" 2>/dev/null) || continue
+            if [ "$created_at" = "$expected_created_at" ]; then
+                return 0
+            fi
+        done
+    fi
+    return 1
+}
+
+cancelled_task_replay() {
+    local task_id=$1
+    local marker
+
+    marker=$(read_cancellation_marker "$task_id") || return 1
+    [ "$(jq -r '.state' <<<"$marker")" = requested ] || return 1
+    # Pueue reuses numeric task ids, so a marker alone does not prove that the
+    # task being asked about is the one that was cancelled.  Pin it to the same
+    # task INSTANCE by requiring the marker's creation time to match the
+    # creation time recorded for this id in an AgentQ request record or
+    # tombstone.  Without this, a marker left behind by an earlier task that
+    # reused the id would make an unrelated task look like a replay.
+    marker_created_at=$(jq -r '.created_at' <<<"$marker")
+    task_instance_created_at_is_recorded "$task_id" "$marker_created_at" || return 1
+    jq -cn --argjson task_id "$task_id" \
+        --arg requested_at "$(jq -r '.requested_at' <<<"$marker")" \
+        '{task_id: $task_id, action: "cancel_requested", cancellation_requested_at: $requested_at, reused: true}'
+}
+
+cancel_task() {
+    local task_id=$1
+    local task
+    local created_at
+    local requested_at
+    local marker
+    local marker_state=''
+    local marker_created_at=''
+
+    ensure_daemon
+    # One status call, not two: raw_compact_task already fails for an unknown
+    # id, so a separate existence probe would only duplicate the Pueue call.
+    if task=$(raw_compact_task "$task_id"); then
+        created_at=$(jq -er '.created_at' <<<"$task")
+    else
+        cancelled_task_replay "$task_id" && return 0
+        fail "unknown AgentQ task id: $task_id"
+    fi
+
+    if marker=$(read_cancellation_marker "$task_id"); then
+        marker_created_at=$(jq -r '.created_at' <<<"$marker")
+        if [ "$marker_created_at" = "$created_at" ]; then
+            marker_state=$(jq -r '.state' <<<"$marker")
+            requested_at=$(jq -r '.requested_at' <<<"$marker")
+        else
+            remove_cancellation_marker_for_task "$task_id" "$created_at" ||
+                fail "cannot remove stale AgentQ cancellation marker: $task_id"
+        fi
+    fi
+
+    if [ "$marker_state" = requested ]; then
+        jq -cn --argjson task_id "$task_id" --arg requested_at "$requested_at" '{task_id: $task_id, action: "cancel_requested", cancellation_requested_at: $requested_at, reused: true}'
+        return 0
+    fi
+
+    if task_is_done <<<"$task"; then
+        if [ "$marker_state" = pending ]; then
+            jq -cn --argjson task_id "$task_id" --arg requested_at "$requested_at" '{task_id: $task_id, state: "cancellation_pending", cancellation_requested_at: $requested_at}'
+            printf '%s: task completed while the cancellation outcome remains unresolved: %s\n' "$program" "$task_id" >&2
+            return 4
+        fi
+        fail "task is not running: $task_id" task_not_running
+    fi
+
+    if [ "$marker_state" != pending ]; then
+        requested_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+        write_cancellation_marker "$task_id" "$created_at" "$requested_at" pending
+    fi
+
+    if task_is_queued <<<"$task"; then
+        if run_pueue remove "$task_id" >/dev/null; then
+            write_cancellation_marker "$task_id" "$created_at" "$requested_at" requested
+            jq -cn --argjson task_id "$task_id" --arg requested_at "$requested_at" '{task_id: $task_id, action: "cancel_requested", cancellation_requested_at: $requested_at, cancellation_mode: "queued_removed"}'
+            return 0
+        fi
+
+        jq -cn --argjson task_id "$task_id" --arg requested_at "$requested_at" '{task_id: $task_id, state: "cancellation_pending", cancellation_requested_at: $requested_at}'
+        printf '%s: failed to remove the queued task; the cancellation request remains pending: %s\n' "$program" "$task_id" >&2
+        return 4
+    fi
+
+    if ! run_pueue kill "$task_id" >/dev/null; then
+        jq -cn --argjson task_id "$task_id" --arg requested_at "$requested_at" '{task_id: $task_id, state: "cancellation_pending", cancellation_requested_at: $requested_at}'
+        printf '%s: failed to confirm cancellation; the request remains pending: %s\n' "$program" "$task_id" >&2
+        return 4
+    fi
+
+    write_cancellation_marker "$task_id" "$created_at" "$requested_at" requested
+    jq -cn --argjson task_id "$task_id" --arg requested_at "$requested_at" '{task_id: $task_id, action: "cancel_requested", cancellation_requested_at: $requested_at}'
+}
+
+remove_task() {
+    local task_id=$1
+    local removable_task
+    local removal_status=0
+    local request_id
+    local record
+
+    ensure_daemon
+    removable_task=$(compact_task "$task_id") || fail "unknown AgentQ task id: $task_id"
+    if mark_request_removing "$removable_task"; then
+        :
+    else
+        return $?
+    fi
+    if run_pueue remove "$task_id" >/dev/null; then
+        if mark_request_removed "$removable_task"; then
+            :
+        else
+            return $?
+        fi
+        jq -cn --argjson task_id "$task_id" '{task_id: $task_id, removed: true}'
+        return 0
+    else
+        removal_status=$?
+    fi
+
+    if request_id=$(request_id_from_task "$removable_task"); then
+        :
+    else
+        return $?
+    fi
+    if [ -n "$request_id" ] && record=$(read_request_record "$request_id"); then
+        if [ "$(jq -r '.state' <<<"$record")" = removing ] && reconcile_removing_request "$request_id" "$record" >/dev/null; then
+            jq -cn --argjson task_id "$task_id" '{task_id: $task_id, removed: true, recovered: true}'
+            return 0
+        fi
+    fi
+
+    printf '%s: Pueue removal did not complete; the AgentQ request remains in removing state: %s\n' "$program" "$task_id" >&2
+    return "$removal_status"
+}
+
+main() {
+    [ "$#" -ge 1 ] || {
+        usage >&2
+        printf '%s: reason=protocol_error\n' "$program" >&2
+        exit 2
+    }
+
+    require_executable "$pueue_bin"
+    require_executable "$pueued_bin"
+    detect_stat_flavor || fail 'cannot determine how to read file identity on this platform'
+    config_file_is_safe "$config_path" || fail "missing or unsafe Pueue config: $config_path"
+    ensure_runtime_dependencies
+    ensure_data_directory
+    ensure_task_log_directory
+    ensure_cancellation_directory
+    ensure_request_directory
+    ensure_runtime_directory
+    ensure_not_in_maintenance
+
+    case "$1" in
+        submit)
+            shift
+            submit_with_operation_lock "$@"
+            ;;
+        lookup)
+            shift
+            lookup_with_operation_lock "$@"
+            ;;
+        status)
+            [ "$#" -eq 1 ] || fail 'status accepts no arguments'
+            status_with_operation_lock
+            ;;
+        logs)
+            shift
+            [ "$#" -ge 1 ] || fail 'logs requires one task id'
+            is_task_id "$1" || fail 'task id must be a non-negative integer'
+            validate_task_id_precision "$1"
+            task_id=$(canonical_task_id "$1")
+            logs_with_operation_lock "$task_id" "${@:2}"
+            ;;
+        cancel)
+            [ "$#" -eq 2 ] || fail 'cancel requires one task id'
+            is_task_id "$2" || fail 'task id must be a non-negative integer'
+            validate_task_id_precision "$2"
+            task_id=$(canonical_task_id "$2")
+            with_operation_lock cancel_task "$task_id"
+            ;;
+        wait)
+            [ "$#" -eq 2 ] || fail 'wait requires one task id'
+            is_task_id "$2" || fail 'task id must be a non-negative integer'
+            validate_task_id_precision "$2"
+            task_id=$(canonical_task_id "$2")
+            with_operation_lock wait_for_task "$task_id"
+            ;;
+        remove)
+            [ "$#" -eq 2 ] || fail 'remove requires one task id'
+            is_task_id "$2" || fail 'task id must be a non-negative integer'
+            validate_task_id_precision "$2"
+            task_id=$(canonical_task_id "$2")
+            with_operation_lock remove_task "$task_id"
+            ;;
+        doctor)
+            [ "$#" -eq 1 ] || fail 'doctor accepts no arguments'
+            doctor_with_operation_lock
+            ;;
+        -h|--help|help)
+            usage
+            ;;
+        *)
+            fail "unknown command: $1"
+            ;;
+    esac
+}
+
+main "$@"

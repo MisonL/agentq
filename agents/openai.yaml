@@ -1,0 +1,4 @@
+interface:
+  display_name: "AgentQ Remote Queue"
+  short_description: "Run persistent remote tasks and SSH sessions"
+  default_prompt: "Use $agentq to run and track an authorized remote command or prepare a persistent SSH session."

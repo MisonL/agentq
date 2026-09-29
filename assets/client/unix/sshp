@@ -1,0 +1,1190 @@
+#!/bin/sh
+
+set -eu
+
+program=${0##*/}
+reconnect_delay=${SSHP_RECONNECT_DELAY:-2}
+ssh_binary=${SSHP_SSH:-}
+sshp_noninteractive_output_limit=65536
+ssh_runtime_directory=''
+remote_platform=''
+windows_input_pid=''
+
+usage() {
+    cat <<EOF
+Usage: $program [--check] <ssh-host-or-alias> [session-name]
+
+Attach to a persistent tmux, GNU screen, or Zellij session on an SSH host.
+The default session name is ghostty.
+On a missing dependency, the first connection asks before installing it.
+The --check mode only probes and never installs anything.
+
+Examples:
+  $program build-host
+  $program build-host work
+  $program --check build-host
+EOF
+}
+
+fail() {
+    printf '%s\n' "$program: $1" >&2
+    exit 2
+}
+
+resolve_ssh_binary() {
+    if [ -n "$ssh_binary" ]; then
+        [ -x "$ssh_binary" ] || fail "SSHP_SSH is not executable: $ssh_binary"
+        return
+    fi
+
+    ssh_binary=$(command -v ssh 2>/dev/null || true)
+    [ -n "$ssh_binary" ] || fail 'OpenSSH client is required; install ssh or set SSHP_SSH'
+}
+
+is_nonnegative_integer() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+runtime_path_is_safe() {
+    runtime_guard_path=$1
+    case "$runtime_guard_path" in
+        '') return 1 ;;
+    esac
+    case "/$runtime_guard_path/" in
+        */../*) return 1 ;;
+    esac
+
+    runtime_guard_probe='.'
+    runtime_guard_remaining=$runtime_guard_path
+    case "$runtime_guard_remaining" in
+        /*)
+            runtime_guard_probe=/
+            runtime_guard_remaining=${runtime_guard_remaining#/}
+            ;;
+    esac
+
+    while [ -n "$runtime_guard_remaining" ]; do
+        case "$runtime_guard_remaining" in
+            */*)
+                runtime_guard_component=${runtime_guard_remaining%%/*}
+                runtime_guard_remaining=${runtime_guard_remaining#*/}
+                ;;
+            *)
+                runtime_guard_component=$runtime_guard_remaining
+                runtime_guard_remaining=''
+                ;;
+        esac
+        [ -n "$runtime_guard_component" ] || continue
+        [ "$runtime_guard_component" = . ] && continue
+        if [ "$runtime_guard_probe" = / ]; then
+            runtime_guard_probe=/$runtime_guard_component
+        else
+            runtime_guard_probe=$runtime_guard_probe/$runtime_guard_component
+        fi
+        [ ! -L "$runtime_guard_probe" ] || return 1
+    done
+
+    [ -d "$runtime_guard_path" ] && [ ! -L "$runtime_guard_path" ]
+}
+
+runtime_file_is_safe() {
+    runtime_file_path=$1
+    runtime_file_parent=${runtime_file_path%/*}
+    runtime_file_name=${runtime_file_path##*/}
+    [ -n "$runtime_file_name" ] || return 1
+    [ "$runtime_file_parent" != "$runtime_file_path" ] || runtime_file_parent=.
+    runtime_path_is_safe "$runtime_file_parent" || return 1
+    [ ! -L "$runtime_file_path" ] || return 1
+    if [ -e "$runtime_file_path" ] && [ ! -f "$runtime_file_path" ]; then
+        return 1
+    fi
+    return 0
+}
+
+require_runtime_file() {
+    runtime_file_is_safe "$1" || fail "unsafe SSH runtime file: $1"
+}
+
+require_existing_runtime_file() {
+    if runtime_file_is_safe "$1" && [ -f "$1" ]; then
+        return 0
+    fi
+    printf '%s: unsafe SSH runtime file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+remove_runtime_file() {
+    if runtime_file_is_safe "$1"; then
+        if ! rm -f -- "$1"; then
+            printf '%s\n' "$program: failed to remove SSH runtime file: $1" >&2
+            return 1
+        fi
+        if [ -e "$1" ] || [ -L "$1" ]; then
+            printf '%s\n' "$program: SSH runtime file remained after cleanup: $1" >&2
+            return 1
+        fi
+        return 0
+    fi
+    printf '%s\n' "$program: refusing to remove an unsafe SSH runtime file: $1" >&2
+    return 2
+}
+
+runtime_fifo_is_safe() {
+    runtime_fifo_path=$1
+    runtime_fifo_parent=${runtime_fifo_path%/*}
+    runtime_fifo_name=${runtime_fifo_path##*/}
+    [ -n "$runtime_fifo_name" ] || return 1
+    [ "$runtime_fifo_parent" != "$runtime_fifo_path" ] || runtime_fifo_parent=.
+    runtime_path_is_safe "$runtime_fifo_parent" || return 1
+    [ ! -L "$runtime_fifo_path" ] || return 1
+    if [ -e "$runtime_fifo_path" ] && [ ! -p "$runtime_fifo_path" ]; then
+        return 1
+    fi
+    return 0
+}
+
+require_runtime_fifo() {
+    runtime_fifo_is_safe "$1" || fail "unsafe SSH runtime FIFO: $1"
+}
+
+remove_runtime_fifo() {
+    if runtime_fifo_is_safe "$1"; then
+        if ! rm -f -- "$1"; then
+            printf '%s\n' "$program: failed to remove SSH runtime FIFO: $1" >&2
+            return 1
+        fi
+        if [ -e "$1" ] || [ -L "$1" ]; then
+            printf '%s\n' "$program: SSH runtime FIFO remained after cleanup: $1" >&2
+            return 1
+        fi
+        return 0
+    fi
+    printf '%s\n' "$program: refusing to remove an unsafe SSH runtime FIFO: $1" >&2
+    return 2
+}
+
+remove_runtime_directory() {
+    runtime_remove_directory=$1
+
+    [ -n "$runtime_remove_directory" ] || return 0
+    runtime_remove_parent=${runtime_remove_directory%/*}
+    runtime_remove_name=${runtime_remove_directory##*/}
+    [ -n "$runtime_remove_name" ] || {
+        printf '%s\n' "$program: refusing to remove an unsafe SSH runtime directory: $runtime_remove_directory" >&2
+        return 2
+    }
+    [ "$runtime_remove_parent" != "$runtime_remove_directory" ] || runtime_remove_parent=.
+    if ! runtime_path_is_safe "$runtime_remove_parent"; then
+        printf '%s\n' "$program: refusing to remove an unsafe SSH runtime directory: $runtime_remove_directory" >&2
+        return 2
+    fi
+    if [ ! -e "$runtime_remove_directory" ] && [ ! -L "$runtime_remove_directory" ]; then
+        return 0
+    fi
+    if ! runtime_path_is_safe "$runtime_remove_directory"; then
+        printf '%s\n' "$program: refusing to remove an unsafe SSH runtime directory: $runtime_remove_directory" >&2
+        return 2
+    fi
+    if ! rm -rf -- "$runtime_remove_directory"; then
+        printf '%s\n' "$program: failed to remove SSH runtime directory: $runtime_remove_directory" >&2
+        return 2
+    fi
+    if [ -e "$runtime_remove_directory" ] || [ -L "$runtime_remove_directory" ]; then
+        printf '%s\n' "$program: SSH runtime directory remained after cleanup: $runtime_remove_directory" >&2
+        return 2
+    fi
+}
+
+ssh_transport_error() {
+    ssh_log_file=$1
+
+    if ! runtime_file_is_safe "$ssh_log_file"; then
+        printf '%s: refusing to inspect an unsafe SSH runtime file: %s\n' "$program" "$ssh_log_file" >&2
+        return 1
+    fi
+    [ -s "$ssh_log_file" ] || return 1
+    require_existing_runtime_file "$ssh_log_file" || return $?
+    LC_ALL=C tr -d '\r' < "$ssh_log_file" | LC_ALL=C grep -E -q \
+        '^(ssh: connect to host [^[:space:]]+ port [0-9]+: (Connection (refused|timed out|reset by peer|aborted)|Operation timed out|No route to host|Network is unreachable|Host is down)|Connection reset by [^[:space:]]+ port [0-9]+\.?|Connection to [^[:space:]]+ closed by remote host\.?|Connection timed out during banner exchange|banner exchange: Connection to [^[:space:]]+ port [0-9]+: (Connection (timed out|reset by peer)|No route to host|Network is unreachable|Host is down)|kex_exchange_identification: (read: )?(Connection (reset by peer|timed out|refused)|No route to host|Network is unreachable|Host is down)|client_loop: .* (Broken pipe|Connection reset by peer)|packet_write_wait: Connection to [^:]+: Broken pipe|Write failed: Broken pipe|Read from remote host [^:]+: Connection reset by peer|Timeout, server [^[:space:]]+ not responding\.|sshp: interactive SSH transport lost; child (terminated by [[:alnum:]_-]+|state unavailable after interact)|sshp: interactive SSH session ended unexpectedly: .*)$'
+}
+
+write_ssh_diagnostic_metadata() {
+    ssh_metadata_file=$1
+    require_existing_runtime_file "$ssh_metadata_file" || return $?
+    require_existing_runtime_file "$ssh_metadata_file" || return $?
+    ssh_metadata_bytes=$(wc -c < "$ssh_metadata_file" | tr -d '[:space:]')
+    if ssh_transport_error "$ssh_metadata_file"; then
+        ssh_metadata_class=transport
+    else
+        require_existing_runtime_file "$ssh_metadata_file" || return $?
+        if LC_ALL=C tr -d '\r' < "$ssh_metadata_file" | LC_ALL=C grep -E -q \
+            '^([^:]*: )?(Permission denied|Host key verification failed|Could not resolve hostname|No supported authentication methods available)'; then
+            ssh_metadata_class=authentication
+        else
+            ssh_metadata_class=ssh
+        fi
+    fi
+    printf '%s: SSH diagnostic omitted for safety (class=%s, %s bytes)\n' \
+        "$program" "$ssh_metadata_class" "$ssh_metadata_bytes" >&2
+}
+
+cleanup_ssh_runtime() {
+    if [ -n "$windows_input_pid" ]; then
+        kill "$windows_input_pid" 2>/dev/null || true
+        wait "$windows_input_pid" 2>/dev/null || true
+        windows_input_pid=''
+    fi
+    if [ -n "$ssh_runtime_directory" ] &&
+        { [ -d "$ssh_runtime_directory" ] || [ -L "$ssh_runtime_directory" ]; }; then
+        remove_runtime_directory "$ssh_runtime_directory" || true
+    fi
+}
+
+initialize_ssh_runtime() {
+    umask 077
+    runtime_parent_directory=$(unset CDPATH; cd -- "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P) || fail 'cannot resolve the temporary directory'
+    runtime_path_is_safe "$runtime_parent_directory" || fail 'temporary directory is not a safe directory'
+    ssh_runtime_directory=$(mktemp -d "$runtime_parent_directory/sshp.XXXXXX") || fail 'cannot create a private runtime directory'
+    runtime_path_is_safe "$ssh_runtime_directory" || fail 'created runtime directory is not safe'
+}
+
+run_ssh_logged() {
+    ssh_log_file=$1
+    shift
+    ssh_message_file="${ssh_log_file}.message"
+
+    require_runtime_file "$ssh_log_file"
+    require_runtime_file "$ssh_message_file"
+    remove_runtime_file "$ssh_log_file" || fail 'cannot clear SSH diagnostic log'
+    remove_runtime_file "$ssh_message_file" || fail 'cannot clear SSH diagnostic message'
+    require_runtime_file "$ssh_log_file"
+    require_runtime_file "$ssh_message_file"
+    if "$ssh_binary" -E "$ssh_log_file" -o LogLevel=ERROR "$@" 2> "$ssh_message_file"; then
+        ssh_status=0
+    else
+        ssh_status=$?
+    fi
+
+    require_runtime_file "$ssh_log_file"
+    require_runtime_file "$ssh_message_file"
+    if [ -s "$ssh_message_file" ]; then
+        require_existing_runtime_file "$ssh_message_file" || return $?
+        cat "$ssh_message_file" >> "$ssh_log_file" || printf '%s\n' "$program: failed to collect SSH diagnostics." >&2
+    fi
+    if [ -s "$ssh_log_file" ]; then
+        write_ssh_diagnostic_metadata "$ssh_log_file"
+    fi
+    return "$ssh_status"
+}
+
+# Dependency probes and installers are non-interactive and should never let
+# remote stdout grow an unbounded shell variable. Interactive sessions keep
+# using run_ssh_logged directly so their terminal stream remains untouched.
+write_bounded_noninteractive_output() {
+    sshp_bounded_output_file=$1
+    require_existing_runtime_file "$sshp_bounded_output_file" || return $?
+    sshp_bounded_output_bytes=$(wc -c < "$sshp_bounded_output_file" | tr -d '[:space:]') || return 2
+    require_existing_runtime_file "$sshp_bounded_output_file" || return $?
+    sshp_bounded_output_max=${sshp_noninteractive_output_limit:-65536}
+    case "$sshp_bounded_output_max" in
+        ''|*[!0-9]*) return 2 ;;
+    esac
+
+    if [ "$sshp_bounded_output_bytes" -gt "$sshp_bounded_output_max" ]; then
+        dd if="$sshp_bounded_output_file" bs=1 count="$sshp_bounded_output_max" 2>/dev/null || return 2
+        printf '\n[sshp stdout truncated after %s bytes]\n' "$sshp_bounded_output_max"
+    else
+        cat "$sshp_bounded_output_file"
+    fi
+}
+
+run_ssh_logged_bounded() {
+    sshp_bounded_log_file=$1
+    shift
+    sshp_bounded_output_file=$(mktemp "$ssh_runtime_directory/sshp-output.XXXXXX") || fail 'cannot create a temporary SSH output file'
+    require_runtime_file "$sshp_bounded_output_file"
+
+    if run_ssh_logged "$sshp_bounded_log_file" "$@" > "$sshp_bounded_output_file"; then
+        sshp_bounded_ssh_status=0
+    else
+        sshp_bounded_ssh_status=$?
+    fi
+    require_runtime_file "$sshp_bounded_output_file"
+
+    if write_bounded_noninteractive_output "$sshp_bounded_output_file"; then
+        sshp_bounded_output_status=0
+    else
+        sshp_bounded_output_status=$?
+    fi
+    if remove_runtime_file "$sshp_bounded_output_file"; then
+        sshp_bounded_cleanup_status=0
+    else
+        sshp_bounded_cleanup_status=$?
+    fi
+    sshp_bounded_output_file=''
+
+    if [ "$sshp_bounded_ssh_status" -eq 0 ] && [ "$sshp_bounded_output_status" -ne 0 ]; then
+        sshp_bounded_ssh_status=$sshp_bounded_output_status
+    fi
+    if [ "$sshp_bounded_ssh_status" -eq 0 ] && [ "$sshp_bounded_cleanup_status" -ne 0 ]; then
+        sshp_bounded_ssh_status=2
+    fi
+    return "$sshp_bounded_ssh_status"
+}
+
+check_only=false
+case "${1:-}" in
+    --check)
+        check_only=true
+        shift
+        ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
+[ "$#" -ge 1 ] && [ "$#" -le 2 ] || {
+    usage >&2
+    exit 2
+}
+
+host=$1
+session=${2:-ghostty}
+
+case "$host" in
+    ''|-*)
+        fail 'SSH host must not be empty or begin with a hyphen'
+        ;;
+esac
+
+case "$session" in
+    ''|-*|*[!A-Za-z0-9_.-]*)
+        fail 'session name must contain only letters, numbers, dots, underscores, or hyphens'
+        ;;
+esac
+
+resolve_ssh_binary
+is_nonnegative_integer "$reconnect_delay" || fail 'SSHP_RECONNECT_DELAY must be a non-negative integer'
+initialize_ssh_runtime
+trap cleanup_ssh_runtime EXIT
+
+# shellcheck disable=SC2016
+remote_probe_command='
+set -eu
+platform=$(uname -s 2>/dev/null || printf "%s" unknown)
+
+case "$platform" in
+    MINGW*|MSYS*|CYGWIN*)
+        # Let native PowerShell decide Windows dependencies and executable paths.
+        printf "%s\n" "__SSHP_WINDOWS_SHELL__:$platform"
+        exit 43
+        ;;
+    Darwin*|Linux*)
+        ;;
+    *)
+        printf "%s\n" "sshp: unsupported remote platform: $platform" >&2
+        printf "%s\n" "__SSHP_INSTALL_UNAVAILABLE__:$platform"
+        exit 127
+        ;;
+esac
+
+if command -v tmux >/dev/null 2>&1 ||
+    command -v screen >/dev/null 2>&1 ||
+    command -v zellij >/dev/null 2>&1; then
+    printf "%s\n" "__SSHP_READY__:$platform"
+    exit 0
+fi
+
+installer=
+installer_label=
+if command -v apt-get >/dev/null 2>&1; then installer=apt; installer_label=apt
+elif command -v dnf >/dev/null 2>&1; then installer=dnf; installer_label=dnf
+elif command -v yum >/dev/null 2>&1; then installer=yum; installer_label=yum
+elif command -v pacman >/dev/null 2>&1; then installer=pacman; installer_label=pacman
+elif command -v zypper >/dev/null 2>&1; then installer=zypper; installer_label=zypper
+elif command -v apk >/dev/null 2>&1; then installer=apk; installer_label=apk
+elif command -v brew >/dev/null 2>&1; then installer=brew; installer_label=Homebrew
+elif command -v port >/dev/null 2>&1; then installer=port; installer_label=MacPorts
+fi
+
+if [ -z "$installer" ]; then
+    printf "%s\n" "sshp: no supported package manager found for $platform; install tmux, GNU screen, or Zellij manually." >&2
+    printf "%s\n" "__SSHP_INSTALL_UNAVAILABLE__:$platform"
+    exit 127
+fi
+printf "%s\n" "sshp: a persistent session tool is missing; installer candidate: $installer_label." >&2
+printf "%s\n" "__SSHP_INSTALL_REQUIRED__:$platform"
+exit 42
+'
+
+# shellcheck disable=SC2016
+remote_install_command='
+set -eu
+if command -v tmux >/dev/null 2>&1 ||
+    command -v screen >/dev/null 2>&1 ||
+    command -v zellij >/dev/null 2>&1; then
+    exit 0
+fi
+
+run_as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        printf "%s\n" "sshp: $1 requires root privileges, but sudo is unavailable." >&2
+        exit 127
+    fi
+}
+
+if command -v apt-get >/dev/null 2>&1; then
+    run_as_root apt-get update
+    run_as_root apt-get install -y tmux
+elif command -v dnf >/dev/null 2>&1; then
+    run_as_root dnf install -y tmux
+elif command -v yum >/dev/null 2>&1; then
+    run_as_root yum install -y tmux
+elif command -v pacman >/dev/null 2>&1; then
+    run_as_root pacman -S --needed --noconfirm tmux
+elif command -v zypper >/dev/null 2>&1; then
+    run_as_root zypper --non-interactive install tmux
+elif command -v apk >/dev/null 2>&1; then
+    run_as_root apk add tmux
+elif command -v brew >/dev/null 2>&1; then
+    brew install tmux
+elif command -v port >/dev/null 2>&1; then
+    run_as_root port install tmux
+else
+    printf "%s\n" "sshp: no supported package manager found; install tmux, GNU screen, or Zellij manually." >&2
+    exit 127
+fi
+
+printf "%s\n" "sshp: dependency installation finished; rechecking in a fresh SSH session." >&2
+'
+
+# shellcheck disable=SC2016
+windows_common_script='
+function Resolve-RemoteApplication {
+    param(
+        [string[]]$CommandNames,
+        [string[]]$Candidates
+    )
+
+    foreach ($commandName in $CommandNames) {
+        $command = Get-Command $commandName -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $command) {
+            continue
+        }
+        $commandPath = $command.Source
+        if ([string]::IsNullOrWhiteSpace($commandPath)) {
+            $commandPath = $command.Path
+        }
+        if ([string]::IsNullOrWhiteSpace($commandPath)) {
+            continue
+        }
+        $commandItem = Get-Item -LiteralPath $commandPath -Force -ErrorAction SilentlyContinue
+        if ($null -eq $commandItem) {
+            continue
+        }
+        if (!(Test-NonReparseWindowsApplicationPath -Path $commandPath)) {
+            throw "Remote application path is unsafe: $commandPath"
+        }
+        if (!$commandItem.PSIsContainer) {
+            return [System.IO.Path]::GetFullPath($commandPath)
+        }
+    }
+    foreach ($candidate in $Candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            continue
+        }
+        $candidateItem = Get-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue
+        if ($null -eq $candidateItem) {
+            continue
+        }
+        if (!(Test-NonReparseWindowsApplicationPath -Path $candidate)) {
+            throw "Remote application path is unsafe: $candidate"
+        }
+        if (!$candidateItem.PSIsContainer) {
+            return [System.IO.Path]::GetFullPath($candidate)
+        }
+    }
+    return $null
+}
+
+function Test-NonReparseWindowsApplicationPath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($Path)
+        $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction SilentlyContinue
+        if ($null -eq $item -or $item.PSIsContainer -or
+            (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            return $false
+        }
+        $parent = [System.IO.Directory]::GetParent($fullPath)
+        if ($null -eq $parent) {
+            return $false
+        }
+        while ($null -ne $parent) {
+            $parentItem = Get-Item -LiteralPath $parent.FullName -Force -ErrorAction SilentlyContinue
+            if ($null -eq $parentItem -or !$parentItem.PSIsContainer -or
+                (($parentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                return $false
+            }
+            $parent = $parent.Parent
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Test-NonReparseWindowsProfilePath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($Path)
+        $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+    } catch {
+        return $false
+    }
+    if (!$item.PSIsContainer -or (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        return $false
+    }
+
+    $parent = [System.IO.Directory]::GetParent($fullPath)
+    while ($null -ne $parent) {
+        $parentItem = Get-Item -LiteralPath $parent.FullName -Force -ErrorAction SilentlyContinue
+        if ($null -eq $parentItem -or !$parentItem.PSIsContainer -or
+            (($parentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            return $false
+        }
+        $parent = $parent.Parent
+    }
+    return $true
+}
+
+function Resolve-RemoteUserEnvironment {
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    if (($null -eq $identity) -or ($null -eq $identity.User)) {
+        throw "Windows user SID is unavailable"
+    }
+    $accountName = $identity.Name
+    $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($identity.User.Value)"
+    $profile = (Get-ItemProperty -LiteralPath $profileKey -Name ProfileImagePath -ErrorAction Stop).ProfileImagePath
+    $profile = [Environment]::ExpandEnvironmentVariables([string]$profile)
+    $profileItem = if ([string]::IsNullOrWhiteSpace($profile)) {
+        $null
+    } else {
+        Get-Item -LiteralPath $profile -Force -ErrorAction SilentlyContinue
+    }
+    if ([string]::IsNullOrWhiteSpace($profile) -or ($null -eq $profileItem) -or !$profileItem.PSIsContainer) {
+        throw "Windows user profile is unavailable for $($identity.Name)"
+    }
+    if (!(Test-NonReparseWindowsProfilePath -Path $profile)) {
+        throw "Windows user profile path is not a regular non-reparse directory: $profile"
+    }
+    $acl = Get-Acl -LiteralPath $profile -ErrorAction Stop
+    $hasUserAccess = @($acl.Access | Where-Object {
+        $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+        (($_.IdentityReference.Value -eq $accountName) -or ($_.IdentityReference.Value -eq $identity.User.Value)) -and
+        (($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Modify) -ne 0)
+    }).Count -gt 0
+    if (!$hasUserAccess) {
+        throw "Windows user profile is not writable by $accountName"
+    }
+    return [pscustomobject]@{
+        Profile = [System.IO.Path]::GetFullPath($profile)
+        LocalAppData = Join-Path $profile "AppData\Local"
+    }
+}
+
+$remoteUserEnvironment = Resolve-RemoteUserEnvironment
+
+function Resolve-RemoteZellij {
+    $candidates = New-Object "System.Collections.Generic.List[string]"
+    if (![string]::IsNullOrWhiteSpace($remoteUserEnvironment.LocalAppData)) {
+        [void]$candidates.Add((Join-Path $remoteUserEnvironment.LocalAppData "Microsoft\WinGet\Links\zellij.exe"))
+        $packageRoot = Join-Path $remoteUserEnvironment.LocalAppData "Microsoft\WinGet\Packages"
+        foreach ($package in @(Get-ChildItem -LiteralPath $packageRoot -Directory -Filter "Zellij.Zellij_*" -ErrorAction SilentlyContinue)) {
+            [void]$candidates.Add((Join-Path $package.FullName "zellij.exe"))
+        }
+    }
+    if (![string]::IsNullOrWhiteSpace($remoteUserEnvironment.Profile)) {
+        [void]$candidates.Add((Join-Path $remoteUserEnvironment.Profile "scoop\shims\zellij.exe"))
+        [void]$candidates.Add((Join-Path $remoteUserEnvironment.Profile "scoop\apps\zellij\current\zellij.exe"))
+        [void]$candidates.Add((Join-Path $remoteUserEnvironment.Profile ".cargo\bin\zellij.exe"))
+    }
+    if (![string]::IsNullOrWhiteSpace($env:ProgramData)) {
+        [void]$candidates.Add((Join-Path $env:ProgramData "chocolatey\bin\zellij.exe"))
+    }
+    return Resolve-RemoteApplication -CommandNames @("zellij.exe") -Candidates $candidates.ToArray()
+}
+
+function Resolve-RemoteInstaller {
+    $candidates = New-Object "System.Collections.Generic.List[string]"
+    if (![string]::IsNullOrWhiteSpace($remoteUserEnvironment.LocalAppData)) {
+        [void]$candidates.Add((Join-Path $remoteUserEnvironment.LocalAppData "Microsoft\WindowsApps\winget.exe"))
+    }
+    $winget = Resolve-RemoteApplication -CommandNames @("winget.exe") -Candidates $candidates.ToArray()
+    if ($null -ne $winget) {
+        return [pscustomobject]@{ Kind = "winget"; Path = $winget }
+    }
+
+    $candidates.Clear()
+    if (![string]::IsNullOrWhiteSpace($remoteUserEnvironment.Profile)) {
+        [void]$candidates.Add((Join-Path $remoteUserEnvironment.Profile "scoop\shims\scoop.cmd"))
+    }
+    $scoop = Resolve-RemoteApplication -CommandNames @("scoop.cmd", "scoop.exe") -Candidates $candidates.ToArray()
+    if ($null -ne $scoop) {
+        return [pscustomobject]@{ Kind = "scoop"; Path = $scoop }
+    }
+
+    $candidates.Clear()
+    if (![string]::IsNullOrWhiteSpace($env:ProgramData)) {
+        [void]$candidates.Add((Join-Path $env:ProgramData "chocolatey\bin\choco.exe"))
+    }
+    $choco = Resolve-RemoteApplication -CommandNames @("choco.exe") -Candidates $candidates.ToArray()
+    if ($null -ne $choco) {
+        return [pscustomobject]@{ Kind = "choco"; Path = $choco }
+    }
+    return $null
+}
+'
+
+# shellcheck disable=SC2016
+windows_probe_script=$windows_common_script'
+$ErrorActionPreference = "Stop"
+$zellij = Resolve-RemoteZellij
+if ($null -ne $zellij) {
+    [Console]::Out.Write("__SSHP_READY__:Windows")
+    exit 0
+}
+$installer = Resolve-RemoteInstaller
+if ($null -ne $installer) {
+    [Console]::Error.WriteLine("sshp: native Zellij is missing; a supported Windows installer is available.")
+    [Console]::Out.Write("__SSHP_INSTALL_REQUIRED__:Windows")
+    exit 42
+}
+[Console]::Error.WriteLine("sshp: native Zellij is missing and no supported Windows installer was found.")
+[Console]::Out.Write("__SSHP_INSTALL_UNAVAILABLE__:Windows")
+exit 127
+'
+
+# shellcheck disable=SC2016
+windows_install_script=$windows_common_script'
+$ErrorActionPreference = "Stop"
+if ($null -ne (Resolve-RemoteZellij)) {
+    exit 0
+}
+$installer = Resolve-RemoteInstaller
+if ($null -eq $installer) {
+    [Console]::Error.WriteLine("sshp: no supported Windows installer found for Zellij.")
+    exit 127
+}
+switch ($installer.Kind) {
+    "winget" {
+        & $installer.Path install --id Zellij.Zellij --exact --accept-source-agreements --accept-package-agreements --disable-interactivity
+    }
+    "scoop" {
+        & $installer.Path install zellij
+    }
+    "choco" {
+        & $installer.Path install zellij --yes --no-progress
+    }
+    default {
+        [Console]::Error.WriteLine("sshp: unsupported Windows installer: $($installer.Kind)")
+        exit 127
+    }
+}
+exit $LASTEXITCODE
+'
+
+windows_remote_command() {
+    printf '%s\n' 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command -'
+}
+
+run_windows_remote_command() {
+    windows_diagnostic_file=$1
+    windows_interactive=$2
+    windows_script=$3
+    windows_command=$(windows_remote_command "$windows_script")
+
+    case "$windows_interactive" in
+        true) terminal_option=-tt ;;
+        false) terminal_option=-T ;;
+        *) fail "internal error: invalid Windows interactive state: $windows_interactive" ;;
+    esac
+
+    windows_script_file=$(mktemp "$ssh_runtime_directory/windows-powershell.XXXXXX") || fail 'cannot create a temporary Windows PowerShell script'
+    require_runtime_file "$windows_script_file"
+    # shellcheck disable=SC2016
+    if ! printf '%s\n%s\n%s\n' \
+        '$ProgressPreference = "SilentlyContinue"' \
+        '$env:MSYS_NO_PATHCONV = "1"' \
+        "$windows_script" > "$windows_script_file"; then
+        remove_runtime_file "$windows_script_file" || true
+        fail 'cannot prepare the Windows PowerShell script'
+    fi
+    require_runtime_file "$windows_script_file"
+
+    if [ "$windows_interactive" = true ]; then
+        # Feed the script before terminal input, then stop the feeder on disconnect.
+        windows_input_pipe="$ssh_runtime_directory/windows-input"
+        command -v mkfifo >/dev/null 2>&1 || {
+            remove_runtime_file "$windows_script_file" || true
+            fail 'mkfifo is required for interactive Windows sessions'
+        }
+        runtime_fifo_is_safe "$windows_input_pipe" || {
+            remove_runtime_file "$windows_script_file" || true
+            fail 'cannot use an unsafe Windows session input pipe'
+        }
+        mkfifo "$windows_input_pipe" || {
+            remove_runtime_file "$windows_script_file" || true
+            fail 'cannot create the Windows session input pipe'
+        }
+        require_runtime_file "$windows_script_file"
+        require_runtime_fifo "$windows_input_pipe"
+        cat "$windows_script_file" - > "$windows_input_pipe" &
+        windows_input_pid=$!
+        require_runtime_fifo "$windows_input_pipe"
+        if run_ssh_logged "$windows_diagnostic_file" \
+            "$terminal_option" \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=10 \
+            -o ServerAliveCountMax=6 \
+            -o TCPKeepAlive=yes \
+            -- "$host" "$windows_command" < "$windows_input_pipe"; then
+            windows_status=0
+        else
+            windows_status=$?
+        fi
+        kill "$windows_input_pid" 2>/dev/null || true
+        wait "$windows_input_pid" 2>/dev/null || true
+        windows_input_pid=''
+        remove_runtime_fifo "$windows_input_pipe" || true
+        remove_runtime_file "$windows_script_file" || true
+    else
+        require_runtime_file "$windows_script_file"
+        if run_ssh_logged_bounded "$windows_diagnostic_file" \
+                "$terminal_option" \
+                -o ConnectTimeout=10 \
+                -o ServerAliveInterval=10 \
+                -o ServerAliveCountMax=6 \
+                -o TCPKeepAlive=yes \
+                -- "$host" "$windows_command" < "$windows_script_file"; then
+            windows_status=0
+        else
+            windows_status=$?
+        fi
+        remove_runtime_file "$windows_script_file" || true
+    fi
+    return "$windows_status"
+}
+
+run_windows_interactive_session_with_expect() {
+    windows_diagnostic_file=$1
+    expect_binary=$(command -v expect 2>/dev/null || true)
+    [ -n "$expect_binary" ] || return 127
+    require_runtime_file "$windows_diagnostic_file"
+    remove_runtime_file "$windows_diagnostic_file" || fail 'cannot prepare the Windows session diagnostic file'
+    windows_transcript_file="$windows_diagnostic_file.transcript"
+    require_runtime_file "$windows_transcript_file"
+    remove_runtime_file "$windows_transcript_file" || fail 'cannot prepare the Windows session transcript file'
+    require_runtime_file "$windows_diagnostic_file"
+    require_runtime_file "$windows_transcript_file"
+
+    # shellcheck disable=SC2016
+    if SSHP_EXPECT_HOST="$host" \
+        SSHP_EXPECT_SESSION="$session" \
+        SSHP_EXPECT_SSH="$ssh_binary" \
+        SSHP_EXPECT_LOG="$windows_diagnostic_file" \
+        SSHP_EXPECT_TRANSCRIPT="$windows_transcript_file" \
+        "$expect_binary" -c '
+set timeout -1
+log_user 1
+log_file -noappend $env(SSHP_EXPECT_TRANSCRIPT)
+spawn $env(SSHP_EXPECT_SSH) \
+    -tt \
+    -o ConnectTimeout=10 \
+    -o ServerAliveInterval=10 \
+    -o ServerAliveCountMax=6 \
+    -o TCPKeepAlive=yes \
+    -E $env(SSHP_EXPECT_LOG) \
+    -- $env(SSHP_EXPECT_HOST)
+after 2000
+# Replace the Git Bash shell with Zellij so a normal detach closes the SSH PTY.
+send -- "exec zellij attach --create $env(SSHP_EXPECT_SESSION)\r"
+set detached 0
+set interact_status [catch {
+    interact -o -re {(?:Bye from Zellij!|Connection to [^[:space:]]+ closed(?: by remote host)?\.?)} {
+        # Windows Zellij can emit its detach marker, or only close the SSH session,
+        # while the ConPTY stays open.
+        set detached 1
+        catch {exec kill -TERM [exp_pid]}
+    }
+} interact_error]
+log_file
+set wait_status [catch {wait} result]
+set transcript ""
+if {[file exists $env(SSHP_EXPECT_TRANSCRIPT)]} {
+    set transcript_channel [open $env(SSHP_EXPECT_TRANSCRIPT) r]
+    fconfigure $transcript_channel -translation binary
+    set transcript [read $transcript_channel]
+    close $transcript_channel
+}
+set transport_line_seen [regexp {Connection to [^[:space:]]+ closed(?: by remote host)?\.?} $transcript]
+if {$wait_status == 0 && [llength $result] >= 4 && [lindex $result 3] == 255 && $transport_line_seen} {
+    set diagnostic [open $env(SSHP_EXPECT_LOG) a]
+    puts $diagnostic "Connection to $env(SSHP_EXPECT_HOST) closed by remote host."
+    close $diagnostic
+}
+if {$wait_status != 0} {
+    set diagnostic [open $env(SSHP_EXPECT_LOG) a]
+    puts $diagnostic "sshp: interactive SSH transport lost; child state unavailable after interact"
+    close $diagnostic
+    exit 255
+}
+if {$detached} {
+    exit 0
+}
+if {[llength $result] >= 5 && [lindex $result 4] eq "CHILDKILLED"} {
+    set diagnostic [open $env(SSHP_EXPECT_LOG) a]
+    puts $diagnostic "sshp: interactive SSH transport lost; child terminated by [lindex $result 5]"
+    close $diagnostic
+    exit 255
+}
+if {$interact_status != 0} {
+    set diagnostic [open $env(SSHP_EXPECT_LOG) a]
+    puts $diagnostic "sshp: interactive SSH session ended unexpectedly: $interact_error"
+    close $diagnostic
+    exit 255
+}
+exit [lindex $result 3]
+'; then
+        windows_status=0
+    else
+        windows_status=$?
+    fi
+    require_runtime_file "$windows_diagnostic_file"
+    require_runtime_file "$windows_transcript_file"
+    if [ -f "$windows_transcript_file" ]; then
+        require_runtime_file "$windows_diagnostic_file"
+        require_existing_runtime_file "$windows_transcript_file" || {
+            transcript_read_status=$?
+            remove_runtime_file "$windows_transcript_file" || true
+            return "$transcript_read_status"
+        }
+        cat "$windows_transcript_file" >> "$windows_diagnostic_file" || printf '%s\n' "$program: failed to collect interactive SSH transcript." >&2
+    fi
+    remove_runtime_file "$windows_transcript_file" || true
+    return "$windows_status"
+}
+
+run_windows_interactive_session() {
+    windows_diagnostic_file=$1
+
+    if [ -t 0 ] && [ -t 1 ] && command -v expect >/dev/null 2>&1; then
+        run_windows_interactive_session_with_expect "$windows_diagnostic_file"
+        return $?
+    fi
+
+    windows_input_pipe="$ssh_runtime_directory/windows-session-input"
+    command -v mkfifo >/dev/null 2>&1 || fail 'mkfifo is required for interactive Windows sessions'
+    runtime_fifo_is_safe "$windows_input_pipe" || fail 'cannot use an unsafe Windows session input pipe'
+    mkfifo "$windows_input_pipe" || fail 'cannot create the Windows session input pipe'
+    require_runtime_fifo "$windows_input_pipe"
+
+    # The Windows SSH server starts Git Bash as its default shell. Send only a
+    # short, validated shell command before forwarding the user's terminal
+    # input; a PowerShell script on a TTY is parsed as interactive input.
+    {
+        # Windows ConPTY accepts the command reliably only when the initial
+        # interactive line uses a Windows-style CRLF terminator.
+        # Replacing Git Bash prevents a detached Zellij client from returning to its shell.
+        printf "exec zellij attach --create '%s'\r\n" "$session"
+        cat
+    } > "$windows_input_pipe" &
+    windows_input_pid=$!
+    require_runtime_fifo "$windows_input_pipe"
+    if run_ssh_logged "$windows_diagnostic_file" \
+            -tt \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=10 \
+            -o ServerAliveCountMax=6 \
+            -o TCPKeepAlive=yes \
+            -- "$host" < "$windows_input_pipe"; then
+        windows_status=0
+    else
+        windows_status=$?
+    fi
+    kill "$windows_input_pid" 2>/dev/null || true
+    wait "$windows_input_pid" 2>/dev/null || true
+    windows_input_pid=''
+    remove_runtime_fifo "$windows_input_pipe" || true
+    return "$windows_status"
+}
+
+prompt_install() {
+    if [ ! -t 0 ]; then
+        printf '%s\n' "$program: dependency installation requires an interactive local terminal." >&2
+        return 1
+    fi
+    printf '%s' 'sshp: install the missing remote dependency automatically now? [y/N] ' >&2
+    if IFS= read -r answer; then
+        :
+    else
+        answer=
+    fi
+
+    case "$answer" in
+        y|Y|yes|YES) return 0 ;;
+        *)
+            printf '%s\n' 'sshp: dependency installation declined.' >&2
+            return 1
+            ;;
+    esac
+}
+
+probe_remote_unix() {
+    run_ssh_logged_bounded "$1" \
+        -T \
+        -o ConnectTimeout=10 \
+        -o ServerAliveInterval=10 \
+        -o ServerAliveCountMax=6 \
+        -o TCPKeepAlive=yes \
+        -- "$host" "$remote_probe_command"
+}
+
+install_remote_unix() {
+    run_ssh_logged_bounded "$1" \
+        -tt \
+        -o ConnectTimeout=10 \
+        -o ServerAliveInterval=10 \
+        -o ServerAliveCountMax=6 \
+        -o TCPKeepAlive=yes \
+        -- "$host" "$remote_install_command"
+}
+
+prepare_remote() {
+    allow_install=$1
+    installation_attempted=0
+    probe_diagnostic_file="$ssh_runtime_directory/probe.stderr"
+    install_diagnostic_file="$ssh_runtime_directory/install.stderr"
+
+    while :; do
+        remote_platform=''
+        remote_ready=false
+        windows_probe_required=false
+
+        if probe_output=$(probe_remote_unix "$probe_diagnostic_file"); then
+            case "$probe_output" in
+                *__SSHP_WINDOWS_SHELL__:MINGW*|*__SSHP_WINDOWS_SHELL__:MSYS*|*__SSHP_WINDOWS_SHELL__:CYGWIN*)
+                    remote_platform=windows
+                    windows_probe_required=true
+                    ;;
+                *__SSHP_READY__:*)
+                    remote_platform=unix
+                    remote_ready=true
+                    ;;
+            esac
+        else
+            unix_probe_status=$?
+            if [ "$unix_probe_status" -eq 255 ] && ssh_transport_error "$probe_diagnostic_file"; then
+                printf '%s\n' "$program: initial SSH transport lost; reconnecting in ${reconnect_delay}s..." >&2
+                sleep "$reconnect_delay"
+                continue
+            fi
+
+            case "$probe_output" in
+                *__SSHP_WINDOWS_SHELL__:MINGW*|*__SSHP_WINDOWS_SHELL__:MSYS*|*__SSHP_WINDOWS_SHELL__:CYGWIN*|*__SSHP_INSTALL_REQUIRED__:MINGW*|*__SSHP_INSTALL_REQUIRED__:MSYS*|*__SSHP_INSTALL_REQUIRED__:CYGWIN*|*__SSHP_INSTALL_UNAVAILABLE__:MINGW*|*__SSHP_INSTALL_UNAVAILABLE__:MSYS*|*__SSHP_INSTALL_UNAVAILABLE__:CYGWIN*)
+                    remote_platform=windows
+                    windows_probe_required=true
+                    ;;
+                *__SSHP_INSTALL_REQUIRED__:*)
+                    remote_platform=unix
+                    ;;
+                *__SSHP_INSTALL_UNAVAILABLE__:*)
+                    printf '%s\n' "$program: persistent remote session unavailable: install tmux, GNU screen, or Zellij manually on the remote host." >&2
+                    return 127
+                    ;;
+            esac
+        fi
+
+        if [ "$remote_platform" = unix ]; then
+            if [ "$remote_ready" = true ]; then
+                return 0
+            fi
+            if [ "$allow_install" != true ]; then
+                printf '%s\n' "$program: persistent remote session unavailable: tmux, GNU screen, or Zellij is required." >&2
+                return 127
+            fi
+            if [ "$installation_attempted" -eq 1 ]; then
+                printf '%s\n' "$program: installation completed, but the dependency is still unavailable in a fresh SSH session." >&2
+                return 127
+            fi
+            if ! prompt_install; then
+                return 1
+            fi
+            if install_remote_unix "$install_diagnostic_file"; then
+                install_status=0
+            else
+                install_status=$?
+            fi
+            if [ "$install_status" -eq 255 ] && ssh_transport_error "$install_diagnostic_file"; then
+                printf '%s\n' "$program: installation SSH transport was lost; installation state is unknown, so it will not be retried automatically." >&2
+                return 255
+            fi
+            [ "$install_status" -eq 0 ] || return "$install_status"
+            installation_attempted=1
+            continue
+        fi
+
+        # Use native PowerShell for every Windows target, including Git Bash.
+        # This avoids stale SSH-server PATH values after WinGet, Scoop, or Chocolatey installs.
+        if probe_output=$(run_windows_remote_command "$probe_diagnostic_file" false "$windows_probe_script"); then
+            case "$probe_output" in
+                *__SSHP_READY__:Windows*)
+                    remote_platform=windows
+                    return 0
+                    ;;
+                *)
+                    printf '%s\n' "$program: remote dependency probe returned an unexpected Windows response." >&2
+                    return 2
+                    ;;
+            esac
+        else
+            windows_probe_status=$?
+            if [ "$windows_probe_status" -eq 255 ] && ssh_transport_error "$probe_diagnostic_file"; then
+                printf '%s\n' "$program: initial SSH transport lost; reconnecting in ${reconnect_delay}s..." >&2
+                sleep "$reconnect_delay"
+                continue
+            fi
+            case "$probe_output" in
+                *__SSHP_INSTALL_REQUIRED__:Windows*)
+                    [ "$windows_probe_status" -eq 42 ] || {
+                        printf '%s\n' "$program: remote dependency probe returned an invalid Windows install status." >&2
+                        return 2
+                    }
+                    remote_platform=windows
+                    ;;
+                *__SSHP_INSTALL_UNAVAILABLE__:Windows*)
+                    printf '%s\n' "$program: persistent remote session unavailable: native Zellij is required on Windows and no supported installer was found." >&2
+                    return 127
+                    ;;
+                *)
+                    if [ "$windows_probe_required" = true ]; then
+                        printf '%s\n' "$program: remote dependency probe failed for the Windows shell." >&2
+                    else
+                        printf '%s\n' "$program: remote dependency probe failed for both Unix and Windows shells." >&2
+                    fi
+                    return "$windows_probe_status"
+                    ;;
+            esac
+        fi
+
+        if [ "$allow_install" != true ]; then
+            printf '%s\n' "$program: persistent remote session unavailable: native Zellij is required on Windows." >&2
+            return 127
+        fi
+        if [ "$installation_attempted" -eq 1 ]; then
+            printf '%s\n' "$program: installation completed, but the dependency is still unavailable in a fresh SSH session." >&2
+            return 127
+        fi
+        if ! prompt_install; then
+            return 1
+        fi
+        if run_windows_remote_command "$install_diagnostic_file" false "$windows_install_script"; then
+            install_status=0
+        else
+            install_status=$?
+        fi
+        if [ "$install_status" -eq 255 ] && ssh_transport_error "$install_diagnostic_file"; then
+            printf '%s\n' "$program: installation SSH transport was lost; installation state is unknown, so it will not be retried automatically." >&2
+            return 255
+        fi
+        [ "$install_status" -eq 0 ] || return "$install_status"
+        installation_attempted=1
+    done
+}
+
+remote_command="
+if command -v tmux >/dev/null 2>&1; then
+    exec tmux new-session -A -s '$session'
+fi
+if command -v screen >/dev/null 2>&1; then
+    exec screen -xRR -S '$session'
+fi
+if command -v zellij >/dev/null 2>&1; then
+    exec zellij attach --create '$session'
+fi
+printf '%s\\n' 'sshp: remote host has neither tmux, GNU screen, nor Zellij.' >&2
+exit 127
+"
+
+if [ "$check_only" = true ]; then
+    allow_install=false
+else
+    allow_install=true
+fi
+prepare_remote "$allow_install"
+
+if [ "$check_only" = true ]; then
+    case "$remote_platform" in
+        windows) printf '%s\n' 'persistent remote session: Zellij (Windows)' ;;
+        unix) printf '%s\n' 'persistent remote session: tmux, GNU screen, or Zellij' ;;
+        *) fail 'internal error: remote platform was not set by the dependency probe' ;;
+    esac
+    exit 0
+fi
+
+trap 'exit 130' HUP INT TERM
+
+while :; do
+    case "$remote_platform" in
+        windows)
+            session_diagnostic_file="$ssh_runtime_directory/windows-session.stderr"
+            if run_windows_interactive_session "$session_diagnostic_file"; then
+                session_exit=0
+            else
+                session_exit=$?
+            fi
+            ;;
+        unix)
+            session_diagnostic_file="$ssh_runtime_directory/unix-session.stderr"
+            if run_ssh_logged "$session_diagnostic_file" \
+                -tt \
+                -o ConnectTimeout=10 \
+                -o ServerAliveInterval=10 \
+                -o ServerAliveCountMax=6 \
+                -o TCPKeepAlive=yes \
+                -- "$host" "$remote_command"; then
+                session_exit=0
+            else
+                session_exit=$?
+            fi
+            ;;
+        *)
+            fail "unsupported remote platform state: $remote_platform"
+            ;;
+    esac
+
+    # OpenSSH reports lost transports as 255. A normal remote exit must not
+    # reopen a session that the user intentionally closed or detached from.
+    [ "$session_exit" -eq 255 ] || exit "$session_exit"
+    ssh_transport_error "$session_diagnostic_file" || exit "$session_exit"
+
+    printf '%s\n' "$program: SSH transport lost; reconnecting in ${reconnect_delay}s..." >&2
+    sleep "$reconnect_delay"
+done

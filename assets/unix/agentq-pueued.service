@@ -1,0 +1,15 @@
+[Unit]
+Description=AgentQ Pueue daemon
+
+[Service]
+Type=simple
+Environment=HOME=%h
+WorkingDirectory=%h
+ExecStart=%h/.agentq/pueued --config %h/.agentq/config/pueue.yml
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=default.target

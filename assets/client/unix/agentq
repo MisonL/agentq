@@ -1,0 +1,3523 @@
+#!/bin/sh
+
+set -eu
+
+program=${0##*/}
+stat_flavor=''
+config_path=${AGENTQ_CONFIG:-"$HOME/.config/agentq/config"}
+configured_host=''
+config_max_bytes=4096
+config_marker='__AGENTQ_CONFIG_READ_BOUNDARY_9f3c7b2a__'
+config_hex=''
+config_snapshot_directory=''
+config_snapshot_file=''
+config_snapshot_directory_identity=''
+config_snapshot_file_identity=''
+config_source_identity=''
+config_source_path_chain_identity=''
+submit_retry_attempts=${AGENTQ_SUBMIT_RETRY_ATTEMPTS:-6}
+submit_retry_delay=${AGENTQ_SUBMIT_RETRY_DELAY:-2}
+operation_retry_attempts=${AGENTQ_OPERATION_RETRY_ATTEMPTS:-6}
+operation_retry_delay=${AGENTQ_OPERATION_RETRY_DELAY:-2}
+platform_probe_timeout=${AGENTQ_PLATFORM_PROBE_TIMEOUT:-30}
+platform_probe_output_limit=65536
+ssh_binary=${AGENTQ_SSH:-}
+json_parser=${AGENTQ_JQ:-}
+remote_platform=${AGENTQ_REMOTE_PLATFORM:-auto}
+remote_argument_file=''
+remote_input_file=''
+submit_input_file=''
+lookup_input_file=''
+remote_argument_file_identity=''
+remote_input_file_identity=''
+submit_input_file_identity=''
+lookup_input_file_identity=''
+mutation_log_file=''
+# Set by run_ssh_logged on every call: the controlled reason token found on the
+# remote command's stderr, or empty.  A global rather than a return value because
+# run_ssh_logged's exit status is already the ssh exit code, and both callers (the
+# operation path and the mutation path) need the same value.
+agentq_remote_failure_reason_value=''
+mutation_output_file=''
+agentq_recovery_log_file=''
+agentq_recovery_output_file=''
+agentq_operation_log_file=''
+agentq_operation_output_file=''
+platform_probe_output_file=''
+platform_probe_log_file=''
+platform_probe_output_identity=''
+platform_probe_log_identity=''
+platform_probe_stdin_file=''
+platform_probe_stdin_identity=''
+windows_probe_prepared_command_line=''
+windows_encoding_input=''
+windows_encoding_output=''
+windows_encoding_input_identity=''
+windows_encoding_output_identity=''
+agentq_temp_directory=''
+# Credential source for ssh password authentication.  Empty means "no password
+# source configured", which keeps BatchMode=yes exactly as it always was -- the
+# fail-fast, never-hangs behaviour an unattended queue depends on.  A non-empty
+# value switches ssh to BatchMode=no plus an askpass program.
+#
+# AGENTQ_ASKPASS names a program (a system credential helper, or the user's own
+# script) that ssh executes to obtain the secret.  AgentQ never reads, stores,
+# or logs the secret itself: it only passes the program name through.  That is
+# why this outranks the plaintext forms below.
+agentq_credential_source=''
+# The program ssh executes.  For the AGENTQ_ASKPASS source this is the user's
+# own file and must NEVER be removed; for the AGENTQ_PASSWORD source it is a
+# temporary this client creates and must always be removed.  The two are kept
+# in separate variables so that cleanup can never touch a user-supplied path.
+agentq_askpass_program=''
+agentq_askpass_temporary=''
+agentq_askpass_temporary_identity=''
+agentq_credential_option_lines=''
+agentq_password_prompt=0
+agentq_number_of_password_prompts=1
+
+
+# Every identity helper below needs the same thing from stat, and each call
+# used to probe both flavors: GNU's `-c` (always fails on BSD) and BSD's `-f`.
+# On a machine where a fork+exec costs ~15ms and one invocation makes dozens of
+# them, that doubled the cost for nothing.  The flavor is probed once, near the
+# top of the file, and everything after that uses only the form this platform
+# supports.
+detect_stat_flavor() {
+    if [ -n "$stat_flavor" ]; then
+        return 0
+    fi
+    if stat -c '%d:%i' -- "$0" >/dev/null 2>&1; then
+        stat_flavor=gnu
+    elif stat -f '%d:%i' "$0" >/dev/null 2>&1; then
+        stat_flavor=bsd
+    else
+        return 1
+    fi
+}
+
+# Emit `device:inode` for a path, or return non-zero.  Callers validate the
+# output exactly as before.  Falls back to probing when the cache is unset, so
+# this stays correct if it is ever called before main() has run -- the probe
+# result is only cached when it happens in the top-level shell.
+stat_device_inode() {
+    stat_device_inode_path=$1
+    stat_device_inode_identity=''
+
+    if [ -z "$stat_flavor" ]; then
+        detect_stat_flavor || return 1
+    fi
+    if [ "$stat_flavor" = gnu ]; then
+        stat_device_inode_identity=$(stat -c '%d:%i' -- "$stat_device_inode_path" 2>/dev/null) || return 1
+    else
+        stat_device_inode_identity=$(stat -f '%d:%i' "$stat_device_inode_path" 2>/dev/null) || return 1
+    fi
+    printf '%s\n' "$stat_device_inode_identity"
+}
+
+# Probe the stat flavor once, in the top-level shell, as soon as the helper
+# exists.  Placement matters twice over: the identity helpers are reached
+# through command substitutions during config resolution -- before any of the
+# top-level command dispatch -- and a probe cached inside a subshell is thrown
+# away with it, so probing later would leave every one of those calls
+# re-probing.  Defining the function first is what makes this callable here.
+detect_stat_flavor || {
+    # fail() is not defined until later in the file, so report this directly.
+    printf '%s: cannot determine how to read file identity on this platform\n' "${0##*/}" >&2
+    exit 2
+}
+
+config_snapshot_identity_for_path() {
+    config_snapshot_identity_path=$1
+    config_snapshot_identity=''
+
+    if config_snapshot_identity=$(stat_device_inode "$config_snapshot_identity_path"); then
+        :
+    else
+        return 1
+    fi
+    case "$config_snapshot_identity" in
+        ''|*[!0-9:]*|*:*:*) return 1 ;;
+    esac
+    printf '%s\n' "$config_snapshot_identity"
+}
+
+config_source_path_chain_identity_for_path() {
+    config_source_chain_guard_path=$1
+    case "$config_source_chain_guard_path" in
+        '') return 1 ;;
+    esac
+    case "/$config_source_chain_guard_path/" in
+        */../*) return 1 ;;
+    esac
+
+    config_source_chain_probe='.'
+    config_source_chain_remaining=$config_source_chain_guard_path
+    case "$config_source_chain_remaining" in
+        /*)
+            config_source_chain_probe=/
+            config_source_chain_remaining=${config_source_chain_remaining#/}
+            ;;
+    esac
+
+    config_source_chain_identity=''
+    while [ -n "$config_source_chain_remaining" ]; do
+        case "$config_source_chain_remaining" in
+            */*)
+                config_source_chain_component=${config_source_chain_remaining%%/*}
+                config_source_chain_remaining=${config_source_chain_remaining#*/}
+                ;;
+            *)
+                config_source_chain_component=$config_source_chain_remaining
+                config_source_chain_remaining=''
+                ;;
+        esac
+        case "$config_source_chain_component" in
+            ''|.) continue ;;
+            ..) return 1 ;;
+        esac
+        if [ "$config_source_chain_probe" = / ]; then
+            config_source_chain_probe=/$config_source_chain_component
+        else
+            config_source_chain_probe=$config_source_chain_probe/$config_source_chain_component
+        fi
+        [ ! -L "$config_source_chain_probe" ] || return 1
+        config_source_chain_component_identity=$(config_snapshot_identity_for_path "$config_source_chain_probe") || return 1
+        if [ -n "$config_source_chain_identity" ]; then
+            config_source_chain_identity=$config_source_chain_identity/$config_source_chain_component_identity
+        else
+            config_source_chain_identity=$config_source_chain_component_identity
+        fi
+    done
+
+    [ -n "$config_source_chain_identity" ] || return 1
+    printf '%s\n' "$config_source_chain_identity"
+}
+
+config_snapshot_path_is_safe() {
+    config_snapshot_guard_path=$1
+    case "$config_snapshot_guard_path" in
+        '') return 1 ;;
+    esac
+    case "/$config_snapshot_guard_path/" in
+        */../*) return 1 ;;
+    esac
+
+    config_snapshot_probe='.'
+    config_snapshot_remaining=$config_snapshot_guard_path
+    case "$config_snapshot_remaining" in
+        /*)
+            config_snapshot_probe=/
+            config_snapshot_remaining=${config_snapshot_remaining#/}
+            ;;
+    esac
+
+    while [ -n "$config_snapshot_remaining" ]; do
+        case "$config_snapshot_remaining" in
+            */*)
+                config_snapshot_component=${config_snapshot_remaining%%/*}
+                config_snapshot_remaining=${config_snapshot_remaining#*/}
+                ;;
+            *)
+                config_snapshot_component=$config_snapshot_remaining
+                config_snapshot_remaining=''
+                ;;
+        esac
+        [ -n "$config_snapshot_component" ] || continue
+        [ "$config_snapshot_component" = . ] && continue
+        if [ "$config_snapshot_probe" = / ]; then
+            config_snapshot_probe=/$config_snapshot_component
+        else
+            config_snapshot_probe=$config_snapshot_probe/$config_snapshot_component
+        fi
+        [ ! -L "$config_snapshot_probe" ] || return 1
+    done
+
+    [ -d "$config_snapshot_guard_path" ] && [ ! -L "$config_snapshot_guard_path" ]
+}
+
+config_snapshot_directory_is_current() {
+    [ -n "$config_snapshot_directory" ] || return 1
+    config_snapshot_path_is_safe "$config_snapshot_directory" || return 1
+    [ -d "$config_snapshot_directory" ] && [ ! -L "$config_snapshot_directory" ] || return 1
+    [ -n "$config_snapshot_directory_identity" ] || return 1
+    config_snapshot_directory_observed_identity=$(config_snapshot_identity_for_path "$config_snapshot_directory") || return 1
+    [ "$config_snapshot_directory_observed_identity" = "$config_snapshot_directory_identity" ]
+}
+
+config_snapshot_file_is_current() {
+    [ -n "$config_snapshot_file" ] || return 1
+    config_snapshot_file_parent=${config_snapshot_file%/*}
+    config_snapshot_file_name=${config_snapshot_file##*/}
+    [ -n "$config_snapshot_file_name" ] || return 1
+    [ "$config_snapshot_file_parent" != "$config_snapshot_file" ] || config_snapshot_file_parent=.
+    config_snapshot_path_is_safe "$config_snapshot_file_parent" || return 1
+    [ -f "$config_snapshot_file" ] && [ ! -L "$config_snapshot_file" ] || return 1
+    [ -n "$config_snapshot_file_identity" ] || return 1
+    config_snapshot_file_observed_identity=$(config_snapshot_identity_for_path "$config_snapshot_file") || return 1
+    [ "$config_snapshot_file_observed_identity" = "$config_snapshot_file_identity" ]
+}
+
+config_source_file_is_current() {
+    [ -n "$config_path" ] || return 1
+    [ -f "$config_path" ] && [ ! -L "$config_path" ] || return 1
+    [ -n "$config_source_path_chain_identity" ] || return 1
+    config_source_path_chain_observed_identity=$(config_source_path_chain_identity_for_path "$config_path") || return 1
+    [ "$config_source_path_chain_observed_identity" = "$config_source_path_chain_identity" ] || return 1
+    [ -n "$config_source_identity" ] || return 1
+    config_source_observed_identity=$(config_snapshot_identity_for_path "$config_path") || return 1
+    [ "$config_source_observed_identity" = "$config_source_identity" ]
+}
+
+cleanup_config_snapshot() {
+    cleanup_config_snapshot_status=0
+    if [ -n "$config_snapshot_file" ]; then
+        if [ -e "$config_snapshot_file" ] || [ -L "$config_snapshot_file" ]; then
+            if config_snapshot_file_is_current; then
+                if ! rm -f -- "$config_snapshot_file"; then
+                    printf '%s: failed to remove configuration snapshot file; preserving it: %s\n' "$program" "$config_snapshot_file" >&2
+                    cleanup_config_snapshot_status=1
+                elif [ -e "$config_snapshot_file" ] || [ -L "$config_snapshot_file" ]; then
+                    printf '%s: configuration snapshot file remained after cleanup; preserving it: %s\n' "$program" "$config_snapshot_file" >&2
+                    cleanup_config_snapshot_status=1
+                fi
+            else
+                printf '%s: refusing to remove an unsafe configuration snapshot file; preserving it: %s\n' "$program" "$config_snapshot_file" >&2
+                cleanup_config_snapshot_status=1
+            fi
+        fi
+        config_snapshot_file=''
+        config_snapshot_file_identity=''
+    fi
+    if [ -n "$config_snapshot_directory" ]; then
+        if [ -e "$config_snapshot_directory" ] || [ -L "$config_snapshot_directory" ]; then
+            if config_snapshot_directory_is_current; then
+                if ! rmdir -- "$config_snapshot_directory"; then
+                    printf '%s: failed to remove configuration snapshot directory; preserving it: %s\n' "$program" "$config_snapshot_directory" >&2
+                    cleanup_config_snapshot_status=1
+                elif [ -e "$config_snapshot_directory" ] || [ -L "$config_snapshot_directory" ]; then
+                    printf '%s: configuration snapshot directory remained after cleanup; preserving it: %s\n' "$program" "$config_snapshot_directory" >&2
+                    cleanup_config_snapshot_status=1
+                fi
+            else
+                printf '%s: refusing to remove an unsafe configuration snapshot directory; preserving it: %s\n' "$program" "$config_snapshot_directory" >&2
+                cleanup_config_snapshot_status=1
+            fi
+        fi
+        config_snapshot_directory=''
+        config_snapshot_directory_identity=''
+    fi
+    return "$cleanup_config_snapshot_status"
+}
+
+trap cleanup_config_snapshot EXIT HUP INT TERM
+
+if [ -L "$config_path" ]; then
+    printf '%s: AGENTQ_CONFIG must be a regular file; symbolic links are not accepted\n' "$program" >&2
+    exit 2
+fi
+if [ -e "$config_path" ] && [ ! -f "$config_path" ]; then
+    printf '%s: AGENTQ_CONFIG must be a regular file\n' "$program" >&2
+    exit 2
+fi
+if [ -r "$config_path" ]; then
+    if ! command -v stat >/dev/null 2>&1; then
+        printf '%s: stat is required to protect configuration snapshot identity\n' "$program" >&2
+        exit 2
+    fi
+    if ! config_snapshot_directory=$(mktemp -d "${TMPDIR:-/tmp}/agentq-config.XXXXXX"); then
+        printf '%s: cannot create a configuration snapshot\n' "$program" >&2
+        exit 2
+    fi
+    if ! config_snapshot_directory=$(unset CDPATH; cd -- "$config_snapshot_directory" 2>/dev/null && pwd -P); then
+        printf '%s: cannot resolve configuration snapshot directory\n' "$program" >&2
+        exit 2
+    fi
+    if ! config_snapshot_directory_identity=$(config_snapshot_identity_for_path "$config_snapshot_directory"); then
+        printf '%s: cannot record configuration snapshot directory identity\n' "$program" >&2
+        exit 2
+    fi
+    if ! config_snapshot_directory_is_current; then
+        printf '%s: configuration snapshot directory changed before reading\n' "$program" >&2
+        exit 2
+    fi
+    if ! config_source_path_chain_identity=$(config_source_path_chain_identity_for_path "$config_path"); then
+        printf '%s: AGENTQ_CONFIG path is unsafe or unavailable\n' "$program" >&2
+        exit 2
+    fi
+    if ! config_source_identity=$(config_snapshot_identity_for_path "$config_path"); then
+        printf '%s: cannot record AGENTQ_CONFIG identity\n' "$program" >&2
+        exit 2
+    fi
+    if ! config_source_file_is_current; then
+        printf '%s: AGENTQ_CONFIG changed before bounded read\n' "$program" >&2
+        exit 2
+    fi
+    config_snapshot_file=$config_snapshot_directory/config
+    if ! dd if="$config_path" bs=$((config_max_bytes + 1)) count=1 of="$config_snapshot_file" 2>/dev/null; then
+        if [ -f "$config_snapshot_file" ] && [ ! -L "$config_snapshot_file" ]; then
+            config_snapshot_file_identity=$(config_snapshot_identity_for_path "$config_snapshot_file") || config_snapshot_file_identity=''
+        fi
+        printf '%s: AGENTQ_CONFIG could not be read\n' "$program" >&2
+        exit 2
+    fi
+    if ! config_snapshot_file_identity=$(config_snapshot_identity_for_path "$config_snapshot_file"); then
+        printf '%s: cannot record configuration snapshot file identity\n' "$program" >&2
+        exit 2
+    fi
+    if ! config_snapshot_file_is_current; then
+        printf '%s: configuration snapshot file changed before validation\n' "$program" >&2
+        exit 2
+    fi
+    if ! config_source_file_is_current; then
+        printf '%s: AGENTQ_CONFIG changed during bounded read\n' "$program" >&2
+        exit 2
+    fi
+    if ! config_hex=$(LC_ALL=C od -An -tx1 "$config_snapshot_file"); then
+        printf '%s: AGENTQ_CONFIG could not be inspected\n' "$program" >&2
+        exit 2
+    fi
+    case " $config_hex " in
+        *[[:space:]]00[[:space:]]*)
+            printf '%s: AGENTQ_CONFIG contains NUL bytes; text syntax is required\n' "$program" >&2
+            exit 2
+            ;;
+    esac
+    if ! config_probe=$(
+        set -e
+        config_snapshot_file_is_current
+        dd if="$config_snapshot_file" bs=$((config_max_bytes + 1)) count=1 2>/dev/null
+        printf '%s' "$config_marker"
+    ); then
+        printf '%s: AGENTQ_CONFIG could not be read\n' "$program" >&2
+        exit 2
+    fi
+    config_probe_bytes=$(LC_ALL=C printf '%s' "$config_probe" | wc -c | tr -d '[:space:]')
+    config_marker_bytes=$(LC_ALL=C printf '%s' "$config_marker" | wc -c | tr -d '[:space:]')
+    config_bytes=$((config_probe_bytes - config_marker_bytes))
+    if [ "$config_bytes" -gt "$config_max_bytes" ]; then
+        printf '%s: AGENTQ_CONFIG exceeds the fixed limit of %s bytes\n' "$program" "$config_max_bytes" >&2
+        exit 2
+    fi
+    if ! config_snapshot_file_is_current; then
+        printf '%s: configuration snapshot file changed during validation\n' "$program" >&2
+        exit 2
+    fi
+    config_text=${config_probe%"$config_marker"}
+    configured_host=$(printf '%s' "$config_text" | sed -n 's/^AGENTQ_HOST=\([^[:space:]]*\)$/\1/p' | tail -n 1)
+    if ! cleanup_config_snapshot; then
+        printf '%s: configuration snapshot cleanup was not verified\n' "$program" >&2
+        exit 2
+    fi
+fi
+
+default_host=${AGENTQ_HOST:-$configured_host}
+
+# ---------------------------------------------------------------------------
+# Password authentication sources
+#
+# ssh only tries password / keyboard-interactive authentication when
+# BatchMode=yes is absent (BatchMode sets `batch_flag` on those two methods, so
+# they are never even offered -- it does not merely decline them), AND, with no
+# tty, only when an askpass program answers the prompt.  Both halves are
+# required: dropping BatchMode alone would leave ssh reading the terminal, and
+# an askpass program alone is never consulted while BatchMode is on.
+#
+# Nothing here is enabled by default.  With no source configured the client
+# behaves exactly as it did before this feature existed: BatchMode=yes, fail
+# fast, never wait for input.
+# ---------------------------------------------------------------------------
+
+# Refuse to run rather than silently fall back to key-only auth: a silent
+# fallback would leave the operator believing a password was being used.
+credential_refuse() {
+    printf '%s: %s\n' "$program" "$1" >&2
+    printf '%s: refusing to run; unset the credential variable to go back to key-only authentication\n' \
+        "$program" >&2
+    exit 2
+}
+
+# A usable askpass program is a regular, executable, non-symlink file.  The
+# symlink rejection matters most: a link could be repointed between this check
+# and ssh's exec of it.
+resolve_credential_source() {
+    agentq_askpass_program=${AGENTQ_ASKPASS:-}
+
+    if [ -n "$agentq_askpass_program" ]; then
+        # ssh executes the WHOLE SSH_ASKPASS value as a single file name -- there is
+        # no shell in between and no word splitting.  So the value is legal exactly
+        # when it names an existing executable file, spaces and all: a path under
+        # "Program Files" is fine, while a value carrying an argument or
+        # surrounding quotes is not.  The test is therefore the FILE SYSTEM, not
+        # the characters -- rejecting anything containing a space would refuse
+        # good paths.
+        #
+        # When the whole value is not a file, say WHY, because "does not exist" is
+        # wrong and misleading when the file is right there and only the shape is
+        # off.  (Measured: a bare path authenticates; both of the shapes below fail.)
+        if [ ! -e "$agentq_askpass_program" ] && [ ! -L "$agentq_askpass_program" ]; then
+            case $agentq_askpass_program in
+                \"*\"|*' '*)
+                    credential_refuse "AGENTQ_ASKPASS must be a single executable path with no arguments and no quotes; ssh executes the whole value as one file name, so neither is supported: $agentq_askpass_program"
+                    ;;
+            esac
+        fi
+        if [ -L "$agentq_askpass_program" ]; then
+            credential_refuse "AGENTQ_ASKPASS must be a regular file; symbolic links are not accepted: $agentq_askpass_program"
+        fi
+        if [ ! -e "$agentq_askpass_program" ]; then
+            credential_refuse "AGENTQ_ASKPASS does not exist: $agentq_askpass_program"
+        fi
+        if [ ! -f "$agentq_askpass_program" ]; then
+            credential_refuse "AGENTQ_ASKPASS must be a regular file: $agentq_askpass_program"
+        fi
+        if [ ! -x "$agentq_askpass_program" ]; then
+            credential_refuse "AGENTQ_ASKPASS is not executable: $agentq_askpass_program"
+        fi
+        # An askpass program is the whole point of that variable; a password
+        # alongside it would be silently ignored, which is worse than refusing.
+        if [ -n "${AGENTQ_PASSWORD:-}" ]; then
+            credential_refuse 'AGENTQ_ASKPASS and AGENTQ_PASSWORD are both set; set only one'
+        fi
+        agentq_credential_source=askpass
+        return 0
+    fi
+
+    if [ -n "${AGENTQ_PASSWORD:-}" ]; then
+        # There is no way to check the permissions of an environment variable.
+        # It is accepted because the user asked for it, and because it is
+        # strictly better than a plaintext file on disk -- but it is NOT
+        # protected, and the documentation says so.
+        agentq_credential_source=password
+        return 0
+    fi
+
+    case "${AGENTQ_PASSWORD_PROMPT:-}" in
+        ''|0) ;;
+        1)
+            # ssh reads the password from the terminal.  With no terminal it
+            # falls back to STDIN, and STDIN is where submit carries its
+            # payload -- so a prompt source without a tty would silently eat
+            # the request instead of failing.  Refuse, rather than find out.
+            if [ ! -t 0 ]; then
+                credential_refuse 'AGENTQ_PASSWORD_PROMPT requires a terminal, but standard input is not one'
+            fi
+            agentq_credential_source=prompt
+            ;;
+        *) credential_refuse 'AGENTQ_PASSWORD_PROMPT must be 1 (or unset)' ;;
+    esac
+}
+
+# The askpass program is the only thing ssh sees; the secret never passes
+# through this client.  For AGENTQ_PASSWORD the secret would otherwise sit in
+# the environment of every ssh child, so it is moved into a 0600 temporary
+# wrapper that is registered for removal on every exit path.
+prepare_credential_delivery() {
+    [ "$agentq_credential_source" = password ] || return 0
+    resolve_agentq_temp_directory || return $?
+
+    agentq_askpass_temporary=''
+    if agentq_askpass_temporary=$(umask 077; make_client_temporary_file "$agentq_temp_directory" 'agentq-askpass'); then
+        :
+    else
+        agentq_askpass_temporary=''
+        printf '%s: cannot allocate a temporary askpass program\n' "$program" >&2
+        return 1
+    fi
+    if agentq_askpass_temporary_identity=$(windows_argument_file_identity "$agentq_askpass_temporary"); then
+        :
+    else
+        printf '%s: cannot record askpass temporary identity: %s\n' "$program" "$agentq_askpass_temporary" >&2
+        return 1
+    fi
+    # Written by redirection, never as an argv: the value must not appear in a
+    # process listing.  The secret is read from the environment by the wrapper,
+    # which is why the wrapper itself carries no credential.
+    (umask 077; cat > "$agentq_askpass_temporary") <<'AGENTQ_ASKPASS_WRAPPER'
+#!/bin/sh
+printf '%s\n' "$AGENTQ_PASSWORD"
+AGENTQ_ASKPASS_WRAPPER
+    chmod 700 "$agentq_askpass_temporary" 2>/dev/null || true
+    windows_argument_verify_identity "$agentq_askpass_temporary" "$agentq_askpass_temporary_identity" 'after writing askpass program' || return $?
+    agentq_askpass_program=$agentq_askpass_temporary
+}
+
+# Emit the ssh option lines that depend on the credential source.  Read-only by
+# design: the caller consumes this through a command substitution, and a
+# command substitution runs in a subshell, so any global set in here would be
+# discarded.  (This project has been bitten by that three times.)
+ssh_credential_options() {
+    if [ "$agentq_credential_source" = '' ]; then
+        printf '%s\n' '-o BatchMode=yes'
+    else
+        printf '%s\n' '-o BatchMode=no'
+        printf '%s\n' "-o NumberOfPasswordPrompts=$agentq_number_of_password_prompts"
+    fi
+}
+
+usage() {
+    cat <<EOF
+Usage:
+  $program [--host <ssh-host>] submit --workdir <remote-directory> [--label <label>] [--request-id <id>] -- <command> [arguments...]
+  $program [--host <ssh-host>] lookup <request-id>
+  $program [--host <ssh-host>] status
+  $program [--host <ssh-host>] logs <task-id> [--tail <lines>]
+  $program [--host <ssh-host>] cancel <task-id>
+  $program [--host <ssh-host>] wait <task-id>
+  $program [--host <ssh-host>] remove <task-id>
+  $program [--host <ssh-host>] doctor
+
+Environment:
+  AGENTQ_HOST                      Default SSH host when --host is omitted.
+  AGENTQ_CONFIG                    Optional non-symlink regular text file containing AGENTQ_HOST.
+  AGENTQ_SUBMIT_RETRY_ATTEMPTS     Confirmed transport retries for submit.
+  AGENTQ_SUBMIT_RETRY_DELAY        Delay in seconds between submit retries.
+  AGENTQ_OPERATION_RETRY_ATTEMPTS  Confirmed transport retries for safe operations.
+  AGENTQ_OPERATION_RETRY_DELAY     Delay in seconds between safe-operation retries.
+  AGENTQ_PLATFORM_PROBE_TIMEOUT    Maximum seconds for a read-only platform/protocol probe.
+  AGENTQ_SSH                       OpenSSH client path; defaults to ssh found on PATH.
+  AGENTQ_JQ                        jq executable used to validate AgentQ JSON responses.
+  AGENTQ_REMOTE_PLATFORM           auto, unix, or windows; defaults to auto.
+  AGENTQ_ASKPASS                   Program that prints the SSH password; enables
+                                   password authentication.  A system credential
+                                   helper works here.  AgentQ never reads it.
+  AGENTQ_PASSWORD                  SSH password, passed as an environment
+                                   variable.  Not protected: prefer AGENTQ_ASKPASS.
+  AGENTQ_PASSWORD_PROMPT           Set to 1 to let ssh prompt on the terminal.
+EOF
+}
+
+fail() {
+    printf '%s: %s\n' "$program" "$1" >&2
+    exit 2
+}
+
+resolve_agentq_temp_directory() {
+    if [ -n "$agentq_temp_directory" ]; then
+        return 0
+    fi
+    agentq_temp_directory=$(unset CDPATH; cd -- "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P) || {
+        printf '%s: cannot resolve the temporary directory\n' "$program" >&2
+        return 2
+    }
+}
+
+windows_argument_file_is_safe() {
+    windows_argument_guard_file=$1
+    [ -n "$windows_argument_guard_file" ] || return 1
+    windows_argument_parent=${windows_argument_guard_file%/*}
+    windows_argument_name=${windows_argument_guard_file##*/}
+    [ -n "$windows_argument_name" ] || return 1
+    [ "$windows_argument_parent" != "$windows_argument_guard_file" ] || windows_argument_parent=.
+    agentq_client_temp_path_is_safe "$windows_argument_parent" || return 1
+    [ ! -L "$windows_argument_guard_file" ] || return 1
+    if [ -e "$windows_argument_guard_file" ] && [ ! -f "$windows_argument_guard_file" ]; then
+        return 1
+    fi
+    return 0
+}
+
+windows_argument_require_file() {
+    if windows_argument_file_is_safe "$1"; then
+        return 0
+    fi
+    printf '%s: unsafe Windows argument temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+windows_argument_require_existing_file() {
+    if windows_argument_file_is_safe "$1" && [ -f "$1" ]; then
+        return 0
+    fi
+    printf '%s: unsafe Windows argument temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+windows_argument_file_identity() {
+    windows_argument_identity_path=$1
+    windows_argument_identity=''
+
+    if windows_argument_identity=$(stat_device_inode "$windows_argument_identity_path"); then
+        :
+    else
+        return 1
+    fi
+    case "$windows_argument_identity" in
+        ''|*[!0-9:]*|*:*:*) return 1 ;;
+    esac
+    printf '%s\n' "$windows_argument_identity"
+}
+
+windows_argument_verify_identity() {
+    windows_argument_verify_path=$1
+    windows_argument_verify_expected_identity=$2
+    windows_argument_verify_phase=$3
+
+    if [ -z "$windows_argument_verify_expected_identity" ]; then
+        printf '%s: refusing to use Windows argument temporary without a recorded identity: %s\n' \
+            "$program" "$windows_argument_verify_path" >&2
+        return 2
+    fi
+    windows_argument_verify_observed_identity=$(windows_argument_file_identity "$windows_argument_verify_path") || {
+        printf '%s: refusing to use Windows argument temporary with an unreadable identity: %s\n' \
+            "$program" "$windows_argument_verify_path" >&2
+        return 1
+    }
+    if [ "$windows_argument_verify_observed_identity" != "$windows_argument_verify_expected_identity" ]; then
+        printf '%s: Windows argument temporary identity changed %s; preserving it: %s\n' \
+            "$program" "$windows_argument_verify_phase" "$windows_argument_verify_path" >&2
+        return 1
+    fi
+    return 0
+}
+
+windows_argument_remove_file() {
+    windows_argument_remove_path=$1
+    windows_argument_remove_expected_identity=${2:-}
+    if windows_argument_file_is_safe "$windows_argument_remove_path"; then
+        if [ -e "$windows_argument_remove_path" ] || [ -L "$windows_argument_remove_path" ]; then
+            if [ -z "$windows_argument_remove_expected_identity" ]; then
+                printf '%s: refusing to remove Windows argument temporary without a recorded identity: %s\n' \
+                    "$program" "$windows_argument_remove_path" >&2
+                return 2
+            fi
+            windows_argument_remove_observed_identity=$(windows_argument_file_identity "$windows_argument_remove_path") || {
+                printf '%s: refusing to remove Windows argument temporary with an unreadable identity: %s\n' \
+                    "$program" "$windows_argument_remove_path" >&2
+                return 1
+            }
+            if [ "$windows_argument_remove_observed_identity" != "$windows_argument_remove_expected_identity" ]; then
+                printf '%s: Windows argument temporary identity changed during cleanup; preserving it: %s\n' \
+                    "$program" "$windows_argument_remove_path" >&2
+                return 1
+            fi
+        fi
+        if ! rm -f -- "$windows_argument_remove_path"; then
+            printf '%s: failed to remove Windows argument temporary file: %s\n' "$program" "$windows_argument_remove_path" >&2
+            return 1
+        fi
+        if [ -e "$windows_argument_remove_path" ] || [ -L "$windows_argument_remove_path" ]; then
+            printf '%s: Windows argument temporary file remained after cleanup: %s\n' "$program" "$windows_argument_remove_path" >&2
+            return 1
+        fi
+        return 0
+    fi
+    printf '%s: refusing to remove an unsafe Windows argument temporary file: %s\n' "$program" "$windows_argument_remove_path" >&2
+    return 2
+}
+
+agentq_client_temp_path_is_safe() {
+    agentq_client_temp_guard_path=$1
+    case "$agentq_client_temp_guard_path" in
+        '') return 1 ;;
+    esac
+    case "/$agentq_client_temp_guard_path/" in
+        */../*) return 1 ;;
+    esac
+
+    agentq_client_temp_probe='.'
+    agentq_client_temp_remaining=$agentq_client_temp_guard_path
+    case "$agentq_client_temp_remaining" in
+        /*)
+            agentq_client_temp_probe=/
+            agentq_client_temp_remaining=${agentq_client_temp_remaining#/}
+            ;;
+    esac
+
+    while [ -n "$agentq_client_temp_remaining" ]; do
+        case "$agentq_client_temp_remaining" in
+            */*)
+                agentq_client_temp_component=${agentq_client_temp_remaining%%/*}
+                agentq_client_temp_remaining=${agentq_client_temp_remaining#*/}
+                ;;
+            *)
+                agentq_client_temp_component=$agentq_client_temp_remaining
+                agentq_client_temp_remaining=''
+                ;;
+        esac
+        [ -n "$agentq_client_temp_component" ] || continue
+        [ "$agentq_client_temp_component" = . ] && continue
+        if [ "$agentq_client_temp_probe" = / ]; then
+            agentq_client_temp_probe=/$agentq_client_temp_component
+        else
+            agentq_client_temp_probe=$agentq_client_temp_probe/$agentq_client_temp_component
+        fi
+        [ ! -L "$agentq_client_temp_probe" ] || return 1
+    done
+
+    [ -d "$agentq_client_temp_guard_path" ] && [ ! -L "$agentq_client_temp_guard_path" ]
+}
+
+response_metadata_file_is_safe() {
+    response_metadata_guard_file=$1
+    [ -n "$response_metadata_guard_file" ] || return 1
+    response_metadata_parent=${response_metadata_guard_file%/*}
+    response_metadata_name=${response_metadata_guard_file##*/}
+    [ -n "$response_metadata_name" ] || return 1
+    [ "$response_metadata_parent" != "$response_metadata_guard_file" ] || response_metadata_parent=.
+    agentq_client_temp_path_is_safe "$response_metadata_parent" || return 1
+    [ -f "$response_metadata_guard_file" ] || return 1
+    [ ! -L "$response_metadata_guard_file" ] || return 1
+    return 0
+}
+
+response_metadata_require_file() {
+    if response_metadata_file_is_safe "$1"; then
+        return 0
+    fi
+    printf '%s: unsafe AgentQ response metadata file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+response_file_is_safe() {
+    response_guard_file=$1
+    [ -n "$response_guard_file" ] || return 1
+    response_guard_parent=${response_guard_file%/*}
+    response_guard_name=${response_guard_file##*/}
+    [ -n "$response_guard_name" ] || return 1
+    [ "$response_guard_parent" != "$response_guard_file" ] || response_guard_parent=.
+    agentq_client_temp_path_is_safe "$response_guard_parent" || return 1
+    [ -f "$response_guard_file" ] || return 1
+    [ ! -L "$response_guard_file" ] || return 1
+    return 0
+}
+
+response_require_existing_file() {
+    if response_file_is_safe "$1"; then
+        return 0
+    fi
+    printf '%s: unsafe AgentQ response file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+agentq_ssh_log_file_is_safe() {
+    agentq_ssh_log_guard_file=$1
+    [ -n "$agentq_ssh_log_guard_file" ] || return 1
+    agentq_ssh_log_parent=${agentq_ssh_log_guard_file%/*}
+    agentq_ssh_log_name=${agentq_ssh_log_guard_file##*/}
+    [ -n "$agentq_ssh_log_name" ] || return 1
+    [ "$agentq_ssh_log_parent" != "$agentq_ssh_log_guard_file" ] || agentq_ssh_log_parent=.
+    agentq_client_temp_path_is_safe "$agentq_ssh_log_parent" || return 1
+    [ ! -L "$agentq_ssh_log_guard_file" ] || return 1
+    if [ -e "$agentq_ssh_log_guard_file" ] && [ ! -f "$agentq_ssh_log_guard_file" ]; then
+        return 1
+    fi
+    return 0
+}
+
+agentq_ssh_log_require_file() {
+    if agentq_ssh_log_file_is_safe "$1"; then
+        return 0
+    fi
+    printf '%s: unsafe SSH diagnostic temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+agentq_ssh_log_require_existing_file() {
+    if agentq_ssh_log_file_is_safe "$1" && [ -f "$1" ]; then
+        return 0
+    fi
+    printf '%s: unsafe SSH diagnostic temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+agentq_ssh_log_remove_file() {
+    if agentq_ssh_log_file_is_safe "$1"; then
+        if ! rm -f -- "$1"; then
+            printf '%s: failed to remove SSH diagnostic temporary file: %s\n' "$program" "$1" >&2
+            return 1
+        fi
+        if [ -e "$1" ] || [ -L "$1" ]; then
+            printf '%s: SSH diagnostic temporary file remained after cleanup: %s\n' "$program" "$1" >&2
+            return 1
+        fi
+        return 0
+    fi
+    printf '%s: refusing to remove an unsafe SSH diagnostic temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+mutation_output_file_is_safe() {
+    mutation_output_guard_file=$1
+    [ -n "$mutation_output_guard_file" ] || return 1
+    mutation_output_parent=${mutation_output_guard_file%/*}
+    mutation_output_name=${mutation_output_guard_file##*/}
+    [ -n "$mutation_output_name" ] || return 1
+    [ "$mutation_output_parent" != "$mutation_output_guard_file" ] || mutation_output_parent=.
+    agentq_client_temp_path_is_safe "$mutation_output_parent" || return 1
+    [ ! -L "$mutation_output_guard_file" ] || return 1
+    if [ -e "$mutation_output_guard_file" ] && [ ! -f "$mutation_output_guard_file" ]; then
+        return 1
+    fi
+    return 0
+}
+
+mutation_output_require_file() {
+    if mutation_output_file_is_safe "$1"; then
+        return 0
+    fi
+    printf '%s: unsafe mutation output temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+mutation_output_require_existing_file() {
+    if mutation_output_file_is_safe "$1" && [ -f "$1" ]; then
+        return 0
+    fi
+    printf '%s: unsafe mutation output temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+mutation_output_remove_file() {
+    if mutation_output_file_is_safe "$1"; then
+        if ! rm -f -- "$1"; then
+            printf '%s: failed to remove mutation output temporary file: %s\n' "$program" "$1" >&2
+            return 1
+        fi
+        if [ -e "$1" ] || [ -L "$1" ]; then
+            printf '%s: mutation output temporary file remained after cleanup: %s\n' "$program" "$1" >&2
+            return 1
+        fi
+        return 0
+    fi
+    printf '%s: refusing to remove an unsafe mutation output temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+agentq_ssh_input_file_is_safe() {
+    agentq_ssh_input_guard_file=$1
+    [ -n "$agentq_ssh_input_guard_file" ] || return 1
+    agentq_ssh_input_parent=${agentq_ssh_input_guard_file%/*}
+    agentq_ssh_input_name=${agentq_ssh_input_guard_file##*/}
+    [ -n "$agentq_ssh_input_name" ] || return 1
+    [ "$agentq_ssh_input_parent" != "$agentq_ssh_input_guard_file" ] || agentq_ssh_input_parent=.
+    agentq_client_temp_path_is_safe "$agentq_ssh_input_parent" || return 1
+    [ ! -L "$agentq_ssh_input_guard_file" ] || return 1
+    if [ -e "$agentq_ssh_input_guard_file" ] && [ ! -f "$agentq_ssh_input_guard_file" ]; then
+        return 1
+    fi
+    return 0
+}
+
+agentq_ssh_input_require_file() {
+    if agentq_ssh_input_file_is_safe "$1"; then
+        return 0
+    fi
+    printf '%s: unsafe SSH input temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+agentq_ssh_input_require_existing_file() {
+    if agentq_ssh_input_file_is_safe "$1" && [ -f "$1" ]; then
+        return 0
+    fi
+    printf '%s: unsafe SSH input temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+run_mutation_ssh() {
+    mutation_ssh_command=$1
+    mutation_ssh_input=${2:-}
+    mutation_output_require_file "$mutation_output_file" || return $?
+    if run_ssh_logged "$mutation_log_file" "$mutation_ssh_command" "$mutation_ssh_input" > "$mutation_output_file"; then
+        mutation_ssh_status=0
+    else
+        mutation_ssh_status=$?
+    fi
+    return "$mutation_ssh_status"
+}
+
+operation_output_file_is_safe() {
+    operation_output_guard_file=$1
+    [ -n "$operation_output_guard_file" ] || return 1
+    operation_output_parent=${operation_output_guard_file%/*}
+    operation_output_name=${operation_output_guard_file##*/}
+    [ -n "$operation_output_name" ] || return 1
+    [ "$operation_output_parent" != "$operation_output_guard_file" ] || operation_output_parent=.
+    agentq_client_temp_path_is_safe "$operation_output_parent" || return 1
+    [ ! -L "$operation_output_guard_file" ] || return 1
+    if [ -e "$operation_output_guard_file" ] && [ ! -f "$operation_output_guard_file" ]; then
+        return 1
+    fi
+    return 0
+}
+
+operation_output_require_file() {
+    if operation_output_file_is_safe "$1"; then
+        return 0
+    fi
+    printf '%s: unsafe operation recovery output temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+operation_output_require_existing_file() {
+    if operation_output_file_is_safe "$1" && [ -f "$1" ]; then
+        return 0
+    fi
+    printf '%s: unsafe operation recovery output temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+operation_output_remove_file() {
+    if operation_output_file_is_safe "$1"; then
+        if ! rm -f -- "$1"; then
+            printf '%s: failed to remove operation recovery output temporary file: %s\n' "$program" "$1" >&2
+            return 1
+        fi
+        if [ -e "$1" ] || [ -L "$1" ]; then
+            printf '%s: operation recovery output temporary file remained after cleanup: %s\n' "$program" "$1" >&2
+            return 1
+        fi
+        return 0
+    fi
+    printf '%s: refusing to remove an unsafe operation recovery output temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+run_operation_ssh() {
+    operation_ssh_command=$1
+    operation_ssh_input=${2:-}
+    operation_output_require_file "$agentq_operation_output_file" || return $?
+    if run_ssh_logged "$agentq_operation_log_file" "$operation_ssh_command" "$operation_ssh_input" > "$agentq_operation_output_file"; then
+        operation_ssh_status=0
+    else
+        operation_ssh_status=$?
+    fi
+    return "$operation_ssh_status"
+}
+
+recovery_output_file_is_safe() {
+    recovery_output_guard_file=$1
+    [ -n "$recovery_output_guard_file" ] || return 1
+    recovery_output_parent=${recovery_output_guard_file%/*}
+    recovery_output_name=${recovery_output_guard_file##*/}
+    [ -n "$recovery_output_name" ] || return 1
+    [ "$recovery_output_parent" != "$recovery_output_guard_file" ] || recovery_output_parent=.
+    agentq_client_temp_path_is_safe "$recovery_output_parent" || return 1
+    [ ! -L "$recovery_output_guard_file" ] || return 1
+    if [ -e "$recovery_output_guard_file" ] && [ ! -f "$recovery_output_guard_file" ]; then
+        return 1
+    fi
+    return 0
+}
+
+recovery_output_require_file() {
+    if recovery_output_file_is_safe "$1"; then
+        return 0
+    fi
+    printf '%s: unsafe submit recovery output temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+recovery_output_require_existing_file() {
+    if recovery_output_file_is_safe "$1" && [ -f "$1" ]; then
+        return 0
+    fi
+    printf '%s: unsafe submit recovery output temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+recovery_output_remove_file() {
+    if recovery_output_file_is_safe "$1"; then
+        if ! rm -f -- "$1"; then
+            printf '%s: failed to remove submit recovery output temporary file: %s\n' "$program" "$1" >&2
+            return 1
+        fi
+        if [ -e "$1" ] || [ -L "$1" ]; then
+            printf '%s: submit recovery output temporary file remained after cleanup: %s\n' "$program" "$1" >&2
+            return 1
+        fi
+        return 0
+    fi
+    printf '%s: refusing to remove an unsafe submit recovery output temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+run_submit_recovery_ssh() {
+    recovery_ssh_command=$1
+    recovery_ssh_input=${2:-}
+    recovery_output_require_file "$agentq_recovery_output_file" || return $?
+    if run_ssh_logged "$agentq_recovery_log_file" "$recovery_ssh_command" "$recovery_ssh_input" > "$agentq_recovery_output_file"; then
+        recovery_ssh_status=0
+    else
+        recovery_ssh_status=$?
+    fi
+    return "$recovery_ssh_status"
+}
+
+cleanup_client_runtime() {
+    cleanup_client_runtime_status=0
+    if cleanup_config_snapshot; then
+        :
+    else
+        cleanup_client_runtime_config_snapshot_status=$?
+        cleanup_client_runtime_status=$cleanup_client_runtime_config_snapshot_status
+    fi
+    if [ -n "$remote_argument_file" ]; then
+        if windows_argument_remove_file "$remote_argument_file" "$remote_argument_file_identity"; then
+            :
+        else
+            cleanup_client_runtime_remote_argument_status=$?
+            if [ "$cleanup_client_runtime_status" -eq 0 ]; then
+                cleanup_client_runtime_status=$cleanup_client_runtime_remote_argument_status
+            fi
+        fi
+    fi
+    if [ -n "$remote_input_file" ]; then
+        if windows_argument_remove_file "$remote_input_file" "$remote_input_file_identity"; then
+            :
+        else
+            cleanup_client_runtime_remote_input_status=$?
+            if [ "$cleanup_client_runtime_status" -eq 0 ]; then
+                cleanup_client_runtime_status=$cleanup_client_runtime_remote_input_status
+            fi
+        fi
+    fi
+    if [ -n "$submit_input_file" ]; then
+        if windows_argument_remove_file "$submit_input_file" "$submit_input_file_identity"; then
+            :
+        else
+            cleanup_client_runtime_submit_input_status=$?
+            if [ "$cleanup_client_runtime_status" -eq 0 ]; then
+                cleanup_client_runtime_status=$cleanup_client_runtime_submit_input_status
+            fi
+        fi
+    fi
+    if [ -n "$lookup_input_file" ]; then
+        if windows_argument_remove_file "$lookup_input_file" "$lookup_input_file_identity"; then
+            :
+        else
+            cleanup_client_runtime_lookup_input_status=$?
+            if [ "$cleanup_client_runtime_status" -eq 0 ]; then
+                cleanup_client_runtime_status=$cleanup_client_runtime_lookup_input_status
+            fi
+        fi
+    fi
+    for client_log_file in "$mutation_log_file" "$agentq_operation_log_file" "$agentq_recovery_log_file"; do
+        if [ -n "$client_log_file" ]; then
+            if agentq_ssh_log_remove_file "$client_log_file"; then
+                :
+            else
+                cleanup_client_runtime_log_status=$?
+                if [ "$cleanup_client_runtime_status" -eq 0 ]; then
+                    cleanup_client_runtime_status=$cleanup_client_runtime_log_status
+                fi
+            fi
+        fi
+    done
+    if [ -n "$mutation_output_file" ]; then
+        if mutation_output_remove_file "$mutation_output_file"; then
+            :
+        else
+            cleanup_client_runtime_mutation_output_status=$?
+            if [ "$cleanup_client_runtime_status" -eq 0 ]; then
+                cleanup_client_runtime_status=$cleanup_client_runtime_mutation_output_status
+            fi
+        fi
+    fi
+    if [ -n "$agentq_operation_output_file" ]; then
+        if operation_output_remove_file "$agentq_operation_output_file"; then
+            :
+        else
+            cleanup_client_runtime_operation_status=$?
+            if [ "$cleanup_client_runtime_status" -eq 0 ]; then
+                cleanup_client_runtime_status=$cleanup_client_runtime_operation_status
+            fi
+        fi
+    fi
+    if [ -n "$agentq_recovery_output_file" ]; then
+        if recovery_output_remove_file "$agentq_recovery_output_file"; then
+            :
+        else
+            cleanup_client_runtime_recovery_status=$?
+            if [ "$cleanup_client_runtime_status" -eq 0 ]; then
+                cleanup_client_runtime_status=$cleanup_client_runtime_recovery_status
+            fi
+        fi
+    fi
+    if [ -n "$platform_probe_output_file" ]; then
+        if platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity"; then
+            :
+        else
+            cleanup_client_runtime_platform_probe_output_status=$?
+            if [ "$cleanup_client_runtime_status" -eq 0 ]; then
+                cleanup_client_runtime_status=$cleanup_client_runtime_platform_probe_output_status
+            fi
+        fi
+    fi
+    if [ -n "$platform_probe_log_file" ]; then
+        if platform_probe_remove_file "$platform_probe_log_file" "$platform_probe_log_identity"; then
+            :
+        else
+            cleanup_client_runtime_platform_probe_log_status=$?
+            if [ "$cleanup_client_runtime_status" -eq 0 ]; then
+                cleanup_client_runtime_status=$cleanup_client_runtime_platform_probe_log_status
+            fi
+        fi
+    fi
+    if [ -n "$platform_probe_stdin_file" ]; then
+        if windows_argument_remove_file "$platform_probe_stdin_file" "$platform_probe_stdin_identity"; then
+            :
+        else
+            cleanup_client_runtime_platform_probe_stdin_status=$?
+            if [ "$cleanup_client_runtime_status" -eq 0 ]; then
+                cleanup_client_runtime_status=$cleanup_client_runtime_platform_probe_stdin_status
+            fi
+        fi
+    fi
+    if [ -n "$agentq_askpass_temporary" ]; then
+        if windows_argument_remove_file "$agentq_askpass_temporary" "$agentq_askpass_temporary_identity"; then
+            :
+        else
+            cleanup_client_runtime_askpass_status=$?
+            if [ "$cleanup_client_runtime_status" -eq 0 ]; then
+                cleanup_client_runtime_status=$cleanup_client_runtime_askpass_status
+            fi
+        fi
+    fi
+    if [ -n "$windows_encoding_input" ]; then
+        if windows_encoding_remove_file "$windows_encoding_input" "$windows_encoding_input_identity"; then
+            :
+        else
+            cleanup_client_runtime_windows_encoding_input_status=$?
+            if [ "$cleanup_client_runtime_status" -eq 0 ]; then
+                cleanup_client_runtime_status=$cleanup_client_runtime_windows_encoding_input_status
+            fi
+        fi
+    fi
+    if [ -n "$windows_encoding_output" ]; then
+        if windows_encoding_remove_file "$windows_encoding_output" "$windows_encoding_output_identity"; then
+            :
+        else
+            cleanup_client_runtime_windows_encoding_output_status=$?
+            if [ "$cleanup_client_runtime_status" -eq 0 ]; then
+                cleanup_client_runtime_status=$cleanup_client_runtime_windows_encoding_output_status
+            fi
+        fi
+    fi
+    return "$cleanup_client_runtime_status"
+}
+
+trap cleanup_client_runtime EXIT
+
+windows_argument_identity_for_path() {
+    windows_argument_lookup_path=$1
+    case "$windows_argument_lookup_path" in
+        "$remote_argument_file") printf '%s\n' "$remote_argument_file_identity" ;;
+        "$remote_input_file") printf '%s\n' "$remote_input_file_identity" ;;
+        "$submit_input_file") printf '%s\n' "$submit_input_file_identity" ;;
+        "$lookup_input_file") printf '%s\n' "$lookup_input_file_identity" ;;
+        "$platform_probe_stdin_file") printf '%s\n' "$platform_probe_stdin_identity" ;;
+        "$agentq_askpass_temporary") printf '%s\n' "$agentq_askpass_temporary_identity" ;;
+        *) return 1 ;;
+    esac
+}
+
+resolve_ssh_binary() {
+    if [ -n "$ssh_binary" ]; then
+        [ -x "$ssh_binary" ] || fail "AGENTQ_SSH is not executable: $ssh_binary"
+        return
+    fi
+
+    ssh_binary=$(command -v ssh 2>/dev/null || true)
+    [ -n "$ssh_binary" ] || fail 'OpenSSH client is required; install ssh or set AGENTQ_SSH'
+}
+
+resolve_json_parser() {
+    if [ -n "$json_parser" ]; then
+        [ -x "$json_parser" ] || fail "AGENTQ_JQ is not executable: $json_parser"
+        return
+    fi
+
+    json_parser=$(command -v jq 2>/dev/null || true)
+    [ -n "$json_parser" ] || fail 'jq is required to validate AgentQ JSON responses; install jq or set AGENTQ_JQ'
+}
+
+write_response_metadata() {
+    response_file=$1
+    response_metadata_require_file "$response_file" || return $?
+    response_metadata_require_file "$response_file" || return $?
+    response_bytes=$(wc -c < "$response_file" | tr -d '[:space:]')
+    printf '%s: raw response omitted for safety (%s bytes)\n' "$program" "$response_bytes" >&2
+}
+
+agentq_remote_failure_reason() {
+    # 服务端在每条以 2 退出的失败路径上都会多打一行 `reason=<class>`（机读通道，
+    # 见 agentq-server 的 fail()）。这里把它从 SSH 日志里取出来并**只**透传这一
+    # 个受控的标识符：字符集限定为小写字母与下划线，所以远端无法借这一行把任意
+    # 文本注入调用端的 stderr。日志原文的其余部分仍然只以脱敏元数据呈现。
+    ssh_reason_log=$1
+    agentq_ssh_log_require_existing_file "$ssh_reason_log" || return 1
+    ssh_reason_value=$(LC_ALL=C tr -d '\r' < "$ssh_reason_log" |
+        LC_ALL=C sed -n 's/^[^:]*: reason=\([a-z][a-z_]*\)$/\1/p' | tail -n 1)
+    [ -n "$ssh_reason_value" ] || return 1
+    printf '%s\n' "$ssh_reason_value"
+}
+
+write_ssh_diagnostic_metadata() {
+    ssh_metadata_file=$1
+    agentq_ssh_log_require_existing_file "$ssh_metadata_file" || return $?
+    agentq_ssh_log_require_existing_file "$ssh_metadata_file" || return $?
+    ssh_metadata_bytes=$(wc -c < "$ssh_metadata_file" | tr -d '[:space:]')
+    if ssh_transport_error "$ssh_metadata_file"; then
+        ssh_metadata_class=transport
+    else
+        agentq_ssh_log_require_existing_file "$ssh_metadata_file" || return $?
+        if LC_ALL=C tr -d '\r' < "$ssh_metadata_file" | LC_ALL=C grep -E -q \
+            '^([^:]*: )?(Permission denied|Host key verification failed|Could not resolve hostname|No supported authentication methods available)'; then
+            ssh_metadata_class=authentication
+        else
+            ssh_metadata_class=ssh
+        fi
+    fi
+    printf '%s: SSH diagnostic omitted for safety (class=%s, %s bytes)\n' \
+        "$program" "$ssh_metadata_class" "$ssh_metadata_bytes" >&2
+    # The class line alone does not tell the operator what to DO, and the next
+    # line the caller prints on a failed platform probe ("set
+    # AGENTQ_REMOTE_PLATFORM") actively points the wrong way: no value of that
+    # variable fixes a missing key.  Measured on a real macOS host offering only
+    # password auth: every AgentQ command failed with the AGENTQ_REMOTE_PLATFORM
+    # hint and nothing else, which reads like a remote service fault.
+    #
+    # The hint goes HERE, not at the caller's decision point, because by then
+    # both the log file and the class are gone: run_platform_probe is invoked as
+    # `local_platform_output=$(run_platform_probe_with_recovery ...)`, and a
+    # command substitution runs in a subshell, so the globals it sets (and the
+    # temporary it cleans up) never reach the caller.  That is the same trap as
+    # the A5a probe-script defect -- third time in this project.
+    # The wording depends on whether a credential source is in play, because
+    # the advice that fixes one case is wrong for the other: telling an operator
+    # to install a key is useless when they already handed AgentQ a password,
+    # and telling them their password was rejected is wrong when none was
+    # configured.  The unconfigured branch is byte-for-byte the message this
+    # client has always printed.
+    if [ "$ssh_metadata_class" = authentication ]; then
+        if [ "$agentq_credential_source" = '' ]; then
+            printf '%s: ssh could not authenticate to %s; AgentQ runs ssh with BatchMode=yes, so it cannot answer a password prompt. Install a key for this host, or use an ssh-agent.\n' \
+                "$program" "$host" >&2
+            printf '%s: to authenticate with a password instead, set AGENTQ_ASKPASS to a program that prints it (for example a system credential helper), or set AGENTQ_PASSWORD.\n' \
+                "$program" >&2
+        else
+            printf '%s: ssh could not authenticate to %s even though a credential source (%s) is configured. Either the password was rejected, or the host does not accept password authentication; keys are tried first, so a key is not the problem.\n' \
+                "$program" "$host" "$agentq_credential_source" >&2
+        fi
+    fi
+}
+
+validate_json_response() {
+    response_file=$1
+    response_operation=$2
+    response_expected_request_id=${3:-}
+    response_expected_task_id=${4:-}
+    response_require_existing_file "$response_file" || return $?
+    # shellcheck disable=SC2016
+    response_numeric_helpers='def parser_preserves_integer_digits: (9007199254740993 | tostring) == "9007199254740993"; def lexical_integer: (tostring | test("^[0-9]+(?:\\.0+)?$")); def nonnegative_integer: if type == "number" then (. >= 0 and (floor == .) and ((. <= 9007199254740991) or (parser_preserves_integer_digits and lexical_integer))) else false end; def canonical_integer_string: if . == 0 then "0" elif . <= 9007199254740991 then (floor | tostring | sub("^0+"; "") | if . == "" then "0" else . end) else (tostring | sub("\\.0+$"; "") | sub("^0+"; "") | if . == "" then "0" else . end) end; def canonical_decimal_key: tostring | sub("^0+"; "") | if . == "" then "0" else . end; def valid_status_task: (.value | type) == "object" and (.value.id | nonnegative_integer) and (.key | test("^[0-9]+$")) and ((.key | canonical_decimal_key) == .key) and ((.value.id | canonical_integer_string) == (.key | canonical_decimal_key)); def task_id_matches($expected): nonnegative_integer and (canonical_integer_string == ($expected | sub("^0+"; "") | if . == "" then "0" else . end)); def valid_done_result: if type == "string" then length > 0 elif type == "object" then length > 0 else false end;'
+    # shellcheck disable=SC2016
+    case "$response_operation" in
+        submit)
+            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.task_id | nonnegative_integer) and ($response.request_id | type == "string") and ($response.request_id | length > 0) and (($expected_request_id_present | not) or $response.request_id == $expected_request_id) and ($response.reused | type == "boolean") then true else false end'
+            ;;
+        lookup)
+            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.request_id | type == "string") and ($response.request_id | length > 0) and (($expected_request_id_present | not) or $response.request_id == $expected_request_id) and ((($response | has("reused")) and (($response | has("state")) | not) and ($response.task_id | nonnegative_integer) and ($response.reused | type == "boolean")) or (($response | has("state")) and (($response | has("reused")) | not) and ($response.state | type == "string") and ($response | has("task_id")) and (if $response.state == "not_found" or $response.state == "not_started" or $response.state == "ambiguous" then $response.task_id == null elif $response.state == "accepted" or $response.state == "removing" or $response.state == "removed" then ($response.task_id | nonnegative_integer) else false end))) then true else false end'
+            ;;
+        status|doctor)
+            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.tasks | type == "object") and ($response.tasks | to_entries | all(.[]; valid_status_task)) then true else false end'
+            ;;
+        logs)
+            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.task | type == "object") and ($response.task.id | nonnegative_integer) and (if $expected_task_id_present then ($response.task.id | task_id_matches($expected_task_id)) else true end) and ($response | has("output")) and (((($response.output | type) == "string") and (($response | has("output_encoding") | not)) and (($response | has("output_base64") | not))) or ($response.output == null and $response.output_encoding == "base64" and (if ($response.output_base64 | type) == "string" then (($response.output_base64 | length) > 0 and ($response.output_base64 | test("^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"))) else false end))) then true else false end'
+            ;;
+        wait)
+            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and (((($response.task | type) == "object") and ($response.task.id | nonnegative_integer) and (if $expected_task_id_present then ($response.task.id | task_id_matches($expected_task_id)) else true end) and (($response.task.status | type) == "object") and (($response.task.status.Done | type) == "object") and ($response.task.status.Done | has("result")) and ($response.task.status.Done.result | valid_done_result)) or (($response.task_id | nonnegative_integer) and (if $expected_task_id_present then ($response.task_id | task_id_matches($expected_task_id)) else true end) and ($response.state == "removed" or $response.state == "unavailable"))) then true else false end'
+            ;;
+        cancel)
+            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and (($response.task_id | nonnegative_integer) and (if $expected_task_id_present then ($response.task_id | task_id_matches($expected_task_id)) else true end)) and ($response.action == "cancel_requested") and ($response.cancellation_requested_at | type == "string") and ($response.cancellation_requested_at | length > 0) and ((($response | has("cancellation_mode")) | not) or ($response.cancellation_mode == "queued_removed")) then true else false end'
+            ;;
+        cancel_pending)
+            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and (($response.task_id | nonnegative_integer) and (if $expected_task_id_present then ($response.task_id | task_id_matches($expected_task_id)) else true end)) and ($response.state == "cancellation_pending") and ($response.cancellation_requested_at | type == "string") and ($response.cancellation_requested_at | length > 0) then true else false end'
+            ;;
+        remove)
+            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and (($response.task_id | nonnegative_integer) and (if $expected_task_id_present then ($response.task_id | task_id_matches($expected_task_id)) else true end)) and ($response.removed == true) then true else false end'
+            ;;
+        *)
+            response_filter='.[0] as $response | if length == 1 and ($response | type == "object") then true else false end'
+            ;;
+    esac
+
+    response_require_existing_file "$response_file" || return $?
+    if "$json_parser" -e -s --arg expected_request_id "$response_expected_request_id" \
+        --arg expected_task_id "$response_expected_task_id" \
+        --argjson expected_task_id_present "$(if [ -n "$response_expected_task_id" ]; then printf true; else printf false; fi)" \
+        --argjson expected_request_id_present "$(if [ -n "$response_expected_request_id" ]; then printf true; else printf false; fi)" \
+        "$response_filter" "$response_file" >/dev/null; then
+        return 0
+    fi
+
+    response_require_existing_file "$response_file" || return $?
+    if [ -s "$response_file" ]; then
+        response_require_existing_file "$response_file" || return $?
+        if "$json_parser" -s '.' "$response_file" >/dev/null 2>&1; then
+            printf '%s: remote %s response failed the AgentQ JSON protocol validation\n' "$program" "$response_operation" >&2
+        else
+            printf '%s: remote %s response failed the AgentQ JSON protocol validation: invalid JSON response\n' "$program" "$response_operation" >&2
+        fi
+        write_response_metadata "$response_file"
+    else
+        printf '%s: remote %s response failed the AgentQ JSON protocol validation\n' "$program" "$response_operation" >&2
+        printf '%s: raw response was empty\n' "$program" >&2
+    fi
+    return 2
+}
+
+validate_wait_response() {
+    response_file=$1
+    response_status=$2
+    response_expected_task_id=${3:-}
+
+    if validate_json_response "$response_file" wait '' "$response_expected_task_id"; then
+        :
+    else
+        response_validation_status=$?
+        return "$response_validation_status"
+    fi
+
+    case "$response_status" in
+        0)
+            wait_semantic_filter='.[0].task.status.Done.result == "Success"'
+            ;;
+        1)
+            wait_semantic_filter="$response_numeric_helpers"' ((.[0].task | type) == "object") and ((.[0].task.status | type) == "object") and ((.[0].task.status.Done | type) == "object") and (.[0].task.status.Done | has("result")) and (.[0].task.status.Done.result | valid_done_result) and (.[0].task.status.Done.result != "Success")'
+            ;;
+        5)
+            wait_semantic_filter="$response_numeric_helpers"' .[0].state == "removed" and (.[0].task_id | nonnegative_integer)'
+            ;;
+        6)
+            wait_semantic_filter="$response_numeric_helpers"' .[0].state == "unavailable" and (.[0].task_id | nonnegative_integer)'
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+
+    response_require_existing_file "$response_file" || return $?
+    if "$json_parser" -e -s "$wait_semantic_filter" "$response_file" >/dev/null; then
+        return 0
+    fi
+
+    printf '%s: remote wait response failed the AgentQ exit/result contract for exit %s\n' \
+        "$program" "$response_status" >&2
+    response_require_existing_file "$response_file" || return $?
+    if [ -s "$response_file" ]; then
+        write_response_metadata "$response_file"
+    else
+        printf '%s: raw response was empty\n' "$program" >&2
+    fi
+    return 2
+}
+
+quote_remote() {
+    printf "'"
+    printf '%s' "$1" | sed "s/'/'\\\\''/g"
+    printf "'"
+}
+
+append_arg() {
+    case "$remote_platform" in
+        windows)
+            [ -n "$remote_argument_file" ] || fail 'internal error: Windows argument stream is unavailable'
+            windows_argument_require_file "$remote_argument_file" || return $?
+            windows_argument_verify_identity "$remote_argument_file" "$remote_argument_file_identity" 'before append' || return $?
+            printf '%s\0' "$1" >> "$remote_argument_file"
+            windows_argument_verify_identity "$remote_argument_file" "$remote_argument_file_identity" 'after append' || return $?
+            ;;
+        unix)
+            remote_command="$remote_command $(quote_remote "$1")"
+            ;;
+        *)
+            fail "internal error: unsupported remote platform: $remote_platform"
+            ;;
+    esac
+}
+
+is_task_id() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+is_positive_integer_or_all() {
+    case "$1" in
+        all) return 0 ;;
+        ''|*[!0-9]*|0) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+is_positive_integer() {
+    case "$1" in
+        ''|*[!0-9]*|0) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+is_request_id() {
+    case "$1" in
+        ''|*[!A-Za-z0-9._-]*|[!A-Za-z0-9]*) return 1 ;;
+    esac
+
+    [ "${#1}" -ge 16 ] && [ "${#1}" -le 128 ]
+}
+
+generate_request_id() {
+    if command -v uuidgen >/dev/null 2>&1; then
+        generated=$(uuidgen | tr '[:upper:]' '[:lower:]')
+        printf 'aq-%s\n' "$generated"
+        return
+    fi
+
+    if command -v openssl >/dev/null 2>&1; then
+        generated=$(openssl rand -hex 16)
+        printf 'aq-%s\n' "$generated"
+        return
+    fi
+
+    fail 'uuidgen or openssl is required to create a durable AgentQ request id'
+}
+
+ssh_transport_error() {
+    ssh_log_file=$1
+
+    if ! agentq_ssh_log_file_is_safe "$ssh_log_file"; then
+        printf '%s: refusing to inspect an unsafe SSH diagnostic temporary file: %s\n' "$program" "$ssh_log_file" >&2
+        return 1
+    fi
+    [ -s "$ssh_log_file" ] || return 1
+    agentq_ssh_log_require_existing_file "$ssh_log_file" || return $?
+    LC_ALL=C tr -d '\r' < "$ssh_log_file" | LC_ALL=C grep -E -q \
+        '^(ssh: connect to host [^[:space:]]+ port [0-9]+: (Connection (refused|timed out|reset by peer|aborted)|Operation timed out|No route to host|Network is unreachable|Host is down)|Connection reset by [^[:space:]]+ port [0-9]+\.?|Connection timed out during banner exchange|banner exchange: Connection to [^[:space:]]+ port [0-9]+: (Connection (timed out|reset by peer)|No route to host|Network is unreachable|Host is down)|kex_exchange_identification: (read: )?(Connection (reset by peer|timed out|refused)|No route to host|Network is unreachable|Host is down)|client_loop: .* (Broken pipe|Connection reset by peer)|packet_write_wait: Connection to [^:]+: Broken pipe|Write failed: Broken pipe|Read from remote host [^:]+: Connection reset by peer|Timeout, server [^[:space:]]+ not responding\.)$'
+}
+
+platform_probe_file_is_safe() {
+    platform_probe_guard_file=$1
+    [ -n "$platform_probe_guard_file" ] || return 1
+    platform_probe_parent=${platform_probe_guard_file%/*}
+    platform_probe_name=${platform_probe_guard_file##*/}
+    [ -n "$platform_probe_name" ] || return 1
+    [ "$platform_probe_parent" != "$platform_probe_guard_file" ] || platform_probe_parent=.
+    agentq_client_temp_path_is_safe "$platform_probe_parent" || return 1
+    [ ! -L "$platform_probe_guard_file" ] || return 1
+    if [ -e "$platform_probe_guard_file" ] && [ ! -f "$platform_probe_guard_file" ]; then
+        return 1
+    fi
+    return 0
+}
+
+platform_probe_require_file() {
+    if platform_probe_file_is_safe "$1"; then
+        return 0
+    fi
+    printf '%s: unsafe platform probe temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+platform_probe_require_existing_file() {
+    if platform_probe_file_is_safe "$1" && [ -f "$1" ]; then
+        return 0
+    fi
+    printf '%s: unsafe platform probe temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+platform_probe_file_identity() {
+    platform_probe_identity_path=$1
+    platform_probe_identity=''
+
+    if platform_probe_identity=$(stat_device_inode "$platform_probe_identity_path"); then
+        :
+    else
+        return 1
+    fi
+    case "$platform_probe_identity" in
+        ''|*[!0-9:]*|*:*:*) return 1 ;;
+    esac
+    printf '%s\n' "$platform_probe_identity"
+}
+
+platform_probe_verify_identity() {
+    platform_probe_verify_path=$1
+    platform_probe_verify_expected_identity=$2
+    platform_probe_verify_phase=$3
+
+    if [ -z "$platform_probe_verify_expected_identity" ]; then
+        printf '%s: refusing to use platform probe temporary without a recorded identity: %s\n' \
+            "$program" "$platform_probe_verify_path" >&2
+        return 2
+    fi
+    platform_probe_verify_observed_identity=$(platform_probe_file_identity "$platform_probe_verify_path") || {
+        printf '%s: refusing to use platform probe temporary with an unreadable identity: %s\n' \
+            "$program" "$platform_probe_verify_path" >&2
+        return 1
+    }
+    if [ "$platform_probe_verify_observed_identity" != "$platform_probe_verify_expected_identity" ]; then
+        printf '%s: platform probe temporary identity changed %s; preserving it: %s\n' \
+            "$program" "$platform_probe_verify_phase" "$platform_probe_verify_path" >&2
+        return 1
+    fi
+    return 0
+}
+
+platform_probe_remove_file() {
+    platform_probe_remove_path=$1
+    platform_probe_remove_expected_identity=${2:-}
+    if platform_probe_file_is_safe "$platform_probe_remove_path"; then
+        if [ -e "$platform_probe_remove_path" ] || [ -L "$platform_probe_remove_path" ]; then
+            if [ -z "$platform_probe_remove_expected_identity" ]; then
+                printf '%s: refusing to remove platform probe temporary without a recorded identity: %s\n' \
+                    "$program" "$platform_probe_remove_path" >&2
+                return 2
+            fi
+            platform_probe_remove_observed_identity=$(platform_probe_file_identity "$platform_probe_remove_path") || {
+                printf '%s: refusing to remove platform probe temporary with an unreadable identity: %s\n' \
+                    "$program" "$platform_probe_remove_path" >&2
+                return 1
+            }
+            if [ "$platform_probe_remove_observed_identity" != "$platform_probe_remove_expected_identity" ]; then
+                printf '%s: platform probe temporary identity changed during cleanup; preserving it: %s\n' \
+                    "$program" "$platform_probe_remove_path" >&2
+                return 1
+            fi
+        fi
+        if ! rm -f -- "$platform_probe_remove_path"; then
+            printf '%s: failed to remove platform probe temporary file: %s\n' "$program" "$1" >&2
+            return 1
+        fi
+        if [ -e "$platform_probe_remove_path" ] || [ -L "$platform_probe_remove_path" ]; then
+            printf '%s: platform probe temporary file remained after cleanup: %s\n' "$program" "$platform_probe_remove_path" >&2
+            return 1
+        fi
+        return 0
+    fi
+    printf '%s: refusing to remove an unsafe platform probe temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+windows_encoding_file_is_safe() {
+    windows_encoding_guard_file=$1
+    [ -n "$windows_encoding_guard_file" ] || return 1
+    windows_encoding_parent=${windows_encoding_guard_file%/*}
+    windows_encoding_name=${windows_encoding_guard_file##*/}
+    [ -n "$windows_encoding_name" ] || return 1
+    [ "$windows_encoding_parent" != "$windows_encoding_guard_file" ] || windows_encoding_parent=.
+    agentq_client_temp_path_is_safe "$windows_encoding_parent" || return 1
+    [ ! -L "$windows_encoding_guard_file" ] || return 1
+    if [ -e "$windows_encoding_guard_file" ] && [ ! -f "$windows_encoding_guard_file" ]; then
+        return 1
+    fi
+    return 0
+}
+
+windows_encoding_require_file() {
+    if windows_encoding_file_is_safe "$1"; then
+        return 0
+    fi
+    printf '%s: unsafe Windows PowerShell encoding temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+windows_encoding_require_existing_file() {
+    if windows_encoding_file_is_safe "$1" && [ -f "$1" ]; then
+        return 0
+    fi
+    printf '%s: unsafe Windows PowerShell encoding temporary file: %s\n' "$program" "$1" >&2
+    return 2
+}
+
+windows_encoding_file_identity() {
+    windows_encoding_identity_path=$1
+    windows_encoding_identity=''
+
+    if windows_encoding_identity=$(stat_device_inode "$windows_encoding_identity_path"); then
+        :
+    else
+        return 1
+    fi
+    case "$windows_encoding_identity" in
+        ''|*[!0-9:]*|*:*:*) return 1 ;;
+    esac
+    printf '%s\n' "$windows_encoding_identity"
+}
+
+windows_encoding_verify_identity() {
+    windows_encoding_verify_path=$1
+    windows_encoding_verify_expected_identity=$2
+    windows_encoding_verify_phase=$3
+
+    if [ -z "$windows_encoding_verify_expected_identity" ]; then
+        printf '%s: refusing to use Windows PowerShell encoding temporary without a recorded identity: %s\n' \
+            "$program" "$windows_encoding_verify_path" >&2
+        return 2
+    fi
+    windows_encoding_verify_observed_identity=$(windows_encoding_file_identity "$windows_encoding_verify_path") || {
+        printf '%s: refusing to use Windows PowerShell encoding temporary with an unreadable identity: %s\n' \
+            "$program" "$windows_encoding_verify_path" >&2
+        return 1
+    }
+    if [ "$windows_encoding_verify_observed_identity" != "$windows_encoding_verify_expected_identity" ]; then
+        printf '%s: Windows PowerShell encoding temporary identity changed %s; preserving it: %s\n' \
+            "$program" "$windows_encoding_verify_phase" "$windows_encoding_verify_path" >&2
+        return 1
+    fi
+    return 0
+}
+
+windows_encoding_remove_file() {
+    windows_encoding_remove_path=$1
+    windows_encoding_remove_expected_identity=${2:-}
+    if windows_encoding_file_is_safe "$windows_encoding_remove_path"; then
+        if [ -e "$windows_encoding_remove_path" ] || [ -L "$windows_encoding_remove_path" ]; then
+            if [ -z "$windows_encoding_remove_expected_identity" ]; then
+                printf '%s: refusing to remove Windows PowerShell encoding temporary without a recorded identity: %s\n' \
+                    "$program" "$windows_encoding_remove_path" >&2
+                return 2
+            fi
+            windows_encoding_remove_observed_identity=$(windows_encoding_file_identity "$windows_encoding_remove_path") || {
+                printf '%s: refusing to remove Windows PowerShell encoding temporary with an unreadable identity: %s\n' \
+                    "$program" "$windows_encoding_remove_path" >&2
+                return 1
+            }
+            if [ "$windows_encoding_remove_observed_identity" != "$windows_encoding_remove_expected_identity" ]; then
+                printf '%s: Windows PowerShell encoding temporary identity changed during cleanup; preserving it: %s\n' \
+                    "$program" "$windows_encoding_remove_path" >&2
+                return 1
+            fi
+        fi
+        if ! rm -f -- "$windows_encoding_remove_path"; then
+            printf '%s: failed to remove Windows PowerShell encoding temporary file: %s\n' "$program" "$windows_encoding_remove_path" >&2
+            return 1
+        fi
+        if [ -e "$windows_encoding_remove_path" ] || [ -L "$windows_encoding_remove_path" ]; then
+            printf '%s: Windows PowerShell encoding temporary file remained after cleanup: %s\n' "$program" "$windows_encoding_remove_path" >&2
+            return 1
+        fi
+        return 0
+    fi
+    printf '%s: refusing to remove an unsafe Windows PowerShell encoding temporary file: %s\n' "$program" "$windows_encoding_remove_path" >&2
+    return 2
+}
+
+run_platform_probe() {
+    platform_probe_command=$1
+    # Optional: a file whose contents are fed to the remote command on stdin.
+    # Windows probes use this so the script body never enters the remote
+    # command LINE, which Windows truncates (see PLAN.md A5a).
+    platform_probe_stdin_file=${2:-}
+    # The identity is NOT reset when a stdin file is supplied: it was recorded by
+    # make_windows_probe_script_file, and clearing it here would make the
+    # identity check below reject the client's own probe temporary ("without a
+    # recorded identity").  Only the no-stdin case (a plain `uname -s` probe)
+    # resets the globals, because then there is nothing to consume.
+    if [ -z "$platform_probe_stdin_file" ]; then
+        platform_probe_stdin_identity=''
+    fi
+    resolve_agentq_temp_directory || return $?
+    command -v stat >/dev/null 2>&1 || {
+        printf '%s: stat is required to protect platform probe temporary identity\n' "$program" >&2
+        return 2
+    }
+    platform_probe_output_file=$(mktemp "$agentq_temp_directory/agentq-platform-output.XXXXXX") || return 2
+    platform_probe_output_identity=$(platform_probe_file_identity "$platform_probe_output_file") || {
+        printf '%s: cannot record platform probe output temporary identity\n' "$program" >&2
+        platform_probe_status=2
+        if platform_probe_remove_file "$platform_probe_output_file" ''; then
+            platform_probe_output_cleanup_status=0
+        else
+            platform_probe_output_cleanup_status=$?
+            if [ "$platform_probe_status" -eq 0 ]; then
+                platform_probe_status=$platform_probe_output_cleanup_status
+            fi
+        fi
+        return "$platform_probe_status"
+    }
+    if platform_probe_require_file "$platform_probe_output_file"; then
+        :
+    else
+        platform_probe_status=$?
+        if platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity"; then
+            platform_probe_output_cleanup_status=0
+        else
+            platform_probe_output_cleanup_status=$?
+            if [ "$platform_probe_status" -eq 0 ]; then
+                platform_probe_status=$platform_probe_output_cleanup_status
+            fi
+        fi
+        return "$platform_probe_status"
+    fi
+    platform_probe_log_file=$(mktemp "$agentq_temp_directory/agentq-platform-log.XXXXXX") || {
+        platform_probe_status=2
+        if platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity"; then
+            platform_probe_output_cleanup_status=0
+        else
+            platform_probe_output_cleanup_status=$?
+            if [ "$platform_probe_status" -eq 0 ]; then
+                platform_probe_status=$platform_probe_output_cleanup_status
+            fi
+        fi
+        return "$platform_probe_status"
+    }
+    platform_probe_log_identity=$(platform_probe_file_identity "$platform_probe_log_file") || {
+        printf '%s: cannot record platform probe log temporary identity\n' "$program" >&2
+        platform_probe_status=2
+        if platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity"; then
+            platform_probe_output_cleanup_status=0
+        else
+            platform_probe_output_cleanup_status=$?
+            if [ "$platform_probe_status" -eq 0 ]; then
+                platform_probe_status=$platform_probe_output_cleanup_status
+            fi
+        fi
+        if platform_probe_remove_file "$platform_probe_log_file" ''; then
+            platform_probe_log_cleanup_status=0
+        else
+            platform_probe_log_cleanup_status=$?
+            if [ "$platform_probe_status" -eq 0 ]; then
+                platform_probe_status=$platform_probe_log_cleanup_status
+            fi
+        fi
+        return "$platform_probe_status"
+    }
+    if platform_probe_require_file "$platform_probe_log_file"; then
+        :
+    else
+        platform_probe_status=$?
+        if platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity"; then
+            platform_probe_output_cleanup_status=0
+        else
+            platform_probe_output_cleanup_status=$?
+            if [ "$platform_probe_status" -eq 0 ]; then
+                platform_probe_status=$platform_probe_output_cleanup_status
+            fi
+        fi
+        if platform_probe_remove_file "$platform_probe_log_file" "$platform_probe_log_identity"; then
+            platform_probe_log_cleanup_status=0
+        else
+            platform_probe_log_cleanup_status=$?
+            if [ "$platform_probe_status" -eq 0 ]; then
+                platform_probe_status=$platform_probe_log_cleanup_status
+            fi
+        fi
+        return "$platform_probe_status"
+    fi
+    if platform_probe_verify_identity "$platform_probe_output_file" "$platform_probe_output_identity" 'before probe' &&
+        platform_probe_verify_identity "$platform_probe_log_file" "$platform_probe_log_identity" 'before probe'; then
+        :
+    else
+        platform_probe_status=$?
+        if platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity"; then
+            platform_probe_output_cleanup_status=0
+        else
+            platform_probe_output_cleanup_status=$?
+            if [ "$platform_probe_status" -eq 0 ]; then
+                platform_probe_status=$platform_probe_output_cleanup_status
+            fi
+        fi
+        if platform_probe_remove_file "$platform_probe_log_file" "$platform_probe_log_identity"; then
+            platform_probe_log_cleanup_status=0
+        else
+            platform_probe_log_cleanup_status=$?
+            if [ "$platform_probe_status" -eq 0 ]; then
+                platform_probe_status=$platform_probe_log_cleanup_status
+            fi
+        fi
+        return "$platform_probe_status"
+    fi
+
+    if platform_probe_require_file "$platform_probe_output_file" &&
+        platform_probe_require_file "$platform_probe_log_file"; then
+        :
+    else
+        platform_probe_status=$?
+        if platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity"; then
+            platform_probe_output_cleanup_status=0
+        else
+            platform_probe_output_cleanup_status=$?
+            if [ "$platform_probe_status" -eq 0 ]; then
+                platform_probe_status=$platform_probe_output_cleanup_status
+            fi
+        fi
+        if platform_probe_remove_file "$platform_probe_log_file" "$platform_probe_log_identity"; then
+            platform_probe_log_cleanup_status=0
+        else
+            platform_probe_log_cleanup_status=$?
+            if [ "$platform_probe_status" -eq 0 ]; then
+                platform_probe_status=$platform_probe_log_cleanup_status
+            fi
+        fi
+        return "$platform_probe_status"
+    fi
+
+    if [ -n "$platform_probe_stdin_file" ]; then
+        if platform_probe_stdin_identity=$(windows_argument_identity_for_path "$platform_probe_stdin_file"); then
+            windows_argument_verify_identity "$platform_probe_stdin_file" "$platform_probe_stdin_identity" 'before platform probe SSH consumption' || return $?
+        else
+            printf '%s: refusing to consume an untracked platform probe stdin temporary: %s\n' "$program" "$platform_probe_stdin_file" >&2
+            return 2
+        fi
+        platform_probe_require_existing_file "$platform_probe_stdin_file" || return $?
+    fi
+
+    # The remote command's stderr must NOT be inherited.  OpenSSH sends it to the
+    # LOCAL stderr (-E carries only ssh's own diagnostics), so without this the
+    # remote could write arbitrary text -- including a forged
+    # `agentq: remote failure reason: <class>` line -- straight onto the caller's
+    # stderr, before the client has printed anything of its own.  The probe runs
+    # before any operation dispatch, and this path does not consume the reason
+    # channel at all, so discarding it loses nothing and closes the surface.
+    # Every other ssh call site in this client captures and redacts through
+    # run_ssh_logged; the probe is the only one that used to bypass that.
+    if [ -n "$platform_probe_stdin_file" ]; then
+        "$ssh_binary" \
+            -E "$platform_probe_log_file" \
+            -o LogLevel=ERROR \
+            $ssh_credential_option_lines \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=12 \
+            -o TCPKeepAlive=yes \
+            -- "$host" "$platform_probe_command" < "$platform_probe_stdin_file" > "$platform_probe_output_file" 2>/dev/null &
+    else
+        "$ssh_binary" \
+            -E "$platform_probe_log_file" \
+            -o LogLevel=ERROR \
+            $ssh_credential_option_lines \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=12 \
+            -o TCPKeepAlive=yes \
+            -- "$host" "$platform_probe_command" > "$platform_probe_output_file" 2>/dev/null &
+    fi
+    platform_probe_pid=$!
+    platform_probe_elapsed=0
+    platform_probe_timed_out=0
+    while kill -0 "$platform_probe_pid" >/dev/null 2>&1; do
+        if [ "$platform_probe_elapsed" -ge "$platform_probe_timeout" ]; then
+            kill "$platform_probe_pid" >/dev/null 2>&1 || true
+            wait "$platform_probe_pid" >/dev/null 2>&1 || true
+            platform_probe_timed_out=1
+            break
+        fi
+        sleep 1
+        platform_probe_elapsed=$((platform_probe_elapsed + 1))
+    done
+
+    if [ "$platform_probe_timed_out" -eq 1 ]; then
+        platform_probe_status=124
+        printf '%s: remote platform/protocol probe timed out after %s seconds on %s\n' \
+            "$program" "$platform_probe_timeout" "$host" >&2
+    elif wait "$platform_probe_pid"; then
+        platform_probe_status=0
+    else
+        platform_probe_status=$?
+    fi
+
+    if platform_probe_require_existing_file "$platform_probe_output_file" &&
+        platform_probe_require_existing_file "$platform_probe_log_file"; then
+        :
+    else
+        platform_probe_status=$?
+        if platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity"; then
+            platform_probe_output_cleanup_status=0
+        else
+            platform_probe_output_cleanup_status=$?
+            if [ "$platform_probe_status" -eq 0 ]; then
+                platform_probe_status=$platform_probe_output_cleanup_status
+            fi
+        fi
+        if platform_probe_remove_file "$platform_probe_log_file" "$platform_probe_log_identity"; then
+            platform_probe_log_cleanup_status=0
+        else
+            platform_probe_log_cleanup_status=$?
+            if [ "$platform_probe_status" -eq 0 ]; then
+                platform_probe_status=$platform_probe_log_cleanup_status
+            fi
+        fi
+        return "$platform_probe_status"
+    fi
+    if platform_probe_verify_identity "$platform_probe_output_file" "$platform_probe_output_identity" 'before reading' &&
+        platform_probe_verify_identity "$platform_probe_log_file" "$platform_probe_log_identity" 'before reading'; then
+        :
+    else
+        platform_probe_status=$?
+        if platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity"; then
+            platform_probe_output_cleanup_status=0
+        else
+            platform_probe_output_cleanup_status=$?
+            if [ "$platform_probe_status" -eq 0 ]; then
+                platform_probe_status=$platform_probe_output_cleanup_status
+            fi
+        fi
+        if platform_probe_remove_file "$platform_probe_log_file" "$platform_probe_log_identity"; then
+            platform_probe_log_cleanup_status=0
+        else
+            platform_probe_log_cleanup_status=$?
+            if [ "$platform_probe_status" -eq 0 ]; then
+                platform_probe_status=$platform_probe_log_cleanup_status
+            fi
+        fi
+        return "$platform_probe_status"
+    fi
+
+    if [ "$platform_probe_status" -eq 255 ]; then
+        if platform_probe_require_existing_file "$platform_probe_log_file"; then
+            if [ -s "$platform_probe_log_file" ]; then
+                if ssh_transport_error "$platform_probe_log_file"; then
+                    platform_probe_status=254
+                fi
+                write_ssh_diagnostic_metadata "$platform_probe_log_file"
+            fi
+        else
+            platform_probe_status=$?
+            platform_probe_output_cleanup_status=0
+            platform_probe_log_cleanup_status=0
+            platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity" ||
+                platform_probe_output_cleanup_status=$?
+            platform_probe_remove_file "$platform_probe_log_file" "$platform_probe_log_identity" ||
+                platform_probe_log_cleanup_status=$?
+            return "$platform_probe_status"
+        fi
+    fi
+    if platform_probe_require_existing_file "$platform_probe_output_file"; then
+        :
+    else
+        platform_probe_status=$?
+        platform_probe_output_cleanup_status=0
+        platform_probe_log_cleanup_status=0
+        if platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity"; then
+            :
+        else
+            platform_probe_output_cleanup_status=$?
+        fi
+        if platform_probe_remove_file "$platform_probe_log_file" "$platform_probe_log_identity"; then
+            :
+        else
+            platform_probe_log_cleanup_status=$?
+        fi
+        return "$platform_probe_status"
+    fi
+    platform_probe_output_bytes=$(wc -c < "$platform_probe_output_file" | tr -d '[:space:]') || {
+        printf '%s: cannot measure platform probe output size\n' "$program" >&2
+        platform_probe_output_cleanup_status=1
+        platform_probe_log_cleanup_status=0
+        platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity" || platform_probe_output_cleanup_status=$?
+        platform_probe_remove_file "$platform_probe_log_file" "$platform_probe_log_identity" || platform_probe_log_cleanup_status=$?
+        return 2
+    }
+    platform_probe_output_max=${platform_probe_output_limit:-65536}
+    if platform_probe_require_existing_file "$platform_probe_output_file"; then
+        :
+    else
+        platform_probe_status=$?
+        platform_probe_output_cleanup_status=0
+        platform_probe_log_cleanup_status=0
+        if platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity"; then
+            :
+        else
+            platform_probe_output_cleanup_status=$?
+        fi
+        if platform_probe_remove_file "$platform_probe_log_file" "$platform_probe_log_identity"; then
+            :
+        else
+            platform_probe_log_cleanup_status=$?
+        fi
+        return "$platform_probe_status"
+    fi
+    if [ "$platform_probe_output_bytes" -gt "$platform_probe_output_max" ]; then
+        if ! dd if="$platform_probe_output_file" bs=1 count="$platform_probe_output_max" 2>/dev/null; then
+            printf '%s: failed to read bounded platform probe output\n' "$program" >&2
+            platform_probe_output_cleanup_status=1
+        else
+            printf '\n[platform probe stdout truncated after %s bytes]\n' "$platform_probe_output_max"
+            platform_probe_output_cleanup_status=0
+        fi
+    else
+        cat "$platform_probe_output_file"
+        platform_probe_output_cleanup_status=0
+    fi
+    if platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity"; then
+        :
+    else
+        platform_probe_cleanup_status=$?
+        if [ "$platform_probe_output_cleanup_status" -eq 0 ]; then
+            platform_probe_output_cleanup_status=$platform_probe_cleanup_status
+        fi
+    fi
+    if platform_probe_remove_file "$platform_probe_log_file" "$platform_probe_log_identity"; then
+        platform_probe_log_cleanup_status=0
+    else
+        platform_probe_log_cleanup_status=$?
+    fi
+    if [ "$platform_probe_output_cleanup_status" -ne 0 ] ||
+        [ "$platform_probe_log_cleanup_status" -ne 0 ]; then
+        return 2
+    fi
+    platform_probe_output_file=''
+    platform_probe_output_identity=''
+    platform_probe_log_file=''
+    platform_probe_log_identity=''
+    return "$platform_probe_status"
+}
+
+run_platform_probe_with_recovery() {
+    platform_probe_command=$1
+    platform_probe_recovery_stdin=${2:-}
+    platform_probe_attempt=0
+
+    while :; do
+        if platform_probe_output=$(run_platform_probe "$platform_probe_command" "$platform_probe_recovery_stdin"); then
+            platform_probe_status=0
+        else
+            platform_probe_status=$?
+        fi
+
+        if [ "$platform_probe_status" -ne 254 ]; then
+            printf '%s\n' "$platform_probe_output"
+            return "$platform_probe_status"
+        fi
+
+        platform_probe_attempt=$((platform_probe_attempt + 1))
+        if [ "$platform_probe_attempt" -gt "$operation_retry_attempts" ]; then
+            printf '%s\n' "$platform_probe_output"
+            printf '%s: SSH transport remained unavailable while detecting the remote platform\n' "$program" >&2
+            return 255
+        fi
+
+        printf '%s: SSH transport lost while detecting the remote platform; retrying %s/%s...\n' \
+            "$program" "$platform_probe_attempt" "$operation_retry_attempts" >&2
+        sleep "$operation_retry_delay"
+    done
+}
+
+encode_windows_powershell() {
+    command -v iconv >/dev/null 2>&1 || return 127
+    command -v base64 >/dev/null 2>&1 || return 127
+
+    resolve_agentq_temp_directory || return $?
+    windows_encoding_input=$(mktemp "$agentq_temp_directory/agentq-windows-powershell.XXXXXX") || return 1
+    windows_encoding_input_identity=$(windows_encoding_file_identity "$windows_encoding_input") || {
+        printf '%s: cannot record Windows PowerShell encoding input identity: %s\n' "$program" "$windows_encoding_input" >&2
+        windows_encoding_status=1
+        if windows_encoding_remove_file "$windows_encoding_input" ''; then
+            windows_encoding_input_cleanup_status=0
+        else
+            windows_encoding_input_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_input_cleanup_status
+            fi
+        fi
+        return "$windows_encoding_status"
+    }
+    if windows_encoding_require_file "$windows_encoding_input"; then
+        :
+    else
+        windows_encoding_status=$?
+        if windows_encoding_remove_file "$windows_encoding_input" "$windows_encoding_input_identity"; then
+            windows_encoding_input_cleanup_status=0
+        else
+            windows_encoding_input_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_input_cleanup_status
+            fi
+        fi
+        return "$windows_encoding_status"
+    fi
+    windows_encoding_output=$(mktemp "$agentq_temp_directory/agentq-windows-powershell-base64.XXXXXX") || {
+        windows_encoding_status=1
+        if windows_encoding_remove_file "$windows_encoding_input" "$windows_encoding_input_identity"; then
+            windows_encoding_input_cleanup_status=0
+        else
+            windows_encoding_input_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_input_cleanup_status
+            fi
+        fi
+        return "$windows_encoding_status"
+    }
+    windows_encoding_output_identity=$(windows_encoding_file_identity "$windows_encoding_output") || {
+        printf '%s: cannot record Windows PowerShell encoding output identity: %s\n' "$program" "$windows_encoding_output" >&2
+        windows_encoding_status=1
+        if windows_encoding_remove_file "$windows_encoding_input" "$windows_encoding_input_identity"; then
+            windows_encoding_input_cleanup_status=0
+        else
+            windows_encoding_input_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_input_cleanup_status
+            fi
+        fi
+        if windows_encoding_remove_file "$windows_encoding_output" ''; then
+            windows_encoding_output_cleanup_status=0
+        else
+            windows_encoding_output_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_output_cleanup_status
+            fi
+        fi
+        return "$windows_encoding_status"
+    }
+    if windows_encoding_require_file "$windows_encoding_output"; then
+        :
+    else
+        windows_encoding_status=$?
+        if windows_encoding_remove_file "$windows_encoding_input" "$windows_encoding_input_identity"; then
+            windows_encoding_input_cleanup_status=0
+        else
+            windows_encoding_input_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_input_cleanup_status
+            fi
+        fi
+        if windows_encoding_remove_file "$windows_encoding_output" "$windows_encoding_output_identity"; then
+            windows_encoding_output_cleanup_status=0
+        else
+            windows_encoding_output_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_output_cleanup_status
+            fi
+        fi
+        return "$windows_encoding_status"
+    fi
+
+    if windows_encoding_verify_identity "$windows_encoding_input" "$windows_encoding_input_identity" 'before UTF-16LE conversion' &&
+        windows_encoding_verify_identity "$windows_encoding_output" "$windows_encoding_output_identity" 'before UTF-16LE conversion'; then
+        :
+    else
+        windows_encoding_status=$?
+        if windows_encoding_remove_file "$windows_encoding_input" "$windows_encoding_input_identity"; then
+            windows_encoding_input_cleanup_status=0
+        else
+            windows_encoding_input_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_input_cleanup_status
+            fi
+        fi
+        if windows_encoding_remove_file "$windows_encoding_output" "$windows_encoding_output_identity"; then
+            windows_encoding_output_cleanup_status=0
+        else
+            windows_encoding_output_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_output_cleanup_status
+            fi
+        fi
+        return "$windows_encoding_status"
+    fi
+    if ! printf '%s' "$1" | iconv -f UTF-8 -t UTF-16LE > "$windows_encoding_input"; then
+        windows_encoding_status=1
+        if windows_encoding_remove_file "$windows_encoding_input" "$windows_encoding_input_identity"; then
+            windows_encoding_input_cleanup_status=0
+        else
+            windows_encoding_input_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_input_cleanup_status
+            fi
+        fi
+        if windows_encoding_remove_file "$windows_encoding_output" "$windows_encoding_output_identity"; then
+            windows_encoding_output_cleanup_status=0
+        else
+            windows_encoding_output_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_output_cleanup_status
+            fi
+        fi
+        return "$windows_encoding_status"
+    fi
+    if windows_encoding_verify_identity "$windows_encoding_input" "$windows_encoding_input_identity" 'before Base64 conversion' &&
+        windows_encoding_verify_identity "$windows_encoding_output" "$windows_encoding_output_identity" 'before Base64 conversion' &&
+        windows_encoding_require_existing_file "$windows_encoding_input" &&
+        windows_encoding_require_file "$windows_encoding_output"; then
+        :
+    else
+        windows_encoding_status=$?
+        if windows_encoding_remove_file "$windows_encoding_input" "$windows_encoding_input_identity"; then
+            windows_encoding_input_cleanup_status=0
+        else
+            windows_encoding_input_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_input_cleanup_status
+            fi
+        fi
+        if windows_encoding_remove_file "$windows_encoding_output" "$windows_encoding_output_identity"; then
+            windows_encoding_output_cleanup_status=0
+        else
+            windows_encoding_output_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_output_cleanup_status
+            fi
+        fi
+        return "$windows_encoding_status"
+    fi
+    if ! base64 < "$windows_encoding_input" | tr -d '\n' > "$windows_encoding_output"; then
+        windows_encoding_status=1
+        if windows_encoding_remove_file "$windows_encoding_input" "$windows_encoding_input_identity"; then
+            windows_encoding_input_cleanup_status=0
+        else
+            windows_encoding_input_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_input_cleanup_status
+            fi
+        fi
+        if windows_encoding_remove_file "$windows_encoding_output" "$windows_encoding_output_identity"; then
+            windows_encoding_output_cleanup_status=0
+        else
+            windows_encoding_output_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_output_cleanup_status
+            fi
+        fi
+        return "$windows_encoding_status"
+    fi
+    if windows_encoding_verify_identity "$windows_encoding_input" "$windows_encoding_input_identity" 'before reading' &&
+        windows_encoding_verify_identity "$windows_encoding_output" "$windows_encoding_output_identity" 'before reading' &&
+        windows_encoding_require_existing_file "$windows_encoding_input" &&
+        windows_encoding_require_existing_file "$windows_encoding_output"; then
+        :
+    else
+        windows_encoding_status=$?
+        if windows_encoding_remove_file "$windows_encoding_input" "$windows_encoding_input_identity"; then
+            windows_encoding_input_cleanup_status=0
+        else
+            windows_encoding_input_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_input_cleanup_status
+            fi
+        fi
+        if windows_encoding_remove_file "$windows_encoding_output" "$windows_encoding_output_identity"; then
+            windows_encoding_output_cleanup_status=0
+        else
+            windows_encoding_output_cleanup_status=$?
+            if [ "$windows_encoding_status" -eq 0 ]; then
+                windows_encoding_status=$windows_encoding_output_cleanup_status
+            fi
+        fi
+        return "$windows_encoding_status"
+    fi
+    windows_encoding_require_existing_file "$windows_encoding_output" || {
+        windows_encoding_status=$?
+        if windows_encoding_remove_file "$windows_encoding_input" "$windows_encoding_input_identity"; then
+            windows_encoding_input_cleanup_status=0
+        else
+            windows_encoding_input_cleanup_status=$?
+        fi
+        if windows_encoding_remove_file "$windows_encoding_output" "$windows_encoding_output_identity"; then
+            windows_encoding_output_cleanup_status=0
+        else
+            windows_encoding_output_cleanup_status=$?
+        fi
+        if [ "$windows_encoding_input_cleanup_status" -ne 0 ] ||
+            [ "$windows_encoding_output_cleanup_status" -ne 0 ]; then
+            return 2
+        fi
+        return "$windows_encoding_status"
+    }
+    cat "$windows_encoding_output"
+    if windows_encoding_remove_file "$windows_encoding_input" "$windows_encoding_input_identity"; then
+        windows_encoding_input_cleanup_status=0
+    else
+        windows_encoding_input_cleanup_status=$?
+    fi
+    if windows_encoding_remove_file "$windows_encoding_output" "$windows_encoding_output_identity"; then
+        windows_encoding_output_cleanup_status=0
+    else
+        windows_encoding_output_cleanup_status=$?
+    fi
+    if [ "$windows_encoding_input_cleanup_status" -ne 0 ] ||
+        [ "$windows_encoding_output_cleanup_status" -ne 0 ]; then
+        return 2
+    fi
+}
+
+# Windows remote command lines are TRUNCATED, not rejected, once they exceed the
+# remote shell's limit -- and the limit depends on the shell sshd was configured
+# with (measured on a real host: Git Bash 8,176 / cmd.exe 8,155 /
+# powershell.exe 8,125).  The reparse-path hardening pushed the protocol probe's
+# script to 3,216 characters, which encodes to an 8,658-character command line:
+# over all three.  The base64 was cut mid-stream, PowerShell reported
+# "TerminatorExpectedAtEndOfString", and every command on that host failed with
+# a message that pointed at the deployment instead of at the client.
+#
+# So the script body does NOT go on the command line.  It is written to a
+# protected temporary and fed to `powershell.exe ... -Command -` on stdin, which
+# leaves a fixed 76-character command line regardless of how large the script
+# grows.  Measured on the same host: 8,658 -> rc=1 with empty output (dead);
+# 76 -> rc=0 with the correct token.
+#
+# The file is registered with the same identity-checked temporary machinery the
+# Windows argument path uses, and run_platform_probe verifies that identity
+# immediately before handing the file to ssh -- the protection is not bypassed.
+make_windows_probe_script_file() {
+    windows_probe_script_text=$1
+    resolve_agentq_temp_directory || return $?
+    # A Windows target runs TWO probes in sequence (platform, then protocol), and
+    # both call this function.  Each call overwrites the global naming the
+    # previous temporary, which would orphan it -- the EXIT trap can only clean
+    # the file it still knows about.  Remove the previous one first.
+    if [ -n "$platform_probe_stdin_file" ]; then
+        windows_argument_remove_file "$platform_probe_stdin_file" "$platform_probe_stdin_identity" || return $?
+        platform_probe_stdin_file=''
+        platform_probe_stdin_identity=''
+    fi
+    platform_probe_stdin_file=$(mktemp "$agentq_temp_directory/agentq-probe-script.XXXXXX") || return 1
+    platform_probe_stdin_identity=$(windows_argument_file_identity "$platform_probe_stdin_file") || {
+        printf '%s: cannot record Windows probe script temporary identity\n' "$program" >&2
+        windows_argument_remove_file "$platform_probe_stdin_file" ''
+        platform_probe_stdin_file=''
+        return 1
+    }
+    printf '%s' "$windows_probe_script_text" > "$platform_probe_stdin_file" || return 1
+    windows_argument_require_existing_file "$platform_probe_stdin_file" || return $?
+    windows_argument_verify_identity "$platform_probe_stdin_file" "$platform_probe_stdin_identity" 'after writing Windows probe script' || return $?
+}
+
+# The fixed command line: everything after this point is fed on stdin.
+windows_probe_command_line() {
+    printf '%s\n' "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command -"
+}
+
+# Wrap a probe script so the exit status survives the REMOTE shell, not just
+# PowerShell.  When sshd's DefaultShell is powershell.exe, an outer PowerShell
+# flattens a native child's non-zero exit code to 1 (measured: inner 2/42/43/
+# 44/45/124 all arrive as 1) -- which destroys the launcher's exit-code
+# contract (42-45 distinguish missing / incompatible / unsafe / too-large).
+# Git Bash and cmd.exe both pass it through unchanged.
+#
+# The fix is out of band: the script prints its token, then prints
+# "agentq-exit:<code>", and the caller takes the code from stdout.  Measured on
+# the same host: the token survived all three outer shells intact while only the
+# exit-code column was flattened under the PowerShell outer shell.
+windows_probe_script_with_exit_token() {
+    windows_probe_script_body=$1
+    # A probe signals failure with `exit N`.  That ends the whole script, so a
+    # token line appended after the body would never run -- and under an outer
+    # PowerShell the code would arrive flattened to 1 with nothing to recover it.
+    # So every `exit N` in the body is rewritten to `$agentqProbeExit = N` and the
+    # token line at the end reports it.  The rewrite is textual and local to the
+    # body: the probes are single-line scripts whose only `exit` calls are the
+    # contract codes, and the pattern is anchored to `; exit <digits>` or a
+    # statement-initial `exit <digits>` so an `exit` inside a string cannot match.
+    windows_probe_rewritten_body=$(printf '%s' "$windows_probe_script_body" |
+        sed -E 's/(^[[:space:]]*|;[[:space:]]*)exit ([0-9]+)/\1$agentqProbeExit = \2/g')
+    printf '%s\n' "$windows_probe_rewritten_body"
+    printf '%s\n' 'if ($null -eq $agentqProbeExit) { $agentqProbeExit = 0 }'
+    printf '%s\n' '[Console]::Out.Write("agentq-exit:" + $agentqProbeExit)'
+    printf '%s\n' 'exit $agentqProbeExit'
+}
+
+windows_probe_command() {
+    windows_platform_script='$ProgressPreference = "SilentlyContinue"; [Console]::Out.Write("agentq-windows")'
+    make_windows_probe_script_file "$(windows_probe_script_with_exit_token "$windows_platform_script")" || return $?
+    windows_probe_prepared_command_line=$(windows_probe_command_line) || return $?
+}
+
+windows_agentq_protocol_probe_command() {
+    # shellcheck disable=SC2016
+    windows_protocol_script='$ProgressPreference = "SilentlyContinue"; $launcher = "C:\ProgramData\AgentQ\agentq-launcher.ps1"; function Test-NonReparseLauncherPath { param([string]$Path); if ([string]::IsNullOrWhiteSpace($Path)) { return $false }; try { $fullPath = [System.IO.Path]::GetFullPath($Path); $item = Get-Item -LiteralPath $fullPath -Force -ErrorAction Stop } catch { return $false }; if ($item.PSIsContainer -or (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) { return $false }; $parent = [System.IO.Directory]::GetParent($fullPath); while ($null -ne $parent) { $parentItem = Get-Item -LiteralPath $parent.FullName -Force -ErrorAction SilentlyContinue; if ($null -eq $parentItem -or !$parentItem.PSIsContainer -or (($parentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) { return $false }; $parent = $parent.Parent }; return $true }; $launcherItem = if ([string]::IsNullOrWhiteSpace($launcher)) { $null } else { Get-Item -LiteralPath $launcher -Force -ErrorAction SilentlyContinue }; if ([string]::IsNullOrWhiteSpace($launcher) -or ($null -eq $launcherItem)) { [Console]::Out.Write("agentq-windows-launcher-missing"); exit 42 }; if (!(Test-NonReparseLauncherPath -Path $launcher)) { [Console]::Out.Write("agentq-windows-launcher-invalid"); exit 44 }; $maximumLauncherBytes = 262144; $launcherStream = $null; try { $launcherStream = [System.IO.File]::Open($launcher, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read); $launcherBytes = [byte[]]::new($maximumLauncherBytes + 1); $launcherOffset = 0; while ($launcherOffset -lt $launcherBytes.Length) { $readCount = $launcherStream.Read($launcherBytes, $launcherOffset, $launcherBytes.Length - $launcherOffset); if ($readCount -eq 0) { break }; $launcherOffset += $readCount } } catch { [Console]::Out.Write("agentq-windows-launcher-invalid"); exit 44 } finally { if ($null -ne $launcherStream) { $launcherStream.Dispose() } }; if ($launcherOffset -gt $maximumLauncherBytes) { [Console]::Out.Write("agentq-windows-launcher-too-large"); exit 45 }; try { if ($launcherOffset -ge 3 -and $launcherBytes[0] -eq 0xEF -and $launcherBytes[1] -eq 0xBB -and $launcherBytes[2] -eq 0xBF) { $launcherEncoding = [System.Text.UTF8Encoding]::new($true, $true); $launcherContentOffset = 3 } elseif ($launcherOffset -ge 2 -and $launcherBytes[0] -eq 0xFF -and $launcherBytes[1] -eq 0xFE) { $launcherEncoding = [System.Text.UnicodeEncoding]::new($false, $true, $true); $launcherContentOffset = 2 } elseif ($launcherOffset -ge 2 -and $launcherBytes[0] -eq 0xFE -and $launcherBytes[1] -eq 0xFF) { $launcherEncoding = [System.Text.UnicodeEncoding]::new($true, $true, $true); $launcherContentOffset = 2 } else { $launcherEncoding = [System.Text.UTF8Encoding]::new($false, $true); $launcherContentOffset = 0 }; $contents = $launcherEncoding.GetString($launcherBytes, $launcherContentOffset, $launcherOffset - $launcherContentOffset) } catch { [Console]::Out.Write("agentq-windows-launcher-invalid"); exit 44 }; if ($contents.IndexOf("ArgumentsBase64", [System.StringComparison]::Ordinal) -lt 0) { [Console]::Out.Write("agentq-windows-launcher-incompatible"); exit 43 }; [Console]::Out.Write("agentq-windows-launcher-ready")'
+    make_windows_probe_script_file "$(windows_probe_script_with_exit_token "$windows_protocol_script")" || return $?
+    windows_probe_prepared_command_line=$(windows_probe_command_line) || return $?
+}
+
+# Read a probe's status from its out-of-band token when it carries one.
+#
+# A Windows probe ends by printing "agentq-exit:<code>" (see
+# windows_probe_script_with_exit_token).  That is authoritative, because the SSH
+# exit code is flattened to 1 by an outer PowerShell when sshd's DefaultShell is
+# powershell.exe.  When the token is absent the probe is not one of ours, so the
+# SSH exit code stands.
+# Sets: windows_probe_token_status, windows_probe_token_output.
+windows_probe_apply_exit_token() {
+    windows_probe_token_ssh_status=$1
+    windows_probe_token_raw=$2
+    windows_probe_token_status=$windows_probe_token_ssh_status
+    windows_probe_token_output=$windows_probe_token_raw
+    case "$windows_probe_token_raw" in
+        *agentq-exit:*)
+            windows_probe_token_code=${windows_probe_token_raw##*agentq-exit:}
+            windows_probe_token_code=${windows_probe_token_code%%[!0-9]*}
+            if [ -n "$windows_probe_token_code" ]; then
+                windows_probe_token_status=$windows_probe_token_code
+                windows_probe_token_output=${windows_probe_token_raw%agentq-exit:*}
+            fi
+            ;;
+    esac
+}
+
+probe_native_windows_platform() {
+    windows_probe_command || {
+        printf '%s: cannot encode the Windows PowerShell platform probe; iconv and base64 are required\n' "$program" >&2
+        return 2
+    }
+    windows_platform_command=$windows_probe_prepared_command_line
+    if windows_platform_output=$(run_platform_probe_with_recovery "$windows_platform_command" "$platform_probe_stdin_file"); then
+        windows_platform_ssh_status=0
+    else
+        windows_platform_ssh_status=$?
+    fi
+    windows_probe_apply_exit_token "$windows_platform_ssh_status" "$windows_platform_output"
+    windows_platform_status=$windows_probe_token_status
+    windows_platform_output=$windows_probe_token_output
+
+    if [ "$windows_platform_status" -eq 0 ] && [ "$windows_platform_output" = agentq-windows ]; then
+        remote_platform=windows
+        return 0
+    fi
+    if [ "$windows_platform_status" -eq 0 ]; then
+        printf '%s: native Windows platform probe returned an unexpected response\n' "$program" >&2
+        return 2
+    fi
+
+    printf '%s: native Windows platform probe failed after a Windows shell was detected\n' "$program" >&2
+    return "$windows_platform_status"
+}
+
+probe_windows_agentq_protocol() {
+    windows_agentq_protocol_probe_command || {
+        printf '%s: cannot encode the Windows AgentQ protocol probe; iconv and base64 are required\n' "$program" >&2
+        return 2
+    }
+    windows_protocol_command=$windows_probe_prepared_command_line
+    if windows_protocol_output=$(run_platform_probe_with_recovery "$windows_protocol_command" "$platform_probe_stdin_file"); then
+        windows_protocol_ssh_status=0
+    else
+        windows_protocol_ssh_status=$?
+    fi
+    windows_probe_apply_exit_token "$windows_protocol_ssh_status" "$windows_protocol_output"
+    windows_protocol_status=$windows_probe_token_status
+    windows_protocol_output=$windows_probe_token_output
+
+    if [ "$windows_protocol_status" -eq 0 ] && [ "$windows_protocol_output" = agentq-windows-launcher-ready ]; then
+        return 0
+    fi
+    if [ "$windows_protocol_status" -eq 42 ] && [ "$windows_protocol_output" = agentq-windows-launcher-missing ]; then
+        printf '%s: remote Windows AgentQ deployment is incomplete: C:/ProgramData/AgentQ/agentq-launcher.ps1 is missing; upgrade AgentQ on %s before using it\n' \
+            "$program" "$host" >&2
+        return 2
+    fi
+    if [ "$windows_protocol_status" -eq 43 ] && [ "$windows_protocol_output" = agentq-windows-launcher-incompatible ]; then
+        printf '%s: remote Windows AgentQ deployment is incompatible: C:/ProgramData/AgentQ/agentq-launcher.ps1 does not support the ArgumentsBase64 protocol; upgrade AgentQ on %s before using it\n' \
+            "$program" "$host" >&2
+        return 2
+    fi
+
+    printf '%s: native Windows AgentQ service protocol probe failed on %s\n' "$program" "$host" >&2
+    return "$windows_protocol_status"
+}
+
+initialize_remote_invocation() {
+    resolve_agentq_temp_directory || return $?
+    case "$remote_platform" in
+        auto)
+            if local_platform_output=$(run_platform_probe_with_recovery 'uname -s 2>/dev/null'); then
+                local_platform_status=0
+            else
+                local_platform_status=$?
+            fi
+            case "$local_platform_output" in
+                MINGW*|MSYS*|CYGWIN*)
+                    probe_native_windows_platform || return $?
+                    ;;
+                Linux*|Darwin*) remote_platform=unix ;;
+                *)
+                    windows_probe_command || fail 'cannot encode the Windows PowerShell platform probe; iconv and base64 are required'
+                    windows_platform_command=$windows_probe_prepared_command_line
+                    if windows_platform_output=$(run_platform_probe_with_recovery "$windows_platform_command" "$platform_probe_stdin_file"); then
+                        windows_platform_status=0
+                    else
+                        windows_platform_status=$?
+                    fi
+                    if [ "$windows_platform_status" -eq 0 ] && [ "$windows_platform_output" = agentq-windows ]; then
+                        remote_platform=windows
+                    elif [ "$local_platform_status" -ne 0 ] && [ "$windows_platform_status" -ne 0 ]; then
+                        printf '%s: unable to detect the remote platform; set AGENTQ_REMOTE_PLATFORM to unix or windows only when the target is known\n' "$program" >&2
+                        return "$local_platform_status"
+                    else
+                        printf '%s: unsupported or undetectable remote platform: %s\n' "$program" "${local_platform_output:-unknown}" >&2
+                        return 2
+                    fi
+                    ;;
+            esac
+            ;;
+        unix|windows)
+            ;;
+        *)
+            fail 'AGENTQ_REMOTE_PLATFORM must be auto, unix, or windows'
+            ;;
+    esac
+
+    if [ "$remote_platform" = windows ]; then
+        probe_windows_agentq_protocol || return $?
+    fi
+
+    case "$remote_platform" in
+        unix)
+            # shellcheck disable=SC2016
+            remote_base_command='agentq_run() { agentq_server="$HOME/.local/bin/agentq"; exec "$agentq_server" "$@"; }; agentq_run'
+            remote_command=$remote_base_command
+            ;;
+        windows)
+            remote_argument_file=$(mktemp "$agentq_temp_directory/agentq-arguments.XXXXXX") || fail 'cannot create a temporary Windows argument stream'
+            remote_argument_file_identity=$(windows_argument_file_identity "$remote_argument_file") || {
+                printf '%s: cannot record Windows argument temporary identity: %s\n' "$program" "$remote_argument_file" >&2
+                windows_argument_status=1
+                if windows_argument_remove_file "$remote_argument_file" "$remote_argument_file_identity"; then
+                    windows_argument_cleanup_status=0
+                else
+                    windows_argument_cleanup_status=$?
+                    if [ "$windows_argument_status" -eq 0 ]; then
+                        windows_argument_status=$windows_argument_cleanup_status
+                    fi
+                fi
+                return "$windows_argument_status"
+            }
+            windows_argument_require_file "$remote_argument_file" || return $?
+            remote_base_command=''
+            remote_command=''
+            ;;
+    esac
+}
+
+reset_windows_argument_stream() {
+    [ "$remote_platform" = windows ] || return 0
+    windows_argument_require_file "$remote_argument_file" || return $?
+    windows_argument_verify_identity "$remote_argument_file" "$remote_argument_file_identity" 'before reset' || return $?
+    : > "$remote_argument_file"
+    windows_argument_require_file "$remote_argument_file" || return $?
+    windows_argument_verify_identity "$remote_argument_file" "$remote_argument_file_identity" 'after reset' || return $?
+    remote_input_file=''
+    remote_input_file_identity=''
+}
+
+build_windows_remote_command() {
+    [ -n "$remote_argument_file" ] || fail 'internal error: Windows argument stream is unavailable'
+    resolve_agentq_temp_directory || return $?
+    windows_argument_require_file "$remote_argument_file" || return $?
+    windows_argument_verify_identity "$remote_argument_file" "$remote_argument_file_identity" 'before Base64 input' || return $?
+    remote_input_file=$(mktemp "$agentq_temp_directory/agentq-windows-arguments.XXXXXX") || fail 'cannot create a temporary Windows argument payload'
+    remote_input_file_identity=$(windows_argument_file_identity "$remote_input_file") || {
+        printf '%s: cannot record Windows argument payload identity: %s\n' "$program" "$remote_input_file" >&2
+        windows_argument_status=1
+        if windows_argument_remove_file "$remote_input_file" "$remote_input_file_identity"; then
+            windows_argument_cleanup_status=0
+        else
+            windows_argument_cleanup_status=$?
+            if [ "$windows_argument_status" -eq 0 ]; then
+                windows_argument_status=$windows_argument_cleanup_status
+            fi
+        fi
+        remote_input_file=''
+        remote_input_file_identity=''
+        return "$windows_argument_status"
+    }
+    if windows_argument_require_file "$remote_input_file"; then
+        :
+    else
+        windows_argument_status=$?
+        if windows_argument_remove_file "$remote_input_file" "$remote_input_file_identity"; then
+            windows_argument_cleanup_status=0
+        else
+            windows_argument_cleanup_status=$?
+            if [ "$windows_argument_status" -eq 0 ]; then
+                windows_argument_status=$windows_argument_cleanup_status
+            fi
+        fi
+        remote_input_file=''
+        remote_input_file_identity=''
+        return "$windows_argument_status"
+    fi
+    windows_argument_require_existing_file "$remote_argument_file" || return $?
+    base64 < "$remote_argument_file" > "$remote_input_file" || fail 'cannot encode the Windows argument stream'
+    windows_argument_require_file "$remote_argument_file" || return $?
+    windows_argument_require_file "$remote_input_file" || return $?
+    windows_argument_verify_identity "$remote_argument_file" "$remote_argument_file_identity" 'after Base64 input' || return $?
+    windows_argument_verify_identity "$remote_input_file" "$remote_input_file_identity" 'after Base64 output' || return $?
+    [ -s "$remote_input_file" ] || fail 'internal error: Windows argument stream is empty'
+    # shellcheck disable=SC2016
+    # Win32-OpenSSH can terminate a non-TTY stdin stream before PowerShell's
+    # -File parameter binder receives the base64 payload. Use an encoded
+    # wrapper that reads stdin explicitly, then invokes the protected launcher.
+    windows_launcher_wrapper='$ProgressPreference = "SilentlyContinue"; $maximumArgumentPayloadCharacters = 1048576; $payloadBuffer = [char[]]::new(4096); $payloadBuilder = [System.Text.StringBuilder]::new(); while ($true) { $payloadReadCount = [Console]::In.Read($payloadBuffer, 0, $payloadBuffer.Length); if ($payloadReadCount -le 0) { break }; if (($payloadBuilder.Length + $payloadReadCount) -gt $maximumArgumentPayloadCharacters) { [Console]::Error.WriteLine("agentq: Windows argument payload exceeds $maximumArgumentPayloadCharacters characters"); exit 2 }; [void]$payloadBuilder.Append($payloadBuffer, 0, $payloadReadCount) }; $payload = $payloadBuilder.ToString(); & "C:\ProgramData\AgentQ\agentq-launcher.ps1" -ArgumentsBase64 $payload; $launcherExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; if ($null -eq $launcherExitCode) { exit 1 }; exit ([int]$launcherExitCode.Value)'
+    windows_launcher_encoded=$(encode_windows_powershell "$windows_launcher_wrapper") || fail 'cannot encode the Windows AgentQ launcher wrapper; iconv and base64 are required'
+    [ -n "$windows_launcher_encoded" ] || fail 'cannot encode the Windows AgentQ launcher wrapper'
+    remote_command="powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $windows_launcher_encoded"
+}
+
+make_client_temporary_file() {
+    # mktemp honors $TMPDIR, which macOS points at /var/folders/... -- long, but
+    # the client has no unix-socket path limit, so that is fine here.  The -t
+    # form is deliberately NOT used: it is GNU-only, and this client must run on
+    # BSD userlands too.  A fallback keeps the failure mode explicit rather than
+    # silently redirecting ssh's stderr to a path nobody reads.
+    client_temporary_directory=$1
+    client_temporary_prefix=$2
+    if [ -n "$client_temporary_directory" ] && [ -d "$client_temporary_directory" ]; then
+        mktemp "$client_temporary_directory/$client_temporary_prefix.XXXXXX" 2>/dev/null && return 0
+    fi
+    mktemp "/tmp/$client_temporary_prefix.XXXXXX" 2>/dev/null && return 0
+    printf '%s: cannot allocate a temporary file for %s\n' "$program" "$client_temporary_prefix" >&2
+    return 1
+}
+
+run_ssh_logged() {
+    ssh_log_file=$1
+    ssh_remote_command=$2
+    ssh_input_file=${3:-}
+
+    agentq_ssh_log_require_file "$ssh_log_file" || return $?
+    agentq_ssh_log_remove_file "$ssh_log_file" || return $?
+    agentq_ssh_log_require_file "$ssh_log_file" || return $?
+    # OpenSSH writes the remote command's stderr to the LOCAL stderr; -E carries
+    # only ssh's own diagnostics.  Measured on macOS with a real sshd: a remote
+    # `printf ... >&2` lands on the local stderr and the -E file gets nothing.
+    # Without this capture the server's reason line would be discarded here --
+    # which is exactly what happened before this fix.  Capture into a protected
+    # file (umask 077), never echo it.
+    ssh_stderr_capture=''
+    ssh_stderr_redirection='/dev/null'
+    if ssh_stderr_capture=$(umask 077; make_client_temporary_file "${agentq_temp_directory:-$ssh_log_file}" 'agentq-ssh-stderr'); then
+        ssh_stderr_redirection=$ssh_stderr_capture
+    fi
+    if [ -n "$ssh_input_file" ]; then
+        agentq_ssh_input_require_file "$ssh_input_file" || return $?
+        if [ "$remote_platform" = windows ]; then
+            if windows_argument_expected_identity=$(windows_argument_identity_for_path "$ssh_input_file"); then
+                windows_argument_verify_identity "$ssh_input_file" "$windows_argument_expected_identity" 'before SSH consumption' || return $?
+            else
+                printf '%s: refusing to consume an untracked Windows argument temporary: %s\n' "$program" "$ssh_input_file" >&2
+                return 2
+            fi
+        fi
+        agentq_ssh_input_require_existing_file "$ssh_input_file" || return $?
+        if "$ssh_binary" \
+            -E "$ssh_log_file" \
+            -o LogLevel=ERROR \
+            $ssh_credential_option_lines \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=12 \
+            -o TCPKeepAlive=yes \
+            -- "$host" "$ssh_remote_command" < "$ssh_input_file" 2>"$ssh_stderr_redirection"; then
+            ssh_status=0
+        else
+            ssh_status=$?
+        fi
+    else
+        if "$ssh_binary" \
+            -E "$ssh_log_file" \
+            -o LogLevel=ERROR \
+            $ssh_credential_option_lines \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=12 \
+            -o TCPKeepAlive=yes \
+            -- "$host" "$ssh_remote_command" 2>"$ssh_stderr_redirection"; then
+            ssh_status=0
+        else
+            ssh_status=$?
+        fi
+    fi
+
+    agentq_remote_failure_reason_value=''
+    if [ -n "$ssh_stderr_capture" ]; then
+        if [ -s "$ssh_stderr_capture" ]; then
+            if ssh_failure_reason=$(agentq_remote_failure_reason "$ssh_stderr_capture"); then
+                agentq_remote_failure_reason_value=$ssh_failure_reason
+            fi
+        fi
+        rm -f -- "$ssh_stderr_capture" || true
+    fi
+    agentq_ssh_log_require_file "$ssh_log_file" || return $?
+    if [ -s "$ssh_log_file" ]; then
+        agentq_ssh_log_require_file "$ssh_log_file" || return $?
+        write_ssh_diagnostic_metadata "$ssh_log_file"
+    fi
+    return "$ssh_status"
+}
+
+run_submit_with_recovery() {
+    agentq_recovery_request_id=$1
+    agentq_recovery_submit_command=$2
+    agentq_recovery_submit_input=$3
+    agentq_recovery_lookup_command=$4
+    agentq_recovery_lookup_input=$5
+    agentq_recovery_attempt=0
+    agentq_recovery_cleanup_failure_status=0
+    resolve_agentq_temp_directory || return $?
+    agentq_recovery_output_file=$(mktemp "$agentq_temp_directory/agentq-submit.XXXXXX") || {
+        printf '%s: cannot create a temporary file for submit recovery\n' "$program" >&2
+        return 2
+    }
+    recovery_output_require_file "$agentq_recovery_output_file" || return $?
+    agentq_recovery_log_file=$(mktemp "$agentq_temp_directory/agentq-submit-log.XXXXXX") || {
+        agentq_recovery_status=2
+        if recovery_output_remove_file "$agentq_recovery_output_file"; then
+            recovery_output_cleanup_status=0
+        else
+            recovery_output_cleanup_status=$?
+            if [ "$agentq_recovery_status" -eq 0 ]; then
+                agentq_recovery_status=$recovery_output_cleanup_status
+            fi
+        fi
+        printf '%s: cannot create a temporary SSH log for submit recovery\n' "$program" >&2
+        return "$agentq_recovery_status"
+    }
+
+    while :; do
+        if run_submit_recovery_ssh "$agentq_recovery_submit_command" "$agentq_recovery_submit_input"; then
+            if recovery_output_require_existing_file "$agentq_recovery_output_file" &&
+                validate_json_response "$agentq_recovery_output_file" submit "$agentq_recovery_request_id"; then
+                :
+            else
+                agentq_recovery_status=$?
+                if recovery_output_remove_file "$agentq_recovery_output_file"; then
+                    agentq_recovery_output_cleanup_status=0
+                else
+                    agentq_recovery_output_cleanup_status=$?
+                    if [ "$agentq_recovery_status" -eq 0 ]; then
+                        agentq_recovery_status=$agentq_recovery_output_cleanup_status
+                    fi
+                fi
+                if agentq_ssh_log_remove_file "$agentq_recovery_log_file"; then
+                    agentq_recovery_log_cleanup_status=0
+                else
+                    agentq_recovery_log_cleanup_status=$?
+                    if [ "$agentq_recovery_status" -eq 0 ]; then
+                        agentq_recovery_status=$agentq_recovery_log_cleanup_status
+                    fi
+                fi
+                return "$agentq_recovery_status"
+            fi
+            recovery_output_require_existing_file "$agentq_recovery_output_file" || return $?
+            cat "$agentq_recovery_output_file"
+            if recovery_output_remove_file "$agentq_recovery_output_file"; then
+                agentq_recovery_output_cleanup_status=0
+            else
+                agentq_recovery_output_cleanup_status=$?
+            fi
+            if agentq_ssh_log_remove_file "$agentq_recovery_log_file"; then
+                agentq_recovery_log_cleanup_status=0
+            else
+                agentq_recovery_log_cleanup_status=$?
+            fi
+            if [ "$agentq_recovery_output_cleanup_status" -ne 0 ]; then
+                return "$agentq_recovery_output_cleanup_status"
+            fi
+            if [ "$agentq_recovery_log_cleanup_status" -ne 0 ]; then
+                return "$agentq_recovery_log_cleanup_status"
+            fi
+            return "$agentq_recovery_cleanup_failure_status"
+        else
+            agentq_recovery_status=$?
+        fi
+
+        if [ "$agentq_recovery_status" -ne 255 ] || ! ssh_transport_error "$agentq_recovery_log_file"; then
+            if recovery_output_require_existing_file "$agentq_recovery_output_file"; then
+                cat "$agentq_recovery_output_file"
+            else
+                agentq_recovery_status=$?
+            fi
+            if recovery_output_remove_file "$agentq_recovery_output_file"; then
+                agentq_recovery_output_cleanup_status=0
+            else
+                agentq_recovery_output_cleanup_status=$?
+                if [ "$agentq_recovery_status" -eq 0 ]; then
+                    agentq_recovery_status=$agentq_recovery_output_cleanup_status
+                fi
+            fi
+            if agentq_ssh_log_remove_file "$agentq_recovery_log_file"; then
+                agentq_recovery_log_cleanup_status=0
+            else
+                agentq_recovery_log_cleanup_status=$?
+                if [ "$agentq_recovery_status" -eq 0 ]; then
+                    agentq_recovery_status=$agentq_recovery_log_cleanup_status
+                fi
+            fi
+            return "$agentq_recovery_status"
+        fi
+
+        agentq_recovery_attempt=$((agentq_recovery_attempt + 1))
+        if [ "$agentq_recovery_attempt" -gt "$submit_retry_attempts" ]; then
+            if recovery_output_remove_file "$agentq_recovery_output_file"; then
+                agentq_recovery_output_cleanup_status=0
+            else
+                agentq_recovery_output_cleanup_status=$?
+                if [ "$agentq_recovery_status" -eq 0 ]; then
+                    agentq_recovery_status=$agentq_recovery_output_cleanup_status
+                fi
+            fi
+            if agentq_ssh_log_remove_file "$agentq_recovery_log_file"; then
+                agentq_recovery_log_cleanup_status=0
+            else
+                agentq_recovery_log_cleanup_status=$?
+                if [ "$agentq_recovery_status" -eq 0 ]; then
+                    agentq_recovery_status=$agentq_recovery_log_cleanup_status
+                fi
+            fi
+            printf '%s: SSH transport remained unavailable while submitting request %s; recover later with: %s --host %s lookup %s\n' \
+                "$program" "$agentq_recovery_request_id" "$program" "$host" "$agentq_recovery_request_id" >&2
+            return "$agentq_recovery_status"
+        fi
+
+        printf '%s: SSH transport lost while submitting request %s; reconciling attempt %s/%s...\n' \
+            "$program" "$agentq_recovery_request_id" "$agentq_recovery_attempt" "$submit_retry_attempts" >&2
+        sleep "$submit_retry_delay"
+
+        if run_submit_recovery_ssh "$agentq_recovery_lookup_command" "$agentq_recovery_lookup_input"; then
+            agentq_recovery_status=0
+            if recovery_output_require_existing_file "$agentq_recovery_output_file" &&
+                validate_json_response "$agentq_recovery_output_file" lookup "$agentq_recovery_request_id"; then
+                :
+            else
+                agentq_recovery_status=$?
+                if recovery_output_remove_file "$agentq_recovery_output_file"; then
+                    agentq_recovery_output_cleanup_status=0
+                else
+                    agentq_recovery_output_cleanup_status=$?
+                    if [ "$agentq_recovery_status" -eq 0 ]; then
+                        agentq_recovery_status=$agentq_recovery_output_cleanup_status
+                    fi
+                fi
+                if agentq_ssh_log_remove_file "$agentq_recovery_log_file"; then
+                    agentq_recovery_log_cleanup_status=0
+                else
+                    agentq_recovery_log_cleanup_status=$?
+                    if [ "$agentq_recovery_status" -eq 0 ]; then
+                        agentq_recovery_status=$agentq_recovery_log_cleanup_status
+                    fi
+                fi
+                return "$agentq_recovery_status"
+            fi
+            recovery_output_require_existing_file "$agentq_recovery_output_file" || return $?
+            cat "$agentq_recovery_output_file"
+            if recovery_output_remove_file "$agentq_recovery_output_file"; then
+                agentq_recovery_output_cleanup_status=0
+            else
+                agentq_recovery_output_cleanup_status=$?
+            fi
+            if agentq_ssh_log_remove_file "$agentq_recovery_log_file"; then
+                agentq_recovery_log_cleanup_status=0
+            else
+                agentq_recovery_log_cleanup_status=$?
+            fi
+            if [ "$agentq_recovery_output_cleanup_status" -eq 0 ]; then
+                return "$agentq_recovery_log_cleanup_status"
+            fi
+            return "$agentq_recovery_output_cleanup_status"
+        else
+            agentq_recovery_status=$?
+        fi
+
+        if [ "$agentq_recovery_status" -eq 3 ] ||
+            [ "$agentq_recovery_status" -eq 4 ] ||
+            [ "$agentq_recovery_status" -eq 5 ]; then
+            if recovery_output_require_existing_file "$agentq_recovery_output_file" &&
+                validate_json_response "$agentq_recovery_output_file" lookup "$agentq_recovery_request_id"; then
+                :
+            else
+                agentq_recovery_status=$?
+                if recovery_output_remove_file "$agentq_recovery_output_file"; then
+                    agentq_recovery_output_cleanup_status=0
+                else
+                    agentq_recovery_output_cleanup_status=$?
+                    if [ "$agentq_recovery_status" -eq 0 ]; then
+                        agentq_recovery_status=$agentq_recovery_output_cleanup_status
+                    fi
+                fi
+                if agentq_ssh_log_remove_file "$agentq_recovery_log_file"; then
+                    agentq_recovery_log_cleanup_status=0
+                else
+                    agentq_recovery_log_cleanup_status=$?
+                    if [ "$agentq_recovery_status" -eq 0 ]; then
+                        agentq_recovery_status=$agentq_recovery_log_cleanup_status
+                    fi
+                fi
+                return "$agentq_recovery_status"
+            fi
+        fi
+
+        if [ "$agentq_recovery_status" -eq 3 ]; then
+            if recovery_output_remove_file "$agentq_recovery_output_file"; then
+                agentq_recovery_output_cleanup_status=0
+            else
+                agentq_recovery_output_cleanup_status=$?
+            fi
+            if agentq_ssh_log_remove_file "$agentq_recovery_log_file"; then
+                agentq_recovery_log_cleanup_status=0
+            else
+                agentq_recovery_log_cleanup_status=$?
+            fi
+            if [ "$agentq_recovery_output_cleanup_status" -ne 0 ]; then
+                return "$agentq_recovery_output_cleanup_status"
+            fi
+            if [ "$agentq_recovery_log_cleanup_status" -ne 0 ]; then
+                return "$agentq_recovery_log_cleanup_status"
+            fi
+            continue
+        fi
+        if [ "$agentq_recovery_status" -eq 4 ]; then
+            if recovery_output_require_existing_file "$agentq_recovery_output_file"; then
+                cat "$agentq_recovery_output_file"
+            else
+                agentq_recovery_status=$?
+            fi
+            if recovery_output_remove_file "$agentq_recovery_output_file"; then
+                agentq_recovery_output_cleanup_status=0
+            else
+                agentq_recovery_output_cleanup_status=$?
+                if [ "$agentq_recovery_status" -eq 0 ]; then
+                    agentq_recovery_status=$agentq_recovery_output_cleanup_status
+                fi
+            fi
+            if agentq_ssh_log_remove_file "$agentq_recovery_log_file"; then
+                agentq_recovery_log_cleanup_status=0
+            else
+                agentq_recovery_log_cleanup_status=$?
+                if [ "$agentq_recovery_status" -eq 0 ]; then
+                    agentq_recovery_status=$agentq_recovery_log_cleanup_status
+                fi
+            fi
+            return "$agentq_recovery_status"
+        fi
+        if [ "$agentq_recovery_status" -eq 5 ]; then
+            if recovery_output_require_existing_file "$agentq_recovery_output_file"; then
+                cat "$agentq_recovery_output_file"
+            else
+                agentq_recovery_status=$?
+            fi
+            if recovery_output_remove_file "$agentq_recovery_output_file"; then
+                agentq_recovery_output_cleanup_status=0
+            else
+                agentq_recovery_output_cleanup_status=$?
+                if [ "$agentq_recovery_status" -eq 0 ]; then
+                    agentq_recovery_status=$agentq_recovery_output_cleanup_status
+                fi
+            fi
+            if agentq_ssh_log_remove_file "$agentq_recovery_log_file"; then
+                agentq_recovery_log_cleanup_status=0
+            else
+                agentq_recovery_log_cleanup_status=$?
+                if [ "$agentq_recovery_status" -eq 0 ]; then
+                    agentq_recovery_status=$agentq_recovery_log_cleanup_status
+                fi
+            fi
+            return "$agentq_recovery_status"
+        fi
+        if [ "$agentq_recovery_status" -eq 255 ] && ssh_transport_error "$agentq_recovery_log_file"; then
+            if recovery_output_remove_file "$agentq_recovery_output_file"; then
+                agentq_recovery_output_cleanup_status=0
+            else
+                agentq_recovery_output_cleanup_status=$?
+                if [ "$agentq_recovery_cleanup_failure_status" -eq 0 ]; then
+                    agentq_recovery_cleanup_failure_status=$agentq_recovery_output_cleanup_status
+                fi
+            fi
+            if agentq_ssh_log_remove_file "$agentq_recovery_log_file"; then
+                agentq_recovery_log_cleanup_status=0
+            else
+                agentq_recovery_log_cleanup_status=$?
+                if [ "$agentq_recovery_cleanup_failure_status" -eq 0 ]; then
+                    agentq_recovery_cleanup_failure_status=$agentq_recovery_log_cleanup_status
+                fi
+            fi
+            continue
+        fi
+
+        if recovery_output_require_existing_file "$agentq_recovery_output_file"; then
+            cat "$agentq_recovery_output_file"
+        else
+            agentq_recovery_status=$?
+        fi
+        if recovery_output_remove_file "$agentq_recovery_output_file"; then
+            agentq_recovery_output_cleanup_status=0
+        else
+            agentq_recovery_output_cleanup_status=$?
+            if [ "$agentq_recovery_status" -eq 0 ]; then
+                agentq_recovery_status=$agentq_recovery_output_cleanup_status
+            fi
+        fi
+        if agentq_ssh_log_remove_file "$agentq_recovery_log_file"; then
+            agentq_recovery_log_cleanup_status=0
+        else
+            agentq_recovery_log_cleanup_status=$?
+            if [ "$agentq_recovery_status" -eq 0 ]; then
+                agentq_recovery_status=$agentq_recovery_log_cleanup_status
+            fi
+        fi
+        return "$agentq_recovery_status"
+    done
+}
+
+run_safe_operation_with_recovery() {
+    agentq_operation_name=$1
+    agentq_operation_command=$2
+    agentq_operation_input=$3
+    agentq_operation_request_id=${4:-}
+    agentq_operation_expected_task_id=${5:-}
+    agentq_operation_attempt=0
+    resolve_agentq_temp_directory || return $?
+    agentq_operation_output_file=$(mktemp "$agentq_temp_directory/agentq-operation.XXXXXX") || {
+        printf '%s: cannot create a temporary file for %s recovery\n' "$program" "$agentq_operation_name" >&2
+        return 2
+    }
+    operation_output_require_file "$agentq_operation_output_file" || return $?
+    agentq_operation_log_file=$(mktemp "$agentq_temp_directory/agentq-operation-log.XXXXXX") || {
+        agentq_operation_status=2
+        if operation_output_remove_file "$agentq_operation_output_file"; then
+            operation_output_cleanup_status=0
+        else
+            operation_output_cleanup_status=$?
+        fi
+        printf '%s: cannot create a temporary SSH log for %s recovery\n' "$program" "$agentq_operation_name" >&2
+        return "$agentq_operation_status"
+    }
+
+    while :; do
+        if run_operation_ssh "$agentq_operation_command" "$agentq_operation_input"; then
+            if operation_output_require_existing_file "$agentq_operation_output_file" &&
+                validate_json_response "$agentq_operation_output_file" "$agentq_operation_name" "$agentq_operation_request_id" "$agentq_operation_expected_task_id"; then
+                if [ "$agentq_operation_name" = wait ]; then
+                    if validate_wait_response "$agentq_operation_output_file" 0 "$agentq_operation_expected_task_id"; then
+                        :
+                    else
+                        agentq_operation_status=$?
+                        if operation_output_remove_file "$agentq_operation_output_file"; then
+                            :
+                        else
+                            operation_output_cleanup_status=$?
+                            if [ "$agentq_operation_status" -eq 0 ]; then
+                                agentq_operation_status=$operation_output_cleanup_status
+                            fi
+                        fi
+                        if agentq_ssh_log_remove_file "$agentq_operation_log_file"; then
+                            :
+                        else
+                            operation_log_cleanup_status=$?
+                            if [ "$agentq_operation_status" -eq 0 ]; then
+                                agentq_operation_status=$operation_log_cleanup_status
+                            fi
+                        fi
+                        return "$agentq_operation_status"
+                    fi
+                fi
+                :
+            else
+                agentq_operation_status=$?
+                if operation_output_remove_file "$agentq_operation_output_file"; then
+                    :
+                else
+                    operation_output_cleanup_status=$?
+                    if [ "$agentq_operation_status" -eq 0 ]; then
+                        agentq_operation_status=$operation_output_cleanup_status
+                    fi
+                fi
+                if agentq_ssh_log_remove_file "$agentq_operation_log_file"; then
+                    :
+                else
+                    operation_log_cleanup_status=$?
+                    if [ "$agentq_operation_status" -eq 0 ]; then
+                        agentq_operation_status=$operation_log_cleanup_status
+                    fi
+                fi
+                return "$agentq_operation_status"
+            fi
+            operation_output_require_existing_file "$agentq_operation_output_file" || return $?
+            cat "$agentq_operation_output_file"
+            if operation_output_remove_file "$agentq_operation_output_file"; then
+                agentq_operation_output_cleanup_status=0
+            else
+                agentq_operation_output_cleanup_status=$?
+            fi
+            if agentq_ssh_log_remove_file "$agentq_operation_log_file"; then
+                agentq_operation_log_cleanup_status=0
+            else
+                agentq_operation_log_cleanup_status=$?
+            fi
+            if [ "$agentq_operation_output_cleanup_status" -eq 0 ]; then
+                return "$agentq_operation_log_cleanup_status"
+            fi
+            return "$agentq_operation_output_cleanup_status"
+        else
+            agentq_operation_status=$?
+        fi
+
+        if [ "$agentq_operation_name" = lookup ] && {
+            [ "$agentq_operation_status" -eq 3 ] ||
+            [ "$agentq_operation_status" -eq 4 ] ||
+            [ "$agentq_operation_status" -eq 5 ]
+        }; then
+            if operation_output_require_existing_file "$agentq_operation_output_file" &&
+                validate_json_response "$agentq_operation_output_file" lookup "$agentq_operation_request_id"; then
+                :
+            else
+                agentq_operation_status=$?
+                if operation_output_remove_file "$agentq_operation_output_file"; then
+                    :
+                else
+                    operation_output_cleanup_status=$?
+                    if [ "$agentq_operation_status" -eq 0 ]; then
+                        agentq_operation_status=$operation_output_cleanup_status
+                    fi
+                fi
+                if agentq_ssh_log_remove_file "$agentq_operation_log_file"; then
+                    :
+                else
+                    operation_log_cleanup_status=$?
+                    if [ "$agentq_operation_status" -eq 0 ]; then
+                        agentq_operation_status=$operation_log_cleanup_status
+                    fi
+                fi
+                return "$agentq_operation_status"
+            fi
+        fi
+
+        # The reason class is the only channel by which a caller driving this
+        # client can tell a retryable lock rejection from an argument error, so
+        # surface it for every failed operation -- not only for the two mutating
+        # commands.  Only the controlled token is forwarded; raw diagnostics stay
+        # withheld below.
+        if [ "$agentq_operation_status" -ne 0 ] && [ -n "$agentq_remote_failure_reason_value" ]; then
+            printf '%s: remote failure reason: %s\n' "$program" "$agentq_remote_failure_reason_value" >&2
+        fi
+
+        if [ "$agentq_operation_status" -ne 255 ] || ! ssh_transport_error "$agentq_operation_log_file"; then
+            if [ "$agentq_operation_name" = wait ] && {
+                [ "$agentq_operation_status" -eq 1 ] ||
+                [ "$agentq_operation_status" -eq 5 ] ||
+                [ "$agentq_operation_status" -eq 6 ]
+            }; then
+                if operation_output_require_existing_file "$agentq_operation_output_file" &&
+                    validate_wait_response "$agentq_operation_output_file" "$agentq_operation_status" "$agentq_operation_expected_task_id"; then
+                    :
+                else
+                    agentq_wait_validation_status=$?
+                    if operation_output_remove_file "$agentq_operation_output_file"; then
+                        :
+                    else
+                        operation_output_cleanup_status=$?
+                        if [ "$agentq_wait_validation_status" -eq 0 ]; then
+                            agentq_wait_validation_status=$operation_output_cleanup_status
+                        fi
+                    fi
+                    if agentq_ssh_log_remove_file "$agentq_operation_log_file"; then
+                        :
+                    else
+                        operation_log_cleanup_status=$?
+                        if [ "$agentq_wait_validation_status" -eq 0 ]; then
+                            agentq_wait_validation_status=$operation_log_cleanup_status
+                        fi
+                    fi
+                    return "$agentq_wait_validation_status"
+                fi
+            fi
+            if operation_output_require_existing_file "$agentq_operation_output_file"; then
+                cat "$agentq_operation_output_file"
+            else
+                agentq_operation_status=$?
+            fi
+            if operation_output_remove_file "$agentq_operation_output_file"; then
+                operation_output_cleanup_status=0
+            else
+                operation_output_cleanup_status=$?
+                if [ "$agentq_operation_status" -eq 0 ]; then
+                    agentq_operation_status=$operation_output_cleanup_status
+                fi
+            fi
+            if agentq_ssh_log_remove_file "$agentq_operation_log_file"; then
+                operation_log_cleanup_status=0
+            else
+                operation_log_cleanup_status=$?
+                if [ "$agentq_operation_status" -eq 0 ]; then
+                    agentq_operation_status=$operation_log_cleanup_status
+                fi
+            fi
+            return "$agentq_operation_status"
+        fi
+
+        agentq_operation_attempt=$((agentq_operation_attempt + 1))
+        if [ "$agentq_operation_attempt" -gt "$operation_retry_attempts" ]; then
+            if operation_output_remove_file "$agentq_operation_output_file"; then
+                operation_output_cleanup_status=0
+            else
+                operation_output_cleanup_status=$?
+                if [ "$agentq_operation_status" -eq 0 ]; then
+                    agentq_operation_status=$operation_output_cleanup_status
+                fi
+            fi
+            if agentq_ssh_log_remove_file "$agentq_operation_log_file"; then
+                operation_log_cleanup_status=0
+            else
+                operation_log_cleanup_status=$?
+                if [ "$agentq_operation_status" -eq 0 ]; then
+                    agentq_operation_status=$operation_log_cleanup_status
+                fi
+            fi
+            printf '%s: SSH transport remained unavailable while running %s on %s\n' \
+                "$program" "$agentq_operation_name" "$host" >&2
+            return "$agentq_operation_status"
+        fi
+
+        printf '%s: SSH transport lost while running %s; retrying %s/%s...\n' \
+            "$program" "$agentq_operation_name" "$agentq_operation_attempt" "$operation_retry_attempts" >&2
+        sleep "$operation_retry_delay"
+    done
+}
+
+is_positive_integer "$submit_retry_attempts" || fail 'AGENTQ_SUBMIT_RETRY_ATTEMPTS must be a positive integer'
+is_positive_integer "$submit_retry_delay" || fail 'AGENTQ_SUBMIT_RETRY_DELAY must be a positive integer'
+is_positive_integer "$operation_retry_attempts" || fail 'AGENTQ_OPERATION_RETRY_ATTEMPTS must be a positive integer'
+is_positive_integer "$operation_retry_delay" || fail 'AGENTQ_OPERATION_RETRY_DELAY must be a positive integer'
+is_positive_integer "$platform_probe_timeout" || fail 'AGENTQ_PLATFORM_PROBE_TIMEOUT must be a positive integer'
+
+# Resolve and validate the credential source before anything reaches ssh --
+# including the platform probe, which is itself an ssh call that runs before
+# operation dispatch.  A source that is configured but unusable is refused here
+# rather than silently degrading to key-only authentication.
+resolve_credential_source
+prepare_credential_delivery || exit $?
+ssh_credential_option_lines=$(ssh_credential_options)
+
+# Exported rather than prefixed per call site: all four ssh invocations need
+# them, and the probe path runs ssh in the background, where a per-command
+# prefix would have to be repeated identically in two branches.
+#
+# The `-n` test is load-bearing.  An exported but EMPTY SSH_ASKPASS is not the
+# same as an unset one to OpenSSH: it tests `getenv(...) != NULL`, which an
+# empty string satisfies, and then tries to exec the empty string as a program.
+# So the askpass environment is set only when there really is a program, which
+# is also exactly what the AGENTQ_PASSWORD_PROMPT source needs -- there ssh must
+# read the terminal itself.
+if [ -n "$agentq_askpass_program" ]; then
+    SSH_ASKPASS=$agentq_askpass_program
+    SSH_ASKPASS_REQUIRE=force
+    export SSH_ASKPASS SSH_ASKPASS_REQUIRE
+else
+    # The prompt source means "let ssh ask on the terminal", so a conflicting
+    # SSH_ASKPASS_REQUIRE inherited from the environment must not silently
+    # redirect the prompt somewhere else.
+    unset SSH_ASKPASS SSH_ASKPASS_REQUIRE 2>/dev/null || true
+fi
+
+host=$default_host
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --host)
+            [ "$#" -ge 2 ] || fail '--host requires an SSH host'
+            host=$2
+            shift 2
+            ;;
+        -h|--help|help)
+            usage
+            exit 0
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+[ -n "$host" ] || fail 'no SSH host configured; pass --host or set AGENTQ_HOST'
+[ "$#" -ge 1 ] || {
+    usage >&2
+    exit 2
+}
+
+resolve_ssh_binary
+resolve_json_parser
+initialize_remote_invocation
+
+operation=$1
+shift
+
+case "$operation" in
+    submit)
+        workdir=''
+        label='command'
+        request_id=''
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --workdir)
+                    [ "$#" -ge 2 ] || fail '--workdir requires a directory'
+                    workdir=$2
+                    shift 2
+                    ;;
+                --label)
+                    [ "$#" -ge 2 ] || fail '--label requires a label'
+                    label=$2
+                    shift 2
+                    ;;
+                --request-id)
+                    [ "$#" -ge 2 ] || fail '--request-id requires a value'
+                    request_id=$2
+                    shift 2
+                    ;;
+                --)
+                    shift
+                    break
+                    ;;
+                *)
+                    fail "unknown submit option: $1"
+                    ;;
+            esac
+        done
+        [ -n "$workdir" ] || fail '--workdir is required'
+        [ "$#" -gt 0 ] || fail 'submit requires a command after --'
+        if [ -z "$request_id" ]; then
+            request_id=$(generate_request_id)
+        fi
+        is_request_id "$request_id" || fail '--request-id must be 16-128 ASCII letters, numbers, dots, underscores, or hyphens and start with a letter or number'
+
+        append_arg submit
+        append_arg --workdir
+        append_arg "$workdir"
+        append_arg --label
+        append_arg "$label"
+        append_arg --request-id
+        append_arg "$request_id"
+        append_arg --
+        for argument in "$@"; do
+            append_arg "$argument"
+        done
+
+        if [ "$remote_platform" = windows ]; then
+            build_windows_remote_command
+            submit_command=$remote_command
+            submit_input_file=$remote_input_file
+            submit_input_file_identity=$remote_input_file_identity
+            reset_windows_argument_stream
+            append_arg lookup
+            append_arg "$request_id"
+            build_windows_remote_command
+            lookup_command=$remote_command
+            lookup_input_file=$remote_input_file
+            lookup_input_file_identity=$remote_input_file_identity
+        else
+            submit_command=$remote_command
+            remote_command=$remote_base_command
+            append_arg lookup
+            append_arg "$request_id"
+            lookup_command=$remote_command
+            submit_input_file=''
+            lookup_input_file=''
+        fi
+        run_submit_with_recovery "$request_id" "$submit_command" "$submit_input_file" "$lookup_command" "$lookup_input_file"
+        exit $?
+        ;;
+    lookup)
+        [ "$#" -eq 1 ] || fail 'lookup requires one request id'
+        is_request_id "$1" || fail 'request id must be 16-128 ASCII letters, numbers, dots, underscores, or hyphens and start with a letter or number'
+        lookup_request_id=$1
+        append_arg lookup
+        append_arg "$1"
+        ;;
+    status|doctor)
+        [ "$#" -eq 0 ] || fail "$operation accepts no arguments"
+        append_arg "$operation"
+        ;;
+    logs)
+        [ "$#" -eq 1 ] || [ "$#" -eq 3 ] || fail 'logs requires a task id and optional --tail <lines>'
+        is_task_id "$1" || fail 'task id must be a non-negative integer'
+        append_arg logs
+        append_arg "$1"
+        if [ "$#" -eq 3 ]; then
+            [ "$2" = '--tail' ] || fail 'logs accepts only --tail <lines>'
+            is_positive_integer_or_all "$3" || fail '--tail must be a positive integer or all'
+            append_arg --tail
+            append_arg "$3"
+        fi
+        ;;
+    cancel|wait|remove)
+        [ "$#" -eq 1 ] || fail "$operation requires one task id"
+        is_task_id "$1" || fail 'task id must be a non-negative integer'
+        append_arg "$operation"
+        append_arg "$1"
+        ;;
+    *)
+        fail "unknown command: $operation"
+        ;;
+esac
+
+if [ "$remote_platform" = windows ]; then
+    build_windows_remote_command
+fi
+
+case "$operation" in
+    lookup|status|logs|wait|doctor)
+        if [ "$operation" = lookup ]; then
+            run_safe_operation_with_recovery "$operation" "$remote_command" "$remote_input_file" "$lookup_request_id"
+        elif [ "$operation" = logs ] || [ "$operation" = wait ]; then
+            run_safe_operation_with_recovery "$operation" "$remote_command" "$remote_input_file" '' "$1"
+        else
+            run_safe_operation_with_recovery "$operation" "$remote_command" "$remote_input_file"
+        fi
+        exit $?
+        ;;
+    cancel|remove)
+        mutation_log_file=$(mktemp "$agentq_temp_directory/agentq-mutation-log.XXXXXX") || fail "cannot create a temporary SSH log for $operation"
+        mutation_output_file=$(mktemp "$agentq_temp_directory/agentq-mutation-output.XXXXXX") || fail "cannot create a temporary output file for $operation"
+        mutation_output_require_file "$mutation_output_file" || exit $?
+        mutation_status=2
+        if run_mutation_ssh "$remote_command" "$remote_input_file"; then
+            if mutation_output_require_existing_file "$mutation_output_file"; then
+                if validate_json_response "$mutation_output_file" "$operation" '' "$1"; then
+                    mutation_status=0
+                else
+                    mutation_status=$?
+                fi
+            else
+                mutation_status=$?
+            fi
+        else
+            mutation_status=$?
+            if [ "$operation" = cancel ] && [ "$mutation_status" -eq 4 ]; then
+                if mutation_output_require_existing_file "$mutation_output_file"; then
+                    if validate_json_response "$mutation_output_file" cancel_pending '' "$1"; then
+                        :
+                    else
+                        mutation_status=$?
+                    fi
+                else
+                    mutation_status=$?
+                fi
+            fi
+        fi
+        # cancel/remove take this path, and it is precisely the path where the
+        # reason class matters most: `task_not_running` and `lock_contention` are
+        # both exit 2 and call for opposite responses.  Without this the class
+        # would be available for every read-only operation and missing for the
+        # two mutating ones.  Raw diagnostics stay withheld here as everywhere
+        # else; only the controlled token is forwarded.
+        if [ "$mutation_status" -ne 0 ] && [ -n "$agentq_remote_failure_reason_value" ]; then
+            printf '%s: remote failure reason: %s\n' "$program" "$agentq_remote_failure_reason_value" >&2
+        fi
+        if [ "$mutation_status" -ne 2 ]; then
+            if mutation_output_require_existing_file "$mutation_output_file"; then
+                cat "$mutation_output_file"
+            else
+                mutation_status=$?
+            fi
+        fi
+        if mutation_output_remove_file "$mutation_output_file"; then
+            :
+        else
+            mutation_output_cleanup_status=$?
+            if [ "$mutation_status" -eq 0 ]; then
+                mutation_status=$mutation_output_cleanup_status
+            fi
+        fi
+        mutation_output_file=''
+        if agentq_ssh_log_remove_file "$mutation_log_file"; then
+            :
+        else
+            mutation_log_cleanup_status=$?
+            if [ "$mutation_status" -eq 0 ]; then
+                mutation_status=$mutation_log_cleanup_status
+            fi
+        fi
+        mutation_log_file=''
+        exit "$mutation_status"
+        ;;
+esac
