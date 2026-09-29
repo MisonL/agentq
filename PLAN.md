@@ -575,7 +575,7 @@ mutation。（`record 7` 是 `aq-c1-q..q7`，`task_id` 全是 16——那是我�
 **顺带纠正一处文档失真**：`CLAUDE.md` 的覆盖边界一节曾写「没有编译器、没有类型
 系统、**没有 git**」，git 落地后已改为如实描述。
 
-**`HANDOFF.md` 第五节「保留 dirty worktree」已按 B1 原计划改写**：保留那一条是因为
+**`HANDOFF.md` 的「不使用 `git reset --hard`…」那条操作规则已按 B1 原计划改写**：保留那一条是因为
 它防的是 `git reset --hard` / `git checkout --` 这类**销毁工作**的操作——本会话真的
 因为先删备份再 `git reset --hard baseline` 把工作树回退过，是靠 git 对象
 `dcff709` 逐字节恢复的。规则没变，理由写清楚了。

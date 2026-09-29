@@ -48,15 +48,16 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
 5. **P2-18 外部审查**：明确审查主体、输入版本、验收标准和授权边界后，另立外部
    approval receipt、live security acceptance 和 final adjudication 证据；目前没有
    当前授权，也没有可替代它们的现有证据。
-6. **项目版本控制管理**：当前 `/Volumes/Work/code/agentq` 没有 `.git` 目录，因而
-   不能用 Git 状态确认该项目的未提交改动。若后续需要提交或审计版本差异，必须先由
-   用户明确决定是否初始化/接入版本库；在此之前以文件和 `CHANGELOG.md` 为准。
+6. **项目版本控制管理**：**已解决**（2026-09-29，用户明确授权）：本仓已 `git init`
+   并完成基线提交，`git status` / `git diff` 现在可用。`.gitattributes` 用 `* -text`
+   钉住字节一致性（开发机 `core.autocrlf=input` 会把 canonical 资产改坏），
+   `.gitignore` 用机制挡住凭据落库。详见 `PLAN.md` B1。
 
 以下事项已明确取消或不构成后续任务：压力、重启、注销、物理断电验收；历史全量扫描、
 完整历史 `shasum -c`；以及未获授权的远端安装、服务变更、队列 mutation、凭证操作或
 生产写入。它们不得重新写入 Goal、待办清单或完成门槛。
 
-## 四、明确未完成、取消或未授权事项
+## 二、明确未完成、取消或未授权事项
 
 以下事项不能在交接时被写成“已完成”：
 
@@ -80,7 +81,7 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
 7. 任何历史文档中出现的 `active` 标记。它们是当时的记录字段，不代表当前 Goal
    仍活动；上一轮 Goal 已完成，当前没有活动 Goal。
 
-## 五、操作规则
+## 三、操作规则
 
 - 新主机先运行：`agentq --host <host> doctor`。
 - AgentQ 任务只走 JSON 协议：`submit -> status/logs -> wait`，需要停止时才
@@ -103,12 +104,12 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
   说成全局验证。
 - 不在目标机运行 `codex exec`，不把 Skill 客户端降级为普通前台 SSH。
 
-## 七、关键当前文件
+## 四、关键当前文件
 
-- 运行规则与命令契约：`SKILL.md`
+- 运行规则与命令契约：`skill/SKILL.md`
 - 开发入口与流程：`CLAUDE.md`
 - 日常验证：`run-tests.sh`（`--quick` 只跑 `01`）
-- 冒烟检查：`smoke/` 下的 16 项，逐项的「覆盖什么 / 不覆盖什么」以
+- 冒烟检查：`smoke/` 下的 17 项，逐项的「覆盖什么 / 不覆盖什么」以
   `CLAUDE.md` 末节的覆盖表为准——本文件不再复制那份清单（复制过一次就漂移过一次）
 - `03`/`04`/`06`/`07` 需要 `AGENTQ_SMOKE_HOME` 指向含真实 `pueue` 的运行时，否则 SKIP；
   `03` 还要求它本身是可用运行时（`config/pueue.yml` + 已在运行的 `pueued`）。
