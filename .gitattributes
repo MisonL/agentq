@@ -1,7 +1,7 @@
 # AgentQ -- byte-exactness rules.
 #
-# The project's hard constraint is that assets/unix/agentq-server and
-# assets/windows-git-bash/agentq are byte-identical (run-tests.sh check 01
+# The project's hard constraint is that skill/assets/unix/agentq-server and
+# skill/assets/windows-git-bash/agentq are byte-identical (run-tests.sh check 01
 # asserts `cmp` returns 0).  Line-ending translation would break that, and it
 # would break it silently on a machine whose core.autocrlf is not `false` --
 # which is the common case on Windows, where these assets are actually used.
@@ -19,5 +19,5 @@
 
 # The two canonical server copies: explicitly binary, so no filter can ever
 # touch them even if a future .gitattributes adds one.
-assets/unix/agentq-server          -text -diff
-assets/windows-git-bash/agentq     -text -diff
+skill/assets/unix/agentq-server          -text -diff
+skill/assets/windows-git-bash/agentq     -text -diff

@@ -23,7 +23,13 @@
 set -euo pipefail
 
 source_home=${AGENTQ_SMOKE_HOME:-}
-client=/Volumes/Work/code/agentq/assets/client/unix/agentq
+# Resolved from the script's own location, not hard-coded: a checkout in a
+# different directory must still find the client under test.
+# Named repo_root, not root: this script reuses `root` further down for the
+# sandbox's remote home, and shadowing it here would silently break any
+# later use of the repository path.
+repo_root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+client="$repo_root/skill/assets/client/unix/agentq"
 client=${AGENTQ_SMOKE_CLIENT:-$client}
 
 if [ -z "$source_home" ] || [ ! -x "$source_home/pueue" ]; then

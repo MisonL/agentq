@@ -56,8 +56,8 @@ root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 failures=0
 rules_checked=0
 
-server_installer="$root/assets/windows-git-bash/install-agentq.ps1"
-client_installer="$root/assets/client/windows/install-client.ps1"
+server_installer="$root/skill/assets/windows-git-bash/install-agentq.ps1"
+client_installer="$root/skill/assets/client/windows/install-client.ps1"
 for file in "$server_installer" "$client_installer"; do
     [ -f "$file" ] || {
         printf 'installer-invariants: missing %s\n' "${file#"$root"/}" >&2
@@ -292,9 +292,9 @@ done
 # ceiling in either embedded wrapper, a changed ceiling in the launcher itself,
 # a changed exit code, and a dropped branch.
 rules_checked=$((rules_checked + 1))
-launcher_ps1="$root/assets/windows-git-bash/agentq-launcher.ps1"
-client_ps1="$root/assets/client/windows/agentq.ps1"
-client_posix="$root/assets/client/unix/agentq"
+launcher_ps1="$root/skill/assets/windows-git-bash/agentq-launcher.ps1"
+client_ps1="$root/skill/assets/client/windows/agentq.ps1"
+client_posix="$root/skill/assets/client/unix/agentq"
 parity_py="$root/smoke/10-launcher-parity.py"
 missing=0
 for file in "$launcher_ps1" "$client_ps1" "$client_posix" "$parity_py"; do
@@ -334,7 +334,7 @@ fi
 # Scope: the two POSIX installers only.  The Windows installers replace files
 # through .NET APIs (Move-Item / File.Replace) inside an ACL'd transaction, so
 # the shell idiom does not apply there and asserting it would be a false rule.
-posix_installers="$root/assets/client/unix/install-client.sh $root/assets/unix/install-agentq.sh"
+posix_installers="$root/skill/assets/client/unix/install-client.sh $root/skill/assets/unix/install-agentq.sh"
 for posix_installer in $posix_installers; do
     [ -f "$posix_installer" ] || {
         printf 'installer-invariants: missing %s\n' "${posix_installer#"$root"/}" >&2

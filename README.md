@@ -17,22 +17,26 @@ or Zellij session and reconnects when the OpenSSH transport drops. Do not use
 
 ## What is in this repository
 
-Everything that actually runs lives in `assets/` — 23 files:
+Everything that actually runs lives in `skill/` — one complete Skill, 25 files:
 
 ```
-assets/
-  client/unix/       POSIX agentq, sshp, install-client.sh
-  client/windows/    PowerShell / CMD / Git Bash clients and installer
-  unix/              agentq-server, install-agentq.sh, pueue.yml, systemd/launchd units
-  windows-git-bash/  agentq-server (byte-identical to the unix copy), launcher,
-                     start-daemon, installer
+skill/
+  SKILL.md             protocol contract and operating instructions
+  agents/openai.yaml   Skill metadata
+  assets/              the deployment unit — 23 files
+    client/unix/       POSIX agentq, sshp, install-client.sh
+    client/windows/    PowerShell / CMD / Git Bash clients and installer
+    unix/              agentq-server, install-agentq.sh, pueue.yml, systemd/launchd units
+    windows-git-bash/  agentq-server (byte-identical to the unix copy), launcher,
+                       start-daemon, installer
 ```
 
-Everything else — the tests, the docs, the sandbox script — exists to protect
-those 23 files.
+`skill/` mirrors `~/.agents/skills/agentq/` one for one, so installing is a
+single `rsync` of that directory. Everything else — the tests, the docs, the
+sandbox script — exists to protect those files.
 
-**Hard constraint:** `assets/unix/agentq-server` and
-`assets/windows-git-bash/agentq` must stay byte-identical. `cmp` must return 0 at
+**Hard constraint:** `skill/assets/unix/agentq-server` and
+`skill/assets/windows-git-bash/agentq` must stay byte-identical. `cmp` must return 0 at
 all times; check `01` enforces it.
 
 ## Requirements
@@ -49,26 +53,26 @@ all times; check `01` enforces it.
 **Client** (macOS, Linux, WSL):
 
 ```sh
-sh assets/client/unix/install-client.sh
-sh assets/client/unix/install-client.sh --check          # read-only drift check
+sh skill/assets/client/unix/install-client.sh
+sh skill/assets/client/unix/install-client.sh --check          # read-only drift check
 ```
 
 Installs `agentq` and `sshp` into `~/.local/bin`. `--check` reports `0` when the
 installed clients match the canonical assets, `1` on drift, `2` on an unsafe
 path — and never writes anything.
 
-**Client** (Windows): `assets/client/windows/install-client.ps1`, with the same
+**Client** (Windows): `skill/assets/client/windows/install-client.ps1`, with the same
 `-Check` contract.
 
 **Server**: stage the platform directory to the target host, then run
-`assets/unix/install-agentq.sh` (or `assets/windows-git-bash/install-agentq.ps1`).
+`skill/assets/unix/install-agentq.sh` (or `skill/assets/windows-git-bash/install-agentq.ps1`).
 The installer refuses to update while the queue has active or non-terminal tasks.
 
 ## Development
 
 Three steps, and nothing else:
 
-1. Change something under `assets/`.
+1. Change something under `skill/`.
 2. Run `./run-tests.sh`.
 3. Append a line to `CHANGELOG.md`.
 
@@ -89,14 +93,17 @@ AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq ./run-tests.sh
 skipped, and check `01` reports `ps1=skipped(...)` rather than a green light when
 `pwsh` is unavailable or unusable.
 
-**After changing `assets/`, sync the Skill directory** — it holds an independent
+**After changing anything under `skill/`, sync the whole directory** — it is the
 install source, and nothing keeps the two in step automatically:
 
 ```sh
-SKILL_ASSETS="${SKILL_ASSETS:-$HOME/.agents/skills/agentq/assets}"
-rsync -a --delete assets/ "$SKILL_ASSETS/"
-diff -rq assets "$SKILL_ASSETS"   # must print nothing
+SKILL_DIR="${SKILL_DIR:-$HOME/.agents/skills/agentq}"
+rsync -a --delete skill/ "$SKILL_DIR/"
+diff -rq skill "$SKILL_DIR"   # must print nothing
 ```
+
+Sync the *whole* directory, not just `assets/`: the previous rule synced only
+`assets/`, which left `SKILL.md` free to drift — and it had, silently.
 
 ## Documentation
 

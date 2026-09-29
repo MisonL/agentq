@@ -28,7 +28,7 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-real_assets="$root/assets/unix"
+real_assets="$root/skill/assets/unix"
 installer_source="$real_assets/install-agentq.sh"
 
 # The installer refuses any path containing a symlink component

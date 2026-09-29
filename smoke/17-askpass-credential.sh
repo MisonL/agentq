@@ -22,7 +22,7 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-client="$root/assets/client/unix/agentq"
+client="$root/skill/assets/client/unix/agentq"
 client=${AGENTQ_SMOKE_CLIENT:-$client}
 
 source_home=${AGENTQ_SMOKE_HOME:-}
