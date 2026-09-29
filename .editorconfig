@@ -1,0 +1,33 @@
+# AgentQ -- editor defaults.
+#
+# The point of this file is the same as .gitattributes: these assets are
+# deployed verbatim, and the two canonical server copies must stay
+# byte-identical.  An editor that silently rewrites indentation, line endings
+# or trailing whitespace changes what gets deployed.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# The assets themselves: leave line endings and trailing whitespace ALONE.
+# `unset` means "do not touch", not "use the platform default".  Everything
+# under assets/ is checked out and deployed as-is -- .gitattributes stores it
+# with `-text` for the same reason.  Note that the Windows assets are LF in
+# this repository; PowerShell and cmd.exe both accept that, and changing it
+# here would rewrite files that are verified byte-for-byte.
+[assets/**]
+end_of_line = unset
+trim_trailing_whitespace = false
+insert_final_newline = unset
+
+[*.{yml,yaml}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
