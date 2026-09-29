@@ -109,7 +109,7 @@ Sync the *whole* directory, not just `assets/`: the previous rule synced only
 
 | File | What it is |
 | --- | --- |
-| [`SKILL.md`](SKILL.md) | Protocol contract and operating instructions — the authoritative reference for exit codes, `cancel` semantics, and Windows terminal behaviour |
+| [`SKILL.md`](skill/SKILL.md) | Protocol contract and operating instructions — the authoritative reference for exit codes, `cancel` semantics, and Windows terminal behaviour |
 | [`CLAUDE.md`](CLAUDE.md) | Development order: what is verified, what is not, and the boundaries that are not todos |
 | [`PLAN.md`](PLAN.md) | The single authoritative list of open work |
 | [`HANDOFF.md`](HANDOFF.md) | Operating rules and limits |
