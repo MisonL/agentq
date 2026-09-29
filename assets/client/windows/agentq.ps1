@@ -461,9 +461,14 @@ function Resolve-CredentialSource {
         # "cmd.exe /c" shape was believed to work) accepted values ssh can never
         # exec, and the failure surfaced as a connection timeout -- pointing the
         # operator at the network instead of at the credential setting.
-        if ($program.Contains('"') -or $program.Contains(' ')) {
-            Stop-Credential ("AGENTQ_ASKPASS must be a single executable path with no arguments and no quotes; " +
-                "ssh executes the whole value as one file name, so neither is supported: $program")
+        if (!(Test-NonReparseWindowsFilePath -Path $program)) {
+            # Only diagnose the shape when the whole value really is not a file;
+            # otherwise the file is fine and the problem is something else.
+            if ($program.Contains('"') -or $program.Contains(' ')) {
+                Stop-Credential ("AGENTQ_ASKPASS must be a single executable path with no arguments and no quotes; " +
+                    "ssh executes the whole value as one file name, so neither is supported: $program")
+            }
+            Stop-Credential "AGENTQ_ASKPASS is not a regular non-reparse file: $program"
         }
 
         if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PASSWORD)) {

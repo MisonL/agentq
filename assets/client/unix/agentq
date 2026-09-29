@@ -457,7 +457,7 @@ resolve_credential_source() {
         # off.  (Measured: a bare path authenticates; both of the shapes below fail.)
         if [ ! -e "$agentq_askpass_program" ] && [ ! -L "$agentq_askpass_program" ]; then
             case $agentq_askpass_program in
-                \"*\"|*' '*)
+                *'"'*|*' '*)
                     credential_refuse "AGENTQ_ASKPASS must be a single executable path with no arguments and no quotes; ssh executes the whole value as one file name, so neither is supported: $agentq_askpass_program"
                     ;;
             esac

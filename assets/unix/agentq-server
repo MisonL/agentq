@@ -330,6 +330,18 @@ ensure_runtime_dependencies() {
         [ -f "$durable_move_helper" ] && [ ! -L "$durable_move_helper" ] ||
             fail "missing AgentQ Windows durable move helper: $durable_move_helper"
     fi
+
+    # Resolve the jq integer-precision probe HERE, in the top-level shell, before
+    # any subshell exists.  jq_preserves_integer_digits() caches its answer in a
+    # shell variable, but this server calls it from subshells -- the
+    # `{ ...; } | jq` pipeline in load_request_records, and several `$( )` sites --
+    # and a variable assigned inside a subshell never reaches the parent, so each
+    # subshell re-ran the probe.  Measured on a 3-record store: 10 of 28 jq
+    # invocations were this one probe.  A subshell INHERITS the parent's value, so
+    # one call here makes every later caller (subshell or not) read the cache.
+    # (This is the same `$( )` trap CLAUDE.md records three times; here it is the
+    # pipeline form of it.)
+    jq_preserves_integer_digits >/dev/null 2>&1 || true
 }
 
 is_task_id() {
