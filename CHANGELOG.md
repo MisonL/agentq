@@ -6,6 +6,9 @@
 YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 ```
 
+2026-09-29  **修正活文档里指向旧路径的资产引用**（改 `CLAUDE.md` 6 处 + `skill/SKILL.md` 1 处 + `PLAN.md` 1 处；**纯文档，`skill/assets/` 与 `smoke/` 零改动**）。Skill 移入 `skill/` 后，这些地方仍写着裸 `assets/`：`.gitattributes`/`.gitignore` 的理由段（「保护 `assets/` 的字节」）、「不要把 `assets/` 下的文件设成可执行后提交」、「凭据不得写进 `assets/`」、部署单元的定义、覆盖边界那句、`SKILL.md` 的跨版本互操作段、以及 `PLAN.md` 的同步纪律第 10 条（原写「改完 `assets/` 必须同步」，实为**整个 `skill/` 目录**，与它上方 20 行的那节自相矛盾）。**保留两处不改**：`CLAUDE.md:6` 的 `SKILL.md` + `agents/` + `assets/`（那是 `skill/` 的内部结构图，本就该是相对名）与 `CLAUDE.md:269` 的「旧规则只同步 `assets/`」（在描述**过去的行为**，改成 `skill/assets/` 反而失真）。同步后 `diff -rq skill ~/.agents/skills/agentq` 无输出。
+  |  ./run-tests.sh --quick → 1 ran 0 skipped 0 failed (10s), exit 0；`diff -rq skill ~/.agents/skills/agentq` → 无输出。**只改文档**，`skill/assets/` 与 `smoke/` 零改动，故上次全量（`17 ran 0 skipped 0 failed (950s)`）的窗口仍然有效
+
 2026-09-29  **文档收口：把 git 落地这件事写进权威清单，并修掉三处因它而失真的陈述**（只改 `README.md`/`PLAN.md`/`HANDOFF.md`；`skill/` 与 `smoke/` **零改动**）。**① `PLAN.md` 的 B1 仍写着「仓库没有 `.git`，这是你的决定」**——用户已在本次会话明确选择「你先初始化 git，我再审」并已完成，而 `PLAN.md` 是**待办的唯一权威清单**（`CLAUDE.md` 明写），所以它不更新就等于把已完成的事继续挂在待办上。现已标注完成，并补记落地时比原计划多做的三件事及各自理由（`* -text` 护住 canonical 字节、`.gitignore` 用机制挡凭据、基线提交与改动提交分离），以及一处顺带纠正：`CLAUDE.md` 覆盖边界里「没有编译器、没有类型系统、**没有 git**」的措辞。**② `HANDOFF.md` 第五节的「保留 dirty worktree」**已按 B1 原计划改写——保留它是因为它防的是 `git reset --hard`/`git checkout --` 这类**销毁工作**的操作（本会话真的踩过：先删备份再 `git reset --hard baseline`，靠 git 对象 `dcff709` 逐字节恢复），而不是要求工作树常脏。**③ `README.md` 的文档表格里 `](SKILL.md)` 是死链**——Skill 移入 `skill/` 后该路径不再存在；全仓相对链接扫描发现这是唯一一处（其余四份文档的链接全部有效）。**④ `PLAN.md` 的「4,736 行」更正为 4,810** 并注明版本控制不改变那条结论——它给的是「改了什么」，不是「改对了没有」。**⑤ 其余 B 项确认全部收口**：`PLAN.md` 的 B 表格里已无未决项。
   |  ./run-tests.sh --quick → 1 ran 0 skipped 0 failed (6s), exit 0；`smoke/16-no-host-identifiers` → files=68 violations=0, exit 0。**本轮只改文档，`skill/` 与 `smoke/` 零改动**，故未重跑全量（上一次全量 `17 ran 0 skipped 0 failed (950s)` 的窗口仍然有效——判据是 `skill/`+`smoke/` 的 mtime 未落在窗口内）
 
