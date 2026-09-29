@@ -20,7 +20,7 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-installer="$root/assets/unix/install-agentq.sh"
+installer="$root/skill/assets/unix/install-agentq.sh"
 
 # Short path on purpose: pueued binds a unix socket inside the home and macOS
 # caps the path at SUN_LEN (~104 bytes).  $TMPDIR is /var/folders/<long hash>/T/
@@ -145,7 +145,7 @@ cmd_up() {
     printf 'fetching pueue 4.0.4 for %s\n' "$(uname -s) $(uname -m)"
     fetch_verified "$PUEUE_ASSET" "$PUEUE_SHA" "$agentq_home/pueue"
     fetch_verified "$PUEUED_ASSET" "$PUEUED_SHA" "$agentq_home/pueued"
-    cp "$root/assets/unix/agentq-server" "$agentq_home/agentq-server"
+    cp "$root/skill/assets/unix/agentq-server" "$agentq_home/agentq-server"
     chmod 700 "$agentq_home/agentq-server"
 
     # Absolute paths, not the asset's '~/.agentq/...'.  run_pueue runs pueue

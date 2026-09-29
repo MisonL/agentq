@@ -18,7 +18,7 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-client="$root/assets/client/unix/agentq"
+client="$root/skill/assets/client/unix/agentq"
 work=$(mktemp -d /tmp/agentq-smoke-client.XXXXXX)
 work=$(unset CDPATH; cd -- "$work" && pwd -P)
 trap 'rm -rf -- "$work"' EXIT

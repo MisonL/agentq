@@ -524,7 +524,7 @@ launcher），拿到确凿的 stderr：`AgentQ operation is already in progress:
 mutation。（`record 7` 是 `aq-c1-q..q7`，`task_id` 全是 16——那是我在复用 id 上做的
 重放用例，属正常元数据，不是残留。）
 
-**主机 C 已重装成功（2026-09-24，用户授权）。** 部署单元 `assets/unix/` 7 个文件经
+**主机 C 已重装成功（2026-09-24，用户授权）。** 部署单元 `skill/assets/unix/` 7 个文件经
 `scp` 暂存后由安装器原子替换；实测 **4,736 行 / `e3b132af`（= 仓库）**、`bash -n` 通过、
 直接调服务端 `status` **exit 0** 返回 `{"tasks":{},"group":{...}}`、
 **数据完整保留**（7 record / 29 tombstone / `shared_secret`）、
@@ -705,7 +705,7 @@ POSIX 客户端在认证类失败时多打一行（点名 `BatchMode=yes` 与可
 救不了缺密钥的方向。修法与 A9 相同（在 `Write-Diagnostics` 里按 class 追加），
 但要跑全套件并配 `smoke/12` 用例。
 
-**已修（2026-09-27，零授权，只改 `assets/client/windows/agentq.ps1` + `smoke/12`）**：在
+**已修（2026-09-27，零授权，只改 `skill/assets/client/windows/agentq.ps1` + `smoke/12`）**：在
 `Write-Diagnostics` 里，打印完 class 行之后按 `$diagnosticClass -eq "authentication"` 追加一行，
 文案与 POSIX 端**逐字相同**，并点名 `$script:TargetHost`（不点名主机，操作者不知道该装哪把钥匙）。
 位置同样在 `Write-Diagnostics` 内而非调用方决策点——调用方是在命令替换里调探针的，
@@ -826,7 +826,7 @@ if (!$applied.AccessRulesProtected -or !$ownerRule) {
 
 **另一处更正：Windows 上服务端文件叫 `agentq`，不叫 `agentq-server`。** 我先前用
 `/c/ProgramData/AgentQ/agentq-server` 探测，得到「MISSING」，一度以为部署不见了——
-实际是我记错了名字（仓库里该资产是 `assets/windows-git-bash/agentq`）。实测
+实际是我记错了名字（仓库里该资产是 `skill/assets/windows-git-bash/agentq`）。实测
 `sha256 = e3b132afc2ec624cbdd49a11d042111f6e673b47f0ae932a2f126a8d223f2af7`，
 **与仓库逐字节相同**，部署完好。
 
@@ -1345,7 +1345,7 @@ ssh 能读的地方，而该客户端**没有顶层 trap 可挂清理**，且 cm
 4. **`10` 只保证「这个具体失效无法再静默复发」，不等于安装器正确。**
    安装器是否真的能装——那仍需真机。
 
-5. **`01` 只证明能解析，不证明任何分支的行为正确。** `assets/unix/agentq-server`
+5. **`01` 只证明能解析，不证明任何分支的行为正确。** `skill/assets/unix/agentq-server`
    是 4,736 行无类型 shell：没有编译器、没有类型系统。改它时把这一点计入风险。
 
 6. **`pgrep -f` 在本机匹配不到沙箱 `pueued`**（实测）。别用它判断 daemon 是否
@@ -1370,7 +1370,7 @@ ssh 能读的地方，而该客户端**没有顶层 trap 可挂清理**，且 cm
         /Users/mison/.agents/skills/agentq/assets   # 必须无输出
     ```
 
-11. **`assets/unix/agentq-server` 与 `assets/windows-git-bash/agentq` 必须逐字节
+11. **`skill/assets/unix/agentq-server` 与 `skill/assets/windows-git-bash/agentq` 必须逐字节
     相同**（硬约束，任何时候 `cmp` 都必须是 0）。
 
 ### 已知边界（不是缺陷，是没证据）

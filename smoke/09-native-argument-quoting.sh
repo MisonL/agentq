@@ -132,7 +132,7 @@ violation() {
 files=0
 sites=0
 
-ps_files=$(find "$root/assets" -name '*.ps1' -type f | sort)
+ps_files=$(find "$root/skill/assets" -name '*.ps1' -type f | sort)
 if [ -z "$ps_files" ]; then
     printf 'native-argument-quoting: no PowerShell assets found\n' >&2
     exit 1

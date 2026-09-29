@@ -73,8 +73,8 @@ export PATH
 mkdir -p "$work/config" "$work/data/task_logs" "$work/data/agentq-cancellations" \
     "$work/data/agentq-requests/.locks" "$work/data/agentq-requests/.tombstones" \
     "$work/runtime"
-cp "$root/assets/unix/agentq-server" "$work/agentq-server"
-cp "$root/assets/unix/pueue.yml" "$work/config/pueue.yml"
+cp "$root/skill/assets/unix/agentq-server" "$work/agentq-server"
+cp "$root/skill/assets/unix/pueue.yml" "$work/config/pueue.yml"
 # The Pueue stubs answer the JSON queries the server makes, so that the jq
 # calls downstream of them are actually reached.  A stub that only prints a
 # version string leaves `verify_group`, `ensure_group` and the status

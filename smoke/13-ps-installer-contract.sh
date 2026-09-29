@@ -21,8 +21,8 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-installer="$root/assets/windows-git-bash/install-agentq.ps1"
-stage_source="$root/assets/windows-git-bash"
+installer="$root/skill/assets/windows-git-bash/install-agentq.ps1"
+stage_source="$root/skill/assets/windows-git-bash"
 pwsh_binary=$(command -v pwsh || true)
 
 if [ -z "$pwsh_binary" ]; then

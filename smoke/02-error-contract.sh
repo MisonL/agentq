@@ -15,8 +15,8 @@ trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/config" "$work/data/task_logs" "$work/data/agentq-cancellations" \
     "$work/data/agentq-requests/.locks" "$work/data/agentq-requests/.tombstones" \
     "$work/runtime"
-cp "$root/assets/unix/agentq-server" "$work/agentq-server"
-cp "$root/assets/unix/pueue.yml" "$work/config/pueue.yml"
+cp "$root/skill/assets/unix/agentq-server" "$work/agentq-server"
+cp "$root/skill/assets/unix/pueue.yml" "$work/config/pueue.yml"
 for stub in pueue pueued; do
     printf '#!/bin/sh\nprintf "%%s 4.0.4\\n" "%s"\n' "$stub" > "$work/$stub"
     chmod 700 "$work/$stub"

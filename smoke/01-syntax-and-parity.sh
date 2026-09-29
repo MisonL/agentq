@@ -44,7 +44,7 @@ check_shell() {
 while IFS= read -r file; do
     check_shell "$file"
     shell_count=$((shell_count + 1))
-done < <(find "$root/assets" -type f -exec sh -c '
+done < <(find "$root/skill/assets" -type f -exec sh -c '
     first=$(head -1 "$1" 2>/dev/null) || exit 0
     case "$first" in
         "#!"*) ;;
@@ -102,7 +102,7 @@ PSEOF
             failures=$((failures + 1))
         fi
         ps_count=$((ps_count + 1))
-    done < <(find "$root/assets" -type f -name '*.ps1' | sort)
+    done < <(find "$root/skill/assets" -type f -name '*.ps1' | sort)
     ps_summary=$ps_count
 else
     # Do not let a missing OR broken parser read as "the .ps1 assets were
@@ -133,7 +133,7 @@ while IFS= read -r file; do
         fi
     fi
     plist_summary=$((plist_summary + 1))
-done < <(find "$root/assets" -type f -name '*.plist' | sort)
+done < <(find "$root/skill/assets" -type f -name '*.plist' | sort)
 
 # --- .yml: real YAML parse ---------------------------------------------------
 yaml_count=0
@@ -152,7 +152,7 @@ except Exception as exc:
             continue
         fi
         yaml_summary=$((yaml_summary + 1))
-    done < <(find "$root/assets" -type f -name '*.yml' | sort)
+    done < <(find "$root/skill/assets" -type f -name '*.yml' | sort)
 else
     yaml_summary='skipped(no pyyaml)'
 fi
@@ -190,7 +190,7 @@ while IFS= read -r file; do
     else
         failures=$((failures + 1))
     fi
-done < <(find "$root/assets" -type f -name '*.service' | sort)
+done < <(find "$root/skill/assets" -type f -name '*.service' | sort)
 
 # --- .cmd: structural --------------------------------------------------------
 # There is no CMD parser here, so this checks the two things that actually
@@ -238,9 +238,9 @@ while IFS= read -r file; do
     else
         failures=$((failures + 1))
     fi
-done < <(find "$root/assets" -type f -name '*.cmd' | sort)
+done < <(find "$root/skill/assets" -type f -name '*.cmd' | sort)
 
-if ! cmp -s "$root/assets/unix/agentq-server" "$root/assets/windows-git-bash/agentq"; then
+if ! cmp -s "$root/skill/assets/unix/agentq-server" "$root/skill/assets/windows-git-bash/agentq"; then
     printf '%s\n' 'canonical server parity FAILED: assets/unix/agentq-server != assets/windows-git-bash/agentq' >&2
     failures=$((failures + 1))
 fi

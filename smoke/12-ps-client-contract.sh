@@ -19,7 +19,7 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-client="$root/assets/client/windows/agentq.ps1"
+client="$root/skill/assets/client/windows/agentq.ps1"
 # Windows PowerShell 5.1 does not accept a POSIX path for -File (pwsh 7.5
 # does), so when this check runs under it on a real Windows host the path has to
 # be handed over in Windows form.  `cygpath` exists only under Git Bash, so this

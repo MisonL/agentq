@@ -32,8 +32,8 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-posix_client="$root/assets/client/unix/agentq"
-windows_client="$root/assets/client/windows/agentq.ps1"
+posix_client="$root/skill/assets/client/unix/agentq"
+windows_client="$root/skill/assets/client/windows/agentq.ps1"
 
 # The smallest measured limit, with a deliberate margin: a command that only
 # just fits is one small edit away from not fitting.
