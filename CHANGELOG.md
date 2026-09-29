@@ -6,6 +6,9 @@
 YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 ```
 
+2026-09-29  **`HANDOFF.md` 四处失真修正**（只改 `HANDOFF.md` + `PLAN.md` 一处交叉引用；`skill/` 与 `smoke/` 零改动）。**① 它仍写着「当前 `/Volumes/Work/code/agentq` 没有 `.git` 目录」**——git 已落地，这是上一轮收口漏掉的同一类失真（同一份文件里另一处已改，这处没有）。**② 冒烟检查数写「16 项」**，实际 17（`smoke/17-askpass-credential` 是 2026-09-28 加的）——**这正是它自己声明要避免的那种复制漂移**，而它现在改为指针了，数字是残留。**③ 文件指针写 `SKILL.md`**，该文件已移入 `skill/`（同轮 `README.md` 的死链是同一根因，那处已修）。**④ 章节编号断裂**：实际是「一 / 四 / 五 / 七」，缺二、三、六——推断原稿有六个章节，重建 `PLAN.md` 时删掉了待办等章节但没重排编号，于是 `PLAN.md` 里那句「`HANDOFF.md` 第五节『保留 dirty worktree』」的引用**锚在一个不存在的编号上**。已重排为一/二/三/四，并把 `PLAN.md` 那处引用改为**按内容引用而非编号**（编号会随章节增删漂移，内容不会）。**同时机械核验了文档里的全部数字**：assets=23、skill=25、smoke=17、`agentq-server`=4,810 行、`install-agentq.sh`=2,755、`install-agentq.ps1`=2,881、`agentq.ps1`=2,327、`client/unix/agentq`=3,523，以及覆盖债分子 3,498 / 分母 25,100 = 13.9%（9 个零覆盖资产逐个数出来相加，与 `PLAN.md` 所写一致）。
+  |  ./run-tests.sh --quick → 1 ran 0 skipped 0 failed (42s), exit 0；`smoke/16-no-host-identifiers` → files=68 violations=0, exit 0；`diff -rq skill ~/.agents/skills/agentq` → 无输出。**只改文档**，`skill/assets/` 与 `smoke/` 零改动
+
 2026-09-29  **修正活文档里指向旧路径的资产引用**（改 `CLAUDE.md` 6 处 + `skill/SKILL.md` 1 处 + `PLAN.md` 1 处；**纯文档，`skill/assets/` 与 `smoke/` 零改动**）。Skill 移入 `skill/` 后，这些地方仍写着裸 `assets/`：`.gitattributes`/`.gitignore` 的理由段（「保护 `assets/` 的字节」）、「不要把 `assets/` 下的文件设成可执行后提交」、「凭据不得写进 `assets/`」、部署单元的定义、覆盖边界那句、`SKILL.md` 的跨版本互操作段、以及 `PLAN.md` 的同步纪律第 10 条（原写「改完 `assets/` 必须同步」，实为**整个 `skill/` 目录**，与它上方 20 行的那节自相矛盾）。**保留两处不改**：`CLAUDE.md:6` 的 `SKILL.md` + `agents/` + `assets/`（那是 `skill/` 的内部结构图，本就该是相对名）与 `CLAUDE.md:269` 的「旧规则只同步 `assets/`」（在描述**过去的行为**，改成 `skill/assets/` 反而失真）。同步后 `diff -rq skill ~/.agents/skills/agentq` 无输出。
   |  ./run-tests.sh --quick → 1 ran 0 skipped 0 failed (10s), exit 0；`diff -rq skill ~/.agents/skills/agentq` → 无输出。**只改文档**，`skill/assets/` 与 `smoke/` 零改动，故上次全量（`17 ran 0 skipped 0 failed (950s)`）的窗口仍然有效
 
