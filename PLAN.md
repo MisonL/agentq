@@ -1380,7 +1380,7 @@ ssh 能读的地方，而该客户端**没有顶层 trap 可挂清理**，且 cm
 9. **`detect_stat_flavor` 这类缓存必须在父 shell 里调用。** `$(...)` 开子 shell，
    在命令替换内部设的全局变量传不回来——缓存会静默失效。
 
-10. **改完 `assets/` 必须同步全局 Skill 目录**，否则安装装出旧代码。两者不会
+10. **改完 `skill/` 必须同步全局 Skill 目录**，否则安装装出旧代码。两者不会
     自动保持一致，忘了就静默分叉：
     ```sh
     rsync -a --delete /Volumes/Work/code/agentq/assets/ \
