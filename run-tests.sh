@@ -48,14 +48,20 @@ while IFS= read -r check <&3; do
     # 0 while printing "syntax error: unexpected end of file".  Without this the
     # check would be reported ok while having aborted part-way, which is exactly
     # how a half-run check hides.  `bash -n` reads the whole file up front.
-    if ! bash -n "$check" 2>"$check.syntax.$$"; then
+    # The scratch file goes in /tmp, not beside the check.  `"$check.syntax.$$"`
+    # put it inside smoke/, which bumped that directory's mtime on every run --
+    # so a frozen-window comparison (`find . -newer <stamp>`) always reported
+    # ./smoke, and the project's own rule is that detailed output goes to /tmp.
+    # A signal that is always present is a signal nobody reads.
+    syntax_output=$(mktemp "${TMPDIR:-/tmp}/agentq-syntax.XXXXXX")
+    if ! bash -n "$check" 2>"$syntax_output"; then
         printf 'FAIL  %-28s syntax error\n' "$name"
-        sed 's/^/      /' "$check.syntax.$$"
-        rm -f "$check.syntax.$$"
+        sed 's/^/      /' "$syntax_output"
+        rm -f "$syntax_output"
         failures=$((failures + 1))
         continue
     fi
-    rm -f "$check.syntax.$$"
+    rm -f "$syntax_output"
 
     output=$(mktemp)
     status=0
