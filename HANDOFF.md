@@ -94,7 +94,11 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
 - response loss 只能使用同一 request ID lookup/reconcile；不得换新 request ID
   重复有副作用命令。
 - `cancel`/`remove` 响应丢失时不要自动重试；先读取 status/logs/wait 重新确认。
-- 保留 dirty worktree，不使用 `git reset --hard`、`git checkout --` 或宽泛清理。
+- 不使用 `git reset --hard`、`git checkout --` 或宽泛清理来「弄干净」工作树——
+  这条防的是**销毁工作**，不是要求工作树常脏。本会话真踩过：先删了备份再
+  `git reset --hard baseline`，把工作树回退掉，最后靠 git 对象 `dcff709` 逐字节恢复。
+  提交本身是正常的 git 工作流，不需要授权之外的额外仪式；但工作树不干净时，
+  先弄清每处改动是什么，再决定提交还是丢弃。
 - 证据采用 `CHANGELOG.md` 的一行记录加 `run-tests.sh` 的退出码；不要把局部验证
   说成全局验证。
 - 不在目标机运行 `codex exec`，不把 Skill 客户端降级为普通前台 SSH。
