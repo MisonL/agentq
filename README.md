@@ -93,8 +93,9 @@ skipped, and check `01` reports `ps1=skipped(...)` rather than a green light whe
 install source, and nothing keeps the two in step automatically:
 
 ```sh
-rsync -a --delete assets/ /Users/mison/.agents/skills/agentq/assets/
-diff -rq assets /Users/mison/.agents/skills/agentq/assets   # must print nothing
+SKILL_ASSETS="${SKILL_ASSETS:-$HOME/.agents/skills/agentq/assets}"
+rsync -a --delete assets/ "$SKILL_ASSETS/"
+diff -rq assets "$SKILL_ASSETS"   # must print nothing
 ```
 
 ## Documentation
