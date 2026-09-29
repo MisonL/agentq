@@ -17,11 +17,16 @@ indent_size = 4
 
 # The assets themselves: leave line endings and trailing whitespace ALONE.
 # `unset` means "do not touch", not "use the platform default".  Everything
-# under assets/ is checked out and deployed as-is -- .gitattributes stores it
-# with `-text` for the same reason.  Note that the Windows assets are LF in
-# this repository; PowerShell and cmd.exe both accept that, and changing it
-# here would rewrite files that are verified byte-for-byte.
-[assets/**]
+# under skill/assets/ is checked out and deployed as-is -- .gitattributes
+# stores it with `-text` for the same reason.  Note that the Windows assets
+# are LF in this repository; PowerShell and cmd.exe both accept that, and
+# changing it here would rewrite files that are verified byte-for-byte.
+#
+# The path must stay in step with where the assets live: this section read
+# `[assets/**]` until 2026-09-29, when the Skill moved under skill/ and it
+# silently stopped matching anything.  An editorconfig pattern that matches
+# no file reports no error -- it just stops protecting.
+[skill/assets/**]
 end_of_line = unset
 trim_trailing_whitespace = false
 insert_final_newline = unset

@@ -245,6 +245,132 @@ if ! cmp -s "$root/skill/assets/unix/agentq-server" "$root/skill/assets/windows-
     failures=$((failures + 1))
 fi
 
+# --- config-file path patterns must still point at real files ----------------
+# .gitattributes and .editorconfig name paths in order to protect them, and a
+# pattern that matches nothing is not an error in either format -- it simply
+# stops protecting.  When the Skill moved under skill/ on 2026-09-29,
+# .editorconfig's `[assets/**]` kept parsing fine and matched zero files, so the
+# section that exists to stop editors rewriting the byte-verified assets became
+# a silent no-op.  Verified with a real editorconfig implementation: the two
+# canonical servers resolved to end_of_line=lf / trim_trailing_whitespace=true,
+# i.e. exactly what that section was written to prevent.
+#
+# So: every path-qualified pattern in these two files must match a real file.
+config_patterns=0
+config_failures=0
+
+glob_to_regex() {
+    local glob=$1 out= i=0 n c d
+    # n must be computed AFTER `local glob=$1`: in `local glob=$1 n=${#glob}`
+    # the expansion happens before the assignment, so n would be 0 and this
+    # function would emit an empty pattern that matches nothing.
+    n=${#glob}
+    while [ "$i" -lt "$n" ]; do
+        c=${glob:$i:1}
+        case $c in
+            '*')
+                if [ "${glob:$((i + 1)):1}" = '*' ]; then
+                    if [ "${glob:$((i + 2)):1}" = / ]; then
+                        out="$out(.*/)?"; i=$((i + 3))
+                    else
+                        out="$out.*"; i=$((i + 2))
+                    fi
+                else
+                    out="$out[^/]*"; i=$((i + 1))
+                fi
+                ;;
+            '?') out="$out[^/]"; i=$((i + 1)) ;;
+            '{')
+                local inner= j=$((i + 1)) depth=1
+                while [ "$j" -lt "$n" ] && [ "$depth" -gt 0 ]; do
+                    d=${glob:$j:1}
+                    [ "$d" = '{' ] && depth=$((depth + 1))
+                    [ "$d" = '}' ] && depth=$((depth - 1))
+                    [ "$depth" -gt 0 ] && inner="$inner$d"
+                    j=$((j + 1))
+                done
+                out="$out(${inner//,/|})"; i=$j
+                ;;
+            '.'|'+'|'('|')'|'|'|'^'|'$'|'['|']'|'\\') out="$out\\$c"; i=$((i + 1)) ;;
+            *) out="$out$c"; i=$((i + 1)) ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+pattern_matches_under() {
+    local re f rel start=$root
+    re="^$(glob_to_regex "$1")\$"
+    [ -n "${2:-}" ] && start="$root/$2"
+    while IFS= read -r f; do
+        rel=${f#"$root"/}
+        if [[ $rel =~ $re ]]; then
+            return 0
+        fi
+    done < <(find "$start" -path "$root/.git" -prune -o -type f -print)
+    return 1
+}
+
+pattern_matches_a_file() {
+    pattern_matches_under "$1" ''
+}
+
+for config_file in .editorconfig .gitattributes; do
+    [ -f "$root/$config_file" ] || continue
+    while IFS= read -r pattern; do
+        case $pattern in
+            */*) ;;
+            *) continue ;;
+        esac
+        config_patterns=$((config_patterns + 1))
+        if ! pattern_matches_a_file "$pattern"; then
+            printf '%s\n' "$config_file: pattern '$pattern' matches no file in the repository" >&2
+            config_failures=$((config_failures + 1))
+            failures=$((failures + 1))
+        fi
+    done < <(
+        if [ "$config_file" = .editorconfig ]; then
+            sed -n 's/^\[\(.*\)\]$/\1/p' "$root/$config_file"
+        else
+            sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "$root/$config_file" | awk '{print $1}'
+        fi
+    )
+done
+
+# ...and the section that protects the assets must still exist.  Deleting it
+# leaves every surviving pattern valid, so the rule above stays green while the
+# protection is gone -- measured: removing the [skill/assets/**] section drops
+# configpaths from 3 to 2 and the check reports a pass.
+asset_protection=0
+section=
+while IFS= read -r line; do
+    case $line in
+        \[*\])
+            section=${line#\[}
+            section=${section%\]}
+            continue
+            ;;
+    esac
+    case $line in
+        *end_of_line*unset*)
+            if [ -n "$section" ] && pattern_matches_under "$section" skill/assets; then
+                asset_protection=$((asset_protection + 1))
+            fi
+            ;;
+    esac
+done < "$root/.editorconfig"
+if [ "$asset_protection" -eq 0 ]; then
+    printf '%s\n' '.editorconfig: no section sets end_of_line = unset for anything under skill/assets -- the byte-verified assets are no longer protected from editor rewrites' >&2
+    failures=$((failures + 1))
+fi
+
+# A pattern count of zero means the extraction broke, not that there was
+# nothing to check -- the same reasoning as the shell-asset enumeration above.
+if [ "$config_patterns" -eq 0 ]; then
+    printf '%s\n' 'no config-file path patterns were extracted; refusing to report a pass' >&2
+    failures=$((failures + 1))
+fi
+
 # Zero shell assets parsed means the enumeration itself failed (missing find,
 # wrong root), not that there was nothing to check.
 if [ "$shell_count" -eq 0 ]; then
@@ -256,5 +382,5 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'syntax-and-parity checks passed: shell=%s ps1=%s plist=%s yml=%s service=%s cmd=%s parity=ok\n' \
-    "$shell_count" "$ps_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary"
+printf 'syntax-and-parity checks passed: shell=%s ps1=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok\n' \
+    "$shell_count" "$ps_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns"
