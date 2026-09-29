@@ -21,5 +21,3 @@
 # touch them even if a future .gitattributes adds one.
 assets/unix/agentq-server          -text -diff
 assets/windows-git-bash/agentq     -text -diff
-
-# Fixture-free zone: nothing in this repo is generated.

@@ -27,6 +27,21 @@ assets/
 没有报告目录，没有 manifest，没有独立哈希清单，没有按切片归档的证据包。
 证据的成本必须低于它提供的价值——这是唯一的标准。
 
+### 版本控制（2026-09-29 起）
+
+本仓已纳入 git（用户授权的一次性动作）。**它不改变上面那三步**——提交不是流程的
+一步，也不是验收门槛。两个配置文件的存在理由都是**保护 `assets/` 的字节**：
+
+- **`.gitattributes` 用 `* -text`**：绝不转换换行。这条是硬需求，不是风格偏好——
+  `core.autocrlf=input` 是很多开发机的默认值，而 `assets/` 是要**原样部署**的；
+  一次换行转换就会让 `cmp` 的两条 canonical 资产不再相同。实测：同一份 CRLF 文件，
+  有这个文件时入库仍是 `0d 0a`，去掉它就变成 `0a`（git 还会打印一行警告）。
+- **`.gitignore` 用机制挡住凭据落库**：askpass 助手、密钥、`.env`、本机 agentq 状态。
+  `CLAUDE.md` 的凭据规则此前只是一句话，现在是可执行的。
+
+**不要**把 `assets/` 下的文件设成可执行后提交——`install-agentq.sh` 刻意保持 644，
+因为 `SKILL.md` 用 `sh ./install-agentq.sh` 调用它，不依赖执行位。
+
 ### 验证
 
 ```sh
@@ -389,7 +404,7 @@ FullControl、其余身份降到 ReadAndExecute、`SetAccessRuleProtection($true
 完全损坏，检查也照样通过。每个用例同时断言 stderr 内容，所以失败可归因。
 
 **这套检查无法发现行为回归。** `assets/unix/agentq-server` 是 4,810 行无类型
-shell，没有编译器、没有类型系统、没有 git。smoke 证明的是：能解析、两条
+shell，没有编译器、没有类型系统。**2026-09-29 起已纳入 git**（用户明确授权的一次性动作；此前本仓刻意不做版本控制，`.gitattributes` 用 `* -text` 钉住字节一致性，`.gitignore` 用机制挡住凭据落库）。smoke 证明的是：能解析、两条
 canonical 资产一致、坏参数被正确拒绝、命令集合没漂移。它不证明任何分支的
 行为正确。
 
