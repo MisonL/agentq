@@ -1,0 +1,40 @@
+# AgentQ -- what must never be committed.
+#
+# Credentials are the reason this file exists.  CLAUDE.md states the rule
+# ("凭据不进仓库、不进脚本、不留盘"); this is the mechanism that enforces it
+# for the paths where they would realistically land.
+
+# Credential material, wherever it is staged.
+.askpass
+.askpass.*
+askpass*
+*askpass*
+.aq-bootstrap/
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+id_ecdsa*
+
+# Local agentq state: hosts, request records, tombstones, locks.
+.agentq/
+config/agentq/
+
+# Check output.  run-tests.sh and the smoke checks write scratch files; the
+# project rule is that detailed output goes to /tmp, and a failure that needs
+# long-term tracking gets its own file deliberately -- never by accident.
+/out
+/err
+*.smoke-out
+*.syntax.*
+
+# Editor and OS noise.
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Sandbox leftovers, in case sandbox.sh is ever pointed at the repo.
+/aqsb/
