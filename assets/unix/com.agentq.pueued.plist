@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agentq.pueued</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__AGENTQ_HOME__/pueued</string>
+    <string>--config</string>
+    <string>__AGENTQ_HOME__/config/pueue.yml</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

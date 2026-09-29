@@ -1,0 +1,18 @@
+shared:
+  pueue_directory: '~/.agentq/data'
+  runtime_directory: '~/.agentq/runtime'
+  use_unix_socket: true
+  unix_socket_permissions: 448
+  pid_path: '~/.agentq/runtime/pueued.pid'
+client:
+  read_local_logs: true
+  show_confirmation_questions: false
+  edit_mode: 'toml'
+daemon:
+  pause_group_on_failure: false
+  pause_all_on_failure: false
+  compress_state_file: true
+  shell_command:
+    - '/bin/bash'
+    - '-lc'
+    - '{{ pueue_command_string }}'
