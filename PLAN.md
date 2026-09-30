@@ -1292,6 +1292,7 @@ ssh 能读的地方，而该客户端**没有顶层 trap 可挂清理**，且 cm
 | **真实升级路径** | 同版本重装，走 `previous_install` 分支 | 服务端 inode 变化（真替换）、daemon 重启、**record 数保留、旧任务仍可读（`reused:true`）**、服务 active、零残留、权限正确 |
 | **真实 arm64 安装 + 协议** | 自建 arm64 systemd 镜像（`--platform linux/arm64`，模拟层） | 平台判定选中 `pueue-aarch64-unknown-linux-musl`；安装出的二进制是 aarch64；`wait`=0/`Success`；零残留 |
 | **失败模式** | Alpine（musl/apk，无 systemd）、Fedora（dnf） | 两者都在**任何写入之前**干净拒绝、**零副作用**。Alpine 先在依赖闸门拒（缺 perl 且无 sudo），补齐依赖后精确停在 `required command is missing: systemctl` |
+| **真实 Fedora 安装 + 协议端到端（2026-09-30 补做）** | `jrei/systemd-fedora`（Fedora 44、systemd PID 1），以普通用户 `aqtest` 身份、`su -` 建真实 logind 会话、`AGENTQ_PUEUE_SOURCE_DIR=/stage` 预置真实二进制（仍走内置 SHA-256 校验） | **`INSTALLER_EXIT=0`**，`AgentQ 4.0.4 installed`；私有树 700/600；unit `enabled`+`active`（`Main PID pueued --config .../pueue.yml`）；linger `yes`；**零残留**；两个二进制哈希与内置常量**逐一相符**。协议面：`status`=0；`submit→wait`=`Success`、`logs` 回 `FED-OK` + `Linux`；**失败任务 `wait`=1 且 result 为 `Failed:7`（未被报成成功）**；`remove`→`wait`=**5**/`removed`；`lookup` 连查 3 次都是 **5**；`cancel` 已结束但仍在 Pueue 的任务=**2**+`reason=task_not_running`；`cancel` queued 返回 `cancel_requested`，**重放 `reused:true`**；`status` 能读到 `cancellation_requested_at`；`doctor`=0 且 stderr 报 `pueue=4.0.4`/`pueued=4.0.4`/`systemd_user_service=active` |
 
 **aarch64 与 x86_64 四个二进制哈希全部与安装器内置常量相符**（逐一实测）。
 
@@ -1299,9 +1300,16 @@ ssh 能读的地方，而该客户端**没有顶层 trap 可挂清理**，且 cm
 - **WSL 无法在容器里伪造**：安装器读 `/proc/version`，而 runc **拒绝**在 `/proc` 内 bind-mount
   （`check proc-safety of /proc/version mount`）。造一个假 fixture 就是本仓反复警告的
   「桩测自己」，所以不做。
-- **Fedora 的 dnf 依赖安装路径未走通**：`jrei/systemd-fedora` 里 `su` 属 `util-linux`，
-  两次并发 dnf 抢锁互相卡死（我自己起的两个后台任务），修完套件窗口已过。
-  **Fedora 格只证明了「无 systemd 时干净拒绝」，没证明 dnf 路径可用。**
+- ~~**Fedora 的 dnf 依赖安装路径未走通**~~ —— **2026-09-30 已补做并关闭**（见上表最后一格）。
+  当时的归因（「两次并发 dnf 抢锁」）**只说对了一半**，重做时才看清全貌：真正的原因是
+  **容器缺两样东西，与安装器无关**——① 最小 Fedora 镜像没有 `procps-ng`，而安装器
+  要求 `ps`（它**正确**地报 `required command is missing: ps`）；② `loginctl
+  enable-linger` 需要 polkit，镜像里没有，于是报 `Could not enable linger:
+  Access denied`。另有一条环境事实：`docker exec` **从不建立 logind 会话**，
+  `loginctl show-user` 因此恒报 `User ID 1000 is not logged in or lingering`
+  （**这个 rc=1 是真实信号**，安装器据此 `fail` 是对的），必须经 `su -` 才有会话。
+  **三轮失败各自报出准确原因、每轮都在写入前停住、回滚干净**——这本身就是安装器
+  失败契约的一次真机复核。补齐这两样后**一次通过**。
 
 #### C5 执行结果（2026-09-24）—— 外部审查
 
@@ -1459,7 +1467,8 @@ helper **在本文件中确有定义**、规则 F 从「前缀式」收紧为**�
 **C2 容器矩阵已执行（2026-09-25）**：本仓**首次跑通 Linux 成功路径**（真实 systemd + 真实
 logind + 真实二进制走内置 SHA 校验，`INSTALLER_EXIT=0`、零残留），外加真实 Linux 协议端到端、
 真实升级路径、真实 arm64 安装+协议、两个失败模式格（均零副作用）。四个二进制哈希逐一相符。
-两格明确不可达并记录（WSL 无法伪造、Fedora 的 dnf 路径未走通）。
+两格明确不可达并记录（WSL 无法伪造、Fedora 的 dnf 路径未走通——**后者已于 2026-09-30
+补做成功**，见 `PLAN.md` C2 一节与 `CHANGELOG.md`）。
 
 **2026-09-25 真机补测（用户点名一台 Windows 主机，地址不入库）**：三件事全做。
 **① PS 5.1 契约**：`smoke/12` 新增 `AGENTQ_SMOKE_PWSH` 覆盖点后，在真
