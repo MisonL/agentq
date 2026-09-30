@@ -353,7 +353,7 @@ tombstone；重复恰恰累积在 tombstone 一侧。）
 
 这可以**零授权**修（只改 `assets/`，不需要真机），但**必须先钉死行为**：
 
-- `agentq-server` 是 4,810 行无类型 shell，本仓 smoke **抓不到行为回归**
+- `agentq-server` 是 4,937 行无类型 shell，本仓 smoke **抓不到行为回归**
 - 这条路径是安全相关的（那两处 `created_at` 相等判断正是防止 id 复用误判的核心）
 - 所以顺序是：先为 `cancelled_task_replay` / `task_instance_created_at` 写一份
   针对性契约检查（**改之前就要能红**），再改，再复跑
@@ -1363,7 +1363,7 @@ ssh 能读的地方，而该客户端**没有顶层 trap 可挂清理**，且 cm
    安装器是否真的能装——那仍需真机。
 
 5. **`01` 只证明能解析，不证明任何分支的行为正确。** `skill/assets/unix/agentq-server`
-   是 **4,810** 行无类型 shell：没有编译器、没有类型系统。（**2026-09-29 起有 git**，
+   是 **4,937** 行无类型 shell：没有编译器、没有类型系统。（**2026-09-29 起有 git**，
    但版本控制不改变这一条——它给的是「改了什么」，不是「改对了没有」。）改它时把
    这一点计入风险。
 
@@ -1411,6 +1411,18 @@ fork+exec 约 15ms。
 经 `request_record_is_valid` 调 jq。这些校验是**完整性防御**，不是可省的冗余。
 `agentq-server` 是无类型 shell，本仓 smoke 抓不到行为回归，而这条路径正好是
 安全相关的。要优化就得**先把行为钉死**（写针对性测试或真机验证），再动。
+
+**2026-09-30 已按这条纪律做了一次，并且坐实了「smoke 抓不到行为回归」不是空话。**
+实测到一个**跳过 crash-window repair 扫描**的变体（约 1.9× 加速）会让合法的
+crash-window record **永远无法自愈**，却跑出 `17 ran 0 failed` 全绿；另一个去掉
+filename↔`request_id` 绑定的变体**静默接受**错配记录，同样全绿。所以顺序是
+**先写能红的 `smoke/18-record-metadata-contract`（21 例），再改扫描代码**。
+改动内容：折叠三处逐条重复的 jq（每 record **4.05 → 1.05** 次，N=40 时 167 → 47），
+外加 `set_current_process_lock_metadata` 的幂等缓存（`status`/`doctor` 2→1、
+`lookup` 7→1 次身份解析）。`status`/`doctor` 在真实任务下输出**逐字节相同**。
+**没有做的**（连同理由）：合并三遍扫描为一遍（会改变 pass 2 归档与 pass 3 的
+可观察顺序，且 pass 1 在锁外、pass 2/3 在锁内）；折叠 `repair` 整轮（它是
+crash-window 自愈的承重路径）；动 26 个 `stat`（TOCTOU 守卫）；结果缓存（无失效机制）。
 
 实测规模因子（2026-09-21，真实 Windows 主机）：272 个 record + 29 个 tombstone
 + 3 个 marker → `status` 1930 次 jq 调用 / 114s。`logs`/`status` 到分钟级是这个
@@ -1530,9 +1542,9 @@ logind + 真实二进制走内置 SHA 校验，`INSTALLER_EXIT=0`、零残留）
 `client/unix/install-client.sh`（251）、`agentq-durable-move.ps1`（118），
 4 个 `.bash`/`.cmd` 薄启动器（42），2 个 `.plist` + 2 个 `pueue.yml` +
 1 个 `.service`（110），以及 `unix/agentq`（5，只是转发 shim）。
-合计 **3,498 行 / 25,100 行 = 13.9%**（2026-09-29 重算。**分子仍未变**——那 9 个资产
-至今没被改过；分母从 24,285 一路长到 25,100，全是**已被覆盖**的资产在长大：
-`agentq-server` 4,727→4,810（×2，canonical pair；末次是 jq 精度探测的顶层预计算，+12 行）、
+合计 **3,498 行 / 25,354 行 = 13.8%**（2026-09-30 重算。**分子仍未变**——那 9 个资产
+至今没被改过；分母从 24,285 一路长到 25,354，全是**已被覆盖**的资产在长大：
+`agentq-server` 4,727→4,937（×2，canonical pair；末次是折叠逐条重复的 jq，+127 行）、
 `client/unix/agentq` 3,293→3,523、`client/windows/agentq.ps1` 2,074→2,327（A18：两端各 +203 / +121 行）。
 所以比例略降而债务未减。别再引用旧的 25.9%——那个分母是改动前的
 24,180，且当时 `install-agentq.ps1` 还没有 `13`）。

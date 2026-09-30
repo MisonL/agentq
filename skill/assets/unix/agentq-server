@@ -640,6 +640,24 @@ resolve_windows_process_id() {
 set_current_process_lock_metadata() {
     local native_pid
 
+    # This shell's own identity cannot change while it lives, so resolve it once.
+    # Both lock acquire and lock release ask for it, and each resolution costs a
+    # fork (`ps -o lstart=`) on unix and a nested `powershell.exe` on Windows --
+    # measured 12.9s per launch on a real Windows host.  Counted before this
+    # cache: `status`/`doctor` resolved it 2x, `lookup` 7x, always for the same
+    # PID.  Callers that need it for an EXTERNAL pid (a lock holder that may have
+    # died) must keep calling process_identity() directly -- caching that would
+    # defeat stale-lock recovery.
+    #
+    # `$$` is deliberate: it is the top-level shell's PID and does not change
+    # inside a subshell or `$( )`, unlike $BASHPID, so a value cached by an
+    # ancestor stays correct for every descendant.  The cache has to live in the
+    # parent shell for the same reason: some callers reach this function through
+    # `$( )`, and a cache written in such a subshell would never reach the parent.
+    if [ -n "$current_lock_pid" ] && [ -n "$current_lock_identity" ]; then
+        return 0
+    fi
+
     current_lock_pid=''
     current_lock_identity=''
 
@@ -2121,16 +2139,9 @@ request_task_label() {
     printf 'agentq:%s\n' "$1"
 }
 
-request_record_is_valid() {
-    local record_path=$1
-    local request_id=$2
-
-    request_metadata_file_is_safe "$record_path" ||
-        fail "invalid AgentQ request record path: $record_path"
-    validate_task_id_precision_in_file "$record_path"
-    request_metadata_file_is_safe "$record_path" ||
-        fail "invalid AgentQ request record path: $record_path"
-    jq -ce --arg request_id "$request_id" '
+# The record predicate, kept in one place so the validating reader and the
+# reader that also needs `.state` cannot drift apart.
+request_record_filter='
         def valid_task_id:
             if type != "number" then
                 false
@@ -2159,7 +2170,18 @@ request_record_is_valid() {
             and (.created_at | type) == "string"
             and (.created_at | length) > 0
         ) then . else error("invalid AgentQ request record") end
-    ' < "$record_path"
+'
+
+request_record_is_valid() {
+    local record_path=$1
+    local request_id=$2
+
+    request_metadata_file_is_safe "$record_path" ||
+        fail "invalid AgentQ request record path: $record_path"
+    validate_task_id_precision_in_file "$record_path"
+    request_metadata_file_is_safe "$record_path" ||
+        fail "invalid AgentQ request record path: $record_path"
+    jq -ce --arg request_id "$request_id" "$request_record_filter" < "$record_path"
 }
 
 request_tombstone_is_valid() {
@@ -2193,8 +2215,71 @@ request_tombstone_is_valid() {
     ' < "$tombstone_path"
 }
 
+request_records_filter='
+def valid_task_id:
+    if type != "number" then
+        false
+    else
+        (. >= 0) and ((floor) == .)
+    end;
+def valid_record($request_id):
+    (.version == 1)
+    and (.request_id == $request_id)
+    and (.payload | type) == "object"
+    and (.payload.workdir | type) == "string"
+    and (.payload.label | type) == "string"
+    and (.payload.argv | type) == "array"
+    and all(.payload.argv[]; type == "string")
+    and (.task_label == ("agentq:" + .request_id))
+    and (.state == "prepared" or .state == "adding" or .state == "accepted" or .state == "removing" or .state == "removed")
+    and (
+        if .state == "prepared" or .state == "adding" then
+            .task_id == null and .task_created_at == null
+        else
+            (.task_id | valid_task_id)
+            and (.task_created_at | type) == "string"
+            and (.task_created_at | length) > 0
+        end
+    )
+    and (.created_at | type) == "string"
+    and (.created_at | length) > 0;
+def valid_request:
+    (.version == 1)
+    and (.request_id | type) == "string"
+    and (.payload | type) == "object"
+    and (.payload.workdir | type) == "string"
+    and (.payload.label | type) == "string"
+    and (.payload.argv | type) == "array"
+    and all(.payload.argv[]; type == "string")
+    and (.task_label == ("agentq:" + .request_id))
+    and (.state == "prepared" or .state == "adding" or .state == "accepted" or .state == "removing")
+    and (
+        if .state == "prepared" or .state == "adding" then
+            .task_id == null and .task_created_at == null
+        else
+            (.task_id | valid_task_id)
+            and (.task_created_at | type) == "string"
+            and (.task_created_at | length) > 0
+        end
+    )
+    and (.created_at | type) == "string"
+    and (.created_at | length) > 0;
+. as $records
+| ($ARGS.positional) as $request_ids
+| if (($records | length) != ($request_ids | length)) then
+    error("invalid AgentQ request record")
+  else . end
+| [ range(0; length) as $index
+    | .[$index] as $record
+    | if ($record | valid_record($request_ids[$index])) then $record
+      else error("invalid AgentQ request record")
+      end ]
+| if all(.[]; valid_request) then . else error("invalid AgentQ request record") end
+'
+
 load_request_records() {
     local record_files=()
+    local record_ids=()
     local record_path
     local record_parent
     local request_id
@@ -2208,6 +2293,15 @@ load_request_records() {
         printf '%s\n' '[]'
         return 0
     fi
+
+    # The request ids are collected here, in the parent shell: the loop that
+    # feeds jq below runs inside a pipeline subshell, so an array filled there
+    # would never reach the jq invocation.  This loop is pure bash and forks
+    # nothing.
+    for record_path in "${record_files[@]}"; do
+        request_id=${record_path##*/}
+        record_ids+=("${request_id%.json}")
+    done
 
     {
     for record_path in "${record_files[@]}"; do
@@ -2226,42 +2320,20 @@ load_request_records() {
             fail "invalid AgentQ request record path: $record_path"
         request_metadata_file_is_safe "$record_path" ||
             fail "invalid AgentQ request record path: $record_path"
-        record=$(request_record_is_valid "$record_path" "$request_id") ||
-            fail "invalid AgentQ request record: $record_path"
+        # The two re-checks request_record_is_valid() used to perform are kept
+        # verbatim: they are bash builtins that fork nothing, so removing them
+        # would shrink the TOCTOU window's coverage for no gain.  Only the
+        # three jq invocations per file are gone -- their verdict is reached by
+        # the single aggregate jq below.
+        validate_task_id_precision_in_file "$record_path"
+        request_metadata_file_is_safe "$record_path" ||
+            fail "invalid AgentQ request record path: $record_path"
+        request_metadata_file_is_safe "$record_path" ||
+            fail "invalid AgentQ request record path: $record_path"
+        record=$(<"$record_path") || fail "invalid AgentQ request record: $record_path"
         printf '%s\n' "$record"
         done
-    } | jq -cse '
-        def valid_task_id:
-            if type != "number" then
-                false
-            else
-                (. >= 0) and ((floor) == .)
-            end;
-        def valid_request:
-            (.version == 1)
-            and (.request_id | type) == "string"
-            and (.payload | type) == "object"
-            and (.payload.workdir | type) == "string"
-            and (.payload.label | type) == "string"
-            and (.payload.argv | type) == "array"
-            and all(.payload.argv[]; type == "string")
-            and (.task_label == ("agentq:" + .request_id))
-            and (.state == "prepared" or .state == "adding" or .state == "accepted" or .state == "removing")
-            and (
-                if .state == "prepared" or .state == "adding" then
-                    .task_id == null and .task_created_at == null
-                else
-                    (.task_id | valid_task_id)
-                    and (.task_created_at | type) == "string"
-                    and (.task_created_at | length) > 0
-                end
-            )
-            and (.created_at | type) == "string"
-            and (.created_at | length) > 0;
-        if all(.[]; valid_request) then .
-        else error("invalid AgentQ request record")
-        end
-    '
+    } | jq -cse --args "$request_records_filter" -- "${record_ids[@]}"
 }
 
 release_request_metadata_files() {
@@ -2352,6 +2424,42 @@ prepare_request_metadata_files() {
         release_request_metadata_files
         return 1
     fi
+}
+
+# Validate the record and print, in one jq run, three lines: the state, the
+# task id (empty when null), and the compact record.  `repair` needs the state to
+# decide whether to archive and used to read it with a SECOND jq on the record it
+# had just validated -- one wasted process per file.
+#
+# The output goes to stdout and the caller captures it with `$( )`, which is not
+# a style choice: it is what keeps the failure path identical to the one this
+# replaces.  The validating `fail` inside then terminates only that subshell, so
+# the caller's own `|| fail "missing ... during recovery"` still produces the
+# second message.  Assigning the values to variables here instead would let
+# `fail` exit the whole server and silently drop that message -- an observable
+# contract change that the recorded-stderr comparison in smoke/18 caught.
+#
+# `jq -r` puts each value on its own line, so no separator character is needed
+# (and none is safe: `-c` would JSON-encode a TAB into backslash-t, which never
+# matches a literal tab).
+read_request_record_state_and_body() {
+    local request_id=$1
+    local record_path
+
+    is_request_id "$request_id" || fail "invalid AgentQ request record id: $request_id"
+    record_path=$(request_record_path "$request_id")
+    if [ ! -e "$record_path" ] && [ ! -L "$record_path" ]; then
+        return 1
+    fi
+    request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
+    request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
+    validate_task_id_precision_in_file "$record_path"
+    request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
+    request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
+
+    jq -re --arg request_id "$request_id" \
+        "$request_record_filter | .state, (.task_id // \"\" | tostring), tojson" < "$record_path" ||
+        fail "invalid AgentQ request record: $record_path"
 }
 
 read_request_record() {
@@ -2824,6 +2932,9 @@ repair_removed_request_records() {
     local record_path
     local request_id
     local record
+    local record_state
+    local record_task_id
+    local output
 
     shopt -s nullglob
     record_files=("$request_directory"/*.json)
@@ -2833,8 +2944,13 @@ repair_removed_request_records() {
         request_id=${record_path##*/}
         request_id=${request_id%.json}
         is_request_id "$request_id" || fail "invalid AgentQ request record filename: $record_path"
-        record=$(read_request_record "$request_id") || fail "missing AgentQ request record during recovery: $record_path"
-        if [ "$(jq -r '.state' <<<"$record")" = removed ]; then
+        output=$(read_request_record_state_and_body "$request_id") ||
+            fail "missing AgentQ request record during recovery: $record_path"
+        record_state=${output%%$'\n'*}
+        output=${output#*$'\n'}
+        record_task_id=${output%%$'\n'*}
+        record=${output#*$'\n'}
+        if [ "$record_state" = removed ]; then
             if ! archive_removed_request "$request_id" "$record" >/dev/null; then
                 fail "cannot archive removed AgentQ request during repair: $request_id"
             fi
@@ -3214,9 +3330,14 @@ recover_removing_requests() {
     local reconcile_status
 
     records=$(load_request_records)
-    while IFS= read -r record; do
-        [ -n "$record" ] || continue
-        request_id=$(jq -r '.request_id' <<<"$record")
+    # The request id and the record's own serialisation are emitted together,
+    # one pair of lines per removing record, so the second jq invocation the
+    # original ran per record disappears.  `tojson` is byte-identical to the
+    # `jq -c` the record already went through, and it escapes newlines inside
+    # string values, so record content cannot break the line-pair framing.
+    while IFS= read -r request_id; do
+        [ -n "$request_id" ] || continue
+        IFS= read -r record || fail "cannot recover removing AgentQ request: $request_id"
         if reconcile_removing_request "$request_id" "$record" >/dev/null; then
             continue
         else
@@ -3224,7 +3345,7 @@ recover_removing_requests() {
         fi
         [ "$reconcile_status" -eq 1 ] ||
             fail "cannot recover removing AgentQ request: $request_id"
-    done < <(jq -c '.[] | select(.state == "removing")' <<<"$records")
+    done < <(jq -r '.[] | select(.state == "removing") | .request_id, tojson' <<<"$records")
 }
 
 request_response() {
@@ -3545,6 +3666,8 @@ wait_reconcile_missing_task() {
     local tombstone
     local record
     local record_state
+    local record_task_id
+    local output
     local matched_request_id=''
     local matched_record=''
     local matched_tombstone_request_id=''
@@ -3563,12 +3686,16 @@ wait_reconcile_missing_task() {
             request_id=${path##*/}
             request_id=${request_id%.json}
             is_request_id "$request_id" || fail "invalid AgentQ request record filename: $path"
-            record=$(read_request_record "$request_id") || fail "missing AgentQ request record during wait recovery: $path"
-            record_state=$(jq -r '.state' <<<"$record")
+            output=$(read_request_record_state_and_body "$request_id") ||
+                fail "missing AgentQ request record during wait recovery: $path"
+            record_state=${output%%$'\n'*}
+            output=${output#*$'\n'}
+            record_task_id=${output%%$'\n'*}
+            record=${output#*$'\n'}
             case "$record_state" in
                 accepted|removing)
-                    validate_task_id_precision "$(jq -r '.task_id' <<<"$record")"
-                    if [ "$(canonical_task_id "$(jq -r '.task_id' <<<"$record")")" = "$(canonical_task_id "$task_id")" ]; then
+                    validate_task_id_precision "$record_task_id"
+                    if [ "$(canonical_task_id "$record_task_id")" = "$(canonical_task_id "$task_id")" ]; then
                         [ -z "$matched_record" ] || fail "multiple AgentQ request records match task id: $task_id"
                         matched_request_id=$request_id
                         matched_record=$record

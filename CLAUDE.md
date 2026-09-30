@@ -396,7 +396,7 @@ FullControl、其余身份降到 ReadAndExecute、`SetAccessRuleProtection($true
 
 ## 测试覆盖的真实边界（重要）
 
-`smoke/` 十七项检查，各自证明什么、不证明什么：
+`smoke/` 十八项检查，各自证明什么、不证明什么：
 
 | 检查 | 覆盖 | 不覆盖 |
 | --- | --- | --- |
@@ -417,12 +417,13 @@ FullControl、其余身份降到 ReadAndExecute、`SetAccessRuleProtection($true
 | `15-transient-pueue-failure` | **瞬时 Pueue 读取失败不得被当成「任务不存在」**——P0 缺陷的回归锁（2026-09-24 外部审查发现）。缺陷机制：`find_request_task` 用 `fail`（即 `exit 2`）表达「读不到 Pueue」，而 6 个调用点全是 `if task=$(find_request_task ...)` 形状——**`exit` 在 `$( )` 里只终止子 shell**，调用方拿到空串 + 假条件，判定任务不存在，于是把**活着的** request 归档成 `removed`（删 record、写 tombstone，任务继续跑）。后果永久：`lookup` 永远 `5`、任务丢掉全部 `agentq` 元数据、request id 再也不能复用。做法：自建真实运行时，包装 `pueue` 只在**第 2 次** `status --json`（即 reconcile 那次；第 1 次是 `ensure_daemon` 的探测，失败会让服务端去 `launchctl`）注入一次失败，然后断言五件事——必须报 exit `2` + `reason=protocol_error`、**record 数不变**、**tombstone 为 0**、**不得报 `removed`**、Pueue 恢复后 `lookup` 必须仍能解析到同一 task id 且任务仍 `Running`。修复前（`1bbfd403`）五条全红、消息精确；修复后全绿 | 除这一处注入外的其它 Pueue 故障形态；`cancel`/`logs`/`remove` 路径上同一根因的**消息误导**（它们 exit `2` 传播正确，只是把「读不出来」说成「id 不存在」）|
 | `16-no-host-identifiers` | **仓库与记忆里不得出现任何主机标识**——这条**规则早就写在文档里**（`CLAUDE.md` 操作边界「仓库与记忆里一律不出现主机名或 IP」），`CHANGELOG` 也记着 2026-09-22 清过 9 处、验证方式是「全仓正则扫描、排除回环、零命中」。**但没有任何检查重跑那次扫描，于是规则静默失效**：到 2026-09-27，仓库里重新出现 **7 个不同地址、46 行**，另有账号名、两把**他人公钥的注释串**（含真实姓名与两个机器名）、一个 `~/.ssh/config` 别名，以及**由地址派生的私钥文件名**。做法：五条规则扫全仓每个文本文件 + 记忆目录——`R1` 非回环 IPv4、`R2` mDNS 主机名、`R3` `user@fqdn`、`R4` `@含数字的裸词`（抓 `R3` 漏掉的序列号式主机名）、`R5` **被压成标识符的地址**（私钥文件名那个形状，`\b` 在这里失效——第一版就是这么写成「永远不匹配」还报绿的）。**输出里的匹配一律打码**，只留前两个字符与长度：检查自己的输出会被阅读、粘贴、归档，原样打印等于把检测器变成新的泄漏通道。**先自校准再扫描**：五条规则各自必须在**它存在的形状**上触发、且在**替换它的占位符**上保持沉默，自校准不过就不给结论；另有一条 canary 把已知坏内容喂进**真实扫描路径**，独立于自校准地证明 grep→判定→退出码这条链是通的。**变异 11 个中 10 个被抓**，1 个 MISSED 如实记录：单独关掉自校准闸门（`if false`）**没有任何可观测变化**——闸门本来就没触发过，单看这一个变异是良性的；它与「某条规则被放宽」组合时会被 canary 抓住（实测 `R2`/`R5` 各自 + 关闸门 → 报 `canary caught 4 of 5 rules`），所以**不声称它是缺陷，也不声称它被覆盖**。真实红/绿已验：把清洗前的 `PLAN.md` 放回去 → 27 处违规、五条规则全部触发；换回当前版本 → 0 | 任何**不具这五种形状**的地址写法（记成「角落那台机器」的扫描器看不见，这是刻意的边界而非疏漏）；`find` 会跳过的二进制文件；规则本身只证明「这五种形状不在文本里」，不证明别处没有 |
 | `17-askpass-credential` | **POSIX 客户端的密码认证路径，跑在真实 sshd 上**。客户端原先 4 处 ssh 调用全部硬编码 `BatchMode=yes`（它禁用全部交互式认证），所以只有密码的目标机连不上。现在配置了凭据来源就改传 `BatchMode=no` + `NumberOfPasswordPrompts`，并经 askpass 取密码；**没配置时逐字节不变**。本检查断言两件事：**有来源时端到端跑通**（真 sshd、真 pueue、submit→wait 的 `result` 必须是 `Success`）、**无来源时 ssh 仍拿 `BatchMode=yes` 且 askpass 一次都不被调用**。两个方向都断言是刻意的——只测一个方向，一个「永远传同一个值」的退化实现也能过（`12` 的 auth-hint 用例已为同类理由写过这个论证）。**凭据来源是三种**：`AGENTQ_ASKPASS`（可执行程序，**排第一**——AgentQ 因此从不接触密码本身，只传程序名）、`AGENTQ_PASSWORD`（环境变量）、`AGENTQ_PASSWORD_PROMPT=1`（人类交互）。**守卫是严格的**：来源配置了但不可用（不存在／不可执行／符号链接／是目录）必须**拒绝运行**（exit 2 + 原因），**不静默回落到密钥认证**——静默回落会让操作者以为在用密码。**为什么用口令私钥而不是账户密码做端到端**：两者走**同一条 `read_passphrase → ssh_askpass` 代码路径**（实测 prompt 文本不同、机制相同），而 macOS 上非 root 的用户级 sshd **无法验证任何真实账户密码**——`getpwnam().pw_passwd` 是 `'********'`、无 `/etc/shadow`、`/usr/sbin/sshd` 无 setuid 位、`UsePAM yes` 明确要求 root。所以账户密码**登录成功**这一环本机测不了，需真机。**实现里三处易错点已钉住**：① 凭据解析必须在**顶层**、早于 `initialize_remote_invocation`——平台探针自己就是一处 ssh 调用，来源若只在操作路径生效，探针会先失败、命令根本走不到操作路径；② `SSH_ASKPASS` 空串**不等于未设置**（OpenSSH 测的是 `getenv() != NULL`），所以只在真有程序时才导出；③ 清理只删**自己建的**临时 wrapper，用户提供的 askpass 程序绝不动（实测把两者混为一谈时清理会去删用户的文件）。变异 6/6（POSIX 参数构造）与 3/3（端到端）全部被抓，其中一个是「清理越界删除用户程序」 | **账户密码登录成功**（macOS 非 root 限制，见左）；**Windows 侧全部**——`agentq.ps1` 的实现已就位并在 pwsh 下断言了选项构造（`12` 的 4 个新用例），但真机行为未验。Windows 上 `AGENTQ_PASSWORD`/`AGENTQ_PASSWORD_PROMPT` **刻意拒绝**（该平台 ssh 无控制台时读 `_getwch()` 会挂死，且没有顶层 trap 可挂清理），只支持 `AGENTQ_ASKPASS`；且 Windows 的 `SSH_ASKPASS` 取值必须是**一个可执行文件的路径**——ssh 把整个值当**单个文件名**执行，无 shell、不分词，**不能带参数、不能加引号，但路径里的空格合法**（判据是「整个值是不是一个存在的可执行文件」而非「有没有空格」；真机实测含空格路径 rc=0 成功。原先的：`cmd.exe /c helper.cmd` 报 `ssh_askpass: exec(...): No such file or directory`；指向带 shebang 的脚本则正常）。**2026-09-29 真机复核**：POSIX 客户端经**真实账户密码**（非口令私钥）在 macOS 主机上跑通完整协议 （`submit`→`wait` 的 `Done.result=Success`→`logs` 回 `Darwin`→`remove`），Linux 目标同样跑通；**这是 A18 标注为「尚未在任何真实主机上验证」的那一项，现已验证**。Windows 客户端已升级到 canonical 并在真机确认守卫与 ACL；**经 Windows 客户端发起的端到端也已验证**（Windows → 那台只有密码的 macOS 主机：`wait` 退 0 + `Done.result=Success`、`logs` 回 `WIN-E2E-OK\nDarwin`、`remove` 回 `removed:true`）。**仍未测的是原生 Windows ssh**（`System32\OpenSSH\ssh.exe`）下的行为——该机 PATH 上解析到的是 **Git Bash 的 MSYS ssh**，两者不是同一实现，所以「原生 ssh 下能否用带参数形态」在这台机器上测不到 |
+| `18-record-metadata-contract` | **`status` 的 request-record 元数据扫描的契约**——21 例，跑在临时目录里自建的合成运行时上（含 `pueue`/`pueued` 桩，桩必须同时答 `status --json` **和** `group --json`，否则 `status` 死于 "group is missing"，看起来像记录问题而其实不是）。**这个检查存在的原因是本仓文档一直写着「smoke 抓不到行为回归」，而本轮用实验坐实了它**：一个跳过 crash-window repair 扫描的变体（约 1.9× 加速）会让合法的 crash-window record **永远无法自愈**，却跑出 `17 ran 0 failed`；另一个去掉 filename↔`request_id` 绑定的变体**静默接受**错配记录，同样全绿。所以先写能红的检查、再改扫描代码。断言：① 8 类坏记录必须 exit `2` + `reason=protocol_error`，且**完整 stderr 与基线逐字节相同**（含 base 因内层 `fail` 落在 `$( )` 里而多打的那条 `missing ... during recovery`——第一版读取器把结果赋给变量而非走 stdout+`$( )`，**丢掉了这条消息**，正是这个检查抓到的）；② 合法 crash-window 状态（`removed` record + 已写 tombstone）必须自愈成 record 0 / tombstone 1；③ `task_id: null` 对 prepared/adding **合法**；④ 好记录的输出逐字节一致。**每个用例都重新播种记录目录**——`status` 会**写**（把 `removed` 归档进 tombstone），两棵树共用一个目录会让先跑的那次消费掉后跑那次要看的输入，报出 IDENTICAL 而实际什么都没测。**变异 3/3 被抓**：跳过 repair → `crashwin: exit code differs (baseline 0, variant 1)` + `did not self-heal`；去掉绑定判据 → `mismatch: expected exit 2, got 1`；把校验的 `error(...)` 换成恒真 → 8 处失败。**1 个 MISSED 如实记录且已查证不是覆盖漏洞**：把**聚合**过滤器换成恒真（`jq -cse .`）报绿——因为 `repair`（pass 1）会先拒掉每一条坏记录，聚合那层的绑定检查在 `status` 路径上**不可达**；另外**直接**用 `jq -cse --args -f` 单独喂给它错配/匹配两种记录，确认判据本身正确（错配 error、匹配通过）。该结论写在检查的注释里，以免绿灯被过度解读。**也记下我自己的两个假红**（都改了检查、没改代码）：`normalize()` 没剥两棵树各自的绝对路径，对**未改动**的服务端也报 7/21 失败 | **真机行为**——全部跑在 macOS 的合成运行时上，不证明真实 Pueue/远端/Windows；**聚合过滤器的绑定检查在 `status` 路径上不可达**（见左，`repair` 先拦住）；只覆盖 `status`，不覆盖 `lookup`/`wait`/`logs`/`submit` 各自的记录读取路径 |
 
 `02` 会在临时目录里自建一个最小运行时（目录结构 + `pueue`/`pueued` 桩），
 否则服务端在解析参数**之前**就因缺少可执行文件退出 2——那样即使参数校验
 完全损坏，检查也照样通过。每个用例同时断言 stderr 内容，所以失败可归因。
 
-**这套检查无法发现行为回归。** `skill/assets/unix/agentq-server` 是 4,810 行无类型
+**这套检查无法发现行为回归。** `skill/assets/unix/agentq-server` 是 4,937 行无类型
 shell，没有编译器、没有类型系统。**2026-09-29 起已纳入 git**（用户明确授权的一次性动作；此前本仓刻意不做版本控制，`.gitattributes` 用 `* -text` 钉住字节一致性，`.gitignore` 用机制挡住凭据落库）。smoke 证明的是：能解析、两条
 canonical 资产一致、坏参数被正确拒绝、命令集合没漂移。它不证明任何分支的
 行为正确。
@@ -553,6 +554,13 @@ shell，在命令替换内部设置的全局变量传不回来——缓存会静
 一次）。这些校验是完整性防御，不是可省的冗余——**所以这里不要为了提速而顺手改**：
 `agentq-server` 是无类型 shell，本仓的 smoke 抓不到行为回归，而这条路径正好是安全
 相关的。要优化就得先把行为钉死（针对该函数写针对性测试或真机验证），再动。
+
+**这条路径现在有针对性检查了：`smoke/18-record-metadata-contract`（21 例）。**
+它是在**改之前**先写的，并且先证明了自己能红——跳过 crash-window repair 的变体、
+去掉 filename↔`request_id` 绑定的变体都被它抓住。**2026-09-30 已按这条纪律完成
+一次优化**：折叠三处逐条重复的 jq，每 record 的 jq 调用 **4.05 → 1.05**
+（N=40 时 169 → 49），墙钟 −37%，`status`/`doctor` 输出逐字节不变。改这条路径时
+先跑 `smoke/18`，它比整套 smoke 更贴近这里的行为。
 
 同一台机器上 `logs`/`status` 达到分钟级是这个规模因子的结果，不是卡死——排查时先数
 元数据文件，再怀疑死锁。
