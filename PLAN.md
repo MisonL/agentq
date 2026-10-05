@@ -164,9 +164,59 @@ C1 在主机 A 上实测。**先说清一个我最初搞错的框架**：Windows
 内层 2/42/43/44/45/124 一律变 1，只有 0 和 1 保留。Git Bash 与 `cmd.exe` 都原样
 传递。**这直接打穿协议**：`42-45` 是 launcher 的契约退出码（缺 launcher /
 不兼容 / reparse 非法 / 过大），压成 1 后客户端分不出"部署不完整"和"一般失败"；
-`124`（平台探测超时）同理。**未验证**：真实 `DefaultShell=powershell.exe` 的主机
-我没碰过，这一条是在现有主机上用外层 `powershell -c` 模拟出来的——结论可靠
-（机制是 PowerShell 自身的），但**没有一台真机以该配置跑过**。
+`124`（平台探测超时）同理。
+
+**2026-10-01：这一列终于有真机了——在专用 Windows 测试机上真造出
+`DefaultShell=powershell.exe` 并端到端跑通。** 做法：写
+`HKLM:\SOFTWARE\OpenSSH` 的 `DefaultShell` = 系统 PowerShell 5.1 路径、
+`DefaultShellCommandOption` = `-c`（该键此前不存在 = 默认 `cmd.exe`），重启 sshd。
+先**证明这一列真的生效**：`echo $PSVersionTable.PSVersion` 回 `5.1.19041.3996`。
+**压平的精确边界（干净复现，比此前更准）**：压平的对象是**原生子进程的非零退出码**，
+不是 PowerShell 自身的 `exit`——`cmd /c exit 0`→0、`cmd /c exit 2`→1、`cmd /c exit 5`→1，
+而 PowerShell 自己的 `exit 0`→0、`exit 5`→5。**AgentQ 的远端操作恰好走前者**：
+客户端发的是 `powershell.exe -EncodedCommand <wrapper>`（原生子进程），wrapper 内层
+`exit ([int]$launcherExitCode.Value)` 是对的、内层确实以该码退出，但 sshd 这一层
+把它压成 1。
+
+**实测的客户端行为，与预测完全一致**：成功路径（`0`）不受影响——`doctor`、
+`submit`、`wait`(`result=Success`)、`logs`(`A5B-PS-OK`)、`remove`(`removed:true`)
+**全部退 0**；而失败/状态路径失真——`lookup` 对 not_found **返回了正确的
+`{"state":"not_found"}` 却退 1**（应退 3）、`lookup` 对 removed 应退 5 却退 **1**、
+`logs`/`remove` 对未知 id 应退 2 却退 **1**。**根因定位到行**：`run_operation_ssh`
+直接取 `$?` 作为远端退出码（`assets/client/unix/agentq:977-987`），**没有**任何
+带外 token——`agentq-exit` 只加在**探针**路径（`windows_probe_apply_exit_token`），
+所以探针能工作、操作路径不能。这**确认**了本节此前的判断（「客户端依赖 `3/4/5/6`
+做恢复判定」），并把「未验证」升级为「真机实测的缺陷」。
+
+**已修（2026-10-02）——通道就是 stderr。** 原先以为要在 stdin（被 base64 payload 占）
+或 stdout（是 JSON 响应本身）之间取舍，但客户端**本来就把远端命令的 stderr 捕获进一个
+受保护临时文件**（服务端的 `reason=` 通道就是这么过来的，见 `run_ssh_logged`）。所以
+launcher wrapper 把 `agentq-exit:<code>` 写到 **stderr**，客户端从那一个通道里取。
+**改动面**：`build_windows_remote_command` 的 wrapper 在两份客户端里各加一行
+`[Console]::Error.WriteLine("agentq-exit:$agentqLauncherExit")`（规则 E 的 parity 仍然
+绿——两份逐 token 相同）；POSIX 侧新增只读的 `agentq_remote_exit_token`（字符集限定
+`[0-9]+`，与 `reason` 通道同样的纪律：只取受控标识符、绝不回显 stderr 原文），在
+`run_ssh_logged` 里**仅当 `remote_platform=windows`** 时用它覆盖 `ssh_status`；
+Windows 侧在 `Invoke-SshLogged` 里用同一个 `(?m)^agentq-exit:(\d+)\s*$` 正则覆盖
+`$exitCode`（同样仅限 windows）。
+
+**为什么「以 token 为准」是安全的**：wrapper 对**两种** `DefaultShell` 都发 token，
+而 token 的值就是 wrapper 真实 `exit` 的码——所以它在 ssh 退出码可信时**与之一致**、
+在不可信时**是唯一正确的**。unix 目标永远不发这个 token，故不受影响。
+
+**真机双向验证（2026-10-01/02，同一台测试机，两列都跑）**：`cmd.exe` 列——
+修复前后行为**逐项相同**（`0/2/3/5` 全对，即修复在该列是 no-op）；`powershell.exe` 列
+——修复前 `lookup(not_found)=1`、`lookup(removed)=1`、`logs/remove(unknown)=1`，
+修复后**分别是 3/5/2/2**，成功路径 `doctor`/`submit`/`wait(Success)`/`logs`/`remove`
+仍全 0。**变异 3 个被抓**：关掉提取 → `lookup` 退回 1；两份 wrapper 都丢掉 token
+（此时 parity 仍绿，只有行为检查能看见）→ 被抓；把 token 解析的字符集放宽 → 被新增的
+注入用例抓住（`agentq-exit:3; echo pwned` 会被当成码 3 传进 `return`，报
+`numeric argument required`）。回归锁：`smoke/05` 新增「flattened 目标」桩 + 注入用例，
+`smoke/12` 新增 wrapper token 断言。
+
+**仍未覆盖**：真实 `4`（`ambiguous`/`cancellation_pending`）需要竞态才能构造，未构造；
+但**通道已用全部协议码（`2/3/4/5/6/42/45/124`）证明**——token 逐码存活、提取模式取到
+最后一个，与具体码值无关。
 
 **已实施（2026-09-22，只改 `assets/`，两台客户端）：**
 
@@ -190,9 +240,14 @@ C1 在主机 A 上实测。**先说清一个我最初搞错的框架**：Windows
 **已交付的检查（`smoke/14-remote-command-length.sh`，零授权、纯静态）**：
 断言"远端命令行长度 <= 8,125 − 256"这个预算。长度是纯静态量，不需要真机；而它
 **已经悄悄破过一次**（探针从 491 涨到 3,216 字符，全套检查没有一条能发现）。
-五个站点：POSIX 协议探针、POSIX 平台探针、launcher wrapper、Windows 协议探针、
+**七个站点**：POSIX 协议探针、POSIX 平台探针、launcher wrapper、Windows 协议探针、
 Windows 客户端自己的 launcher wrapper（第 5 个是 C5 审查补上的——此前它从未被测量过，
-把它撑到 26,538 字符全套检查依然全绿）。
+把它撑到 26,538 字符全套检查依然全绿），以及 **Windows 客户端的 unix 探针脚本（2,707）
+与 unix 安装脚本（1,267）**（第 6、7 个是 A21 修法**自己造出来的**：那两条脚本原先作为
+裸 argv 发出、命令行上很小，改成 base64 通道后**第一次出现在命令行上**，而 base64(UTF-8)
+约为原脚本的 4/3——**这个修复让这两条命令行比它替换掉的字节更长**，而本检查存在的全部
+理由就是 Windows 目标的命令行上限。这正是第 5 个站点那条教训的直接应用：站点不在列表里，
+就永远量不到。`sshp` 的**会话命令刻意不量**，理由与它不被包装相同——需要 tty）。
 
 **量的是命令行，不是脚本体**——这是修好之后必须重写检查的原因：把脚本体搬到
 stdin 之后，"脚本多大"不再是风险，把脚本量进预算会把**修好的代码报成红的**。
@@ -224,10 +279,10 @@ bash 下被当普通字符串。所以修法只能是**让命令对三种都安�
 外层 Git Bash / `cmd.exe` / PowerShell **三者都返回 `agentq-windows-launcher-ready`**；
 失败路径 `42/43/44/45` 在三种外层下**有效状态全部正确**。
 
-**仍未验证**：`DefaultShell` **真的**配置为 `powershell.exe` 的主机——我是在现有主机
-上用外层 `powershell -c` **模拟**出来的。机制是 PowerShell 自身的（机制可靠），
-但没有一台真机以该配置跑过。也**不能**声称主机 A 经 AgentQ 协议可用（那需要端到端
-真机复验，属 C1 的遗留项）。
+**（此段已过时，保留作历史）** 当时**仍未验证**：`DefaultShell` 真的配置为
+`powershell.exe` 的主机——那是用外层 `powershell -c` 模拟的。**2026-10-01 已在专用
+测试机上真造出该配置并端到端实测**（见下文「2026-10-01：这一列终于有真机了」与
+「2026-10-02 已修」）。
 
 **2026-09-23 补测：压平的范围比本节原先写的更广——是全部协议码，不只 launcher 的 42-45。**
 模拟外层 PowerShell 跑内层原生 `powershell.exe`，内层退 `2/3/4/5/6/42/124` **一律变 1**，
@@ -334,6 +389,9 @@ argument vector ... launcher 4 13 status`）；③ payload 是合法 submit 向�
 
 **仍未覆盖**：submit 路径的**退出码通道**（A5b 那条），`DefaultShell=powershell.exe`
 时非零仍被压平为 1。本节只证明 payload 送达。
+（**2026-10-02 更新**：这条已不再是缺口——A5b 的操作路径 token 走 stderr 后，
+submit 与其余操作共用同一个 `run_operation_ssh`，退出码随之恢复；见上方 A5b 正文
+与 A20 的真机端到端。）
 
 ### A6. `task_instance_created_at` 的"取第一条匹配" —— **已修并验证（零授权，只改 `assets/`）**
 
@@ -1160,10 +1218,14 @@ shell 脚本可以直接作 askpass**（MSYS ssh 能 exec 它）。所以原先�
 所以这是**文档/注释缺陷，不是行为缺陷**：照文档写的用户会失败，照代码语义
 （给一个可执行程序）写用户会成功。
 
-**仍未验证**：Windows 客户端经**原生 Windows ssh**（`C:\Windows\System32\OpenSSH\ssh.exe`）
-的行为——那个版本的 `ssh_askpass` 走 win32compat 的 `posix_spawnp`，与 MSYS 版
-不是同一实现，可能确实支持带参数形态。**但主机 A 的客户端解析到的是 MSYS 版**，
-所以「原生 ssh 下能否用 `cmd.exe /c`」在这台机器上**测不到**，不得声称。
+**仍未验证（仅指 `System32` 8.1p1 这一格）**：该构建的 `ssh_askpass` 走 win32compat 的
+`posix_spawnp`，与 MSYS 版不是同一实现，可能确实支持带参数形态。**但主机 A 的客户端
+解析到的是 MSYS 版**，所以「`System32` 8.1p1 下能否用 `cmd.exe /c`」在这台机器上
+**测不到**，不得声称。
+（**2026-10-02 更新**：**原生 Windows ssh 整体已不再是未验证项**——专用测试机上验证的是
+`C:\Program Files\OpenSSH\ssh.exe` 9.5p1，同样原生。唯一仍属边界的是这里说的
+`System32` 8.1p1（早于 `SSH_ASKPASS_REQUIRE`，且不是客户端默认解析到的构建）。
+见下方 A18 结论与 A20。）
 
 #### 实现
 
@@ -1253,10 +1315,12 @@ ssh 能读的地方，而该客户端**没有顶层 trap 可挂清理**，且 cm
 带引号 rc=255、带参数 rc=255——即后两者**永远不会成功**，而前两者都合法。
 
 **仍未验证，不得声称**：
-**Windows 客户端经原生 Windows ssh**（`C:\Windows\System32\OpenSSH\ssh.exe`，
-8.1p1）的 askpass 行为——该机客户端 PATH 上解析到的是 **Git Bash 的 MSYS ssh**
-（`C:\Program Files\Git\usr\bin\ssh.exe`，9.9p1，`objdump -p` 确认链接 `msys-2.0.dll`），
-两者不是同一实现，所以「原生 ssh 下 `cmd.exe /c` 形态是否可行」在这台机器上**测不到**。
+**`System32\OpenSSH\ssh.exe`（8.1p1）那一格的 askpass 行为**——它是原生 ssh，但**早于
+`SSH_ASKPASS_REQUIRE`**，实测「有无 `REQUIRE`」两列都阻塞。**但「原生 Windows ssh
+未验证」这个更大的说法已在 2026-10-02 关闭**：专用测试机的客户端 PATH 解析到
+`C:\Program Files\OpenSSH\ssh.exe`（`OpenSSH_for_Windows_9.5p1`，**原生**，非 MSYS），
+经它跑通完整协议（见 A20）。所以现在**原生 ssh 已验**，只有 8.1p1 那个更旧的构建
+是记录在案的边界，且**它不是客户端默认解析到的那个**。
 **macOS 本机非 root 的用户级 sshd 仍验不了真实密码**（`getpwnam().pw_passwd`
 是 `'********'`、无 `/etc/shadow`、`/usr/sbin/sshd` 无 setuid 位、`UsePAM yes`
 明确要求 root）——**但这不再限制结论**：账户密码登录成功已在真机上由上述两台
@@ -1265,6 +1329,407 @@ ssh 能读的地方，而该客户端**没有顶层 trap 可挂清理**，且 cm
 **过程中记录在案的一处自造假绿**：`smoke/05` 的失败检查块原先在凭据断言**之前**，
 于是那些 `failures` 计数全被累加却从不被检查——检查照常报绿。是变异测试
 （把守卫改成恒假后仍绿）暴露的，已把该块移到断言之后。
+
+---
+
+### A19. `DefaultShell=cmd.exe` 的 Windows 目标根本连不上 —— **已修（2026-09-30 / 10-01，两台资产共三处）**
+
+在 ESXi 上新部署一台 Windows 10 目标机做端到端验证时，**POSIX 客户端一条命令都发不出去**，
+报 `unsupported or undetectable remote platform: unknown`。两个独立缺陷叠加，都不在
+smoke 的可见范围内。
+
+**缺陷一：`auto` 分支漏了 exit-token 剥离（`assets/client/unix/agentq`）。**
+平台探针**成功**返回 `agentq-windowsagentq-exit:0`，但 `initialize_remote_invocation`
+的 `auto` 分支拿这个**未剥离的整串**去比对 `agentq-windows`，于是永远不等。
+带外状态令牌（A5b 加的）只有 `probe_native_windows_platform`（MINGW 分支）剥了，
+`auto` 分支没剥——**同一个机制抄在两处、只修了一处**，与本仓 A9、规则 E 同一类。
+修法是让 `auto` 分支调用同一个 `windows_probe_apply_exit_token`。
+
+**为什么此前一直没暴露**：`auto` 分支是 `DefaultShell` 为 Windows 默认值 `cmd.exe`
+时的必经之路，而 CLAUDE.md 记录的 Windows 验证都在 **Git Bash** 终端下做的
+（`uname -s` 答 `MINGW64_*`，直接走 MINGW 分支，绕开了这条路径）。
+`smoke/14` 只量命令行长度、`smoke/05` 用 MINGW 桩，两者都碰不到 `auto` 分支。
+
+**缺陷二：安装器在 StrictMode 下把「组不存在」变成终止错误
+（`assets/windows-git-bash/install-agentq.ps1`）。**
+第 2796 行 `if ($null -ne $groups.agentq)` 的本意是「组已存在就设并行度、否则新建」，
+但 `$groups` 是 `ConvertFrom-Json` 的对象，而文件第 8 行是
+`Set-StrictMode -Version Latest`——**取不存在的属性会抛 `PropertyNotFoundException`**，
+所以**首次安装（组尚不存在）必然失败**。实测消息逐字为
+`在此对象上找不到属性"agentq"`，与 PS 5.1.19041.3996 上的独立复现一致。
+
+**同一文件里已有正确写法**：`Get-PueueHealthFromTemporaryFile` 用
+`$result.PSObject.Properties["groups"]` 逐级取值。本次把两处（另有一处同类站点在
+launcher smoke 的 `$status.groups.agentq`）统一到该惯用法，**没有引入新风格**。
+
+**证据形状**：三处修复都由**真实端到端**确认，不是推理——
+`doctor` 返回 `{"tasks":{},"group":{"status":"Running","parallel_tasks":1}}`，
+`submit` → `wait`（`"result":"Success"`）→ `logs`（`"output":"AGENTQ-E2E-OK"`，
+正是提交的字符串）→ `remove`（`removed:true`）→ `wait`（`5`/`removed`）。
+`smoke/13` 明确**不覆盖**安装器行为（只覆盖参数契约与平台闸门），所以这两个缺陷
+此前没有任何检查能看见；修复后整套 `./run-tests.sh` 仍 **18 ran / 0 skipped / 0 failed**。
+
+**缺陷三（2026-10-01 真机复核缺陷二时暴露，同一安装器）：回滚路径对首次安装必然误报
+「rollback incomplete」。** `Restore-ScheduledTaskDefinition` 的签名是
+`param([AllowNull()][string]$Definition)`，守卫写成 `if ($null -ne $Definition)`。
+**PowerShell 的 `[string]` 参数把 `$null` 强制转成 `""`**，所以绑定 `$null` 之后
+`$null -ne $Definition` 为**真**，于是走进 `Register-ScheduledTask -Xml ""`，
+后者对空 Xml 抛 `无法对参数"Xml"执行参数验证`。首次安装时本就没有前一个计划任务
+（`Get-ScheduledTaskDefinition` 返回 `$null`），所以**只要首次安装失败，回滚就崩**，
+把一次干净的失败说成「rollback is incomplete」并留下 `recovery artifacts` 残留。
+
+**判定与取证**：这不是推理，是 PS 5.1.19041.3996 上的直接实测——把 `$null` 绑到
+`[AllowNull()][string]` 后读回 `isNull=False / isNullOrEmpty=True`，而模拟的
+`$null -ne $Definition` 守卫**放行**了空串。修法是改用
+`![string]::IsNullOrWhiteSpace($Definition)`——**这正是同文件里兄弟守卫
+（`Remove-AgentQInstallerResponseTemporaryFile` 的 `$ExpectedIdentity`）一直在用的写法**，
+本次把这一处对齐，没有引入新风格。
+
+**两个方向都验过**：① 变异安装器（只还原缺陷二的 `$groups.agentq`，缺陷三的修复保留）
+在干净机上失败时，**回滚干净**——stderr 只有缺陷二的原始 `PropertyNotFoundStrict`，
+**不再有** `rollback is incomplete`、`Xml 为 Null`、`recovery artifacts` 残留；
+② 未修复时（修复前实测）同样场景三条都在。
+
+**已实测（2026-10-01/02）**：`DefaultShell=powershell.exe` 那一列**已有真机**——在专用
+测试机上真造出该配置，端到端确认了 A5b 缺陷并修复（见 A5b）。**原生 Windows ssh
+也已在同一台机上验证**（该机客户端 PATH 解析到 `C:\Program Files\OpenSSH\ssh.exe`
+9.5p1，**原生**，非 MSYS；见 A20）。
+
+---
+
+### A20. Windows 客户端的探针被 `-Command -` 静默吞掉 —— **已修（2026-10-02，一台资产两处）**
+
+**这是本会话最有价值的产出**，也是「`smoke` 抓不到行为回归」的又一实证。缺陷与
+A5a/A5b 同类（Windows 远端终端兼容性），但**根因完全不同**，此前从未被识别。
+
+**缺陷**：`powershell.exe -Command -` 把 **stdin 当交互式输入读**。一行若**开启一个块**
+（`if {`、`function {`、`try {`），读取器进入**续行**状态，缓冲的语句**只有在遇到一个
+空行时才执行**；**EOF 时未终止的缓冲区被静默丢弃**——rc=0、无输出、**什么也没执行**。
+单行语句则读一行执行一行。
+
+**为什么这恰好打中 Windows 客户端**：它的**协议探针**是一段**多行 here-string**
+（`Get-WindowsAgentQProtocolProbeCommand`，4006 字节、含 `if`/`function`/`try` 块），
+经 stdin 喂给 `-Command -`。于是**整个探针体被丢掉**，`Confirm-WindowsAgentQProtocol`
+拿不到 `agentq-windows-launcher-ready`，对**任何** Windows 目标都报
+`native Windows AgentQ service protocol probe failed`——**指向部署，而不是客户端**。
+**平台探针是单行的**，所以从不受影响；**POSIX 客户端的两个探针也都是单行的**，
+所以 POSIX 客户端连 Windows 目标**正常**——这正是缺陷能长期潜伏的原因：**只有
+「Windows 客户端 → Windows 目标」这一条组合会走到多行探针**。
+
+**四处独立复现**（不是推测）：Mac `pwsh` 7、Windows PS 5.1（经 `ProcessStartInfo`
+按客户端的方式喂 stdin）、Git Bash 的 MSYS ssh、Mac 的 OpenSSH ssh。判据一致：
+多行块 → 空输出 rc=0；**追加一个空行** → 正常输出 + `agentq-exit:0`。
+
+**修法**：`Add-ProbeExitToken` 是全部探针脚本的唯一出口，在返回的脚本末尾追加
+**一个空行**（`"`n`n"`），让 `-Command -` 在 EOF 前冲刷掉最后的缓冲块。一行修复，
+两个探针都覆盖。
+
+**验证**：
+- **回归锁（行为级，非源码级）**：`smoke/12` 新增一例，构造**真实探针输入**、
+  用**当前解释器自身**喂给 `-Command -`，断言输出里出现 `agentq-exit:<code>`
+  （只断言「体执行了」，不断言具体码值——有部署是 0、没有是 42，两者都证明执行）。
+  **源码级断言看不见这个缺陷**：问题在 PowerShell 如何消费文本，不在文本本身。
+- **变异**：去掉那一个空行 → `smoke/12` 在 **pwsh 7 与真 PS 5.1 上都报红**
+  （`the probe body did not run when fed to -Command - on stdin (out=[])`）。
+- **端到端（真机，2026-10-02）**：Windows 客户端 → Windows 目标（同一台机，密码认证，
+  **无密钥**）跑通完整协议：`submit` rc=0（`task_id=1`）→ `wait` rc=0
+  （`"result":"Success"`）→ `logs` rc=0（`"output":"WINWIN-OK"`）→ `remove` rc=0
+  （`"removed":true`）。修复前同一条命令报 `protocol probe failed`、rc=2。
+  **这同时关闭了两个此前的「不得声称」**：Windows 客户端经**原生 Windows ssh**的行为
+  （该机 `Get-Command ssh.exe` 解析到 `C:\Program Files\OpenSSH\ssh.exe`，
+  `OpenSSH_for_Windows_9.5p1`——**不是** Git Bash 的 MSYS ssh），
+  以及「Windows 客户端 → Windows 目标」这一组合。认证走的是 **askpass 密码路径**
+  （实测 askpass 被调用 4 次且认证成功；若公钥可用则 askpass 根本不会被调用）。
+
+**askpass 的 `SSH_ASKPASS_REQUIRE` 也已同机实测（2026-10-02）**：本机三种 ssh 各跑
+「有无 `REQUIRE`」两列，判据是 askpass 是否被调用、调用是否返回——按客户端的
+`ProcessStartInfo`（重定向流、无控制台）：
+
+| ssh 实现 | 无 `REQUIRE` | `REQUIRE=force` |
+| --- | --- | --- |
+| `Program Files` 9.5p1（**PATH 默认，原生**） | **阻塞**、askpass 未调用 | rc=0、askpass 调用一次 |
+| `System32` 8.1p1（原生，更老） | 阻塞 | **仍阻塞**（该构建早于该变量） |
+| Git Bash MSYS 9.9p1 | rc=255 | rc=0、askpass 调用一次 |
+
+所以客户端**必须**发 `SSH_ASKPASS_REQUIRE=force`（它此前只发 `SSH_ASKPASS`，头注释里
+还写着「Windows ssh 没有 `SSH_ASKPASS_REQUIRE` 的对应物」——**该前提是错的**）。
+Windows 上没有 `DISPLAY`，没有这个变量 ssh 永远不会去调 askpass，而是退回读**控制台**
+的 `_getwch()`——无控制台时**永久阻塞**。已修（`New-SshProcessStartInfo` 与
+`Invoke-SshLogged` 两条路径都发它，且无来源时显式清除继承来的值——Git Bash 会导出
+`SSH_ASKPASS`）。**唯一不支持它的是 `System32` 的 8.1p1**，而那不是客户端默认解析到的
+构建；8.1p1 那一格如实记为「本机测到的边界」，不是缺陷。
+
+---
+
+### A21. 两个 Windows 客户端把 unix 远端脚本作为 **ssh 的原生参数**发出 —— **已定位并修复（2026-10-02），回归锁 `smoke/20`**
+
+**这是 A5a/`09` 同一机制（PS 5.1 原生参数词分割）的第三处落点，而 `09` 的扫描规则
+看不见它。** 发现路径：给 `sshp`（POSIX）写 `smoke/19` 时顺手看 `sshp.ps1`，
+发现它把一段 **2010 字节、含 32 个双引号的多行 shell 脚本**当 ssh 的参数传出去。
+
+**调用形态**（`09` 只扫 `-c`/`-lc` 与 `Invoke-GitBashScript -Script`，都不匹配）：
+
+| 资产 | 行 | 形态 |
+| --- | --- | --- |
+| `client/windows/sshp.ps1` | `& $script:SshPath @sshArguments` | `-RemoteCommand (Get-UnixProbeCommand)` / `(Get-UnixInstallCommand)` |
+| `client/windows/agentq.ps1` | `& $script:SshPath @sshArguments` | `New-UnixRemoteInvocation` 拼出的 `agentq_run() {...}` |
+
+**对照：`agentq.ps1` 的探针路径本来是对的。** 它走 `Invoke-SshLoggedWithTimeout` →
+`New-SshProcessStartInfo` → `Convert-ToProcessArgument`（逐字符转义，`\"` 正确产出）。
+把该函数的输出喂回同一条 CRT 模型：**argc=1、且逐字节往返一致**。所以问题不在
+「PowerShell 传原生参数」本身，而在**用 `&` 调用运算符 splat 数组**——那是
+`09` 已经实测钉过的、不转义内部双引号的路径。
+
+**实测证据（模型 + 差分执行，不是推测）**：
+
+1. 用 pwsh 真跑 `sshp.ps1 --check`（`SSHP_SSH` 指向记录 argv 的桩），取出它**实际发出**的
+   那个 argv 元素：2010 字节，与源码里 `Get-UnixProbeCommand` 的 here-string **逐字节相同**
+   ——证明这段脚本确实走命令行，不走 stdin/文件。
+2. 把该字符串与 `agentq.ps1` 的 `New-UnixRemoteInvocation` 输出分别喂给**与 `smoke/09`
+   同一份、同一组 5 行实测校准值**的 CRT 模型：argc 分别为 **17** 与 **1**（后者不含换行，
+   仅引号被剥）。
+3. **决定性差分**（在真实 bash 上跑「完好脚本」vs「模型受损脚本」）：
+   - `sshp.ps1` 探针、目标缺 tmux 且只有 apt 时：**完好 exit 42 / stdout
+     `__SSHP_INSTALL_REQUIRED__:Linux`；受损 exit 127 / stdout 变成
+     `sshp:ntmuxnisnmissingn`**。客户端 `Get-ProbeOutcome` 对这组「退出码 + marker」
+    都匹配不上 → 返回 `$null` → 报
+     `remote dependency probe failed`（**指向部署，不指向客户端**）。
+   - `agentq.ps1` 的 unix 操作：`"$@"` → `$@`、`"$agentq_server"` → `$agentq_server`，
+     于是 `exec $agentq_server $@` **把参数再词分割一次**。实测把
+     `submit --workdir '/tmp/my dir' -- echo a*b` 交给两版：完好 argv n=6 含
+     `[/tmp/my dir]`，受损 n=7 裂成 `[/tmp/my]` `[dir]`。
+   - **反例同样记录**：`sshp.ps1` 的 READY 与 MINGW 两条分支在这组输入下**仍然匹配**
+     （marker 正则 `[^\r\n]+` 容忍了尾部那个 `n`，退出码也保住），所以这不是
+     「凡受损必失败」——**损坏是真实的，后果依分支而定**。
+
+**诚实边界（不要过度声称）**：以上是**模型 + 差分**，模型虽经 5 行真机实测校准，
+但**这一具体调用形态（`& $exe @splat`）尚未在任何真 PS 5.1 上直接测量**。
+`sshp.cmd`/`agentq.cmd` 都经 `powershell.exe`（= 5.1）调用，所以平台是可达的；
+pwsh 7.5 不复现该缺陷（这也是它能在本机一路绿灯的原因）。
+
+**为什么 `09` 没抓住**：它的两条 grep 模式只认 `-c`/`-lc` 与
+`Invoke-GitBashScript -Script`，而这里是 splat 数组；`sites` 因此根本没计入这两个文件。
+
+**修法（已落地 2026-10-02）**：改用 `09` 自己列为**唯一许可通道**的 base64——两个资产
+各新增一个小助手（`agentq.ps1` 内联同款、`sshp.ps1` 的 `Convert-ToPosixScriptCommand`），
+把脚本编码成 `printf %s <b64> | base64 -d | sh`。base64 字母表无需引号，故命令行无论本地
+PowerShell 对它做什么都能存活；`sh` 放在管道末位，所以脚本的退出状态就是 ssh 返回的状态
+（与旧的裸脚本 + `agentq_run` 形式保持同一退出码语义）。**为什么不用 stdin**：`sshp.ps1`
+的安装路径以 `-tt` 运行，stdin 要留给终端。
+
+**一处刻意的例外：会话命令必须保持裸参数。** `Get-UnixSessionCommand`（`exec
+tmux/screen/zellij`）**不**走 base64，因为该通道是 `printf %s <b64> | base64 -d | sh`，
+`sh` 的 **stdin 是管道**，而多路复用器要求 stdin 是 tty——实测（pty 下跑两版）：
+`stdin=tty` 时 screen 正常起，`stdin=pipe` 与 `< /dev/null` 一律
+`Must be connected to a terminal.`。它能安全地裸着是因为**一个双引号都没有**（`"` 才是
+PS 5.1 词分割的触发字节；会话名用单引号且值已被 `[A-Za-z0-9_.-]` 限定）。
+**所以这条例外是有条件的，条件本身要被守住**，否则往那段脚本里加一个 `"` 就会静默复发
+A21——`smoke/20` 为此有 4 例（必须仍裸、必须仍带 tmux 分发、必须仍是一个参数、字节必须不变），
+两个方向都断言（只测一个方向，一个「一律 base64」的退化实现也能过）。
+变异 3/3 被抓。
+
+**回归锁（已落地）**：`smoke/20-ps-native-argv-roundtrip`（8 例）——**行为级**，在 pwsh 里
+真跑两个客户端、用记录 argv 的桩捕获**实际发出**的那个 argv 元素，再套用 `09` 同一份
+校准模型，断言过模型后**恰好一个参数且字节完全一致**；**并**解码 base64 断言通道里装的
+确实是客户端本意的脚本（只断言「命令行完好」会让一个「完好但什么都不做」的命令通过）。
+**变异 2/2 被抓**（两个资产各自退回裸脚本）。**为什么不是给 `09` 加第三条 grep**：先试过
+静态规则，两次都没能触发（只读数组初始字面量、漏了 `+=` 追加；嵌套 heredoc 弄坏外层
+`case`）——**一个静默不触发的检测器正是本套件的头号反模式**，故不修补第三次。
+
+**仍未做**：这一具体形态（`& $exe @splat`）**尚未在任何真 PS 5.1 上直接测量**——本机只有
+pwsh 7.5（引号处理正确，故不复现）。有真机时应补一次直接测量。
+
+---
+
+### A22. POSIX 安装器渲染 launchd plist 时**不检查占位符是否被替换** —— **已修（2026-10-03，零授权，一台资产一处）**
+
+**同一机制抄在多处、只有一处设防**的又一例（A9 / A19 / `smoke/10` 规则 E 同类）。
+
+**机制**：`install-agentq.sh` 的 macos 分支用三条 `sed` 把 `__AGENTQ_HOME__`、
+`__AGENTQ_USER__`、`__AGENTQ_HOME_PARENT__` 替换进 `com.agentq.pueued.daemon.plist`，
+然后 `plutil -lint` 就完事。**它的 Windows 姊妹渲染器两个方向都设了防**——
+`Install-PueueConfiguration` 与 launcher 配置函数都在替换前查「模板缺占位符」（`IndexOf(...) -lt 0` → throw）、
+替换后查「渲染结果仍含占位符」（`IndexOf(...) -ge 0` → throw）。POSIX 这一处**两个方向都没有**。
+
+**为什么长期不可见**：`plutil -lint` 只验 XML 合法性，而 `__AGENTQ_HOME__/pueued` 是**完全合法的字符串**。
+实测（修复前）：把 plist 里一个占位符改名成安装器不认识的名字 → `01`/`10`/`11` **全绿**；
+把 `sed` 模式改成永不匹配（模拟漏替换）→ 同样全绿。后果是 launchd 去 exec 一个字面量
+`__AGENTQ_HOME__/pueued`，**到服务加载才现形**。
+
+**修法**：渲染后加运行时守卫——泛化扫 `__[A-Z][A-Z0-9_]*__`，命中即 `fail`。用泛化模式而非三个已知 token 的列表，
+是为了让「模板新增了 token 但 `sed` 列表没跟上」这种漂移也被抓住（那正是本缺陷的形状）。
+误报面已评估：替换进去的值必须**含一段字面 `__ALLCAPS__`** 才会命中，真出现时安装**大声失败**并打出消息，不会写出坏服务。
+
+**回归锁（已落地）**：
+- `smoke/10` 规则 I（**静态**）：三对 template↔renderer（plist↔POSIX 安装器、`pueue.yml`↔Windows 安装器、
+  `agentq-launcher.ps1`↔Windows 安装器）的 token 集合必须互相知晓，且每个渲染器必须带那个运行时守卫标记。
+  带**自检闸门**（任一侧 token 提取为空即拒绝给结论）与**配对数下限**（<3 即报「规则没在检查它声称的东西」）。
+  **变异 6/6 被抓**（三对各自改模板 token、三处各自去掉守卫）。
+- `smoke/11`（**行为级**）：把安装器里那段渲染代码按锚点抽出来、桩掉三个 helper 后真跑，
+  断言未知占位符必须退 2 且消息正确、**真实模板必须渲染干净**（两个方向都断言）。
+  **变异 2/2 被抓**（去掉守卫 → 抽取自检报 `guard block was not extracted`；守卫改成恒假 → `expected exit 2, got 0`）。
+
+**刻意排除一个文件**：legacy `com.agentq.pueued.plist`（25 行）**不被渲染**——它只被
+`require_file` 检查存在，是旧安装路径的遗留（`~/Library/LaunchAgents/` 那个位置现在只用于
+停用并备份既有文件）。把它纳入同一 token 集会让正确代码报红，故规则注释里显式写明这条排除。
+**这是一处可清理的死资产**（`require_file` 一个从不使用的文件），但删它会改变部署单元，
+需要单独决定，不在本次范围。
+
+### A23. `wait_reconcile_missing_task` 看似能复用 `load_request_records` —— **否掉，不改**（2026-10-03）
+
+**起因**：本轮补 `smoke/26`（`lookup`/`wait` 的记录读取路径）时注意到，
+`wait_reconcile_missing_task`（`agentq-server:3659`）自己逐文件扫描 `*.json`，
+每条记录经 `read_request_record_state_and_body` 调一次 jq，而同文件里早已有聚合加载器
+`load_request_records`（`2280`）——正是 2026-09-30 那次优化（每 record jq 4.05 → 1.05）动过的。
+按 A9/A19 的教训，同一机制抄在多处、只在一处设防，所以看上去是个明显的重复。
+
+**但复用并非行为等价，所以不改。** 两个读取器的判据在 `removed` 这个状态上分岔：
+
+| 读取器 | 判据 | 对 `removed` 记录 |
+| --- | --- | --- |
+| `wait` 逐条扫描 → `read_request_record_state_and_body`（`2445`） | `request_record_filter`（`2144`）**接受** `removed` | 接受，随后 `case` 只匹配 `accepted\|removing`，**跳过** |
+| `load_request_records` → 聚合 | `request_records_filter`（`2218`）的 `valid_request` 只接受 `prepared\|adding\|accepted\|removing`——**排除** `removed` | 整批 `error("invalid AgentQ request record")` → `exit 2` |
+
+即换成聚合加载器会把 crash-window 状态（本仓最在意的那个状态）从「跳过」变成**致命 exit 2**。
+这正是 `CLAUDE.md` 记的「两处规则不等价，删任何一个都改变行为，而这是安全路径，**不要为提速顺手改**」
+的又一实例。**故保持现状**，并把这个判据差写进 `smoke/26` 的注释，让下一个人不必重推一遍。
+
+**顺带坐实的一处既有重复（非缺陷，仅记录）**：`lookup` 的 `state==removed` 分支
+（`4470`）自己调 `archive_removed_request`，而 `acquire_operation_lock` 会先跑
+`ensure_request_record_layout → migrate_removed_request_records → repair_removed_request_records`
+（`agentq-server:1627`），后者**自己就归档 `removed` 记录**——所以 lookup 那次调用当前**冗余**。
+实测：树里放一条 `removed` 记录 + 墓碑，跑 `lookup` 记录数 1→0、墓碑 0→1；把 lookup 的
+`archive_removed_request` 调用去掉（变异 M2），输出与 counts **完全不变**。
+两处归档**语义一致**（都调同一个 `archive_removed_request`），所以不构成正确性缺陷，
+只是同一机制两处存在。**不在本次删除**——删它需要真机验证崩溃窗口的恢复，而收益是零子进程。
+
+**一个必须记的可达性边界（否则会写成假绿）**：`wait_reconcile_missing_task` 的
+逐条扫描**只看得到 `accepted` 记录**。`removed` 记录已被锁布局的 repair pass 归档
+（每条命令的必经之路），`removing` 记录已被 `ensure_daemon → recover_removing_requests`
+归档（`wait` 在扫描前先调 `ensure_daemon`）——两者都**早于**那次扫描。实测：`wait` 一个
+`removing` 记录自己的 task id，基线与「从 case 里删掉 removing 匹配」的变异体输出**逐字相同**。
+所以 `smoke/26` **不声称覆盖** wait 扫描的 `removed`/`removing` 分支，也不声称能挡住那个重构。
+
+### A24. `submit`/`cancel`/`remove` 的记录读取路径覆盖 —— **已补（2026-10-04，零授权，`skill/assets/` 零改动）**
+
+`smoke/26` 覆盖了 `lookup`/`wait`，其「不覆盖」列留下 `submit`/`cancel`/`remove`。
+本轮补上（`smoke/27-record-write-paths.sh`，34 例，同一合成运行时骨架）。至此
+**每条依赖读取请求记录的命令都有针对性检查**：`status`（`18`）、`lookup`/`wait`（`26`）、
+`submit`/`cancel`/`remove`（`27`）。
+
+**实测得到、且改变了第一版用例的两条**（不是猜测，是踩出来的）：
+① `normalize_workdir` 把 `/tmp` 解析成 `/private/tmp`（实测），所以「匹配 payload」的
+合成记录必须写**解析后**的路径；第一版 5 个 submit 用例里 4 个因此落到 payload-mismatch
+分支、完全没测到目标。
+② 若 pueue 桩在 `pueue add` **之前**就报告 task 可见，`submit` 走**恢复**路径
+（`reused:true`）而非 add 路径；S5 因此改用**有状态桩**（`add` 后才可见）。
+
+**可达性边界（与 `26` 同源，实测）**：`submit` 的 `state=removing` 分支**不可达**——
+`ensure_daemon → recover_removing_requests` 在 submit 自己的分派读记录**之前**就把
+该记录归档；`cancel` 的 **queued** 分支（`pueue remove` + `queued_removed`）需真实
+排队任务，由 `smoke/03` 端到端覆盖。两者都写进了 `27` 的「不覆盖」列，不声称覆盖。
+
+---
+
+### A25. 折叠 `repair_removed_request_records` 的逐条 jq —— **已完成（2026-10-04，零授权，`skill/assets/` 两处同步改）**
+
+**为什么现在能改**：`status`（`18`）、`lookup`/`wait`（`26`）、`submit`/`cancel`/`remove`
+（`27`）都已把记录读取路径的行为钉住，这是本仓「先钉行为、再动热点」的前提。
+
+**热点**：`repair_removed_request_records` 对**每个** `*.json` 调一次
+`read_request_record_state_and_body`（内部一次 jq），而它**只需要找出
+`state == removed` 的记录**。它**每条命令都跑**（`acquire_operation_lock` →
+`ensure_request_record_layout` → `migrate_removed_request_records` → `repair`）。
+这是继 2026-09-30 折叠 `load_request_records` 之后**最后一处**逐条 jq。
+
+**改法**：新增 `request_removed_records_filter`（一次聚合 jq，逐条套用
+`request_record_filter`——**它接受 `removed`**，与 `load_request_records` 的
+`request_records_filter` 不同，见 A23），快路径一次拿到全部 removed 记录；**任何
+失败（守卫、长度不符、畸形、正文读不到）都回退到原来的逐文件循环**。回退是**保真的
+唯一手段**：聚合 jq 丢掉 per-file 的 `:1` 行号与路径归属，无法逐字节复现 jq 的
+parse error，而 `smoke/18` 逐字节 diff stderr。另把守卫序列抽成
+`request_record_path_guards_or_fail`，使逐文件读取器与快路径不会漂移（规则 E）。
+
+**子进程计数（shim 实测，`status`）**：N=0 5/42→5/42；N=40 63/152→24/113；
+N=80 119/260→40/181。**每 record 恰好省 1 次 jq、1 个子进程，N=0 零成本**。
+
+**这次踩到一个 bash 语义陷阱，是本轮最重要的记录**：`output=$(…) 2>/dev/null`
+**不抑制**命令替换里命令的 stderr——重定向绑在**赋值**上，不在替换上。第一版就是
+这么写的，快路径的聚合 jq 把 parse error 漏到 stderr，**每条坏记录打印两遍**。
+
+**而我最初以为「已验证」的其实是假绿**：我以 `AGENTQ_SMOKE_SERVER=<folded> ./smoke/18`
+跑，全绿——但默认运行里 base 与 variant 是**同一份资产**，`compare_case` 只 diff
+两侧，**确定性的重复行两侧相同、它看不见**。真正抓住它的是**把 base 换成 pre-fold
+版本**做对照（那一刻报 6 处 `stderr differs`）。修法是给快路径整个子 shell 加花括号
+`{ …; } 2>/dev/null`。**教训**：`AGENTQ_SMOKE_SERVER=<改后的同一份资产>` 与默认运行
+等价，证明不了任何东西；变体模式的意义在于 base 与 variant **不同**。
+
+**回归锁**：`smoke/18` 新增第 27 例 `assert_jq_diagnostics`（每条坏记录的 jq 诊断
+**恰好 1 条**），在**默认运行**下就能红——实测把漏 stderr 的形态放回资产：6 处
+`expected 1 jq diagnostic line(s), got 2`。
+
+**变异（结构层，全部被抓）**：去掉 removed-only `select` → 5 处红；去掉快路径的归档
+循环 → `crashwin` 不自愈；去掉逐条 `valid($ids[$i])` 绑定判据 → 12 处红，且**直接
+probe 证明**它承重（一条「文件名与 request_id 不符、state=removed」的记录会被错误
+归档，tombstone 1→2）。**1 个无效变异如实记录**：我第一版把绑定判据改成
+`[ range(0; length) ]`，那**丢掉了记录本身**（输出整数而非记录）、行为上是 no-op——
+改成保留记录、只去掉 `valid()` 才是有意义的变异（MC2）。
+
+**边界**：全部证据来自 macOS 合成运行时，不证明真实 Pueue/远端/Windows；回退路径的
+正确性依赖「快路径失败 ⟺ 回退能逐字复现」这一等价，由 `smoke/18` 的逐字节 diff 守住，
+但**没有**对「快路径失败而回退也失败」这种双重失败单独构造用例（实测中未出现）。
+
+---
+
+### A26. 折叠 `wait` 恢复与 cancel 重放路径的逐条 jq —— **已完成（2026-10-04，零授权，`skill/assets/` 两处同步改）**
+
+A25 折叠的是**每条命令都跑**的 `repair`。折叠后我用 jq-shim 把**全部命令**在
+N=272（生产规模）上重新计数，发现还有三处**同类**热点——它们不在 `status` 热路径上，
+但都在**阻塞式**调用（`wait`）或**取消重放**（`cancel`）上，每次仍对每个文件各起一个 jq：
+
+| 路径 | 函数 | 折叠前 jq（N=272 rec + 58 tomb） |
+| --- | --- | ---: |
+| `wait`（任务已从 Pueue 消失） | `wait_reconcile_missing_task` 记录扫描 | 272 |
+| 同上 | 同函数 墓碑扫描 | 174（3 jq × 58） |
+| `cancel` 重放 | `task_instance_created_at_is_recorded` | 330（272 + 58） |
+
+**改法**：三处都照 A25 的**快路径 + 保真回退**模式。新增三个聚合过滤器——
+`request_records_states_filter`（每条记录输出 id/state/task_id/正文四行）、
+`request_tombstones_states_filter`（每个墓碑输出 id/task_id/created_at 三行）、
+`request_instance_probe_filter`（一个布尔：是否存在某文件记录该 task id 与该
+created_at）。前两者复用 `request_record_filter` / 新抽出的 `request_tombstone_filter`
+（把原内联过滤器提到变量，规则 E），并各自配一个守卫 helper
+（`request_record_path_guards_or_fail` 复用、`request_tombstone_path_guards_or_fail` 新增）。
+
+**第三处的语义**与另两处**不同**，是它必须单独设计的原因：
+`task_instance_created_at_is_recorded` 的原循环**吞掉**畸形文件
+（`2>/dev/null || continue`）继续扫描，**不是 fail-closed**；且它**不做**逐文件路径守卫。
+所以它的聚合过滤器**必须容忍**：一个畸形文件让整次 slurp 失败 → 回退到逐文件循环
+（那里 `|| continue` 复现 skip 行为）。**不能用 fail-closed 的记录过滤器套在这里**——
+那会把「跳过畸形文件」变成「拒绝整个重放」，改变语义。另外原循环**先扫完记录再扫墓碑**
+（记录命中即 `return 0`，从不读墓碑），所以快路径把两个列表**分开**扫，不在一次 jq 里合并。
+
+**子进程计数（jq-shim 实测，N=272 + 58 tomb）**：
+
+| 命令 | 折叠前 | 折叠后 |
+| --- | ---: | ---: |
+| `wait`（任务消失） | 892 | 9 |
+| `cancel` 重放（无匹配，最坏） | 339 | 10 |
+| `status` | 251 | 8 |
+| `doctor` | 251 | 8 |
+| `lookup` / `logs` / `remove` / `wait`（普通） | — | 各 1 |
+
+**至此 N=272 上全部命令的 jq 调用都是 O(1)**（不再随记录数增长）。
+
+**验证**：三处各自与 pre-fold HEAD 做**逐字节**对照（stderr + stdout + 退出码），
+覆盖命中记录/命中墓碑/无匹配/畸形文件回退/文件名与 id 不符/多墓碑取首个匹配等
+场景，全部 IDENTICAL。变异：`MR1`（记录快路径丢掉正文行 → 4 行读取器错位）、
+`MR2`（墓碑快路径丢掉 created_at 行）、`MR3`（记录快路径永不匹配）三者被
+`smoke/26` 抓住（7/3/7 处红）；`M3a`（探测恒真 → 陈旧 marker 被误判为重放）、
+`M3b`（探测恒假 → 真重放被拒）被 `smoke/03` 与自建 harness 抓住。
+
+**边界**：全部证据来自 macOS 合成运行时，不证明真实 Pueue/远端/Windows；三处的回退
+路径同样依赖「快路径失败 ⟺ 回退逐字复现」这一等价，由逐字节对照守住。
 
 ---
 
@@ -1277,7 +1742,7 @@ ssh 能读的地方，而该客户端**没有顶层 trap 可挂清理**，且 cm
 | --- | --- | --- |
 | C1 | P1-3 整体操作矩阵（**改为三台**、**真实网络中断**；2026-09-22 用户裁定） | **已执行（2026-09-22）**，结果与两个新缺陷见 `CHANGELOG.md`。三台里只有一台跑当前版本。**两项遗留均已消解（2026-09-24）**：① 主机 A 的客户端路径——重装后 `status`/`submit`/`wait`/`logs`/`remove` 五项 exit 0（见 B5-执行）；② 缺陷二已修并验证（见 A6，`smoke/03` 有用例、M3 证明其敏感）。**C1 无遗留** |
 | C2 | 平台/安装矩阵（WSL、arm64、RHEL、Fedora、Alpine、真实升级回滚） | **已执行容器可覆盖的部分（2026-09-24，用户全权授权）**，见下 |
-| C3 | 原生 Windows 其余边界（NTFS reparse 点语义、registry/profile、跨用户安装/服务身份） | 一台可用的 Windows 机器 + 是否允许改系统状态。**用户已声明无生产权限**，主机 A 是生产机，故不主动推进 |
+| C3 | 原生 Windows 其余边界（NTFS reparse 点语义、registry/profile、跨用户安装/服务身份） | **部分已执行（2026-10-01）**，见下；余项仍需授权。**用户已声明无生产权限**，主机 A 是生产机，故不主动推进 |
 | C4 | 真实服务/生产边界（远端服务生命周期、TLS/shared key、生产凭证、发布回滚） | **不是「不做」，是「用户无权授权」**：生产环境属上游，用户是 fork 贡献者，只在私有 CF 上部署测试。此项**不得**记为待办，也不得声称已验证 |
 | C5 | P2-18 外部审查 | **已执行（2026-09-24，用户指示「按正规工程审查做、使用 agents」）**，见下 |
 
@@ -1310,6 +1775,22 @@ ssh 能读的地方，而该客户端**没有顶层 trap 可挂清理**，且 cm
   （**这个 rc=1 是真实信号**，安装器据此 `fail` 是对的），必须经 `su -` 才有会话。
   **三轮失败各自报出准确原因、每轮都在写入前停住、回滚干净**——这本身就是安装器
   失败契约的一次真机复核。补齐这两样后**一次通过**。
+
+#### C3 执行结果（2026-10-01）—— 专用 Windows 测试机上可做的部分
+
+在那台新部署的 Windows 10 测试目标机（`DefaultShell=cmd.exe`，见 A19）上做了
+**两项此前只有源码断言、没有执行证据**的验证。两者都是**真实执行**，不是常量核对：
+
+| 项 | 做法 | 结果 |
+| --- | --- | --- |
+| **NTFS reparse 点语义**（此前记「未测 reparse 点本身」） | 从**已发布资产** `client/windows/agentq.ps1` 经 PowerShell AST **逐字抽出** `Test-NonReparseWindowsFilePath` 的函数体（不是副本，是发行版里的那份），在真机上造 fixture：普通目录／普通文件／**目录 junction**（`mklink /J`）／junction 下的文件／**文件符号链接**（`New-Item -ItemType SymbolicLink`），跑 8 个用例 | **8/8 符合预期**：普通文件 True；普通目录、junction 本身、junction **之下**的文件、文件符号链接、缺失文件、空串、普通目录里的缺失文件全部 False。fixture 自证属性：junction `container=True reparse=True`、文件符号链接 `container=False reparse=True`。**变异 3/3 被抓**（M2 最初 MISSED——是**用例缺口**：没有「非目录叶子重解析点」这一形态，补上文件符号链接用例后被抓） |
+| **客户端安装器真机行为**（`client/windows/install-client.ps1`，此前只有 `10` 的两条源码不变量） | 在真机上真正运行安装器 | 安装 **exit 0**；`-Check` 双向断言；**ACL 已核实**（`CodexSandboxUsers` 不再出现、`AuthenticatedUsers : ReadAndExecute`）——即 `chmod`→ACL 那处修复在真机上确实生效 |
+
+**仍未验证（C3 余项）**：**registry/profile**（`Resolve-GitBashPaths` 从
+`HKLM:\SOFTWARE\GitForWindows` 等读 `InstallPath` 那条路径——本机 PortableGit 未写注册表，
+是走 PATH 分支解析到的）、**跨用户安装/服务身份**（本机只以单个管理员账户装过，
+`-LogonType Interactive` + 用户级计划任务在**多用户/服务账户**下的行为无证据）。
+这两项需要改系统状态或第二账户，未获当次授权，故不做。
 
 #### C5 执行结果（2026-09-24）—— 外部审查
 
@@ -1388,14 +1869,16 @@ ssh 能读的地方，而该客户端**没有顶层 trap 可挂清理**，且 cm
 9. **`detect_stat_flavor` 这类缓存必须在父 shell 里调用。** `$(...)` 开子 shell，
    在命令替换内部设的全局变量传不回来——缓存会静默失效。
 
-10. **改完 `skill/` 必须同步全局 Skill 目录**，否则安装装出旧代码。两者不会
-    自动保持一致，忘了就静默分叉：
+10. **改完 `skill/` 必须同步全局 Skill 目录**（**整个目录**，不是只同步 `assets/`），
+    否则安装装出旧代码、且 `SKILL.md` 会静默分叉。两者不会自动保持一致，忘了就分叉：
     ```sh
-    rsync -a --delete /Volumes/Work/code/agentq/assets/ \
-        /Users/mison/.agents/skills/agentq/assets/
-    diff -rq /Volumes/Work/code/agentq/assets \
-        /Users/mison/.agents/skills/agentq/assets   # 必须无输出
+    SKILL_DIR="${SKILL_DIR:-$HOME/.agents/skills/agentq}"
+    rsync -a --delete /Volumes/Work/code/agentq/skill/ "$SKILL_DIR/"
+    diff -rq /Volumes/Work/code/agentq/skill "$SKILL_DIR"   # 必须无输出
     ```
+    **为什么是整目录**：旧规则只同步 `assets/`，于是 `SKILL.md` 不在范围内、静默分叉
+    （2026-09-29 实测：仓库的 `SKILL.md` 比全局目录里的新 5 行，差的正是几处已被推翻的断言）。
+    与 `CLAUDE.md`「改完 `skill/` 必须同步全局 Skill 目录」一节同一条规则。
 
 11. **`skill/assets/unix/agentq-server` 与 `skill/assets/windows-git-bash/agentq` 必须逐字节
     相同**（硬约束，任何时候 `cmp` 都必须是 0）。
@@ -1406,8 +1889,8 @@ ssh 能读的地方，而该客户端**没有顶层 trap 可挂清理**，且 cm
 - 原生 Windows 上**已实测**：完整协议（submit/wait/logs/remove/cancel 两路径与
   重放/base64 日志/doctor/锁竞争/坏参数退出码/launcher `ArgumentsBase64` 转发）、
   PS 5.1 客户端坏参数路径、`noacl` 挂载下 `chmod` 无效
-- 原生 Windows 上**仍未验证**：NTFS reparse 点语义（只确认了文件系统是 NTFS 与
-  上述 ACL 实测，未测 reparse 点本身）、registry/profile、跨用户安装/服务身份
+- 原生 Windows 上**仍未验证**：registry/profile、跨用户安装/服务身份。
+  （**NTFS reparse 点语义已于 2026-10-01 实测**，8/8 + 变异 3/3，见「C3 执行结果」）
 
 ### 性能事实（改热点路径前先读）
 
@@ -1431,6 +1914,9 @@ filename↔`request_id` 绑定的变体**静默接受**错配记录，同样全�
 **没有做的**（连同理由）：合并三遍扫描为一遍（会改变 pass 2 归档与 pass 3 的
 可观察顺序，且 pass 1 在锁外、pass 2/3 在锁内）；折叠 `repair` 整轮（它是
 crash-window 自愈的承重路径）；动 26 个 `stat`（TOCTOU 守卫）；结果缓存（无失效机制）。
+**其中「折叠 `repair` 整轮」后来做了**——见 `PLAN.md` A25/A26（2026-10-04）：在
+`smoke/18`/`26`/`27` 把行为钉死之后，`repair` 与 `wait`/`cancel` 恢复路径的逐条 jq
+已折叠成单次聚合，回退路径保真；上面「不折叠」是 2026-09-30 当时的判断，不是长期边界。
 
 实测规模因子（2026-09-21，真实 Windows 主机）：272 个 record + 29 个 tombstone
 + 3 个 marker → `status` 1930 次 jq 调用 / 114s。`logs`/`status` 到分钟级是这个
@@ -1523,37 +2009,75 @@ logind + 真实二进制走内置 SHA 校验，`INSTALLER_EXIT=0`、零残留）
 | ~~**B4 覆盖债第一刀**~~ | 已完成：`smoke/13-ps-installer-contract` |
 | ~~**C1**~~ | 已执行（三台） |
 | **C2–C5** | 平台/Windows/生产/审查的范围授权 |
-| **A5b submit 退出码通道** | 零授权、可做，但要先解决通道冲突（submit 的 stdin 已在传 base64 payload，token 只能走 stdout）。**不是回归**，是 A5b 记录的未验证范围 |
+| ~~**A5b 操作路径退出码通道**~~ | **已修（2026-10-02）**：token 走 **stderr**（客户端本就捕获它，服务端 `reason=` 同路），两份客户端各改一处、`smoke/05`+`smoke/12` 各加回归锁，真机两列双向验证 + 变异 3/3。见 A5b 正文 |
 | ~~**A8/B5 主机 C**~~ | **2026-09-24 那次已完成**（队列已空、已重装、端到端通过）。**但 2026-09-25 又落后了一版**：主机 A（Windows）与主机 B（Linux）已升到 `97088c62`，**主机 C（macOS）仍是 `e3b132af`**，即 A12 的 P0 在该机未消除。原因不是拒绝升级，是**该地址在本机网络层不可达**（ARP `incomplete`、同网段网关也不通）。恢复连通性后按同一流程处理 |
 | ~~**原「主机 C」的地址**~~ | **已决定不追**（2026-09-26）：用户指定 macOS 主机以新那台为准，该机已完成全新安装。原那台仍带 A12 的 P0，但**不在当前机群内**——若将来重新启用，先升级 |
 | ~~**A16 Windows 客户端认证提示**~~ | **已完成**（2026-09-27）：照 A9 在 `Write-Diagnostics` 里按 class 追加，配 `smoke/12` 双向用例（认证必打且须含主机名，其余 class 必不打），红/绿 + 变异已验证 |
 | ~~**A17 脱敏不变量回归**~~ | **已完成**（2026-09-27）：46 处地址等标识清除，并新增 `smoke/16-no-host-identifiers` 把那次一次性扫描变成常设检查 |
-| ~~**A18 密码认证支持**~~ | **已完成**（2026-09-28）：`BatchMode` 条件化 + 三种凭据来源（`AGENTQ_ASKPASS` / `AGENTQ_PASSWORD` / `AGENTQ_PASSWORD_PROMPT`），严格守卫；新增 `smoke/17-askpass-credential`（真实 sshd 端到端）+ `smoke/05`/`12` 各一组 argv 与拒绝用例。**2026-09-29 真机补验**：账户密码登录成功已在真机验证（POSIX 与 Windows 客户端各连一台只有密码的 macOS 主机，完整协议 `Done.result="Success"`）；Windows 客户端已升级到 canonical 并跑通端到端。**仍不得声称**：Windows 客户端经**原生 Windows ssh** 的行为（该机 PATH 上是 Git Bash MSYS ssh，非同一实现）。见 A18 |
+| ~~**A18 密码认证支持**~~ | **已完成**（2026-09-28）：`BatchMode` 条件化 + 三种凭据来源（`AGENTQ_ASKPASS` / `AGENTQ_PASSWORD` / `AGENTQ_PASSWORD_PROMPT`），严格守卫；新增 `smoke/17-askpass-credential`（真实 sshd 端到端）+ `smoke/05`/`12` 各一组 argv 与拒绝用例。**2026-09-29 真机补验**：账户密码登录成功已在真机验证（POSIX 与 Windows 客户端各连一台只有密码的 macOS 主机，完整协议 `Done.result="Success"`）；Windows 客户端已升级到 canonical 并跑通端到端。**2026-10-02 关闭「原生 Windows ssh 未验证」**：专用测试机的客户端 PATH 解析到 `C:\Program Files\OpenSSH\ssh.exe`（`OpenSSH_for_Windows_9.5p1`，**原生**，非 Git Bash MSYS），Windows→Windows 经它跑通完整协议。**唯一仍属边界的**是 `System32\OpenSSH\ssh.exe` 8.1p1（早于 `SSH_ASKPASS_REQUIRE`，且不是客户端默认解析到的构建）。见 A18 |
 
 **A1/A2 之后覆盖债的实际变化，要说准。** 这两个检查覆盖的是**契约**，不是按行数
 成比例的覆盖，所以「覆盖债从 12,419 行降到 N 行」这种算法是**错的**，不要用。
 
-准确的说法：12 个零覆盖资产里，现在有 3 个**各有一份契约检查**——
+准确的说法：12 个零覆盖资产里，现在有 **7 个**各有一份契约检查——
 
-- `install-agentq.sh`（2,755 行）：失败契约 **15 例**（`smoke/11` 自报 `cases=15`）。
-  **成功路径仍是零覆盖**，而成功路径才是它 2,755 行里的绝大部分。
-- `client/windows/agentq.ps1`（**2,327** 行，本轮 A18 新增 121 行）：本地参数契约 **40 例**（`smoke/12`
-  自报 `cases=40`，pwsh 下）。**远端交互、传输、重试、恢复全部仍未覆盖**，A18 新加的凭据路径
-  也只有**选项构造**被断言，真机行为未验。
+- `client/unix/install-client.sh`（251 行）：本地契约 **11 例**（`smoke/21`，2026-10-03 新增）。
+  **唯一一个成功路径也可测的安装器**（只拷两个文件进沙箱，无网络/无服务管理器/无包管理器），
+  故契约与成功路径都覆盖了。真实 `~/.local/bin`、live 目标上的崩溃语义仍未覆盖。
+- `windows-git-bash/agentq-launcher.ps1`（430 行，**本仓最大的零覆盖资产**）：**49 例**（`smoke/22`，
+  2026-10-03 新增），覆盖在 macOS 上可跑的三块——payload 解码器、路径守卫、env→argv 回环 bash 脚本，
+  **外加 `agentq-start-daemon.ps1` 的两个路径守卫**（与 launcher 的守卫近乎逐字拷贝，故一并断言两份行为一致）。
+  **Windows API 路径（`WindowsIdentity`+HKLM）仍未覆盖**，摘要行明写 `windows-api=NOT-covered`。
+- `windows-git-bash/agentq-durable-move.ps1`（118 行）：参数契约 4 例 + **源码级 access-mask 不变量** 3 例
+  （`smoke/23`，2026-10-03 新增）。它是本项目第一个原生 Windows 缺陷的现场；那条 access-mask 常量
+  只有真机能注意到回归，故源码级钉住。**move/flush 行为仍未覆盖**（本机死在 kernel32 P/Invoke）。
+- `install-agentq.sh`（2,769 行）：失败契约 **17 例**（`smoke/11` 自报 `cases=17`）。
+  **成功路径仍是零覆盖**，而成功路径才是它 2,769 行里的绝大部分。
+- `client/windows/agentq.ps1`（**2,424** 行，本轮 A18 新增 121 行）：本地参数契约 **45 例**（`smoke/12`
+  自报 `cases=45`，pwsh 下；2026-10-02 在真 PS 5.1 上实跑 `ps51=covered`）。**远端交互、传输、重试、恢复全部仍未覆盖**，
+  A18 新加的凭据路径**选项构造**已被断言，且**真机行为已验**（2026-10-02 专用 Windows
+  测试机：原生 ssh + askpass 密码，Windows→Windows 完整协议）。
 
-- `windows-git-bash/install-agentq.ps1`（2,881 行）：参数契约 + 平台闸门 6 例。
+- `windows-git-bash/install-agentq.ps1`（2,911 行）：参数契约 + 平台闸门 6 例。
   **这台机器上不可达的 staging/ACL/事务路径仍是零覆盖**，且已实测确认不可达
   （任何参数组合都死在第一条语句上），所以这一份契约检查的覆盖面比前两个更窄。
 
+- `client/windows/install-client.ps1`（496 行）：**从「只有源码断言」升级为「有行为执行」**
+  （`smoke/25`，2026-10-03 新增，8 例）。此前它只有 `10` 的四条源码不变量——按本表的定义
+  那算「执行过」，但**从未被运行过**，与 `install-agentq.ps1` 在 `13` 之前的状态同类。
+  现在参数契约（缺值／未知参数／`-Check` 下未知参数）与平台闸门被真正执行，并证明
+  **闸门先于任何写入**、`-Check` 也撞闸门。**staging/ACL/原子移动/PATH 更新仍是零覆盖**
+  （第一条语句之后的全部，实测在 macOS 上不可达）。**分子不变**（该资产本就被计入
+  「已覆盖」），但证据从源码级升到了行为级。
+
+- `client/unix/sshp`（1,190 行）：本地契约 **18 例**（`smoke/19`，2026-10-02 新增）。
+  覆盖参数校验、环境变量校验、`--help`、探测分派（含 `--check` **不得安装**）、
+  重连策略、实际 argv、TMPDIR 零残留，以及会话名的注入守卫。
+  **任何真实远端仍是零覆盖**——桩证明的是 sshp **发出什么**；交互会话本体、
+  Windows 路径、远端安装路径都未覆盖（见 `smoke/19` 头注释的边界清单）。
+
+`client/windows/sshp.ps1`（1,114 行）**不再属于「从未被执行过」那一类**：`smoke/20`
+（2026-10-02）在 pwsh 里真跑它 `--check`、捕获它实际发给 ssh 的 argv 并断言往返。
+但要说准：那是**一条路径**的断言（脚本怎么交给 ssh），不是它的本地契约——
+它的参数校验、会话建立、Windows 路径仍未覆盖。
+
 仍然**没有任何检查执行过**的资产（"执行过" = 行为执行或源码断言；只有 `01` 的
-语法/结构解析不算）。按行数：`client/unix/sshp`（1,190）、`sshp.ps1`（1,092）、
-`agentq-launcher.ps1`（430）、`agentq-start-daemon.ps1`（260）、
-`client/unix/install-client.sh`（251）、`agentq-durable-move.ps1`（118），
-4 个 `.bash`/`.cmd` 薄启动器（42），2 个 `.plist` + 2 个 `pueue.yml` +
-1 个 `.service`（110），以及 `unix/agentq`（5，只是转发 shim）。
-合计 **3,498 行 / 25,354 行 = 13.8%**（2026-09-30 重算。**分子仍未变**——那 9 个资产
-至今没被改过；分母从 24,285 一路长到 25,354，全是**已被覆盖**的资产在长大：
-`agentq-server` 4,727→4,937（×2，canonical pair；末次是折叠逐条重复的 jq，+127 行）、
-`client/unix/agentq` 3,293→3,523、`client/windows/agentq.ps1` 2,074→2,327（A18：两端各 +203 / +121 行）。
-所以比例略降而债务未减。别再引用旧的 25.9%——那个分母是改动前的
-24,180，且当时 `install-agentq.ps1` 还没有 `13`）。
+语法/结构解析不算）。按行数：`agentq-start-daemon.ps1`（260），
+2 个 `.cmd` 薄启动器（8），
+2 个 `.plist` + 2 个 `pueue.yml` + 1 个 `.service`（110），以及 `unix/agentq`（5，
+只是转发 shim）。合计 **383 行 / 26,157 行 = 1.5%**（分母 2026-10-05 重算：`skill/assets/` 全部 23 个资产 `wc -l` 之和；此前记的 25,536 是 2026-10-03 的数，此后服务端折叠与本轮客户端/安装器改动都动了字节；同日 last-wins 修复给 `agentq.ps1` 加的行又把 26,120 推到 **26,157**。**分子 383 未变**——新增的 `smoke/28` 覆盖的是已计入覆盖的客户端，last-wins 的两条新用例同理，它们不改变这张表）。
+`agentq-start-daemon.ps1`（260 行）**大部分仍零覆盖**：顶层第一条语句就死于 `WindowsIdentity`
+（同 `install-agentq.ps1` 的形态），已实测确认不可测而非推测；但它的**两个路径守卫**是纯 .NET、
+可跑，已由 `smoke/22` 覆盖（见上）。
+
+**分子连续第三轮变小**：上一版分子 1,216 行里，`agentq-launcher.ps1`（430）、
+`install-client.sh`（251）、`agentq-durable-move.ps1`（118）合计 **799 行**
+（占旧分子的 66%）那一轮**离开了这张表**——`smoke/22` 覆盖前者在 macOS 上可跑的三块，
+`smoke/21` 给中者补上契约+成功路径，`smoke/23` 覆盖后者的参数契约与 access-mask 不变量。
+这一轮 `smoke/24` 又拿走两个 Git Bash 启动器（`agentq.bash` 19 + `sshp.bash` 15 = **34 行**）
+——它们**不是死文件**（`install-client.ps1` 把它们拷成 `.local\bin` 下的无扩展名
+`agentq`/`sshp`），此前只有 `01` 的 `bash -n`。剩下的 383 行里，**没有一个资产超过 260 行**，
+且其中 260 行的那个（`agentq-start-daemon.ps1`）已实测确认在 macOS 上不可测；余下的是
+2 个 `.cmd`（8 行，`01` 已有结构断言）与声明式配置（`.plist`/`.yml`/`.service`，110 行）。
+分母已于 2026-10-05 重算为 **26,157**（`skill/assets/` 全部 23 个资产 `wc -l` 之和）。
+别再引用旧的 25.9%、13.8%、4.8%、1.6% 或 25,536。

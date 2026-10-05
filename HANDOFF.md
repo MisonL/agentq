@@ -38,9 +38,11 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
 1. **P1-3 整体操作矩阵**：在获得明确授权并建立新的证据切片后，补齐真实四机各类
    操作和网络中断变体的矩阵；已证明的 submit-response-loss 范围不得重复执行，
    也不得升级为整个 P1-3 已完成。
-2. **原生 Windows 边界**：如确有验收需要，单独验证 Windows PowerShell 5.1、NTFS
-   reparse、ACL、registry/profile、跨用户身份和 PID reuse；本机没有可代替这些证据
-   的验证手段。
+2. **原生 Windows 边界**：如确有验收需要，单独验证 Windows PowerShell 5.1、ACL、
+   registry/profile、跨用户身份和 PID reuse；本机没有可代替这些证据的验证手段。
+   （**PS 5.1 与 NTFS reparse 已在专用测试机上验证**：前者见 `smoke/12` 的
+   `ps51=covered` 与 `PLAN.md` A5b 的 `DefaultShell=powershell.exe` 真机列，
+   后者见 `PLAN.md` C3 执行结果。）
 3. **平台和安装矩阵**：补充 WSL、arm64、RHEL、Fedora、Alpine，以及原生包管理器、
    权限/网络/特权组合和真实升级回滚；这些属于未证明边界。
 4. **真实服务与生产边界**：在得到精确主机、用户、工作目录、恢复方式和副作用授权后，
@@ -71,8 +73,10 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
    路径参数、PowerShell 5.1 词分割脚本参数，以及 `chmod` 在 `noacl` 挂载上的静默
    空操作），详见 `CHANGELOG.md` 与 `smoke/08`、`smoke/09`、`smoke/10`。
    第四项已修：客户端安装器改走 ACL（`Set-ClientLauncherAcl`，含 `Get-Acl` 读回
-   校验），`chmod` 已从该资产移除。**仍未验证**：NTFS reparse 点语义、
-   registry/profile、跨用户安装/服务身份。
+   校验），`chmod` 已从该资产移除。**仍未验证**：registry/profile、跨用户安装/服务
+   身份。**NTFS reparse 点语义已于 2026-10-01 实测**（专用测试机上从发行版资产经
+   AST 抽出 `Test-NonReparseWindowsFilePath` 逐字执行，8/8 符合预期、变异 3/3 被抓；
+   见 `PLAN.md` C3 执行结果），故不再是未验证项。
 3. 真实远端服务、队列、TLS/shared key、生产凭证和外部通知/外部渠道验收。
 4. 额外高风险生命周期和持续压力验收。用户已明确取消，不再作为待办或门槛。
 5. 真实安装、升级、回滚、第二 Windows 身份迁移和生产发布。除非用户另行明确
@@ -109,7 +113,7 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
 - 运行规则与命令契约：`skill/SKILL.md`
 - 开发入口与流程：`CLAUDE.md`
 - 日常验证：`run-tests.sh`（`--quick` 只跑 `01`）
-- 冒烟检查：`smoke/` 下的 18 项，逐项的「覆盖什么 / 不覆盖什么」以
+- 冒烟检查：`smoke/` 下的 28 项，逐项的「覆盖什么 / 不覆盖什么」以
   `CLAUDE.md` 末节的覆盖表为准——本文件不再复制那份清单（复制过一次就漂移过一次）
 - `03`/`04`/`06`/`07` 需要 `AGENTQ_SMOKE_HOME` 指向含真实 `pueue` 的运行时，否则 SKIP；
   `03` 还要求它本身是可用运行时（`config/pueue.yml` + 已在运行的 `pueued`）。
