@@ -142,6 +142,11 @@ expect_env_rejected() {
 }
 
 failures=0
+# The count of cases.  It was a literal `16` in the summary line until
+# 2026-10-05, which meant a new case could be added without the reported number
+# moving -- a small false green of its own.  It starts at the 16 pre-existing
+# cases and the cases added since increment it; the summary prints this value.
+cases=16
 
 # expect_rejected <expected-message-fragment> [args...]
 expect_rejected() {
@@ -623,6 +628,203 @@ if [ "$submit_leftovers" -ne 0 ]; then
     failures=$((failures + 1))
 fi
 
+# --- the flattened exit-code column (DefaultShell=powershell.exe) --------------
+# When sshd's DefaultShell is powershell.exe, the outer PowerShell flattens the
+# exit code of a native child (the `powershell.exe -EncodedCommand` launcher) to
+# 1.  Measured on Windows 10 / PS 5.1 (2026-10-01): `cmd /c exit 5` -> 1, while
+# a PowerShell-native `exit 5` -> 5; AgentQ's remote command is the former.  So
+# the SSH exit code loses the 2/3/4/5/6 the recovery logic depends on, and the
+# launcher wrapper reports the real code out of band as `agentq-exit:<code>` on
+# stderr -- the same channel the server's `reason=` line already uses.
+#
+# This stub models exactly that: the JSON response on stdout, the token on
+# stderr, and a FLATTENED exit 1.  The client must recover the real code from
+# the token.  A regression that dropped the extraction would leave exit 1 and
+# these assertions would fail -- the defect this lock exists for.
+flat_stub="$work/bin/ssh-flattened"
+cat > "$flat_stub" <<'STUB'
+#!/bin/sh
+work=${AGENTQ_FLAT_STUB_WORK:?}
+last=''
+for argument in "$@"; do last=$argument; done
+case "$last" in
+    *uname*) printf 'MINGW64_NT-10.0-19045\n'; exit 0 ;;
+    *-EncodedCommand*)
+        # The stub DERIVES its token from the wrapper it is handed, rather than
+        # printing one unconditionally.  The real chain is: the client builds
+        # the wrapper, the remote PowerShell runs it, and the wrapper emits
+        # `agentq-exit:<code>`.  A stub that always emitted the token would test
+        # only the client's extraction and stay green even if BOTH wrapper
+        # copies dropped the emission (parity would also stay green, since the
+        # two copies would still agree).  Decoding the wrapper and emitting the
+        # token only when the wrapper actually emits it closes that gap.
+        encoded=$(printf '%s' "$last" | sed -n 's/.*-EncodedCommand //p')
+        wrapper=$(printf '%s' "$encoded" | base64 -d 2>/dev/null | iconv -f UTF-16LE -t UTF-8 2>/dev/null || printf '')
+        # Key on the FINAL emission (the one carrying the launcher's real
+        # code), not any `agentq-exit:` substring: the wrapper also emits a
+        # token in its too-large and null-exit branches, so a substring match
+        # would stay green even if the final emission -- the one that matters --
+        # were dropped.  Measured: that is exactly how a first version of this
+        # lock missed its mutation.
+        emits_token=no
+        case "$wrapper" in *'agentq-exit:$agentqLauncherExit'*) emits_token=yes ;; esac
+        cat > "$work/flat-stdin.$$"
+        operation=$(base64 -d < "$work/flat-stdin.$$" 2>/dev/null | tr '\0' '\n' | head -1)
+        rm -f "$work/flat-stdin.$$"
+        case "$operation" in
+            lookup)
+                # A not_found lookup: correct JSON, contract exit 3.
+                printf '{"request_id":"smokeclient00000009","task_id":null,"state":"not_found"}'
+                [ "$emits_token" = yes ] && printf 'agentq-exit:3\n' >&2
+                ;;
+            *)
+                printf '{"group":"agentq","tasks":{}}'
+                [ "$emits_token" = yes ] && printf 'agentq-exit:0\n' >&2
+                ;;
+        esac
+        # The flattening: the real code is lost to the SSH exit status.
+        exit 1
+        ;;
+    *powershell.exe*)
+        cat > /dev/null
+        printf 'agentq-windows'
+        printf 'agentq-exit:0'
+        exit 0
+        ;;
+esac
+printf '{"group":"agentq","tasks":{}}'
+exit 0
+STUB
+chmod 700 "$flat_stub"
+
+flat_status=0
+AGENTQ_FLAT_STUB_WORK="$work" AGENTQ_SSH="$flat_stub" \
+    AGENTQ_HOST=smoke-win AGENTQ_REMOTE_PLATFORM=auto TMPDIR="$windows_tmp" \
+    "$client" lookup smokeclient00000009 >"$work/flat.out" 2>"$work/flat.err" || flat_status=$?
+if [ "$flat_status" -ne 3 ]; then
+    printf 'lookup on a flattened (DefaultShell=powershell.exe) target returned exit %s, expected 3: the out-of-band agentq-exit token was not honoured; stderr=%s\n' \
+        "$flat_status" "$(tr '\n' '|' < "$work/flat.err")" >&2
+    failures=$((failures + 1))
+fi
+
+# A malformed or hostile token must be IGNORED, not adopted.  The token is
+# parsed with a digits-only charset (same discipline as the reason channel) and
+# a non-numeric value would break the client's arithmetic comparisons, so the
+# safe behaviour is to fall back to the SSH exit code.  A remote that emits
+# `agentq-exit:<garbage>` must not steer the client's exit status.
+junk_stub="$work/bin/ssh-junk-token"
+cat > "$junk_stub" <<'STUB'
+#!/bin/sh
+last=''
+for argument in "$@"; do last=$argument; done
+case "$last" in
+    *uname*) printf 'MINGW64_NT-10.0-19045\n'; exit 0 ;;
+    *-EncodedCommand*)
+        cat > /dev/null
+        printf '{"request_id":"smokeclient00000010","task_id":null,"state":"not_found"}'
+        # A token that is not a plain integer, and one carrying shell syntax.
+        printf 'agentq-exit:3; echo pwned\n' >&2
+        exit 1
+        ;;
+    *powershell.exe*) cat > /dev/null; printf 'agentq-windows'; printf 'agentq-exit:0'; exit 0 ;;
+esac
+printf '{"group":"agentq","tasks":{}}'
+exit 0
+STUB
+chmod 700 "$junk_stub"
+junk_status=0
+junk_out=$(AGENTQ_SSH="$junk_stub" AGENTQ_HOST=smoke-win AGENTQ_REMOTE_PLATFORM=auto \
+    TMPDIR="$windows_tmp" "$client" lookup smokeclient00000010 2>"$work/junk.err") || junk_status=$?
+if [ "$junk_status" -ne 1 ]; then
+    printf 'a hostile agentq-exit token changed the client exit to %s; expected the SSH code 1: %s\n' \
+        "$junk_status" "$(tr '\n' '|' < "$work/junk.err")" >&2
+    failures=$((failures + 1))
+fi
+case "$junk_out" in *pwned*) printf '%s\n' 'the agentq-exit token was executed as shell' >&2; failures=$((failures + 1)) ;; esac
+
+# --- an EARLY valid token must not override the real one --------------------
+# The junk case above proves a non-numeric token is ignored.  This one is the
+# shape that actually decides the client's behaviour: every token here is a
+# well-formed integer, so nothing is malformed and no charset guard rejects it.
+# The remote emits a success token FIRST and the real failure token LAST.
+#
+# Why last wins: the launcher wrapper writes its authoritative token AFTER the
+# launcher's own stderr, so the last token is the genuine one.  A first-match
+# reader would take the planted `agentq-exit:0` and report SUCCESS for an
+# operation that failed -- and this value drives the 3/4/5/6 recovery decisions,
+# so a forged 0 skips the reconcile entirely.
+#
+# Measured divergence between the two clients (fixed 2026-10-05): the POSIX
+# client has always taken the last match; the Windows client took the first, so
+# a remote could make it claim success where POSIX correctly reported the
+# failure.  Both directions are asserted here: the planted 0 must be ignored,
+# and the trailing 3 must be honoured.
+multi_stub="$work/bin/ssh-multi-token"
+cat > "$multi_stub" <<'STUB'
+#!/bin/sh
+last=''
+for argument in "$@"; do last=$argument; done
+case "$last" in
+    *uname*) printf 'MINGW64_NT-10.0-19045\n'; exit 0 ;;
+    *-EncodedCommand*)
+        cat > /dev/null
+        printf '{"request_id":"smokeclient00000010","task_id":null,"state":"not_found"}'
+        # A planted success token, then the real one.  Both are valid integers.
+        printf 'agentq-exit:0\n' >&2
+        printf 'agentq-exit:3\n' >&2
+        exit 1
+        ;;
+    *powershell.exe*) cat > /dev/null; printf 'agentq-windows'; printf 'agentq-exit:0'; exit 0 ;;
+esac
+printf '{"group":"agentq","tasks":{}}'
+exit 0
+STUB
+chmod 700 "$multi_stub"
+multi_status=0
+AGENTQ_SSH="$multi_stub" AGENTQ_HOST=smoke-win AGENTQ_REMOTE_PLATFORM=auto \
+    TMPDIR="$windows_tmp" "$client" lookup smokeclient00000010 >/dev/null 2>"$work/multi.err" || multi_status=$?
+cases=$((cases + 1))
+if [ "$multi_status" -ne 3 ]; then
+    printf 'a planted leading agentq-exit:0 changed the client exit to %s; expected the LAST token (3): %s\n' \
+        "$multi_status" "$(tr '\n' '|' < "$work/multi.err")" >&2
+    failures=$((failures + 1))
+fi
+
+# The mirror image: a planted trailing token must NOT be honoured either, which
+# is the same "last wins" rule seen from the other side -- if the reader took
+# the first, this case would still pass, so it alone does not discriminate.  It
+# is kept because the two together pin the rule to "last", not to "the one that
+# happens to look like a plausible protocol code".
+multi2_stub="$work/bin/ssh-multi-token-2"
+cat > "$multi2_stub" <<'STUB'
+#!/bin/sh
+last=''
+for argument in "$@"; do last=$argument; done
+case "$last" in
+    *uname*) printf 'MINGW64_NT-10.0-19045\n'; exit 0 ;;
+    *-EncodedCommand*)
+        cat > /dev/null
+        printf '{"request_id":"smokeclient00000011","task_id":null,"state":"not_found"}'
+        printf 'agentq-exit:3\n' >&2
+        printf 'agentq-exit:0\n' >&2
+        exit 1
+        ;;
+    *powershell.exe*) cat > /dev/null; printf 'agentq-windows'; printf 'agentq-exit:0'; exit 0 ;;
+esac
+printf '{"group":"agentq","tasks":{}}'
+exit 0
+STUB
+chmod 700 "$multi2_stub"
+multi2_status=0
+AGENTQ_SSH="$multi2_stub" AGENTQ_HOST=smoke-win AGENTQ_REMOTE_PLATFORM=auto \
+    TMPDIR="$windows_tmp" "$client" lookup smokeclient00000011 >/dev/null 2>"$work/multi2.err" || multi2_status=$?
+cases=$((cases + 1))
+if [ "$multi2_status" -ne 0 ]; then
+    printf 'a planted trailing agentq-exit:0 changed the client exit to %s; expected 0: %s\n' \
+        "$multi2_status" "$(tr '\n' '|' < "$work/multi2.err")" >&2
+    failures=$((failures + 1))
+fi
+
 # --- credential sources -------------------------------------------------------
 # What the client tells ssh, which no static check can see.
 assert_credentials no 'without a credential source'
@@ -729,4 +931,4 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 
-printf 'client-contract checks passed: cases=16 env=10 cred=4 stub-ssh=yes reason=forwarded/injection-safe windows-probe=stdin-fed/no-leak windows-submit=payload-delivered/args-checked/no-leak\n'
+printf 'client-contract checks passed: cases=%s env=10 cred=4 stub-ssh=yes reason=forwarded/injection-safe exit-token=last-wins windows-probe=stdin-fed/no-leak windows-submit=payload-delivered/args-checked/no-leak\n' "$cases"

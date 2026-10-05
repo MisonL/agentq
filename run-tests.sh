@@ -14,6 +14,7 @@ start=$(date +%s)
 failures=0
 ran=0
 skipped=0
+partial=0
 
 # The check list is held in a variable, NOT streamed into the loop on stdin.
 # A check may spawn a process that reads stdin -- 07-client-transport starts a
@@ -78,6 +79,17 @@ while IFS= read -r check <&3; do
     elif grep -q 'SKIPPED' "$output"; then
         printf 'SKIP  %-28s %s\n' "$name" "$(grep SKIPPED "$output" | head -1)"
         skipped=$((skipped + 1))
+    elif grep -qi 'skipped' "$output"; then
+        # The whole check ran and exited 0, but it reported an inner sub-part it
+        # could not verify.  smoke/01 does this: with pwsh absent it still checks
+        # the 9 shell assets, the plists, the .yml and the canonical parity, and
+        # only the 7 .ps1 AST parses are `skipped(pwsh-absent)`.  Classifying the
+        # whole check as SKIP would UNDERSTATE what ran; classifying it ok would
+        # let a real gap read as a full pass.  Neither -- so it gets its own
+        # bucket, and it counts toward NOT A FULL PASS because something in the
+        # check was not verified.
+        printf 'PART  %-28s %s\n' "$name" "$(grep -i skipped "$output" | head -1)"
+        partial=$((partial + 1))
     elif [ ! -s "$output" ]; then
         # A check that exits 0 without printing anything has not demonstrated
         # anything.  Treat silence as failure so a vacuous pass cannot hide
@@ -118,14 +130,14 @@ elapsed=$(( $(date +%s) - start ))
 # past.  The exit code stays 0: skipping is a property of the environment, not a
 # failure of the code under test.
 verdict=$([ "$failures" -eq 0 ] && echo PASS || echo FAIL)
-if [ "$skipped" -ne 0 ]; then
-    printf '\n%s checks: %s ran, %s skipped, %s failed (%ss)\n' \
-        "$verdict" "$ran" "$skipped" "$failures" "$elapsed"
-    printf '%s\n' "NOT A FULL PASS: $skipped check(s) skipped and therefore not verified."
+if [ "$skipped" -ne 0 ] || [ "$partial" -ne 0 ]; then
+    printf '\n%s checks: %s ran, %s skipped, %s partial, %s failed (%ss)\n' \
+        "$verdict" "$ran" "$skipped" "$partial" "$failures" "$elapsed"
+    printf '%s\n' "NOT A FULL PASS: $skipped check(s) skipped and $partial check(s) only partially verified."
     printf '%s\n' 'Set AGENTQ_SMOKE_HOME to a runtime containing pueue to run them (see CLAUDE.md).'
 else
-    printf '\n%s checks: %s ran, %s skipped, %s failed (%ss)\n' \
-        "$verdict" "$ran" "$skipped" "$failures" "$elapsed"
+    printf '\n%s checks: %s ran, %s skipped, %s partial, %s failed (%ss)\n' \
+        "$verdict" "$ran" "$skipped" "$partial" "$failures" "$elapsed"
 fi
 
 [ "$failures" -eq 0 ] || exit 1

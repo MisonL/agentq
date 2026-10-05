@@ -161,12 +161,14 @@ $script:TargetHost = $null
 # exactly as it always was: fail fast, never wait for input.  A non-empty value
 # switches ssh to BatchMode=no plus an askpass program.
 #
-# This is NOT the POSIX design transplanted.  On Windows ssh has no equivalent of
-# OpenSSH's SSH_ASKPASS_REQUIRE, and its readpassphrase() reads the CONSOLE via
-# _getwch() rather than stdin -- so with no console it blocks forever instead of
-# failing.  A client that switched BatchMode off without providing an askpass
-# program would hang an unattended queue.  Askpass is therefore mandatory here,
-# and it is the ONLY source this platform offers: see Resolve-CredentialSource.
+# This is NOT the POSIX design transplanted, but it is closer than it looks.  On
+# Windows ssh has no terminal to prompt on, so an askpass program is mandatory:
+# with no console its readpassphrase() reads the CONSOLE via _getwch() and blocks
+# forever instead of failing, which would hang an unattended queue.  Askpass is
+# therefore the ONLY source this platform offers: see Resolve-CredentialSource.
+# Like the POSIX client, the program is reached through SSH_ASKPASS_REQUIRE=force
+# -- without it ssh never invokes the program at all (there is no DISPLAY on
+# Windows, so it has no other trigger) and blocks on the console instead.
 $script:CredentialSource = ""
 $script:CredentialOptionLines = @()
 
@@ -775,8 +777,32 @@ function New-SshProcessStartInfo {
     # The askpass program has to reach ssh through the environment.  Set on the
     # ProcessStartInfo rather than through $env: so it cannot leak into any other
     # child this client starts.
+    #
+    # SSH_ASKPASS_REQUIRE=force is not optional here.  ssh reaches for the
+    # askpass program only when it has no terminal AND is allowed to; on Windows
+    # there is no DISPLAY, so WITHOUT this variable the program is never invoked
+    # and ssh falls back to readpassphrase(), which reads the CONSOLE via
+    # _getwch() -- and with no console it blocks forever instead of failing.
+    # Measured on the real Windows test host (OpenSSH_for_Windows_9.5p1, started
+    # the way this client starts ssh: ProcessStartInfo, redirected streams): with
+    # the variable unset the call BLOCKS and the program is never called; with
+    # `force` it returns rc=0 and the program is called once.  An earlier revision
+    # omitted it on the false premise that "Windows ssh has no equivalent of
+    # SSH_ASKPASS_REQUIRE" -- the Win32-OpenSSH builds in use here do support it
+    # (measured: 9.5p1, the PATH default, and the Git Bash MSYS 9.9p1; only the
+    # much older System32 8.1p1 predates it and blocks regardless).
     if ($script:CredentialSource -ne "") {
         $startInfo.EnvironmentVariables["SSH_ASKPASS"] = $script:AskPassProgram
+        $startInfo.EnvironmentVariables["SSH_ASKPASS_REQUIRE"] = "force"
+    } else {
+        # EnvironmentVariables starts as a copy of THIS process's environment, so
+        # an inherited SSH_ASKPASS would otherwise reach ssh.  Git Bash exports
+        # one (measured on the real host: SSH_ASKPASS=C:/Git/mingw64/bin/
+        # git-askpass.exe), and the POSIX client clears it for the same reason --
+        # the credential sources are AGENTQ_ASKPASS/AGENTQ_PASSWORD, not whatever
+        # the ambient environment happens to hold.  Remove is safe when absent.
+        [void]$startInfo.EnvironmentVariables.Remove("SSH_ASKPASS")
+        [void]$startInfo.EnvironmentVariables.Remove("SSH_ASKPASS_REQUIRE")
     }
     $startInfo.RedirectStandardInput = $true
     $startInfo.RedirectStandardOutput = $true
@@ -1128,9 +1154,19 @@ function Invoke-SshLogged {
         $previousErrorActionPreference = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         $previousAskPass = $env:SSH_ASKPASS
+        $previousAskPassRequire = $env:SSH_ASKPASS_REQUIRE
         try {
             if ($script:CredentialSource -ne "") {
                 $env:SSH_ASKPASS = $script:AskPassProgram
+                # Without this ssh never invokes the program on Windows (no
+                # DISPLAY) and blocks reading the console.  See
+                # New-SshProcessStartInfo for the measurement.
+                $env:SSH_ASKPASS_REQUIRE = "force"
+            } else {
+                # Clear an inherited value for the same reason the
+                # ProcessStartInfo path does (Git Bash exports SSH_ASKPASS).
+                Remove-Item Env:\SSH_ASKPASS -ErrorAction SilentlyContinue
+                Remove-Item Env:\SSH_ASKPASS_REQUIRE -ErrorAction SilentlyContinue
             }
             if ($null -eq $InputPayload) {
                 & $script:SshPath @sshArguments 1> $outputPath 2> $errorPath
@@ -1140,6 +1176,32 @@ function Invoke-SshLogged {
             $exitCode = Get-LastExitCodeOrFailure
             $transportDiagnostics = Get-FileTextOrEmpty -Path $sshLogPath -Bounded
             $standardError = Get-FileTextOrEmpty -Path $errorPath -Bounded
+            # The launcher wrapper reports its status out of band on stderr as
+            # `agentq-exit:<code>`, because an sshd whose DefaultShell is
+            # powershell.exe flattens a native child's exit code to 1 -- so on
+            # such a target the SSH exit code loses the 2/3/4/5/6 the recovery
+            # logic depends on.  The wrapper emits the token for every
+            # DefaultShell value and it agrees with the SSH code whenever that
+            # code is trustworthy, so the token wins when present.  Only the
+            # Windows launcher emits it; other remote commands do not.
+            if ($script:RemotePlatform -eq "windows") {
+                # The LAST token wins, not the first.  Two reasons, and the
+                # second is the one that matters:
+                #   * the wrapper writes its authoritative token AFTER the
+                #     launcher's own stderr, so the last one is the real one;
+                #   * this text is remote-controlled.  A remote (or anything that
+                #     can write to its stderr) that emits `agentq-exit:0`
+                #     before its real token would make a first-match reader
+                #     report SUCCESS where the operation actually failed -- and
+                #     this value drives the 3/4/5/6 recovery decisions, so a
+                #     forged 0 silently skips the reconcile.
+                # The POSIX client has always taken the last match; this aligns
+                # the two copies rather than leaving them to disagree.
+                $exitTokenMatches = [regex]::Matches($standardError, '(?m)^agentq-exit:(\d+)\s*$')
+                if ($exitTokenMatches.Count -gt 0) {
+                    $exitCode = [int]$exitTokenMatches[$exitTokenMatches.Count - 1].Groups[1].Value
+                }
+            }
             $diagnostics = $transportDiagnostics
             if (![string]::IsNullOrWhiteSpace($standardError)) {
                 if (![string]::IsNullOrEmpty($diagnostics) -and !$diagnostics.EndsWith("`n")) {
@@ -1161,6 +1223,11 @@ function Invoke-SshLogged {
                 Remove-Item Env:\SSH_ASKPASS -ErrorAction SilentlyContinue
             } else {
                 $env:SSH_ASKPASS = $previousAskPass
+            }
+            if ($null -eq $previousAskPassRequire) {
+                Remove-Item Env:\SSH_ASKPASS_REQUIRE -ErrorAction SilentlyContinue
+            } else {
+                $env:SSH_ASKPASS_REQUIRE = $previousAskPassRequire
             }
         }
     } catch {
@@ -1633,12 +1700,24 @@ function Convert-ToPosixQuotedArgument {
 function New-UnixRemoteInvocation {
     param([string[]]$Arguments)
 
-    $command = 'agentq_run() { agentq_server="$HOME/.local/bin/agentq"; exec "$agentq_server" "$@"; }; agentq_run'
+    $script = 'agentq_run() { agentq_server="$HOME/.local/bin/agentq"; exec "$agentq_server" "$@"; }; agentq_run'
     foreach ($argument in $Arguments) {
-        $command += " " + (Convert-ToPosixQuotedArgument -Value $argument)
+        $script += " " + (Convert-ToPosixQuotedArgument -Value $argument)
     }
+    # The script travels base64-encoded, NOT as a command-line argument.
+    # PowerShell 5.1 wraps a native argument containing a space in double quotes
+    # but does not escape the double quotes already inside it, so handing this
+    # script to ssh through `& $script:SshPath @sshArguments` splits it: `"$@"`
+    # arrives as `$@` and the remote shell then word-splits every argument a
+    # second time, so `--workdir '/tmp/my dir'` reaches the server as two
+    # arguments.  Measured against the model smoke/09 calibrates and executed
+    # both ways in a real shell -- see PLAN.md A21 and smoke/20.  The base64
+    # alphabet needs no quoting, so the command line survives whatever the local
+    # PowerShell does to it; `sh` is last in the pipeline, so the script's exit
+    # status is still what ssh returns.
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($script))
     return [pscustomobject]@{
-        Command = $command
+        Command = "printf %s $encoded | base64 -d | sh"
         Input = $null
     }
 }
@@ -1677,6 +1756,7 @@ while ($true) {
     }
     if (($payloadBuilder.Length + $payloadReadCount) -gt $maximumArgumentPayloadCharacters) {
         [Console]::Error.WriteLine("agentq: Windows argument payload exceeds $maximumArgumentPayloadCharacters characters")
+        [Console]::Error.WriteLine("agentq-exit:2")
         exit 2
     }
     [void]$payloadBuilder.Append($payloadBuffer, 0, $payloadReadCount)
@@ -1685,9 +1765,12 @@ $payload = $payloadBuilder.ToString()
 & "C:\ProgramData\AgentQ\agentq-launcher.ps1" -ArgumentsBase64 $payload
 $launcherExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
 if ($null -eq $launcherExitCode) {
+    [Console]::Error.WriteLine("agentq-exit:1")
     exit 1
 }
-exit ([int]$launcherExitCode.Value)
+$agentqLauncherExit = [int]$launcherExitCode.Value
+[Console]::Error.WriteLine("agentq-exit:$agentqLauncherExit")
+exit $agentqLauncherExit
 '@
     $encodedWrapper = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($launcherWrapper))
     return [pscustomobject]@{
@@ -1760,10 +1843,24 @@ function Add-ProbeExitToken {
     # covers indentation; the `;` alternative still covers the single-line
     # `; exit N` form the platform probe uses.
     $rewritten = [regex]::Replace($Script, '(?m)(^[ \t]*|;[ \t]*)exit ([0-9]+)', '${1}$agentqProbeExit = $2')
+    # The probe body travels to `powershell.exe -Command -` on STDIN, and stdin
+    # is read in INTERACTIVE mode: a line that opens a block (`if {`, `function
+    # {`, `try {`) puts the reader into continuation, and the buffered statement
+    # runs only when a BLANK LINE terminates it.  At EOF a pending buffer is
+    # DISCARDED SILENTLY -- rc=0, no output, nothing executed.  The protocol
+    # probe is a multi-line here-string, so without this terminator the whole
+    # probe body is thrown away and every command against a Windows target fails
+    # with "protocol probe failed", pointing at the deployment rather than at the
+    # client.  Measured on a real Windows host (OpenSSH_for_Windows sshd, PS
+    # 5.1): the identical body with one trailing newline -> empty output rc=0;
+    # with a blank line appended -> "agentq-windows-launcher-ready" + the exit
+    # token.  Reproduced four ways (pwsh 7 and PS 5.1, via Git Bash ssh and via a
+    # POSIX ssh).  The platform probe is single-line and so was never affected --
+    # which is why only the protocol probe, and only Windows targets, broke.
     return ($rewritten + "`n" +
         'if ($null -eq $agentqProbeExit) { $agentqProbeExit = 0 }' + "`n" +
         '[Console]::Out.Write("agentq-exit:" + $agentqProbeExit)' + "`n" +
-        'exit $agentqProbeExit')
+        'exit $agentqProbeExit' + "`n`n")
 }
 
 function Get-WindowsProbeCommand {
@@ -1894,9 +1991,19 @@ function Resolve-ProbeExitToken {
         [string]$Output
     )
 
-    if ($Output -match 'agentq-exit:(\d+)') {
-        $Output = $Output -replace 'agentq-exit:\d+\s*$', ''
-        return [pscustomobject]@{ ExitCode = [int]$Matches[1]; Output = $Output.TrimEnd() }
+    # The LAST token wins, matching the POSIX client's
+    # windows_probe_apply_exit_token (which strips up to the final
+    # `agentq-exit:` via ${raw##*agentq-exit:}).  The probe body prints its token
+    # last, so the last one is authoritative; and the output is remote-controlled,
+    # so a first-match reader could be steered by a planted leading token.  Both
+    # callers additionally require an exact Output value, which already rejects
+    # most forgeries -- this keeps the two copies aligned rather than relying on
+    # that as the only defense.
+    $exitTokenMatches = [regex]::Matches($Output, 'agentq-exit:(\d+)')
+    if ($exitTokenMatches.Count -gt 0) {
+        $lastToken = $exitTokenMatches[$exitTokenMatches.Count - 1]
+        $Output = $Output.Substring(0, $lastToken.Index).TrimEnd()
+        return [pscustomobject]@{ ExitCode = [int]$lastToken.Groups[1].Value; Output = $Output }
     }
     return [pscustomobject]@{ ExitCode = $SshExitCode; Output = $Output }
 }

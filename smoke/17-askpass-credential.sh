@@ -265,6 +265,67 @@ if [ ! -x "$work/askpass.sh" ]; then
     failures=$((failures + 1))
 fi
 
+# --- 2b. the AGENTQ_PASSWORD source: end to end, and nothing left behind -----
+# Until 2026-10-05 this source had ZERO coverage: AGENTQ_PASSWORD appeared in
+# this file only inside `env -u`, so nothing ever set it.  That gap covered
+# exactly the code path the 2026-10-05 review touched -- the client builds its
+# OWN temporary askpass wrapper for this source (rather than using a program the
+# user supplies), registers it for removal, and records its identity.  A defect
+# there is invisible to every other check: the AGENTQ_ASKPASS source never
+# allocates that file, and smoke/05 asserts only what reaches ssh's argv and
+# environment, not the wrapper's lifecycle on disk.
+#
+# TMPDIR is redirected so "nothing left behind" is a real assertion about files
+# this check can name, rather than a hope about whatever else is in /tmp.
+password_tmp="$work/password-tmp"
+mkdir -p "$password_tmp"
+run_protocol_password() {
+    env -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD_PROMPT \
+        TMPDIR="$password_tmp" \
+        AGENTQ_SSH="$work/bin/ssh" AGENTQ_HOST=127.0.0.1 \
+        AGENTQ_REMOTE_PLATFORM=unix AGENTQ_CONFIG="$work/absent-config" \
+        AGENTQ_PASSWORD='agentq-smoke-passphrase' \
+        "$client" "$@"
+}
+# The passphrase is the same secret the AGENTQ_ASKPASS program above prints, so
+# this exercises the same authentication -- only the delivery differs.  That is
+# the point: the source under test is how the secret REACHES ssh, not whether
+# the sandbox can authenticate at all.
+: > "$work/askpass.log"
+pw_submit_status=0
+pw_submit_out=$(run_protocol_password submit --workdir "$workdir" \
+    --request-id smoke-askpass-request-0002 -- sh -c 'echo password-ok') || pw_submit_status=$?
+pw_task_id=$(printf '%s' "$pw_submit_out" | jq -r '.task_id // empty' 2>/dev/null || printf '')
+cases=$((cases + 1))
+if [ "$pw_submit_status" -ne 0 ] || [ -z "$pw_task_id" ]; then
+    printf 'askpass-credential: submit over AGENTQ_PASSWORD failed (exit %s): %s\n' \
+        "$pw_submit_status" "$(printf '%s' "$pw_submit_out" | head -c 200)" >&2
+    failures=$((failures + 1))
+fi
+
+if [ -n "$pw_task_id" ]; then
+    cases=$((cases + 1))
+    pw_wait_status=0
+    pw_wait_out=$(run_protocol_password wait "$pw_task_id") || pw_wait_status=$?
+    pw_wait_result=$(printf '%s' "$pw_wait_out" | jq -r '.task.status.Done.result // empty' 2>/dev/null || printf '')
+    if [ "$pw_wait_status" -ne 0 ] || [ "$pw_wait_result" != 'Success' ]; then
+        printf 'askpass-credential: wait over AGENTQ_PASSWORD failed (exit %s, result %s)\n' \
+            "$pw_wait_status" "${pw_wait_result:-<none>}" >&2
+        failures=$((failures + 1))
+    fi
+fi
+
+# The wrapper this source creates is the client's own temporary, so it must be
+# gone.  This is the assertion that would have caught the ssh_stderr_capture
+# leak fixed on 2026-10-05, had it been reachable from here.
+cases=$((cases + 1))
+pw_residue=$(find "$password_tmp" -mindepth 1 | wc -l | tr -d ' ')
+if [ "$pw_residue" -ne 0 ]; then
+    printf 'askpass-credential: AGENTQ_PASSWORD left %s file(s) in TMPDIR: %s\n' \
+        "$pw_residue" "$(find "$password_tmp" -mindepth 1 -exec basename {} \; | tr '\n' ' ')" >&2
+    failures=$((failures + 1))
+fi
+
 # --- 3. a broken source is refused, not downgraded ------------------------
 # Silently falling back to key-only auth is the failure this guards: the
 # operator would believe a password was in use while none was.
@@ -296,4 +357,4 @@ if [ "$failures" -ne 0 ]; then
     printf 'askpass-credential: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'askpass-credential checks passed: sshd=real cases=%s askpass=invoked protocol=submit/wait source=passphrase-key\n' "$cases"
+printf 'askpass-credential checks passed: sshd=real cases=%s askpass=invoked protocol=submit/wait source=askpass+password\n' "$cases"

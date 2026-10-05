@@ -32,7 +32,7 @@ fi
 # AGENTQ_SMOKE_PWSH lets this check run under a DIFFERENT PowerShell than the
 # one on PATH -- specifically Windows PowerShell 5.1, which is the version this
 # project has actually been bitten by and which pwsh does not reproduce.  Set it
-# to `powershell.exe` to run the same 31 cases on the interpreter that matters.
+# to `powershell.exe` to run the same cases on the interpreter that matters.
 # Left unset (the normal case) the behaviour is unchanged.
 pwsh_binary=${AGENTQ_SMOKE_PWSH:-$(command -v pwsh || true)}
 
@@ -371,6 +371,72 @@ if [ "$status" -ne 0 ] || ! grep -qF 'credential cases ok' "$work/out"; then
     failures=$((failures + 1))
 fi
 
+# --- the askpass environment must force ssh to use the program ----------------
+# ssh runs SSH_ASKPASS only when it has no terminal AND is allowed to reach for
+# it.  On POSIX the trigger is SSH_ASKPASS_REQUIRE=force; on Windows there is no
+# DISPLAY at all, so WITHOUT that variable the program is never invoked and ssh
+# falls back to readpassphrase(), which reads the CONSOLE via _getwch() -- with
+# no console it blocks forever instead of failing.  The client sets SSH_ASKPASS
+# but an earlier revision did NOT set SSH_ASKPASS_REQUIRE, on the false premise
+# (stated in its own header comment) that "Windows ssh has no equivalent of
+# OpenSSH's SSH_ASKPASS_REQUIRE".  Measured on the real Windows test host
+# (OpenSSH_for_Windows_9.5p1, PATH default; ProcessStartInfo with redirected
+# streams, exactly how the client starts ssh): with the variable unset the call
+# BLOCKS and the askpass program is never called; with `force` it returns rc=0
+# and the program is called once.  (The native System32 8.1p1 build predates the
+# variable and blocks either way -- but that is not the build this client
+# resolves by default, and it is out of scope here.)
+#
+# Both directions are asserted: the variable must be set to `force` when a
+# credential source is configured, and must be ABSENT otherwise (an exported
+# force with no program is the inverse defect, and would make ssh try to exec
+# an empty askpass).
+askpass_env_probe='
+. "'"$client_arg"'" 2>$null
+$bad = 0
+# EnvironmentVariables is a plain dictionary that THROWS on a missing key, so
+# every read goes through this helper rather than indexing directly.
+function Get-EnvValue($si, $name) {
+    if ($si.EnvironmentVariables.ContainsKey($name)) { return $si.EnvironmentVariables[$name] }
+    return $null
+}
+$script:CredentialSource = "askpass"
+$script:AskPassProgram = "helper.exe"
+$si = New-SshProcessStartInfo -Arguments @("-o","BatchMode=no","--","smoke-host","cmd")
+$askpass = Get-EnvValue $si "SSH_ASKPASS"
+$require = Get-EnvValue $si "SSH_ASKPASS_REQUIRE"
+if ($askpass -ne "helper.exe") {
+    [Console]::Error.WriteLine("askpass-env: SSH_ASKPASS not set on the ssh process: [$askpass]")
+    $bad += 1
+}
+if ($require -ne "force") {
+    [Console]::Error.WriteLine("askpass-env: SSH_ASKPASS_REQUIRE must be force, got: [$require]")
+    $bad += 1
+}
+# No source -> neither variable may be present.
+$script:CredentialSource = ""
+$si = New-SshProcessStartInfo -Arguments @("-o","BatchMode=yes","--","smoke-host","cmd")
+if (![string]::IsNullOrEmpty((Get-EnvValue $si "SSH_ASKPASS"))) {
+    [Console]::Error.WriteLine("askpass-env: SSH_ASKPASS leaked without a credential source")
+    $bad += 1
+}
+if (![string]::IsNullOrEmpty((Get-EnvValue $si "SSH_ASKPASS_REQUIRE"))) {
+    [Console]::Error.WriteLine("askpass-env: SSH_ASKPASS_REQUIRE leaked without a credential source")
+    $bad += 1
+}
+if ($bad -ne 0) { exit 1 }
+"askpass env cases ok"
+'
+cases=$((cases + 1))
+status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command "$askpass_env_probe" \
+    >"$work/out" 2>"$work/err" || status=$?
+if [ "$status" -ne 0 ] || ! grep -qF 'askpass env cases ok' "$work/out"; then
+    printf '%s\n' 'ps-client: the askpass environment does not force ssh to use the program' >&2
+    head -5 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+
 # POSIX-only sources must be refused here, not silently ignored.  Windows ssh
 # reads the password from the console and blocks when there is none, so
 # accepting these would hang an unattended call instead of failing.
@@ -488,6 +554,209 @@ for shape in 'plain' 'space'; do
     fi
     status=0
 done
+
+# --- the launcher wrapper must emit the out-of-band exit token ---------------
+# Same defect class as the probe token above, on the OPERATION path.  When
+# sshd's DefaultShell is powershell.exe the outer PowerShell flattens the exit
+# code of the native launcher child to 1, so the wrapper prints the real code on
+# stderr as `agentq-exit:<code>` and Invoke-SshLogged reads that back.  If the
+# wrapper stops emitting the FINAL token (the one carrying the launcher's real
+# code), every nonzero protocol code degrades to 1 on such a target and the
+# recovery logic breaks.
+#
+# Asserted by building the wrapper and checking the emission is present and
+# carries the launcher's code -- not a substring test, because the wrapper also
+# emits a token in its too-large and null-exit branches, so a substring test
+# would stay green if only the final one were dropped.  (Measured: that is
+# exactly how a first version of the smoke/05 lock missed its mutation.)
+wrapper_probe='
+. "'"$client_arg"'" 2>$null
+$invocation = New-WindowsRemoteInvocation -Arguments @("status")
+$encoded = ($invocation.Command -replace "^.*-EncodedCommand ", "")
+$wrapper = [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded))
+$tokenLiteral = "agentq-exit:" + [char]36 + "agentqLauncherExit"
+$exitLiteral = "exit " + [char]36 + "agentqLauncherExit"
+if (!$wrapper.Contains($tokenLiteral)) {
+    [Console]::Error.WriteLine("launcher wrapper does not emit the final agentq-exit token")
+    exit 1
+}
+if (!$wrapper.Contains($exitLiteral)) {
+    [Console]::Error.WriteLine("launcher wrapper does not exit with the launcher code")
+    exit 1
+}
+"launcher exit token ok"
+'
+cases=$((cases + 1))
+status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command "$wrapper_probe" \
+    >"$work/out" 2>"$work/err" || status=$?
+if [ "$status" -ne 0 ] || ! grep -qF 'launcher exit token ok' "$work/out"; then
+    printf '%s\n' 'ps-client: the launcher wrapper does not emit its out-of-band exit token' >&2
+    head -3 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+
+# --- the exit token reader must take the LAST token, not the first -----------
+# The wrapper writes its authoritative token AFTER the launcher's own stderr, so
+# the last one is the real code -- and the text is remote-controlled: a target
+# that emits `agentq-exit:0` before its real token would make a first-match
+# reader report SUCCESS where the operation failed, silently skipping the 3/4/5/6
+# reconcile.  The POSIX client has always taken the last match; this pins the
+# PowerShell copy to agree.  Behavioral on purpose -- a source-level assertion
+# would have to re-implement the regex and could not see the count-1 index.
+#
+# A stub ssh on AGENTQ_SSH emits two tokens (0 then 3) and exits 1.  The real
+# Invoke-SshLogged is driven, and its ExitCode must be 3 (the last), not 0 (the
+# first) and not 1 (the ssh code).
+exit_token_dir="$work/exit-token-ssh"
+mkdir -p "$exit_token_dir"
+cat > "$exit_token_dir/ssh" <<'STUB'
+#!/bin/sh
+cat > /dev/null 2>&1 || true
+printf 'agentq-exit:0\n' >&2
+printf 'agentq-exit:3\n' >&2
+exit 1
+STUB
+chmod 700 "$exit_token_dir/ssh"
+exit_token_probe='
+. "'"$client_arg"'" 2>$null
+$env:AGENTQ_SSH = "'"$exit_token_dir"'/ssh"
+$script:SshPath = Resolve-SshPath
+$script:RemotePlatform = "windows"
+$script:TargetHost = "smoke-host"
+$script:CredentialSource = ""
+$script:CredentialOptionLines = Get-CredentialSshOptions
+$r = Invoke-SshLogged -RemoteCommand "ignored" -InputPayload $null
+if ($r.ExitCode -ne 3) {
+    [Console]::Error.WriteLine("exit token: expected the LAST token (3), got $($r.ExitCode)")
+    exit 1
+}
+"exit token last-wins ok"
+'
+cases=$((cases + 1))
+status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command "$exit_token_probe" \
+    >"$work/out" 2>"$work/err" || status=$?
+if [ "$status" -ne 0 ] || ! grep -qF 'exit token last-wins ok' "$work/out"; then
+    printf '%s\n' 'ps-client: the exit token reader does not take the last match' >&2
+    grep -i 'exit token' "$work/err" >&2 || head -3 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+
+# --- the PROBE token reader must take the last token too ---------------------
+# The same divergence existed on the PROBE path, over stdout instead of stderr:
+# the POSIX client's windows_probe_apply_exit_token strips up to the FINAL
+# `agentq-exit:` (${raw##*agentq-exit:}), while this copy used a first-match
+# regex.  A remote whose stdout carries a planted leading `agentq-exit:0` would
+# make the first-match reader report a platform it never answered for.  Both
+# callers already require an exact Output value, so this is defence in depth --
+# the point is that the two copies stop disagreeing.
+#
+# Five cases: three single-token ones that must be BYTE-IDENTICAL to the pre-fix
+# implementation (so this case also proves the fix is narrow), plus the two
+# multi-token ones, whose EXIT codes must match the POSIX result (3 and 5) and
+# whose Output is everything before the last token (then TrimEnd()ed, which is
+# this copy's pre-existing behaviour -- the POSIX side keeps the trailing
+# newline, so the two are compared on exit code and on content, not bytes).
+probe_token_probe='
+. "'"$client_arg"'" 2>$null
+function Resolve-ProbeExitTokenBefore {
+    param([int]$SshExitCode,[string]$Output)
+    if ($Output -match "agentq-exit:(\d+)") {
+        $Output = $Output -replace "agentq-exit:\d+\s*$", ""
+        return [pscustomobject]@{ ExitCode = [int]$Matches[1]; Output = $Output.TrimEnd() }
+    }
+    return [pscustomobject]@{ ExitCode = $SshExitCode; Output = $Output }
+}
+$bad = 0
+# (name, output, expected exit, expected output, must-match-pre-fix)
+$cases = @(
+    @{ n="single0";  o="agentq-windows`nagentq-exit:0"; e=0;  x="agentq-windows"; old=$true },
+    @{ n="single42"; o="agentq-windows-launcher-missing`nagentq-exit:42"; e=42; x="agentq-windows-launcher-missing"; old=$true },
+    @{ n="notoken";  o="agentq-windows"; e=1;  x="agentq-windows"; old=$true },
+    @{ n="planted";  o="agentq-exit:0`nagentq-windows`nagentq-exit:3"; e=3; x="agentq-exit:0`nagentq-windows"; old=$false },
+    @{ n="midtoken"; o="agentq-exit:5`nagentq-windows"; e=5; x=""; old=$false }
+)
+foreach ($c in $cases) {
+    $r = Resolve-ProbeExitToken -SshExitCode 1 -Output $c.o
+    if ($r.ExitCode -ne $c.e -or $r.Output -cne $c.x) {
+        [Console]::Error.WriteLine("probe token $($c.n): expected exit=$($c.e) out=[$($c.x)] got exit=$($r.ExitCode) out=[$($r.Output)]")
+        $bad += 1
+        continue
+    }
+    if ($c.old) {
+        $o = Resolve-ProbeExitTokenBefore -SshExitCode 1 -Output $c.o
+        if ($o.ExitCode -ne $r.ExitCode -or $o.Output -cne $r.Output) {
+            [Console]::Error.WriteLine("probe token $($c.n): single-token case changed (before exit=$($o.ExitCode) out=[$($o.Output)])")
+            $bad += 1
+        }
+    }
+}
+if ($bad -ne 0) { exit 1 }
+"probe exit token last-wins ok"
+'
+cases=$((cases + 1))
+status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command "$probe_token_probe" \
+    >"$work/out" 2>"$work/err" || status=$?
+if [ "$status" -ne 0 ] || ! grep -qF 'probe exit token last-wins ok' "$work/out"; then
+    printf '%s\n' 'ps-client: the PROBE exit token reader does not take the last match' >&2
+    grep -i 'probe token' "$work/err" >&2 || head -3 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+
+# --- the probe body must actually RUN when fed to `-Command -` on stdin ------
+# The Windows probes travel to `powershell.exe -Command -` on STDIN, and stdin is
+# read in INTERACTIVE mode: a line that opens a block (`if {`, `function {`,
+# `try {`) buffers until a BLANK LINE terminates it, and at EOF a pending buffer
+# is DISCARDED SILENTLY -- rc=0, no output, nothing executed.  The protocol probe
+# is a multi-line here-string, so without a terminating blank line its whole body
+# is thrown away: every command against a Windows target fails with "protocol
+# probe failed", which points at the deployment rather than at the client.  The
+# platform probe is single-line and so was never affected.
+#
+# This case is BEHAVIORAL on purpose: the source-level assertions above cannot
+# see it, because the bug is in how PowerShell consumes the text, not in the
+# text.  It builds the real probe input and feeds it to the SAME interpreter
+# running this check (via the current process's own image), so it is meaningful
+# under both pwsh 7 and Windows PowerShell 5.1.  The assertion is that the probe
+# produced its exit token -- that proves the body executed.  Which token value
+# appears is deliberately NOT asserted: on a host with the launcher deployed it
+# is `agentq-exit:0`, and without it `agentq-exit:42`, and both prove the body
+# ran.  Measured: with the defect, out=[] for the multi-line body.
+probe_stdin_probe='
+. "'"$client_arg"'" 2>$null
+$probe = Get-WindowsAgentQProtocolProbeCommand
+$exe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+$si = [System.Diagnostics.ProcessStartInfo]::new()
+$si.FileName = $exe
+$si.UseShellExecute = $false
+$si.CreateNoWindow = $true
+$si.RedirectStandardInput = $true
+$si.RedirectStandardOutput = $true
+$si.RedirectStandardError = $true
+$si.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command -"
+$p = [System.Diagnostics.Process]::Start($si)
+$p.StandardInput.Write($probe.Input)
+$p.StandardInput.Close()
+$out = $p.StandardOutput.ReadToEnd()
+$err = $p.StandardError.ReadToEnd()
+$p.WaitForExit(30000) | Out-Null
+if ($out -notmatch "agentq-exit:\d+") {
+    [Console]::Error.WriteLine("the probe body did not run when fed to -Command - on stdin (out=[$out] err=[$err])")
+    exit 1
+}
+"probe stdin delivery ok"
+'
+cases=$((cases + 1))
+status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command "$probe_stdin_probe" \
+    >"$work/out" 2>"$work/err" || status=$?
+if [ "$status" -ne 0 ] || ! grep -qF 'probe stdin delivery ok' "$work/out"; then
+    printf '%s\n' 'ps-client: the probe body is silently discarded by -Command - on stdin' >&2
+    head -5 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
 
 # --- the one case that must succeed ------------------------------------------
 cases=$((cases + 1))
