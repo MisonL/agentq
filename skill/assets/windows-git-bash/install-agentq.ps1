@@ -1784,7 +1784,25 @@ function Invoke-AgentQLauncherSmoke {
             }
 
             $status = Read-AgentQInstallerJsonFile -Path $statusPath -Description "AgentQ launcher smoke"
-            if (($null -eq $status.tasks) -or ($null -eq $status.groups.agentq)) {
+            # StrictMode turns a missing property into a terminating error, so a
+            # parsed payload must be reached through PSObject.Properties -- same
+            # idiom as the staged health check above.
+            $statusTasks = $null
+            $statusAgentqGroup = $null
+            if ($null -ne $status) {
+                $tasksProperty = $status.PSObject.Properties["tasks"]
+                if ($null -ne $tasksProperty) {
+                    $statusTasks = $tasksProperty.Value
+                }
+                $groupsProperty = $status.PSObject.Properties["groups"]
+                if ($null -ne $groupsProperty -and $null -ne $groupsProperty.Value) {
+                    $agentqProperty = $groupsProperty.Value.PSObject.Properties["agentq"]
+                    if ($null -ne $agentqProperty) {
+                        $statusAgentqGroup = $agentqProperty.Value
+                    }
+                }
+            }
+            if ($null -eq $statusTasks -or $null -eq $statusAgentqGroup) {
                 throw "AgentQ launcher smoke returned an invalid status payload"
             }
         }
@@ -1933,7 +1951,12 @@ function Restore-ScheduledTaskDefinition {
     param([AllowNull()][string]$Definition)
 
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-    if ($null -ne $Definition) {
+    # A `[string]` parameter coerces $null to "", so `$null -ne $Definition` is
+    # true for the first-install case where no previous task existed -- and
+    # Register-ScheduledTask then rejects the empty Xml.  Test for empty, not
+    # for null.  Verified on Windows 10 / PS 5.1: a [AllowNull()][string] bound
+    # to $null reports isNull=False / isNullOrEmpty=True.
+    if (![string]::IsNullOrWhiteSpace($Definition)) {
         Register-ScheduledTask -TaskName $taskName -Xml $Definition | Out-Null
     }
 }
@@ -2793,7 +2816,14 @@ try {
     Set-PrivateTreeAcl -Path $rootDirectory
     Assert-ManagedPueueConnection -ClientPath $newClientPath -ConfigPath $newConfigPath -DaemonPath $newDaemonPath -Description "Staged protected"
     $groups = Get-PueueGroupsFromTemporaryFile -ClientPath $newClientPath -ConfigPath $newConfigPath -RuntimeDirectory $runtimeDirectory
-    if ($null -ne $groups.agentq) {
+    # A missing group is the normal first-install case, and StrictMode would
+    # otherwise turn that absence into a terminating error instead of the
+    # `group add` branch below.
+    $agentqGroupProperty = $null
+    if ($null -ne $groups) {
+        $agentqGroupProperty = $groups.PSObject.Properties["agentq"]
+    }
+    if ($null -ne $agentqGroupProperty) {
         & $newClientPath --config $newConfigPath parallel --group agentq 1 1> $null
     } else {
         & $newClientPath --config $newConfigPath group add --parallel 1 agentq 1> $null
@@ -2865,17 +2895,28 @@ try {
     }
     throw
 } finally {
-    if (!(Remove-SafeTransactionDirectory -Path $stageRootDirectory -Description "staging root")) {
-        throw "staging root cleanup failed: $stageRootDirectory"
-    }
-    if (!$preserveRecoveryArtifacts) {
-        if (!(Remove-SafeTransactionDirectory -Path $failedRootDirectory -Description "failed AgentQ root")) {
-            throw "failed AgentQ root cleanup failed: $failedRootDirectory"
+    # A `throw` inside a `finally` REPLACES the in-flight exception and aborts
+    # the rest of the block -- so a cleanup failure here would both mask the
+    # real install error (from the catch above) and skip Release-MaintenanceLock,
+    # leaving the lock held for the next invocation.  Each cleanup step is
+    # therefore made non-throwing (report to stderr, keep going), and the lock
+    # release is wrapped in its OWN finally so it runs no matter what.
+    try {
+        if (!(Remove-SafeTransactionDirectory -Path $stageRootDirectory -Description "staging root")) {
+            [Console]::Error.WriteLine("AgentQ staging root cleanup failed; preserving it: $stageRootDirectory")
         }
-    } elseif ($preserveRecoveryArtifacts) {
-        [Console]::Error.WriteLine("AgentQ recovery artifacts were preserved at $rootDirectory and $backupRootDirectory")
-    }
-    if (!$preserveRecoveryArtifacts) {
-        Release-MaintenanceLock
+        if (!$preserveRecoveryArtifacts) {
+            if (!(Remove-SafeTransactionDirectory -Path $failedRootDirectory -Description "failed AgentQ root")) {
+                [Console]::Error.WriteLine("AgentQ failed root cleanup failed; preserving it: $failedRootDirectory")
+            }
+        } else {
+            [Console]::Error.WriteLine("AgentQ recovery artifacts were preserved at $rootDirectory and $backupRootDirectory")
+        }
+    } catch {
+        [Console]::Error.WriteLine("AgentQ transaction cleanup error: $($_.Exception.Message)")
+    } finally {
+        if (!$preserveRecoveryArtifacts) {
+            Release-MaintenanceLock
+        }
     }
 }

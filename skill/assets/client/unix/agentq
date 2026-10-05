@@ -38,6 +38,16 @@ mutation_log_file=''
 # run_ssh_logged's exit status is already the ssh exit code, and both callers (the
 # operation path and the mutation path) need the same value.
 agentq_remote_failure_reason_value=''
+# The protected file the remote command's stderr is captured into while an SSH
+# call is in flight.  A global, and registered in cleanup_client_runtime, because
+# run_ssh_logged can return early (an input temporary that fails its identity
+# check, for instance) and those early returns run BEFORE its own removal at the
+# end of the function -- so without this the capture outlived every one of them.
+# Its identity is recorded at creation because the removal helper refuses to
+# delete a path whose identity was never recorded, which is the same rule every
+# other temporary here follows.
+ssh_stderr_capture=''
+ssh_stderr_capture_identity=''
 mutation_output_file=''
 agentq_recovery_log_file=''
 agentq_recovery_output_file=''
@@ -509,9 +519,15 @@ resolve_credential_source() {
 }
 
 # The askpass program is the only thing ssh sees; the secret never passes
-# through this client.  For AGENTQ_PASSWORD the secret would otherwise sit in
-# the environment of every ssh child, so it is moved into a 0600 temporary
-# wrapper that is registered for removal on every exit path.
+# through this client as an argument.  For AGENTQ_PASSWORD the wrapper is a 0600
+# temporary registered for removal on every exit path.  NOTE, precisely: the
+# wrapper READS the password from the environment, so the password does sit in
+# the environment of each ssh child that runs it -- that is unavoidable while the
+# secret comes from an env var at all, and it is why AGENTQ_ASKPASS (a program
+# the client never reads) is the preferred source.  What this buys is that the
+# secret is never an argv (so never in a process listing) and never written to
+# disk: the wrapper file itself contains only the literal string
+# "$AGENTQ_PASSWORD", not its value.
 prepare_credential_delivery() {
     [ "$agentq_credential_source" = password ] || return 0
     resolve_agentq_temp_directory || return $?
@@ -537,7 +553,16 @@ prepare_credential_delivery() {
 #!/bin/sh
 printf '%s\n' "$AGENTQ_PASSWORD"
 AGENTQ_ASKPASS_WRAPPER
-    chmod 700 "$agentq_askpass_temporary" 2>/dev/null || true
+    # A failed chmod is not a permission WIDENING -- creation already happened
+    # under umask 077, so a failure leaves 0600, which is stricter than the 0700
+    # asked for.  It is still reported rather than swallowed: the identity check
+    # below compares device/inode only, so a lost chmod would be invisible, and
+    # this file has been bitten before by a call that "succeeded" while changing
+    # nothing (the Windows chmod-is-a-no-op case).
+    if ! chmod 700 "$agentq_askpass_temporary" 2>/dev/null; then
+        printf '%s: cannot set the askpass program mode to 0700 (it stays at the umask default, which is stricter): %s\n' \
+            "$program" "$agentq_askpass_temporary" >&2
+    fi
     windows_argument_verify_identity "$agentq_askpass_temporary" "$agentq_askpass_temporary_identity" 'after writing askpass program' || return $?
     agentq_askpass_program=$agentq_askpass_temporary
 }
@@ -1165,6 +1190,16 @@ cleanup_client_runtime() {
             fi
         fi
     fi
+    if [ -n "$ssh_stderr_capture" ]; then
+        if windows_argument_remove_file "$ssh_stderr_capture" "$ssh_stderr_capture_identity"; then
+            :
+        else
+            cleanup_client_runtime_ssh_stderr_capture_status=$?
+            if [ "$cleanup_client_runtime_status" -eq 0 ]; then
+                cleanup_client_runtime_status=$cleanup_client_runtime_ssh_stderr_capture_status
+            fi
+        fi
+    fi
     if [ -n "$agentq_askpass_temporary" ]; then
         if windows_argument_remove_file "$agentq_askpass_temporary" "$agentq_askpass_temporary_identity"; then
             :
@@ -1198,7 +1233,19 @@ cleanup_client_runtime() {
     return "$cleanup_client_runtime_status"
 }
 
+# The EXIT trap owns ALL cleanup (it calls cleanup_config_snapshot first, then
+# removes every runtime temporary).  The signal traps must therefore run that
+# same function and then EXIT -- not merely return.  A signal handler that
+# returns lets the shell RESUME the interrupted operation (verified: a handler
+# for HUP/INT/TERM that does not exit leaves the script running past the
+# interrupt), so a Ctrl-C during `wait` would neither stop nor clean up.
+# `sshp` and `install-client.sh` already use this `exit 130` form; this client
+# was the one place they diverged.  The earlier `trap cleanup_config_snapshot
+# EXIT HUP INT TERM` at the top rebinds HUP/INT/TERM to a function that trims
+# only the config snapshot, so it is superseded here where the full runtime
+# cleanup is defined.
 trap cleanup_client_runtime EXIT
+trap 'cleanup_client_runtime; exit 130' HUP INT TERM
 
 windows_argument_identity_for_path() {
     windows_argument_lookup_path=$1
@@ -1252,6 +1299,21 @@ agentq_remote_failure_reason() {
         LC_ALL=C sed -n 's/^[^:]*: reason=\([a-z][a-z_]*\)$/\1/p' | tail -n 1)
     [ -n "$ssh_reason_value" ] || return 1
     printf '%s\n' "$ssh_reason_value"
+}
+
+# The Windows launcher wrapper reports its status out of band on stderr as
+# `agentq-exit:<code>`, because an sshd whose DefaultShell is powershell.exe
+# flattens the exit code of a native child to 1 -- so the SSH exit code cannot
+# be trusted there.  Same discipline as the reason token above: extract only the
+# controlled identifier (digits) and never echo the surrounding stderr.  Only
+# the Windows wrapper emits it, so a unix target is unaffected.
+agentq_remote_exit_token() {
+    ssh_exit_token_log=$1
+    agentq_ssh_log_require_existing_file "$ssh_exit_token_log" || return 1
+    ssh_exit_token_value=$(LC_ALL=C tr -d '\r' < "$ssh_exit_token_log" |
+        LC_ALL=C sed -n 's/^agentq-exit:\([0-9][0-9]*\)$/\1/p' | tail -n 1)
+    [ -n "$ssh_exit_token_value" ] || return 1
+    printf '%s\n' "$ssh_exit_token_value"
 }
 
 write_ssh_diagnostic_metadata() {
@@ -2530,6 +2592,13 @@ initialize_remote_invocation() {
                     else
                         windows_platform_status=$?
                     fi
+                    # The probe reports its status through an out-of-band
+                    # "agentq-exit:<code>" token, because an outer PowerShell
+                    # flattens the SSH exit code.  Strip it before comparing the
+                    # payload; the MINGW branch above already does this.
+                    windows_probe_apply_exit_token "$windows_platform_status" "$windows_platform_output"
+                    windows_platform_status=$windows_probe_token_status
+                    windows_platform_output=$windows_probe_token_output
                     if [ "$windows_platform_status" -eq 0 ] && [ "$windows_platform_output" = agentq-windows ]; then
                         remote_platform=windows
                     elif [ "$local_platform_status" -ne 0 ] && [ "$windows_platform_status" -ne 0 ]; then
@@ -2640,7 +2709,7 @@ build_windows_remote_command() {
     # Win32-OpenSSH can terminate a non-TTY stdin stream before PowerShell's
     # -File parameter binder receives the base64 payload. Use an encoded
     # wrapper that reads stdin explicitly, then invokes the protected launcher.
-    windows_launcher_wrapper='$ProgressPreference = "SilentlyContinue"; $maximumArgumentPayloadCharacters = 1048576; $payloadBuffer = [char[]]::new(4096); $payloadBuilder = [System.Text.StringBuilder]::new(); while ($true) { $payloadReadCount = [Console]::In.Read($payloadBuffer, 0, $payloadBuffer.Length); if ($payloadReadCount -le 0) { break }; if (($payloadBuilder.Length + $payloadReadCount) -gt $maximumArgumentPayloadCharacters) { [Console]::Error.WriteLine("agentq: Windows argument payload exceeds $maximumArgumentPayloadCharacters characters"); exit 2 }; [void]$payloadBuilder.Append($payloadBuffer, 0, $payloadReadCount) }; $payload = $payloadBuilder.ToString(); & "C:\ProgramData\AgentQ\agentq-launcher.ps1" -ArgumentsBase64 $payload; $launcherExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; if ($null -eq $launcherExitCode) { exit 1 }; exit ([int]$launcherExitCode.Value)'
+    windows_launcher_wrapper='$ProgressPreference = "SilentlyContinue"; $maximumArgumentPayloadCharacters = 1048576; $payloadBuffer = [char[]]::new(4096); $payloadBuilder = [System.Text.StringBuilder]::new(); while ($true) { $payloadReadCount = [Console]::In.Read($payloadBuffer, 0, $payloadBuffer.Length); if ($payloadReadCount -le 0) { break }; if (($payloadBuilder.Length + $payloadReadCount) -gt $maximumArgumentPayloadCharacters) { [Console]::Error.WriteLine("agentq: Windows argument payload exceeds $maximumArgumentPayloadCharacters characters"); [Console]::Error.WriteLine("agentq-exit:2"); exit 2 }; [void]$payloadBuilder.Append($payloadBuffer, 0, $payloadReadCount) }; $payload = $payloadBuilder.ToString(); & "C:\ProgramData\AgentQ\agentq-launcher.ps1" -ArgumentsBase64 $payload; $launcherExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue; if ($null -eq $launcherExitCode) { [Console]::Error.WriteLine("agentq-exit:1"); exit 1 }; $agentqLauncherExit = [int]$launcherExitCode.Value; [Console]::Error.WriteLine("agentq-exit:$agentqLauncherExit"); exit $agentqLauncherExit'
     windows_launcher_encoded=$(encode_windows_powershell "$windows_launcher_wrapper") || fail 'cannot encode the Windows AgentQ launcher wrapper; iconv and base64 are required'
     [ -n "$windows_launcher_encoded" ] || fail 'cannot encode the Windows AgentQ launcher wrapper'
     remote_command="powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $windows_launcher_encoded"
@@ -2677,9 +2746,21 @@ run_ssh_logged() {
     # which is exactly what happened before this fix.  Capture into a protected
     # file (umask 077), never echo it.
     ssh_stderr_capture=''
+    ssh_stderr_capture_identity=''
     ssh_stderr_redirection='/dev/null'
     if ssh_stderr_capture=$(umask 077; make_client_temporary_file "${agentq_temp_directory:-$ssh_log_file}" 'agentq-ssh-stderr'); then
         ssh_stderr_redirection=$ssh_stderr_capture
+        # Record the identity immediately.  windows_argument_remove_file refuses
+        # to delete a temporary whose identity was never recorded, so skipping
+        # this would make the file unremovable by cleanup_client_runtime -- the
+        # opposite of what registering it there is for.  A capture we cannot
+        # attribute is dropped rather than tracked, which keeps the old
+        # /dev/null behaviour instead of leaking an unattributable file.
+        if ! ssh_stderr_capture_identity=$(windows_argument_file_identity "$ssh_stderr_capture"); then
+            ssh_stderr_capture_identity=''
+            ssh_stderr_redirection='/dev/null'
+            ssh_stderr_capture=''
+        fi
     fi
     if [ -n "$ssh_input_file" ]; then
         agentq_ssh_input_require_file "$ssh_input_file" || return $?
@@ -2727,8 +2808,35 @@ run_ssh_logged() {
             if ssh_failure_reason=$(agentq_remote_failure_reason "$ssh_stderr_capture"); then
                 agentq_remote_failure_reason_value=$ssh_failure_reason
             fi
+            # On a Windows target the wrapper's out-of-band token is the
+            # authoritative exit code: sshd with DefaultShell=powershell.exe
+            # flattens every nonzero native exit to 1, so the SSH code loses the
+            # 2/3/4/5/6 the recovery logic depends on.  The wrapper emits the
+            # token for both DefaultShell values, and it agrees with the SSH
+            # code whenever the SSH code is trustworthy, so preferring it is
+            # safe; unix targets never emit it.
+            if [ "$remote_platform" = windows ]; then
+                if ssh_exit_token=$(agentq_remote_exit_token "$ssh_stderr_capture"); then
+                    ssh_status=$ssh_exit_token
+                fi
+            fi
         fi
-        rm -f -- "$ssh_stderr_capture" || true
+        # Identity-checked removal, like every other temporary in this file --
+        # NOT `rm -f ... || true`.  That form was the one place a removal failure
+        # was swallowed and never folded into the exit status.  cleanup_client_runtime
+        # also removes this path, so a failure here is not fatal: it is reported
+        # and the EXIT trap retries.
+        if windows_argument_remove_file "$ssh_stderr_capture" "$ssh_stderr_capture_identity"; then
+            :
+        else
+            ssh_stderr_capture_status=$?
+            printf '%s: failed to remove the ssh stderr capture: %s\n' "$program" "$ssh_stderr_capture" >&2
+            if [ "$ssh_status" -eq 0 ]; then
+                ssh_status=$ssh_stderr_capture_status
+            fi
+        fi
+        ssh_stderr_capture=''
+        ssh_stderr_capture_identity=''
     fi
     agentq_ssh_log_require_file "$ssh_log_file" || return $?
     if [ -s "$ssh_log_file" ]; then

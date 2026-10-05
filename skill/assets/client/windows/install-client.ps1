@@ -259,6 +259,7 @@ function Install-AtomicFile {
     $temporaryPath = $null
     $backupPath = $null
     $cleanupFailed = $false
+    $originalError = $null
     try {
         $temporaryPath = New-InstallerTemporaryFile -Directory $DestinationDirectory -Prefix "stage"
         Assert-NonReparsePathChain -Path $SourcePath -Description "client source file"
@@ -276,6 +277,9 @@ function Install-AtomicFile {
             Assert-NonReparsePathChain -Path $DestinationPath -Description "client destination file"
             [System.IO.File]::Move($temporaryPath, $DestinationPath)
         }
+    } catch {
+        $originalError = $_
+        throw
     } finally {
         foreach ($pathAndDescription in @(
             @($temporaryPath, "client temporary file"),
@@ -289,7 +293,15 @@ function Install-AtomicFile {
             }
         }
         if ($cleanupFailed) {
-            throw "Client installer temporary cleanup failed"
+            # A `throw` from `finally` replaces the in-flight exception, so when
+            # the try body already failed, report the cleanup failure to stderr
+            # and let the ORIGINAL error propagate instead of masking it.  Only
+            # when the body succeeded is the cleanup failure itself the error.
+            if ($null -ne $originalError) {
+                [Console]::Error.WriteLine("Client installer temporary cleanup failed")
+            } else {
+                throw "Client installer temporary cleanup failed"
+            }
         }
     }
 }

@@ -7,7 +7,7 @@
 # the installers have no behavioural coverage (they need a Windows host and a
 # real queue), so these source-level invariants are the only automatic guard.
 #
-# The six defects, and the rule each produced:
+# The defects, and the rule each produced:
 #
 #   1. A hard-coded 1 MiB ceiling on `pueue status --json` refused to update a
 #      host with enough history (measured: 1507407 bytes, 270 tasks).
@@ -45,6 +45,32 @@
 #      failure observed on a real host.
 #      -> RULE G: an `mv` into a destination must be re-checked in the same
 #         function.
+#   9. `Restore-ScheduledTaskDefinition` guarded its `Register-ScheduledTask
+#      -Xml $Definition` with `if ($null -ne $Definition)`, but the parameter is
+#      `[AllowNull()][string]` -- and PowerShell coerces `$null` to `""` for a
+#      `[string]` parameter.  So the guard PASSED on the first-install case
+#      (there was no previous task, `Get-ScheduledTaskDefinition` returned
+#      `$null`), and `Register-ScheduledTask -Xml ""` threw a parameter
+#      validation error.  Every FIRST install that failed reported
+#      "rollback is incomplete" and left recovery artifacts behind -- a clean
+#      failure described as a broken rollback.  Measured on Windows 10 /
+#      PS 5.1.19041.3996: binding `$null` to `[AllowNull()][string]` reports
+#      isNull=False / isNullOrEmpty=True.  The sibling guard one function away
+#      (`Remove-AgentQInstallerResponseTemporaryFile`, `$ExpectedIdentity`)
+#      already tested `[string]::IsNullOrWhiteSpace`; this site alone did not.
+#      -> RULE H: a guard on a `[string]`-typed value must test for empty, not
+#         for `$null`.
+#
+#  10. The POSIX installer rendered the launchd daemon plist with three `sed`
+#      substitutions and never checked that any of them MATCHED -- so a template
+#      and its sed list could drift apart and ship a plist whose ProgramArguments
+#      is literally "__AGENTQ_HOME__/pueued", which launchd cannot exec.  The
+#      Windows renderer guards this in both directions (throws when the template
+#      LACKS the placeholder, throws again when the rendered text RETAINS it);
+#      the POSIX site had neither.  Measured: renaming a placeholder left
+#      01/10/11 all green, because plutil -lint only checks XML well-formedness.
+#      -> RULE I: every placeholder a rendered template carries must be known to
+#         its renderer, and the renderer must refuse a retained placeholder.
 #
 # What this proves: the shape is absent from these files.  What it does not
 # prove: that the installers work -- that still needs a real host.  A rule here
@@ -425,9 +451,242 @@ $(grep -nE '(^|[[:space:]])(run_as_root[[:space:]]+)?mv([[:space:]]|$)' "$posix_
 EOF
 done
 
+# --- RULE H: a [AllowNull()][string] guard must test for empty, not $null -----
+# PowerShell coerces $null to "" for a [string] parameter, so `$null -ne $x` is
+# TRUE when $x is the empty string.  A guard written that way passes on exactly
+# the empty value it was meant to reject.
+#
+# The defect this pins: `Restore-ScheduledTaskDefinition` guarded
+# `Register-ScheduledTask -Xml $Definition` with `$null -ne $Definition`, so the
+# first-install case (no previous task, `Get-ScheduledTaskDefinition` returned
+# `$null`) fell through to `-Xml ""` and threw a parameter-validation error --
+# turning a clean first-install failure into a reported "rollback is incomplete"
+# with recovery artifacts left behind.  The sibling guard one function away
+# (`Remove-AgentQInstallerResponseTemporaryFile`, `$ExpectedIdentity`) already
+# tested `[string]::IsNullOrWhiteSpace`; this site alone did not.
+#
+# Scope: only parameters declared `[AllowNull()][string]`.  A `[string]`
+# parameter WITHOUT AllowNull cannot bind $null at all -- the binder rejects it
+# -- so a $null guard there is redundant rather than wrong, and matching every
+# `[string]` parameter produced false positives on local variables named `$item`
+# that hold filesystem objects.  The AllowNull attribute is precisely what makes
+# a $null guard look necessary while being ineffective.
+rules_checked=$((rules_checked + 1))
+for file in "$server_installer" "$client_installer"; do
+    allownull_vars=$(grep -oE '\[AllowNull\(\)\][[:space:]]*\[string\][[:space:]]*\$[A-Za-z_][A-Za-z0-9_]*' "$file" 2>/dev/null |
+        sed -E 's/.*\$//' | sort -u || true)
+    for var in $allownull_vars; do
+        # `grep -vE '^[0-9]+:[[:space:]]*#'` drops comments.  A comment is not a
+        # guard, and the fix for this very defect quotes the bad pattern in one
+        # -- a rule that counted it would fail the corrected file.
+        while IFS=: read -r lineno text; do
+            [ -n "$lineno" ] || continue
+            fail "$file" "line $lineno guards [AllowNull()][string] \$$var with a \$null comparison; PowerShell coerces \$null to \"\" for [string], so the guard passes on the empty value"
+        done <<EOF
+$(grep -nE "\\\$null[[:space:]]+-(eq|ne)[[:space:]]+\\\$$var([^A-Za-z0-9_]|$)|\\\$$var[[:space:]]+-(eq|ne)[[:space:]]+\\\$null([^A-Za-z0-9_]|$)" "$file" 2>/dev/null |
+    grep -vE '^[0-9]+:[[:space:]]*#' || true)
+EOF
+    done
+done
+
+# --- RULE I: a rendered template's placeholders must be substituted -----------
+# Three templates in this repo are rendered by substituting `__AGENTQ_*__`
+# tokens: the launchd daemon plist (POSIX installer, three sed rules), the
+# Windows pueue.yml and the Windows launcher (PowerShell installer, .Replace).
+# A token that survives into the rendered output means the template and the
+# renderer's substitution list have drifted apart; the artifact then ships with
+# a literal "__AGENTQ_...__" where a path belongs, and the failure surfaces only
+# at run time -- launchd execs a nonexistent path, or the daemon starts with the
+# wrong Git Bash.
+#
+# The Windows renderer already guards BOTH directions for both of its templates:
+# it throws when the template LACKS the placeholder, and again when the RENDERED
+# text RETAINS it.  The POSIX site had neither.  Measured before the fix
+# (2026-10-03): renaming a plist placeholder so the installer no longer knows it
+# left 01/10/11 all green (plutil -lint only checks XML well-formedness --
+# "__AGENTQ_X__/pueued" is a perfectly valid string), and breaking the sed
+# pattern the same way was equally invisible.
+#
+# Scope: exactly the templates a renderer substitutes.  The legacy
+# `com.agentq.pueued.plist` is NOT rendered (only require_file'd; it is a
+# leftover of an older install path), so holding it to the same token set would
+# fail correct code -- it is named here so the omission is deliberate.
+rules_checked=$((rules_checked + 1))
+# template|renderer|guard-marker triples.  Both renderers must know every token
+# their template carries, and each must carry a runtime guard that refuses a
+# retained token.  The delimiter is `|`, not `:` -- the guard markers contain
+# spaces and, on a host whose paths contain a colon, so could the paths.
+render_pairs="\
+$root/skill/assets/unix/com.agentq.pueued.daemon.plist|$root/skill/assets/unix/install-agentq.sh|retained a template placeholder
+$root/skill/assets/windows-git-bash/pueue.yml|$root/skill/assets/windows-git-bash/install-agentq.ps1|retained the Git Bash runtime placeholder
+$root/skill/assets/windows-git-bash/agentq-launcher.ps1|$root/skill/assets/windows-git-bash/install-agentq.ps1|retained the Git Bash launcher placeholder"
+render_pairs_seen=0
+while IFS='|' read -r template renderer guard_marker; do
+    [ -n "$template" ] || continue
+    render_pairs_seen=$((render_pairs_seen + 1))
+    # Self-check: both extractors must find something, or the comparison below is
+    # vacuously true and the rule would pass on any input.  A rule that cannot
+    # fail is worse than no rule -- the false-green this repo keeps hitting.
+    template_tokens=$(grep -oE '__[A-Z][A-Z0-9_]*__' "$template" 2>/dev/null | sort -u)
+    renderer_tokens=$(grep -oE '__[A-Z][A-Z0-9_]*__' "$renderer" 2>/dev/null | sort -u)
+    if [ -z "$template_tokens" ] || [ -z "$renderer_tokens" ]; then
+        fail "$template" "placeholder extraction found nothing (template=[$template_tokens] renderer=[$renderer_tokens]); the rule cannot conclude"
+        continue
+    fi
+    # Every template placeholder must be known to the renderer (present in its
+    # source, i.e. named by a substitution).  A token only in the template is one
+    # nothing substitutes -- exactly the drift this rule exists for.
+    for token in $template_tokens; do
+        if ! printf '%s\n' "$renderer_tokens" | grep -qxF -- "$token"; then
+            fail "$template" "placeholder $token appears in the template but not in ${renderer#"$root"/}: nothing substitutes it, so it would ship literally"
+        fi
+    done
+    # The renderer must also REFUSE a retained placeholder at run time, or a
+    # future drift is caught only by this static rule and never at install time.
+    if ! grep -qF -- "$guard_marker" "$renderer"; then
+        fail "$renderer" "no runtime guard refuses a retained placeholder for ${template#"$root"/} (expected marker: $guard_marker)"
+    fi
+done <<EOF
+$render_pairs
+EOF
+# The pair list must not have silently emptied -- that would make the whole rule
+# vacuous while still reporting green.
+if [ "$render_pairs_seen" -lt 3 ]; then
+    fail "smoke/10" "template/renderer pair list yielded $render_pairs_seen pair(s), expected 3; the rule is not checking what it claims"
+fi
+
+# --- RULE J: the maintenance lock must be released even if cleanup fails -----
+# Both installers hold a maintenance lock across the deployment and release it in
+# the `finally` of the top-level try.  In PowerShell a `throw` inside a `finally`
+# REPLACES the in-flight exception and aborts the rest of the block, so a cleanup
+# step that threw would skip the release entirely.  Measured 2026-10-05 by
+# reproducing the structure under pwsh: with the old shape, a failing
+# Remove-SafeTransactionDirectory made the reported error the CLEANUP error --
+# hiding the real install failure -- and Release-MaintenanceLock never ran, so the
+# next invocation found a stale lock and refused.  Both symptoms at once.
+#
+# The invariant is about REACHABILITY, not about a particular keyword: the lock
+# release has to sit somewhere that a failing sibling statement cannot jump over.
+# Asserting "no throw anywhere in the finally" would be both too broad (the
+# release itself is entitled to throw when the lock genuinely cannot be removed --
+# that is a real condition the operator must see) and too weak (the throw could
+# simply move above the release and the rule would pass).  So the rule extracts
+# the cleanup region and requires the release to be wrapped in its own `finally`,
+# which is the one construct that is unconditional.
+#
+# Scope: the SERVER installer only -- it is the one that takes a maintenance lock.
+# The client installer has the same finally-masking shape but no lock, so its
+# invariant is different and is rule K below.  This is a source-level invariant by
+# necessity -- neither installer is executable on this host, so there is no
+# behavioural alternative here.  See this file's header for why that is still
+# worth having.
+rules_checked=$((rules_checked + 1))
+cleanup_regions=$(awk '
+    # The cleanup is the LAST top-level `} finally {` in each installer: the one
+    # that closes the deployment try/catch/finally.  Anchoring on `^}` (column 1)
+    # is what makes this the top-level block rather than a nested one.  The
+    # opening line itself matches the `^}` end pattern, so the end is only
+    # considered on a line AFTER the opening one -- otherwise the block is the
+    # opening line alone and the extraction is empty of everything that matters.
+    /^\} finally \{/ { buf = $0 "\n"; capturing = 1; next }
+    capturing { buf = buf $0 "\n" }
+    capturing && /^\}/ { last = buf; capturing = 0 }
+    END { printf "%s", last }
+' "$server_installer")
+if [ -z "$cleanup_regions" ]; then
+    fail "$server_installer" "could not extract the top-level cleanup finally; rule J cannot conclude"
+else
+    # Locate the last NESTED `} finally {` (line 1 of the region is the outer
+    # opener itself and must not count -- a version of this rule that let it count
+    # passed a mutation with no nested finally at all, measured), then require the
+    # release statement to sit INSIDE it, before its closing brace.
+    #
+    # "Inside" is decided by brace depth, not by line order: a release placed after
+    # the nested finally has closed is a sibling of it, reachable only if nothing
+    # threw -- which is exactly the defect.  Depth is the only thing that tells the
+    # two apart, and it is what an awk scan can actually establish.
+    #
+    # The call is matched, not the bare word: the explanatory comment above the
+    # block names Release-MaintenanceLock too, and anchoring on that line would
+    # make the rule measure the comment instead of the statement.
+    release_verdict=$(printf '%s\n' "$cleanup_regions" | awk '
+        { line[NR] = $0 }
+        END {
+            nested = 0
+            for (i = 2; i <= NR; i++) {
+                if (line[i] ~ /^[ \t]*\} finally \{/) nested = i
+            }
+            if (nested == 0) { print "NO_NESTED_FINALLY"; exit }
+            # Depth starts at 1: the `{` on the nested opener line is already open,
+            # and that line itself is not rescanned.
+            depth = 1
+            inside = 0
+            for (i = nested + 1; i <= NR; i++) {
+                if (line[i] ~ /^[ \t]*Release-MaintenanceLock[ \t]*$/ && depth >= 1) inside = 1
+                opens = gsub(/\{/, "", line[i])
+                closes = gsub(/\}/, "", line[i])
+                depth += opens - closes
+                if (depth < 1) break
+            }
+            print (inside ? "INSIDE" : "OUTSIDE")
+        }
+    ')
+    case "$release_verdict" in
+        INSIDE) ;;
+        NO_NESTED_FINALLY)
+            fail "$server_installer" "the top-level cleanup finally has no nested finally, so a cleanup step that throws skips Release-MaintenanceLock and leaves the lock held"
+            ;;
+        *)
+            fail "$server_installer" "Release-MaintenanceLock is not inside the nested finally of the top-level cleanup; a cleanup step that throws skips it and leaves the lock held"
+            ;;
+    esac
+fi
+
+# --- RULE K: a cleanup throw must not mask the failure that caused it ---------
+# The client installer's Install-AtomicFile removes its staged temporary and
+# backup in a `finally`.  When that removal fails it has to report something, and
+# `throw` is the natural choice -- but a `throw` from `finally` replaces the
+# in-flight exception, so an unconditional throw there erases the real error: the
+# operator is told the cleanup failed and never learns that the copy, the reparse
+# check, or the atomic replace is what actually broke.  Measured 2026-10-05 by
+# reproducing the shape under pwsh.
+#
+# The fix keeps the report but makes it conditional: when the body already threw,
+# the cleanup failure goes to stderr and the ORIGINAL error propagates; only when
+# the body succeeded is the cleanup failure itself the error.  That requires the
+# catch to capture the exception into a variable the finally can test.
+#
+# The invariant, stated so it cannot be satisfied by the old code: if the finally
+# throws on cleanup failure, it must first distinguish "the body failed" from
+# "the body succeeded".  Asserting merely that a throw exists would pass the
+# defective version; asserting a specific variable name would be brittle.  So the
+# rule requires that the finally both (a) throws for the cleanup failure and
+# (b) tests a captured-exception variable before doing so.
+#
+# Source-level by necessity, like rule J: this installer cannot run on this host.
+rules_checked=$((rules_checked + 1))
+client_finally=$(awk '
+    /^function Install-AtomicFile/ { in_fn = 1 }
+    in_fn { print }
+    in_fn && /^\}/ { exit }
+' "$client_installer" | awk '
+    /\} finally \{/ { capturing = 1; next }
+    capturing { print }
+')
+if [ -z "$client_finally" ]; then
+    fail "$client_installer" "could not extract Install-AtomicFile its finally block; rule K cannot conclude"
+else
+    cleanup_throw=$(printf '%s\n' "$client_finally" | grep -cE '^\s*throw "Client installer temporary cleanup failed"' || true)
+    if [ "$cleanup_throw" -eq 0 ]; then
+        fail "$client_installer" "Install-AtomicFile no longer throws when its temporary cleanup fails; a cleanup failure would pass silently"
+    elif ! printf '%s\n' "$client_finally" | grep -qE '\$originalError'; then
+        fail "$client_installer" "Install-AtomicFile throws on cleanup failure without testing a captured exception; the throw replaces the in-flight error and masks why the install failed"
+    fi
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'installer-invariants: %s violation(s)\n' "$failures" >&2
     exit 1
 fi
 
-printf 'installer-invariants checks passed: rules=%s files=5 violations=0 acl-properties=verified posix-mv-recheck=asserted\n' "$rules_checked"
+printf 'installer-invariants checks passed: rules=%s files=5 violations=0 acl-properties=verified posix-mv-recheck=asserted placeholder-substitution=guarded lock-release=unconditional\n' "$rules_checked"
