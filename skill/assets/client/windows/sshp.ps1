@@ -696,8 +696,30 @@ exit 127
 '@)
 }
 
+function Convert-ToPosixScriptCommand {
+    param([string]$Script)
+
+    # Hand a POSIX shell script to ssh WITHOUT putting it on the command line.
+    #
+    # PowerShell 5.1 wraps a native argument containing a space in double quotes
+    # but does not escape the double quotes already inside it, so a script passed
+    # through `& $script:SshPath @sshArguments` is word-split before ssh sees it:
+    # `printf "%s\n"` arrives as `printf %s\n`, `"$installer"` as `$installer`.
+    # Measured both ways in a real shell -- the damaged probe exits 127 with a
+    # corrupted marker instead of exiting 42 with `__SSHP_INSTALL_REQUIRED__`,
+    # which the client reports as "remote dependency probe failed" and blames
+    # the deployment.  See PLAN.md A21 and smoke/20.
+    #
+    # base64 is used rather than stdin because the install path runs with `-tt`
+    # and needs its terminal on stdin; the payload rides the command line, which
+    # costs nothing since the base64 alphabet needs no quoting.  `sh` is last in
+    # the pipeline, so the script's exit status is what ssh reports.
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Script))
+    return "printf %s $encoded | base64 -d | sh"
+}
+
 function Get-UnixProbeCommand {
-    return @'
+    return Convert-ToPosixScriptCommand -Script @'
 set -eu
 platform=$(uname -s 2>/dev/null || printf "%s" unknown)
 case "$platform" in
@@ -787,7 +809,7 @@ exit ([int]$lastExitCode.Value)
 }
 
 function Get-UnixInstallCommand {
-    return @'
+    return Convert-ToPosixScriptCommand -Script @'
 set -eu
 if command -v tmux >/dev/null 2>&1 || command -v screen >/dev/null 2>&1 || command -v zellij >/dev/null 2>&1; then
     exit 0
@@ -1005,6 +1027,17 @@ if (`$null -eq `$zellij) {
 }
 
 function Get-UnixSessionCommand {
+    # DELIBERATELY NOT base64-wrapped, unlike the probe and install commands.
+    # This script `exec`s tmux/screen/Zellij, which require stdin to be a tty;
+    # the `printf %s <b64> | base64 -d | sh` channel hands `sh` a PIPE on stdin
+    # and the multiplexer then refuses with "Must be connected to a terminal."
+    # (measured under a pty: stdin=tty starts screen, stdin=pipe does not).
+    # What keeps this shape safe is that the script carries NO double quote at
+    # all -- PowerShell 5.1 word-splits a splatted argument only at a `"`, so a
+    # script without one survives as a single argument.  The session name is
+    # single-quoted and its value is already restricted to `[A-Za-z0-9_.-]`, so
+    # no quote can enter.  ADDING A DOUBLE QUOTE TO THIS SCRIPT WOULD BREAK IT:
+    # `smoke/20` asserts this argument still round-trips as one argv element.
     $singleQuote = [string][char]39
     $escapedSession = $script:SessionName.Replace($singleQuote, $singleQuote + [string][char]34 + $singleQuote + [string][char]34 + $singleQuote)
     return @"
