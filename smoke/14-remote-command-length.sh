@@ -34,6 +34,7 @@ set -euo pipefail
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 posix_client="$root/skill/assets/client/unix/agentq"
 windows_client="$root/skill/assets/client/windows/agentq.ps1"
+sshp_client="$root/skill/assets/client/windows/sshp.ps1"
 
 # The smallest measured limit, with a deliberate margin: a command that only
 # just fits is one small edit away from not fitting.
@@ -209,6 +210,46 @@ PYEOF4
 )
 check_site 'Windows client: launcher argument wrapper' "$win_launcher_len"
 
+# 6-7. Windows client: the two UNIX scripts, which now ride the command line.
+#
+# These sites did not exist before the A21 fix: the scripts used to travel as a
+# raw argv element (small on the command line, but word-split by PowerShell 5.1).
+# Moving them to the base64 channel put them ON the command line for the first
+# time, and base64 of UTF-8 is ~4/3 the size of the script -- so this fix made
+# these two command lines LONGER than the bytes they replaced.  Measuring them is
+# the price of that fix; leaving them unmeasured is how the Windows launcher
+# wrapper went unmeasured until 2026-09-24 (padded to 26,538 chars, still green).
+#
+# Which limit actually applies: these scripts run under a POSIX shell -- on a
+# unix target, or on a Windows target whose DefaultShell is Git Bash (that is the
+# only Windows case sshp's MINGW detection can see, since it keys on `uname -s`).
+# So the real bound is bash/Git-Bash (8,176) or a unix ARG_MAX, both of which are
+# LARGER than this check's 8,125 budget -- applying it here is CONSERVATIVE, not
+# exact.  Conservative is the right choice: a command that clears the smallest
+# limit clears every one of them, and the point of raising these two sites at all
+# is that nothing measured them before.
+#
+# The command line is `printf %s <b64> | base64 -d | sh`, so the length is the
+# fixed prefix plus the base64 of the UTF-8 script.  The sshp SESSION command is
+# deliberately NOT base64-wrapped (it needs a tty on stdin, see PLAN.md A21) and
+# is not measured here for the same reason it is not wrapped.
+unix_cmdline_len() {
+    python3 - "$sshp_client" "$1" <<'PYEOF5'
+import base64, io, re, sys
+src = io.open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r"function " + sys.argv[2] + r" \{\r?\n    return Convert-ToPosixScriptCommand -Script @'\r?\n(.*?)\r?\n'@",
+              src, re.S)
+if not m:
+    sys.stdout.write("0")
+    sys.exit(0)
+body = m.group(1).replace("\r\n", "\n")
+encoded = base64.b64encode(body.encode("utf-8")).decode("ascii")
+sys.stdout.write(str(len("printf %s ") + len(encoded) + len(" | base64 -d | sh")))
+PYEOF5
+}
+check_site 'Windows client: unix probe script' "$(unix_cmdline_len Get-UnixProbeCommand)"
+check_site 'Windows client: unix install script' "$(unix_cmdline_len Get-UnixInstallCommand)"
+
 # The three DefaultShell limits this budget came from, restated so a reader can
 # re-derive the number instead of trusting it.
 printf '\nlimits measured on a real host: bash=8176 cmd=8155 powershell=8125\n'
@@ -221,5 +262,5 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 
-printf '\nremote-command-length checks passed: sites=5 budget=%s smallest-limit=%s\n' \
+printf '\nremote-command-length checks passed: sites=7 budget=%s smallest-limit=%s\n' \
     "$budget" "$smallest_measured_limit"

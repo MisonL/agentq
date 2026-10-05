@@ -1644,6 +1644,20 @@ prepare_service_stage() {
                 "$asset_directory/com.agentq.pueued.daemon.plist" > "$service_stage"
             chmod 600 "$service_stage"
             require_installer_stage_file "$service_stage" 'service staging path'
+            # A placeholder that survives substitution means the template and this
+            # sed list have drifted apart (a renamed or newly added token): launchd
+            # would then exec a literal "__AGENTQ_...__" path.  The Windows
+            # installer guards its templates the same way; fail loudly instead of
+            # installing a service that cannot start.  The pattern is deliberately
+            # generic rather than a list of the three known tokens, so a token
+            # added to the template but not to the sed list is caught too -- which
+            # is the drift this exists for.  A substituted value would have to
+            # contain a literal "__ALLCAPS__" run to trip it, and if that ever
+            # happened the install fails loudly with this message rather than
+            # writing a broken service.
+            if grep -qE '__[A-Z][A-Z0-9_]*__' "$service_stage"; then
+                fail "generated launchd plist retained a template placeholder: $service_stage"
+            fi
             plutil -lint "$service_stage" >/dev/null || fail "generated launchd plist is invalid: $service_stage"
             resolve_macos_launch_domain
             ;;

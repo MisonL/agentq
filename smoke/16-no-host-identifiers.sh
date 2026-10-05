@@ -47,11 +47,23 @@ memory_dir="$HOME/.claude/projects/-Volumes-Work-code-agentq/memory"
 # R5  an address flattened into an identifier -- the private-key filename shape.
 #     No `\b`: it fails between `_` and a digit, which is how the first version
 #     of this rule matched nothing at all while reporting a clean tree.
+# R6  a FQDN under an internal-only TLD.  Added 2026-10-05: the original five
+#     shapes missed the most common real leak of all -- an intranet host name
+#     under an internal TLD (`.corp`, `.intranet`, `.lan`, ...) -- because R2
+#     only knows `.local` and
+#     R3/R4 require an `@`.  The TLD must be the LAST label (nothing but a
+#     non-dot, non-alnum separator or end-of-line after it): without that anchor
+#     `web01.corp.example.com` matches, and RFC 2606 reserves `example`/`test`/
+#     `invalid` precisely so that placeholder FQDNs are safe to write down --
+#     this file's own CHANGELOG entry cites one.  Excluding the reserved TLDs
+#     keeps documentation placeholders legal while still catching the internal
+#     names they stand in for.
 RE_R1='([0-9]{1,3}\.){3}[0-9]{1,3}'
 RE_R2='[A-Za-z0-9][A-Za-z0-9-]*\.local'
 RE_R3='[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+'
 RE_R4='@[A-Za-z0-9-]*[0-9][A-Za-z0-9-]*'
 RE_R5='[0-9]{1,3}(_[0-9]{1,3}){3}'
+RE_R6='[A-Za-z0-9][A-Za-z0-9-]*\.(internal|intranet|lan|corp|localdomain|home)([^A-Za-z0-9.-]|$)'
 # R1 additionally excludes these, which are fixtures rather than hosts.
 RE_R1_ALLOW='^(127\.|0\.0\.0\.0$)'
 
@@ -98,6 +110,7 @@ first_match() {
     R3) got=$(printf '%s' "$line" | grep -oE "$RE_R3" | head -1 || true) ;;
     R4) got=$(printf '%s' "$line" | grep -oE "$RE_R4" | head -1 || true) ;;
     R5) got=$(printf '%s' "$line" | grep -oE "$RE_R5" | head -1 || true) ;;
+    R6) got=$(printf '%s' "$line" | grep -oE "$RE_R6" | head -1 || true) ;;
     esac
     printf '%s' "$got"
 }
@@ -127,7 +140,7 @@ $hits
 EOF
     fi
 
-    for spec in "R2:$RE_R2" "R3:$RE_R3" "R4:$RE_R4" "R5:$RE_R5"; do
+    for spec in "R2:$RE_R2" "R3:$RE_R3" "R4:$RE_R4" "R5:$RE_R5" "R6:$RE_R6"; do
         rule=${spec%%:*}
         re=${spec#*:}
         hits=$(grep -nE "$re" "$file" 2>/dev/null || true)
@@ -181,6 +194,13 @@ s_unspec=$(printf '%s.%s.%s.%s' 0 0 0 0)
 s_placeholder=$(printf '%s@%s' '<user>' '<host>')
 s_fixture=$(printf '%s@%s' smokeuser smoke-host)
 s_benign=$(printf 'task_id=%s records=%s' 4200 1507407)
+# R6.  Built from fragments for the same reason as the rest: this file must not
+# contain the shape it hunts.  The negative sample is the one that decides
+# whether the rule is usable at all -- a placeholder FQDN under a reserved TLD
+# has to stay legal, and the repo's own CHANGELOG cites exactly that form.
+s_internal=$(printf '%s.%s' db01 corp)
+s_internal2=$(printf '%s.%s' jump intranet)
+s_reserved_fqdn=$(printf '%s.%s.%s.%s' web01 corp example com)
 
 expect fire   R1 "$s_ipv4"        'a bare IPv4 literal'
 expect silent R1 "$s_loopback"    'loopback (07 sandbox sshd)'
@@ -195,6 +215,11 @@ expect silent R4 "$s_fixture"     'the smokeuser@smoke-host fixture'
 expect silent R4 "$s_benign"      'unrelated numbers'
 expect fire   R5 "$s_flat"        'an address flattened into a filename'
 expect silent R5 "$s_benign"      'unrelated numbers'
+expect fire   R6 "$s_internal"    'an intranet FQDN under .corp'
+expect fire   R6 "$s_internal2"   'an intranet FQDN under .intranet'
+expect silent R6 "$s_reserved_fqdn" 'a placeholder FQDN under the reserved .example TLD'
+expect silent R6 "$s_mdns"        'the .local sample (R2 territory, not R6)'
+expect silent R6 "$s_benign"      'unrelated numbers'
 
 if [ "$selftest_failures" -ne 0 ]; then
     printf 'no-host-identifiers: %s self-test failure(s); the scan below would not have been trustworthy\n' \
@@ -218,15 +243,15 @@ fi
 # (measured: loosening R2 with the gate off was not caught by the R1-only canary).
 canary_file=$(mktemp "${TMPDIR:-/tmp}/agentq-smoke-hostid.XXXXXX")
 trap 'rm -f -- "$canary_file"' EXIT
-printf '%s\n' "$s_ipv4" "$s_mdns" "$s_user_fqdn" "$s_user" "$s_flat" > "$canary_file"
+printf '%s\n' "$s_ipv4" "$s_mdns" "$s_user_fqdn" "$s_user" "$s_flat" "$s_internal" > "$canary_file"
 canary_failures_before=$failures
 # The canary is expected to be caught, so its report is noise on a green run;
 # swallow it here.  Only the COUNT matters -- if it is short, the message below
 # says which rules went quiet.
 scan_file "$canary_file" 2>/dev/null
 canary_caught=$((failures - canary_failures_before))
-if [ "$canary_caught" -lt 5 ]; then
-    printf 'no-host-identifiers: canary caught %s of 5 rules -- a rule that no longer fires on its own sample means the scan path is broken for it, regardless of what the self-test says\n' \
+if [ "$canary_caught" -lt 6 ]; then
+    printf 'no-host-identifiers: canary caught %s of 6 rules -- a rule that no longer fires on its own sample means the scan path is broken for it, regardless of what the self-test says\n' \
         "$canary_caught" >&2
     exit 1
 fi
@@ -281,5 +306,5 @@ if [ "$memory_state" != scanned ]; then
     exit 0
 fi
 
-printf 'no-host-identifiers checks passed: files=%s rules=5 selftest=calibrated memory=%s violations=0\n' \
+printf 'no-host-identifiers checks passed: files=%s rules=6 selftest=calibrated memory=%s violations=0\n' \
     "$scanned" "$memory_state"

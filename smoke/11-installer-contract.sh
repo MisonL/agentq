@@ -610,8 +610,83 @@ background_pids=
 rm -rf "$home/.agentq.maintenance.lock"
 assert_home_clean 'lock liveness cannot be re-confirmed'
 
+# --- the launchd template's retained-placeholder guard ------------------------
+# The full installer only reaches prepare_service_stage after a successful
+# download+verify of pueue/pueued, which is out of scope here (no network).  So
+# this case drives the EXACT block from the asset -- extracted by text between
+# two anchors, the way smoke/22 extracts PowerShell functions -- with its three
+# helpers stubbed.  That is what makes the guard behavioural rather than a grep:
+# a future edit that drops it fails here, not just in smoke/10's static rule.
+#
+# The defect it pins: the POSIX installer rendered the daemon plist with three
+# sed substitutions and had NO check that any of them matched.  A placeholder
+# that survives ships a plist whose ProgramArguments is literally
+# "__AGENTQ_HOME__/pueued" -- launchd then cannot exec the daemon.  Its Windows
+# sibling already guarded both directions; this one did not.
+plist_guard_dir="$work/plist-guard"
+mkdir -p "$plist_guard_dir/assets"
+# An unknown placeholder that no sed rule substitutes, structure otherwise intact
+# (so plutil -lint would still pass -- which is exactly why 01 never saw it).
+sed 's/__AGENTQ_HOME_PARENT__/__AGENTQ_UNKNOWN__/' \
+    "$real_assets/com.agentq.pueued.daemon.plist" > "$plist_guard_dir/assets/com.agentq.pueued.daemon.plist"
+python3 - "$installer_source" > "$plist_guard_dir/run.sh" <<'PY'
+import io, sys
+src = io.open(sys.argv[1], encoding='utf-8').read()
+start = src.index('            escaped_home=$(printf')
+end = src.index('            plutil -lint', start)
+block = src[start:end]
+sys.stdout.write('''#!/bin/sh
+set -eu
+program=agentq
+fail() { printf "%s: %s\\n" "$program" "$1" >&2; exit 2; }
+require_installer_stage_file() { [ -f "$1" ] || fail "stage file missing: $1"; }
+asset_directory="$1"; service_stage="$2"
+agentq_home=/Users/smoke/.agentq
+HOME=/Users/smoke
+platform_kind=macos
+agentq_parent=/tmp; agentq_base=agentq
+macos_system_service_directory=/tmp
+''')
+sys.stdout.write(block)
+sys.stdout.write('printf "RENDERED-OK\\n"\n')
+PY
+# The extractor must find the block, or this case silently tests nothing.
+if ! grep -q 'retained a template placeholder' "$plist_guard_dir/run.sh"; then
+    printf '%s\n' 'installer plist-placeholder case: the guard block was not extracted from the installer' >&2
+    failures=$((failures + 1))
+else
+    cases=$((cases + 1))
+    guard_status=0
+    /bin/sh "$plist_guard_dir/run.sh" "$plist_guard_dir/assets" "$plist_guard_dir/staged.plist" \
+        >"$work/guard.out" 2>"$work/guard.err" || guard_status=$?
+    if [ "$guard_status" -ne 2 ]; then
+        printf 'installer retained-placeholder: expected exit 2, got %s\n' "$guard_status" >&2
+        sed 's/^/      /' "$work/guard.err" >&2 || true
+        failures=$((failures + 1))
+    elif ! grep -qF 'retained a template placeholder' "$work/guard.err"; then
+        printf '%s\n' 'installer retained-placeholder: refused, but not for the placeholder reason' >&2
+        sed 's/^/      /' "$work/guard.err" >&2 || true
+        failures=$((failures + 1))
+    fi
+    # ...and the other direction: the REAL template must render clean, so the
+    # guard is not simply rejecting everything.
+    cp "$real_assets/com.agentq.pueued.daemon.plist" "$plist_guard_dir/assets/"
+    cases=$((cases + 1))
+    ok_status=0
+    /bin/sh "$plist_guard_dir/run.sh" "$plist_guard_dir/assets" "$plist_guard_dir/staged-ok.plist" \
+        >"$work/guard-ok.out" 2>"$work/guard-ok.err" || ok_status=$?
+    if [ "$ok_status" -ne 0 ]; then
+        printf 'installer retained-placeholder: the real template was rejected (exit %s)\n' "$ok_status" >&2
+        sed 's/^/      /' "$work/guard-ok.err" >&2 || true
+        failures=$((failures + 1))
+    elif grep -q '__AGENTQ' "$plist_guard_dir/staged-ok.plist"; then
+        printf '%s\n' 'installer retained-placeholder: the real template rendered with a leftover placeholder' >&2
+        failures=$((failures + 1))
+    fi
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'installer-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'installer-contract checks passed: cases=%s sandbox-home=yes stub-path=yes download-path=covered toctou-path=covered\n' "$cases"
+printf 'installer-contract checks passed: cases=%s sandbox-home=yes stub-path=yes download-path=covered toctou-path=covered plist-placeholder=guarded\n' "$cases"
