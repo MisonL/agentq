@@ -2172,6 +2172,105 @@ request_record_filter='
         ) then . else error("invalid AgentQ request record") end
 '
 
+# The batch form of `request_record_filter`: validate every record against its
+# own filename-derived id (positional binding, exactly as load_request_records
+# does), then emit, for each record in state `removed`, its request id and its
+# serialisation as two lines.  This exists so repair can find the removed records
+# in ONE jq instead of one per file, while keeping the predicate identical to the
+# per-file reader -- note it uses `request_record_filter` (which ACCEPTS
+# `removed`), NOT the `load_request_records` filter, whose `valid_request` gate
+# rejects `removed` (see PLAN.md A23).  The parameter is named `$request_id` on
+# purpose: it is the same name the embedded filter references, so the body is
+# reused verbatim rather than rewritten.  `tojson` framing (not @tsv) matches
+# recover_removing_requests; @tsv would double-escape what tojson already emits.
+request_removed_records_filter="
+def valid(\$request_id): (
+$request_record_filter
+);
+. as \$records
+| (\$ARGS.positional) as \$ids
+| if ((\$records | length) != (\$ids | length)) then
+    error(\"invalid AgentQ request record\")
+  else . end
+| [ range(0; length) as \$i | (\$records[\$i] | valid(\$ids[\$i])) ]
+| .[]
+| select(.state == \"removed\")
+| (.request_id, tojson)
+"
+
+# The batch form of `request_record_filter` that emits EVERY record's identity
+# and body (not only the removed ones): the wait-recovery scan needs the state
+# and task id of every record to decide which one matches the vanished task.
+# Same positional binding and same predicate as the per-file reader, so the two
+# cannot drift (rule E).  Four lines per record: request id, state, task id
+# (empty when null, matching the per-file reader's `// ""`), and the body.
+request_records_states_filter="
+def valid(\$request_id): (
+$request_record_filter
+);
+. as \$records
+| (\$ARGS.positional) as \$ids
+| if ((\$records | length) != (\$ids | length)) then
+    error(\"invalid AgentQ request record\")
+  else . end
+| range(0; length) as \$i
+| (\$records[\$i] | valid(\$ids[\$i]))
+| (\$ids[\$i], .state, ((.task_id // \"\") | tostring), tojson)
+"
+
+# The tombstone predicate, kept in one place so the validating reader and the
+# batch reader below cannot drift (rule E).
+request_tombstone_filter='
+        def valid_task_id:
+            if type != "number" then
+                false
+            else
+                (. >= 0) and ((floor) == .)
+            end;
+        if (
+            (.version == 1)
+            and (.request_id == $request_id)
+            and (.task_id | valid_task_id)
+            and (.task_created_at | type) == "string"
+            and (.task_created_at | length) > 0
+            and (.state == "removed")
+            and (.removed_at | type) == "string"
+            and (.removed_at | length) > 0
+        ) then .
+        else error("invalid AgentQ request tombstone")
+        end
+'
+
+# The batch form of `request_tombstone_filter`: validate every tombstone against
+# its own filename-derived id, then emit, per tombstone, its request id, task id
+# and task_created_at as three lines.  Lets the wait-recovery scan find the
+# matching tombstone in ONE jq instead of three per file.
+request_tombstones_states_filter="
+def valid(\$request_id): (
+$request_tombstone_filter
+);
+. as \$tombstones
+| (\$ARGS.positional) as \$ids
+| if ((\$tombstones | length) != (\$ids | length)) then
+    error(\"invalid AgentQ request tombstone\")
+  else . end
+| range(0; length) as \$i
+| (\$tombstones[\$i] | valid(\$ids[\$i]))
+| (\$ids[\$i], (.task_id | tostring), .task_created_at)
+"
+
+# The batch form of the `select(.task_id == $id) | .task_created_at // empty`
+# probe that task_instance_created_at_is_recorded runs per file.  TOLERANT on
+# purpose: the per-file loop swallows a malformed file (`2>/dev/null ||
+# continue`) and keeps scanning, so this filter must NOT be used where a bad
+# record should fail closed.  It answers a single boolean: does ANY slurped
+# file record this task id with this creation time?  A malformed file makes the
+# whole slurp fail, which sends the caller to its verbatim fallback.
+request_instance_probe_filter='
+[ .[] | select(.task_id == $id) | select((.task_created_at // empty) == $expected) ]
+| length > 0
+'
+
 request_record_is_valid() {
     local record_path=$1
     local request_id=$2
@@ -2193,26 +2292,24 @@ request_tombstone_is_valid() {
     validate_task_id_precision_in_file "$tombstone_path"
     request_metadata_file_is_safe "$tombstone_path" ||
         fail "invalid AgentQ request tombstone path: $tombstone_path"
-    jq -ce --arg request_id "$request_id" '
-        def valid_task_id:
-            if type != "number" then
-                false
-            else
-                (. >= 0) and ((floor) == .)
-            end;
-        if (
-            (.version == 1)
-            and (.request_id == $request_id)
-            and (.task_id | valid_task_id)
-            and (.task_created_at | type) == "string"
-            and (.task_created_at | length) > 0
-            and (.state == "removed")
-            and (.removed_at | type) == "string"
-            and (.removed_at | length) > 0
-        ) then .
-        else error("invalid AgentQ request tombstone")
-        end
-    ' < "$tombstone_path"
+    jq -ce --arg request_id "$request_id" "$request_tombstone_filter" < "$tombstone_path"
+}
+
+# The tombstone-path guard sequence, in ONE place so the per-file reader above
+# and the batch reader in wait_reconcile_missing_task cannot drift (rule E).
+# Mirrors read_request_tombstone + request_tombstone_is_valid: existence, then
+# the four safety re-checks with the precision probe between the last two.  It
+# calls `fail`, so a caller that discards stderr to fall back gets the same
+# verdict as the per-file path.
+request_tombstone_path_guards_or_fail() {
+    local tombstone_path=$1
+    [ -e "$tombstone_path" ] || [ -L "$tombstone_path" ] ||
+        fail "invalid AgentQ request tombstone path: $tombstone_path"
+    request_metadata_file_is_safe "$tombstone_path" || fail "invalid AgentQ request tombstone path: $tombstone_path"
+    request_metadata_file_is_safe "$tombstone_path" || fail "invalid AgentQ request tombstone path: $tombstone_path"
+    request_metadata_file_is_safe "$tombstone_path" || fail "invalid AgentQ request tombstone path: $tombstone_path"
+    validate_task_id_precision_in_file "$tombstone_path"
+    request_metadata_file_is_safe "$tombstone_path" || fail "invalid AgentQ request tombstone path: $tombstone_path"
 }
 
 request_records_filter='
@@ -2451,15 +2548,26 @@ read_request_record_state_and_body() {
     if [ ! -e "$record_path" ] && [ ! -L "$record_path" ]; then
         return 1
     fi
+    request_record_path_guards_or_fail "$record_path"
+
+    jq -re --arg request_id "$request_id" \
+        "$request_record_filter | .state, (.task_id // \"\" | tostring), tojson" < "$record_path" ||
+        fail "invalid AgentQ request record: $record_path"
+}
+
+# The record-path guard sequence, in ONE place so the per-file reader above and
+# the batch reader in repair_removed_request_records cannot drift (rule E: the
+# same mechanism written twice is this repo's recurring defect).  It calls
+# `fail`, so a caller that needs the two-message recovery contract must run it
+# inside a subshell -- exactly as read_request_record_state_and_body's caller
+# does -- while a caller that discards stderr to fall back gets the same verdict.
+request_record_path_guards_or_fail() {
+    local record_path=$1
     request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
     request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
     validate_task_id_precision_in_file "$record_path"
     request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
     request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
-
-    jq -re --arg request_id "$request_id" \
-        "$request_record_filter | .state, (.task_id // \"\" | tostring), tojson" < "$record_path" ||
-        fail "invalid AgentQ request record: $record_path"
 }
 
 read_request_record() {
@@ -2933,13 +3041,56 @@ repair_removed_request_records() {
     local request_id
     local record
     local record_state
-    local record_task_id
+    local record_ids=()
     local output
 
     shopt -s nullglob
     record_files=("$request_directory"/*.json)
     shopt -u nullglob
     [ "${#record_files[@]}" -gt 0 ] || return 0
+
+    # The request ids are collected here, in the parent shell: the body loop
+    # below runs left of a pipe, so an array filled there would never arrive
+    # (the $( )/pipeline trap this repo has recorded four times).  The
+    # filename-shape check is kept here verbatim.
+    for record_path in "${record_files[@]}"; do
+        request_id=${record_path##*/}
+        request_id=${request_id%.json}
+        is_request_id "$request_id" || fail "invalid AgentQ request record filename: $record_path"
+        record_ids+=("$request_id")
+    done
+
+    # Fast path: the guards AND the aggregate run inside ONE subshell whose
+    # stderr is discarded.  Any guard failure, a length mismatch, a malformed
+    # record, or a body that cannot be read makes it exit non-zero -- and then
+    # the original per-file loop below runs verbatim and reproduces the exact
+    # stderr and exit status (guard message + the caller's "missing ..." line,
+    # or jq's own parse error plus both fail messages).  This is what makes the
+    # fold byte-for-byte faithful: an aggregate jq cannot reproduce a per-file
+    # jq's error text, so any failure falls back to the code that can.
+    #
+    # On a well-formed tree it emits one "id\nrecord" pair per removed record
+    # (usually none), which is all repair ever acts on -- the other states are
+    # validated but not otherwise consulted.
+    if output=$(
+        {
+            for record_path in "${record_files[@]}"; do
+                request_record_path_guards_or_fail "$record_path"
+                printf '%s\n' "$(<"$record_path")"
+            done | jq -rs --args "$request_removed_records_filter" -- "${record_ids[@]}"
+        } 2>/dev/null
+    ); then
+        while IFS= read -r request_id; do
+            [ -n "$request_id" ] || continue
+            IFS= read -r record || fail "cannot archive removed AgentQ request during repair: $request_id"
+            archive_removed_request "$request_id" "$record" >/dev/null ||
+                fail "cannot archive removed AgentQ request during repair: $request_id"
+        done <<<"$output"
+        return 0
+    fi
+
+    # Fallback: the original loop, unchanged.  record_task_id is not read here
+    # (repair only branches on the state), so it is not decoded.
     for record_path in "${record_files[@]}"; do
         request_id=${record_path##*/}
         request_id=${request_id%.json}
@@ -2948,7 +3099,6 @@ repair_removed_request_records() {
             fail "missing AgentQ request record during recovery: $record_path"
         record_state=${output%%$'\n'*}
         output=${output#*$'\n'}
-        record_task_id=${output%%$'\n'*}
         record=${output#*$'\n'}
         if [ "$record_state" = removed ]; then
             if ! archive_removed_request "$request_id" "$record" >/dev/null; then
@@ -3667,6 +3817,10 @@ wait_reconcile_missing_task() {
     local record
     local record_state
     local record_task_id
+    local record_ids=()
+    local tombstone_ids=()
+    local tombstone_task_id
+    local tombstone_created_at
     local output
     local matched_request_id=''
     local matched_record=''
@@ -3682,27 +3836,65 @@ wait_reconcile_missing_task() {
     shopt -u nullglob
 
     if [ "${#record_files[@]}" -gt 0 ]; then
+        # The ids are collected in the parent shell: the body loop below runs
+        # left of a pipe, so an array filled there would never arrive (the
+        # $( )/pipeline trap this repo has recorded four times).
         for path in "${record_files[@]}"; do
             request_id=${path##*/}
             request_id=${request_id%.json}
             is_request_id "$request_id" || fail "invalid AgentQ request record filename: $path"
-            output=$(read_request_record_state_and_body "$request_id") ||
-                fail "missing AgentQ request record during wait recovery: $path"
-            record_state=${output%%$'\n'*}
-            output=${output#*$'\n'}
-            record_task_id=${output%%$'\n'*}
-            record=${output#*$'\n'}
-            case "$record_state" in
-                accepted|removing)
-                    validate_task_id_precision "$record_task_id"
-                    if [ "$(canonical_task_id "$record_task_id")" = "$(canonical_task_id "$task_id")" ]; then
-                        [ -z "$matched_record" ] || fail "multiple AgentQ request records match task id: $task_id"
-                        matched_request_id=$request_id
-                        matched_record=$record
-                    fi
-                    ;;
-            esac
+            record_ids+=("$request_id")
         done
+        # Fast path: ONE aggregate jq yields four lines per record (id, state,
+        # task id, body) instead of one jq per file -- this scan is the wait
+        # path's dominant cost at scale.  The guards AND the aggregate run in
+        # one subshell whose stderr is discarded, so any failure (guard,
+        # length mismatch, malformed record, unreadable body) falls back to the
+        # verbatim per-file loop below and reproduces its exact stderr/exit.
+        if output=$(
+            {
+                for path in "${record_files[@]}"; do
+                    request_record_path_guards_or_fail "$path"
+                    printf '%s\n' "$(<"$path")"
+                done | jq -rs --args "$request_records_states_filter" -- "${record_ids[@]}"
+            } 2>/dev/null
+        ); then
+            while IFS= read -r request_id && IFS= read -r record_state &&
+                IFS= read -r record_task_id && IFS= read -r record; do
+                case "$record_state" in
+                    accepted|removing)
+                        validate_task_id_precision "$record_task_id"
+                        if [ "$(canonical_task_id "$record_task_id")" = "$(canonical_task_id "$task_id")" ]; then
+                            [ -z "$matched_record" ] || fail "multiple AgentQ request records match task id: $task_id"
+                            matched_request_id=$request_id
+                            matched_record=$record
+                        fi
+                        ;;
+                esac
+            done <<<"$output"
+        else
+            for path in "${record_files[@]}"; do
+                request_id=${path##*/}
+                request_id=${request_id%.json}
+                is_request_id "$request_id" || fail "invalid AgentQ request record filename: $path"
+                output=$(read_request_record_state_and_body "$request_id") ||
+                    fail "missing AgentQ request record during wait recovery: $path"
+                record_state=${output%%$'\n'*}
+                output=${output#*$'\n'}
+                record_task_id=${output%%$'\n'*}
+                record=${output#*$'\n'}
+                case "$record_state" in
+                    accepted|removing)
+                        validate_task_id_precision "$record_task_id"
+                        if [ "$(canonical_task_id "$record_task_id")" = "$(canonical_task_id "$task_id")" ]; then
+                            [ -z "$matched_record" ] || fail "multiple AgentQ request records match task id: $task_id"
+                            matched_request_id=$request_id
+                            matched_record=$record
+                        fi
+                        ;;
+                esac
+            done
+        fi
     fi
 
     if [ -z "$matched_record" ]; then
@@ -3711,14 +3903,45 @@ wait_reconcile_missing_task() {
                 request_id=${path##*/}
                 request_id=${request_id%.json}
                 is_request_id "$request_id" || fail "invalid AgentQ request tombstone filename: $path"
-                tombstone=$(read_request_tombstone "$request_id") || fail "missing AgentQ request tombstone during wait recovery: $path"
-                validate_task_id_precision "$(jq -r '.task_id' <<<"$tombstone")"
-                if [ "$(canonical_task_id "$(jq -r '.task_id' <<<"$tombstone")")" = "$(canonical_task_id "$task_id")" ]; then
-                    matched_tombstone_request_id=$request_id
-                    matched_tombstone_created_at=$(jq -r '.task_created_at' <<<"$tombstone")
-                    break
-                fi
+                tombstone_ids+=("$request_id")
             done
+            # Fast path: ONE aggregate jq yields three lines per tombstone (id,
+            # task id, created_at) instead of three jq per file.  Same
+            # fast-path/fallback contract as the record scan above: any failure
+            # falls back to the verbatim per-file loop and reproduces its exact
+            # stderr/exit.  The first match in glob order wins, as the loop's
+            # `break` did.
+            if output=$(
+                {
+                    for path in "${tombstone_files[@]}"; do
+                        request_tombstone_path_guards_or_fail "$path"
+                        printf '%s\n' "$(<"$path")"
+                    done | jq -rs --args "$request_tombstones_states_filter" -- "${tombstone_ids[@]}"
+                } 2>/dev/null
+            ); then
+                while IFS= read -r request_id && IFS= read -r tombstone_task_id &&
+                    IFS= read -r tombstone_created_at; do
+                    validate_task_id_precision "$tombstone_task_id"
+                    if [ "$(canonical_task_id "$tombstone_task_id")" = "$(canonical_task_id "$task_id")" ]; then
+                        matched_tombstone_request_id=$request_id
+                        matched_tombstone_created_at=$tombstone_created_at
+                        break
+                    fi
+                done <<<"$output"
+            else
+                for path in "${tombstone_files[@]}"; do
+                    request_id=${path##*/}
+                    request_id=${request_id%.json}
+                    is_request_id "$request_id" || fail "invalid AgentQ request tombstone filename: $path"
+                    tombstone=$(read_request_tombstone "$request_id") || fail "missing AgentQ request tombstone during wait recovery: $path"
+                    validate_task_id_precision "$(jq -r '.task_id' <<<"$tombstone")"
+                    if [ "$(canonical_task_id "$(jq -r '.task_id' <<<"$tombstone")")" = "$(canonical_task_id "$task_id")" ]; then
+                        matched_tombstone_request_id=$request_id
+                        matched_tombstone_created_at=$(jq -r '.task_created_at' <<<"$tombstone")
+                        break
+                    fi
+                done
+            fi
         fi
         if [ -z "$matched_tombstone_request_id" ] && [ "$allow_untracked" != true ]; then
             return 1
@@ -4698,9 +4921,30 @@ task_instance_created_at_is_recorded() {
     tombstones=("$request_tombstone_directory"/*.json)
     shopt -u nullglob
 
-    # bash 3.2 (this project's macOS /bin/bash) treats an empty array
-    # expansion as an unbound variable under `set -u`, so each list is guarded
-    # by its length -- the same pattern the wait-recovery scan above uses.
+    # Fast path: ONE aggregate jq answers the whole question, instead of one
+    # jq per record and per tombstone.  TOLERANT like the loop it replaces: a
+    # malformed file makes the slurp fail, and the fallback below then reproduces
+    # the per-file scan's skip-and-continue exactly.  The two lists are scanned
+    # separately (as the loop did) so a hit in the records is reported without
+    # ever reading a tombstone.
+    local combined=()
+    if [ "${#records[@]}" -gt 0 ]; then combined+=("${records[@]}"); fi
+    if [ "${#tombstones[@]}" -gt 0 ]; then combined+=("${tombstones[@]}"); fi
+    if [ "${#combined[@]}" -gt 0 ]; then
+        if probe=$( {
+                for path in "${combined[@]}"; do
+                    request_id=${path##*/}
+                    request_id=${request_id%.json}
+                    is_request_id "$request_id" || continue
+                    printf '%s\n' "$(<"$path")"
+                done | jq -rs --argjson id "$task_id" --arg expected "$expected_created_at" \
+                    "$request_instance_probe_filter"
+            } 2>/dev/null ); then
+            [ "$probe" = true ] && return 0
+            return 1
+        fi
+    fi
+    # Fallback: the original per-file scan, unchanged.
     if [ "${#records[@]}" -gt 0 ]; then
         for path in "${records[@]}"; do
             request_id=${path##*/}

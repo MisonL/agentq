@@ -176,6 +176,32 @@ expect_refused() {
     fi
 }
 
+# assert_jq_diagnostics <label> <expected-count>
+#
+# A malformed record is diagnosed by jq's own message (e.g. "jq: parse error:
+# ..."), and the repair pass reaches it through a PER-FILE jq in its fallback
+# path -- exactly one diagnostic line per malformed record.  This count is the
+# lock against a fold that runs a batch jq first and lets ITS stderr escape:
+# then every diagnostic prints twice.  compare_case cannot see that in a default
+# run, because base and variant are the same asset and it only diffs the two
+# sides -- a doubled line is identical on both.  (Measured: the first draft of
+# the repair fold leaked the aggregate jq's stderr this way and printed each
+# parse error twice, while compare_case stayed green.)
+assert_jq_diagnostics() {
+    local label=$1 expected=$2
+    cases=$((cases + 1))
+    local count
+    # `|| true`: grep -c prints 0 AND exits 1 on no match; without it the
+    # assignment would abort under `set -e`.
+    count=$(grep -c '^jq:' "$work/variant.$label.err" || true)
+    if [ "$count" != "$expected" ]; then
+        printf 'records-contract %s: expected %s jq diagnostic line(s), got %s\n' \
+            "$label" "$expected" "$count" >&2
+        head -6 "$work/variant.$label.err" >&2 || true
+        failures=$((failures + 1))
+    fi
+}
+
 # ---------------------------------------------------------------- case setup
 # Every case is seeded into BOTH trees with identical bytes.
 case_wellformed() { seed base "$1" "$2"; seed variant "$1" "$2"; }
@@ -193,6 +219,7 @@ run_case base badjson status
 run_case variant badjson status
 compare_case badjson
 expect_refused badjson 'invalid AgentQ request record'
+assert_jq_diagnostics badjson 1
 
 # 3. Wrong protocol version.
 case_wellformed AQVERBAD-00000000001.json "$(record_json AQVERBAD-00000000001 | sed 's/"version":1/"version":2/')"
@@ -200,6 +227,7 @@ run_case base verbad status
 run_case variant verbad status
 compare_case verbad
 expect_refused verbad 'invalid AgentQ request record'
+assert_jq_diagnostics verbad 1
 
 # 4. The filename and the record's own request_id disagree.  This is the case a
 #    dropped per-record binding check silently accepts.
@@ -208,6 +236,7 @@ run_case base mismatch status
 run_case variant mismatch status
 compare_case mismatch
 expect_refused mismatch 'invalid AgentQ request record'
+assert_jq_diagnostics mismatch 1
 
 # 5. A non-integral task id.
 case_wellformed AQFLOAT-000000000001.json "$(record_json AQFLOAT-000000000001 | sed 's/"task_id":1001/"task_id":10.5/')"
@@ -215,6 +244,7 @@ run_case base float status
 run_case variant float status
 compare_case float
 expect_refused float 'invalid AgentQ request record'
+assert_jq_diagnostics float 1
 
 # 6. `accepted` with a null task_created_at -- the state/id pairing is checked.
 case_wellformed AQNOCREATED-00000001.json "$(record_json AQNOCREATED-00000001 | sed 's/"task_created_at":"2026-09-29T00:00:00Z"/"task_created_at":null/')"
@@ -222,6 +252,7 @@ run_case base nocreated status
 run_case variant nocreated status
 compare_case nocreated
 expect_refused nocreated 'invalid AgentQ request record'
+assert_jq_diagnostics nocreated 1
 
 # 7. An illegal request-id filename (too short for the documented shape).
 case_wellformed short.json "$(record_json short | sed 's/"agentq:short"/"agentq:short"/')"
@@ -240,6 +271,7 @@ run_case base midbad status
 run_case variant midbad status
 compare_case midbad
 expect_refused midbad 'invalid AgentQ request record'
+assert_jq_diagnostics midbad 1
 
 # 9. `task_id: null` is LEGAL for prepared/adding.  A reader that assumes a
 #    numeric task_id would reject these.
