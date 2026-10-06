@@ -348,13 +348,20 @@ FullControl、其余身份降到 ReadAndExecute、`SetAccessRuleProtection($true
 那个 chmod 块）与 `Invoke-GitBashScript`（删掉 chmod 后 install-client.ps1 已无任何
 原生脚本调用）。`Resolve-GitBashPath` 保留——它决定是否安装 Git Bash 启动器。
 
-**仍然未被验证**：原生 Windows 上的真实远端队列、生产凭证，以及 C3 的两项余项
-（**registry/profile**——本机 PortableGit 未写注册表，走的是 PATH 分支；
-**跨用户安装/服务身份**——只以单个管理员账户装过）。**NTFS reparse 点语义已不再
-是未验证项**（2026-10-01 在专用测试机上实测：从发行版资产经 AST 抽出
-`Test-NonReparseWindowsFilePath` 逐字执行，普通文件/junction/junction 下的文件/
-文件符号链接等 8 例全对、变异 3/3 被抓；客户端安装器真机 exit 0 且 ACL 已核实），
-详见 `PLAN.md` C3 执行结果。
+**C3 三项已全部关闭**（2026-10-01 与 2026-10-06 在同一台专用测试机上）：**NTFS reparse
+点语义**（从发行版资产经 AST 抽出 `Test-NonReparseWindowsFilePath` 逐字执行，普通文件/
+junction/junction 下的文件/文件符号链接等 8 例全对、变异 3/3 被抓；客户端安装器真机
+exit 0 且 ACL 已核实）、**registry/profile**（`Resolve-GitBashPaths` 逐字抽出真机执行；
+该机 `HKLM\SOFTWARE\GitForWindows` **存在**、走注册表分支，两个方向的变异——改
+`InstallPath` 则解析随之改变、移走整个键则回落到 PATH 分支——都被抓到并已还原）、
+**跨用户安装/服务身份**（建第二个非管理员账户实测：身份解析正确、故意污染
+`USERPROFILE`/`HOME`/`TEMP` 仍不信任继承值、第二用户对 `C:\ProgramData\AgentQ`
+的四个子项全部 `UnauthorizedAccessException`、跨用户注册计划任务本身可行）。
+**注意**：这三项证明的是**这些函数与隔离属性在真机上的行为**，不是「安装器端到端在第二个
+用户下装成功」——安装器全文在本机仍不可执行（撞平台闸门）。详见 `PLAN.md` C3 执行结果。
+
+**仍然未被验证**：原生 Windows 上的真实远端队列、生产凭证，以及
+**真实升级回滚**（`C2` 余项，WSL 本机也无法伪造）。
 
 **先分清两件不同的事，否则会把它们混为一谈**：Git Bash 在 Windows 上既是
 **AgentQ 的运行时依赖**，也可能是**远端终端**。前者是设计（安装器会装 Git Bash；
