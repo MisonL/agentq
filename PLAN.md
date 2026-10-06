@@ -1742,7 +1742,7 @@ created_at）。前两者复用 `request_record_filter` / 新抽出的 `request_
 | --- | --- | --- |
 | C1 | P1-3 整体操作矩阵（**改为三台**、**真实网络中断**；2026-09-22 用户裁定） | **已执行（2026-09-22）**，结果与两个新缺陷见 `CHANGELOG.md`。三台里只有一台跑当前版本。**两项遗留均已消解（2026-09-24）**：① 主机 A 的客户端路径——重装后 `status`/`submit`/`wait`/`logs`/`remove` 五项 exit 0（见 B5-执行）；② 缺陷二已修并验证（见 A6，`smoke/03` 有用例、M3 证明其敏感）。**C1 无遗留** |
 | C2 | 平台/安装矩阵（WSL、arm64、RHEL、Fedora、Alpine、真实升级回滚） | **已执行容器可覆盖的部分（2026-09-24，用户全权授权）**，见下 |
-| C3 | 原生 Windows 其余边界（NTFS reparse 点语义、registry/profile、跨用户安装/服务身份） | **部分已执行（2026-10-01）**，见下；余项仍需授权。**用户已声明无生产权限**，主机 A 是生产机，故不主动推进 |
+| C3 | 原生 Windows 其余边界（NTFS reparse 点语义、registry/profile、跨用户安装/服务身份） | **已执行（2026-10-01 与 2026-10-06，专用测试机）**，三项全部关闭，见下。**用户已声明无生产权限**，故不在生产机上做 |
 | C4 | 真实服务/生产边界（远端服务生命周期、TLS/shared key、生产凭证、发布回滚） | **不是「不做」，是「用户无权授权」**：生产环境属上游，用户是 fork 贡献者，只在私有 CF 上部署测试。此项**不得**记为待办，也不得声称已验证 |
 | C5 | P2-18 外部审查 | **已执行（2026-09-24，用户指示「按正规工程审查做、使用 agents」）**，见下 |
 
@@ -1786,11 +1786,34 @@ created_at）。前两者复用 `request_record_filter` / 新抽出的 `request_
 | **NTFS reparse 点语义**（此前记「未测 reparse 点本身」） | 从**已发布资产** `client/windows/agentq.ps1` 经 PowerShell AST **逐字抽出** `Test-NonReparseWindowsFilePath` 的函数体（不是副本，是发行版里的那份），在真机上造 fixture：普通目录／普通文件／**目录 junction**（`mklink /J`）／junction 下的文件／**文件符号链接**（`New-Item -ItemType SymbolicLink`），跑 8 个用例 | **8/8 符合预期**：普通文件 True；普通目录、junction 本身、junction **之下**的文件、文件符号链接、缺失文件、空串、普通目录里的缺失文件全部 False。fixture 自证属性：junction `container=True reparse=True`、文件符号链接 `container=False reparse=True`。**变异 3/3 被抓**（M2 最初 MISSED——是**用例缺口**：没有「非目录叶子重解析点」这一形态，补上文件符号链接用例后被抓） |
 | **客户端安装器真机行为**（`client/windows/install-client.ps1`，此前只有 `10` 的两条源码不变量） | 在真机上真正运行安装器 | 安装 **exit 0**；`-Check` 双向断言；**ACL 已核实**（`CodexSandboxUsers` 不再出现、`AuthenticatedUsers : ReadAndExecute`）——即 `chmod`→ACL 那处修复在真机上确实生效 |
 
-**仍未验证（C3 余项）**：**registry/profile**（`Resolve-GitBashPaths` 从
-`HKLM:\SOFTWARE\GitForWindows` 等读 `InstallPath` 那条路径——本机 PortableGit 未写注册表，
-是走 PATH 分支解析到的）、**跨用户安装/服务身份**（本机只以单个管理员账户装过，
-`-LogonType Interactive` + 用户级计划任务在**多用户/服务账户**下的行为无证据）。
-这两项需要改系统状态或第二账户，未获当次授权，故不做。
+**C3 余项已于 2026-10-06 关闭**，见下面「C3 执行结果（2026-10-06）」一节——
+两项都做了**真实执行**，且第一项暴露出本文档原先记的**前提是错的**。
+
+#### C3 执行结果（2026-10-06）—— 余下两项（registry/profile、跨用户服务身份）
+
+同一台 `专用测试机` 测试机（Windows 10 22H2 19045.3996；**地址按项目规则不入库**）。
+SSH 走 **2222** 端口
+（`DefaultShell` 未设置 = `cmd.exe`），登录账户 `<账户名>`（管理员）。**方法照 2026-10-01 那次**：
+函数体从**发行版资产** `skill/assets/windows-git-bash/install-agentq.ps1` 经 PowerShell AST
+**逐字抽取**后在真机上执行，不是副本、不是常量核对。
+
+| 项 | 做法 | 结果 |
+| --- | --- | --- |
+| **registry/profile** | 抽取 `Resolve-GitBashPaths` 真机执行；再对 `HKLM\SOFTWARE\GitForWindows` 的 `InstallPath` 做**两个方向的变异** | **该机注册表键存在**（`InstallPath = C:\Program`），走的是**注册表分支**。基线解析 `C:\Program\bin\bash.exe`；变异一（`InstallPath`→`C:\Git`）解析**随之变成** `C:\Git\bin\bash.exe`（证明该值真被读）；变异二（整键移走）**回落到 PATH 分支**、结果仍是 `C:\Program\bin\bash.exe`。两次变异均已还原 |
+| **跨用户安装/服务身份** | 建第二个**非管理员**账户 `<第二账户>`，以它 SSH 登录并执行发行版的 `Get-CurrentWindowsUserEnvironment`；另做环境变量污染测试与私有树隔离探测 | 身份解析正确（`UserName=<第二账户>`、`LocalAppData=C:\Users\<第二账户>\AppData\Local`、`IsAdmin=False`）；**污染测试**：故意把 `USERPROFILE`/`HOME`/`USERNAME`/`TEMP` 全指向 <账户名> 的 profile，函数**仍返回 `<第二账户>` 的路径**（读 SID→ProfileList，不信任继承值）；**隔离测试**：`<第二账户>` 对 `C:\ProgramData\AgentQ` 的 `Get-Acl` 被拒、四个子项（`config`/`agentq-launcher.ps1`/`data`/`runtime`）**全部 `UnauthorizedAccessException`**；**注册身份**：现有任务 `UserId=<账户名> LogonType=Interactive RunLevel=Limited`，触发器 `MSFT_TaskLogonTrigger user=<计算机名>\<账户名>`；把注册身份换成不存在的用户名会被 `Register-ScheduledTask` 拒绝并给出明确消息，而 `<第二账户>`/`<账户名>` 都能注册 |
+
+**本文档原先关于 registry/profile 的前提是错的**：上一版写「本机 PortableGit 未写注册表，
+是走 PATH 分支解析到的」——那是 2026-10-01 那台机的情况，**这台机装的是 Git for Windows
+全量版、注册表键存在**，所以走的正是注册表分支。两台机不是一回事，已按实测改正。
+
+**证据形状（如实记）**：函数体是**从发行版资产抽取**后执行，但**不是安装器整体运行**——
+安装器全文在本机仍不可执行（`13` 撞平台闸门），所以这两项证明的是「这两个函数在真机、
+真注册表、真第二账户下的行为」，不是「安装器端到端在第二个用户下装成功」。后者的前置
+（`Set-PrivateTreeAcl` 对第二用户的隔离、跨用户注册能力）本次已各自单独证明。
+
+**机器状态**：测试用账户 `<第二账户>` **保留**（跨用户验证的现场）；探针账户 `探针账户`/`探针账户`/
+`探针账户`/`探针账户` 已删；测试脚本与结果文件已全部清除（`dir /b` 确认为空）；`InstallPath`
+已还原为 `C:\Program`。
 
 #### C5 执行结果（2026-09-24）—— 外部审查
 
@@ -1888,9 +1911,12 @@ created_at）。前两者复用 `request_record_filter` / 新抽出的 `request_
 - 真实远端服务、队列、TLS/shared key、生产凭证**均未被验证**
 - 原生 Windows 上**已实测**：完整协议（submit/wait/logs/remove/cancel 两路径与
   重放/base64 日志/doctor/锁竞争/坏参数退出码/launcher `ArgumentsBase64` 转发）、
-  PS 5.1 客户端坏参数路径、`noacl` 挂载下 `chmod` 无效
-- 原生 Windows 上**仍未验证**：registry/profile、跨用户安装/服务身份。
-  （**NTFS reparse 点语义已于 2026-10-01 实测**，8/8 + 变异 3/3，见「C3 执行结果」）
+  PS 5.1 客户端坏参数路径、`noacl` 挂载下 `chmod` 无效、**NTFS reparse 点语义**
+  （2026-10-01，8/8 + 变异 3/3）、**registry/profile** 与**跨用户安装/服务身份**
+  （2026-10-06，见「C3 执行结果」）——**C3 三项已全部关闭**
+- 原生 Windows 上**仍未验证**：真实远端队列（`专用测试机` 是本机目标，不是
+  经 AgentQ 连的生产队列）、生产凭证；以及 **C2 的「真实升级回滚」**（WSL 本机
+  也无法伪造）
 
 ### 性能事实（改热点路径前先读）
 
