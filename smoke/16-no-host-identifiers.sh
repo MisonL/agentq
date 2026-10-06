@@ -287,12 +287,22 @@ scanned=$((scanned - 1))
 # --- the tree --------------------------------------------------------------
 # Binary files are skipped: they are not text a reader copies an address out of,
 # and grepping them produces noise.  `grep -Iq .` is the test for "is text".
+tree_scanned=0
 while IFS= read -r file; do
     grep -Iq . "$file" 2>/dev/null || continue
+    tree_scanned=$((tree_scanned + 1))
     scan_file "$file"
 done <<EOF
 $(find "$root" -type f -not -path '*/.git/*' -not -name '*.syntax.*' | sort)
 EOF
+# Zero files means the enumeration broke, not that the tree is clean.  Without
+# this guard a bad root reported "files=17 violations=0" (all from the memory
+# half) and exited 0 -- measured 2026-10-06 by pointing root at an empty
+# directory.  Same class as 01's shell_count/config_patterns guards.
+if [ "$tree_scanned" -eq 0 ]; then
+    printf 'no-host-identifiers: FAIL (the repository scan enumerated 0 files; a broken tree walk must not read as a clean scan)\n' >&2
+    exit 1
+fi
 
 # --- the memory directory --------------------------------------------------
 # Not part of the repo, but the rule covers it, and it is where the address

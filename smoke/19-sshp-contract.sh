@@ -248,7 +248,11 @@ run_case 'empty session name is accepted' 0 '' -- --check smoke-host ''
 # (an install attempt would be a second call).
 plan_stub '42	__SSHP_INSTALL_REQUIRED__:Linux'
 run_case 'check: missing dependency is not installed' 127 'tmux, GNU screen, or Zellij is required' -- --check smoke-host
+# `cat` of an EMPTY file succeeds with empty output, so the old `|| printf 0`
+# never fired and `[ "" -ne N ]` errored instead of counting (latent since the
+# empty-stub case was masked by other assertions; fixed 2026-10-06).
 calls_made=$(cat "$work/count" 2>/dev/null || printf '0')
+calls_made=${calls_made:-0}
 if [ "$calls_made" -ne 1 ]; then
     printf 'sshp-contract: --check with a missing dependency made %s ssh call(s); it must probe once and stop\n' "$calls_made" >&2
     failures=$((failures + 1))
@@ -293,7 +297,11 @@ if ! grep -qF 'initial SSH transport lost; reconnecting' "$work/err"; then
     printf 'sshp-contract: transport reconnect: did not report the lost transport\n' >&2
     failures=$((failures + 1))
 fi
+# `cat` of an EMPTY file succeeds with empty output, so the old `|| printf 0`
+# never fired and `[ "" -ne N ]` errored instead of counting (latent since the
+# empty-stub case was masked by other assertions; fixed 2026-10-06).
 calls_made=$(cat "$work/count" 2>/dev/null || printf '0')
+calls_made=${calls_made:-0}
 if [ "$calls_made" -ne 2 ]; then
     printf 'sshp-contract: transport reconnect: made %s ssh call(s); expected exactly 2 (fail, retry)\n' "$calls_made" >&2
     failures=$((failures + 1))

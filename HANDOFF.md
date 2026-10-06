@@ -40,9 +40,9 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
    也不得升级为整个 P1-3 已完成。
 2. **原生 Windows 边界**：如确有验收需要，单独验证 Windows PowerShell 5.1、ACL、
    registry/profile、跨用户身份和 PID reuse；本机没有可代替这些证据的验证手段。
-   （**PS 5.1 与 NTFS reparse 已在专用测试机上验证**：前者见 `smoke/12` 的
-   `ps51=covered` 与 `PLAN.md` A5b 的 `DefaultShell=powershell.exe` 真机列，
-   后者见 `PLAN.md` C3 执行结果。）
+   （**PS 5.1、NTFS reparse、registry/profile 与跨用户身份已在专用测试机上验证**：
+   前者见 `smoke/12` 的 `ps51=covered` 与 `PLAN.md` A5b 的
+   `DefaultShell=powershell.exe` 真机列，后三者见 `PLAN.md` C3 执行结果。）
 3. **平台和安装矩阵**：补充 WSL、arm64、RHEL、Fedora、Alpine，以及原生包管理器、
    权限/网络/特权组合和真实升级回滚；这些属于未证明边界。
 4. **真实服务与生产边界**：在得到精确主机、用户、工作目录、恢复方式和副作用授权后，
@@ -73,8 +73,8 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
    路径参数、PowerShell 5.1 词分割脚本参数，以及 `chmod` 在 `noacl` 挂载上的静默
    空操作），详见 `CHANGELOG.md` 与 `smoke/08`、`smoke/09`、`smoke/10`。
    第四项已修：客户端安装器改走 ACL（`Set-ClientLauncherAcl`，含 `Get-Acl` 读回
-   校验），`chmod` 已从该资产移除。**仍未验证**：registry/profile、跨用户安装/服务
-   身份。**NTFS reparse 点语义已于 2026-10-01 实测**（专用测试机上从发行版资产经
+   校验），`chmod` 已从该资产移除。**registry/profile 与跨用户安装/服务身份已于
+   2026-10-06 实测**（专用测试机；见 `PLAN.md` C3 执行结果），不再是未验证项。**NTFS reparse 点语义已于 2026-10-01 实测**（专用测试机上从发行版资产经
    AST 抽出 `Test-NonReparseWindowsFilePath` 逐字执行，8/8 符合预期、变异 3/3 被抓；
    见 `PLAN.md` C3 执行结果），故不再是未验证项。
 3. 真实远端服务、队列、TLS/shared key、生产凭证和外部通知/外部渠道验收。
@@ -101,7 +101,8 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
 - `cancel`/`remove` 响应丢失时不要自动重试；先读取 status/logs/wait 重新确认。
 - 不使用 `git reset --hard`、`git checkout --` 或宽泛清理来「弄干净」工作树——
   这条防的是**销毁工作**，不是要求工作树常脏。本会话真踩过：先删了备份再
-  `git reset --hard baseline`，把工作树回退掉，最后靠 git 对象 `dcff709` 逐字节恢复。
+  `git reset --hard baseline`，把工作树回退掉，最后靠 git 对象 `dcff709` 逐字节恢复（该对象已随 2026-10-06 的历史改写被 repack 清除——
+它本就不可达、任何一次 `gc` 都会清掉；改写前的镜像备份亦已按用户要求清理删除）。
   提交本身是正常的 git 工作流，不需要授权之外的额外仪式；但工作树不干净时，
   先弄清每处改动是什么，再决定提交还是丢弃。
 - 证据采用 `CHANGELOG.md` 的一行记录加 `run-tests.sh` 的退出码；不要把局部验证

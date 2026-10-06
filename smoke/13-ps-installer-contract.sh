@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Smoke: assets/windows-git-bash/install-agentq.ps1 -- its parameter contract and
-# its platform gate.  This file is the second-largest asset in the repo (2,881
+# its platform gate.  This file is the second-largest asset in the repo (2,922
 # lines) and, before this check, nothing had ever executed it: 01 parses it with
 # the PowerShell AST and 10 asserts four source-level invariants about it, but
 # neither runs it.

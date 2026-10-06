@@ -423,6 +423,15 @@ jq -e '.action == "cancel_requested"' <<<"$queued_cancel" >/dev/null || {
     printf 'queued cancel did not report cancel_requested: %s\n' "$queued_cancel" >&2
     exit 1
 }
+# The field must EXIST before the replay comparison below can mean anything: if
+# it vanished from both responses the comparison would be null == null and pass
+# vacuously (measured 2026-10-06 by deleting it from the server's templates --
+# this check stayed green).  The running path asserts the field at its own
+# cancel; the queued path did not.
+[ "$(jq -r '.cancellation_requested_at | type' <<<"$queued_cancel")" = string ] || {
+    printf 'queued cancel did not report a cancellation_requested_at: %s\n' "$queued_cancel" >&2
+    exit 1
+}
 
 # A cancel whose task has already left Pueue must REPLAY, not fail.  A confirmed
 # cancellation is recorded in the task's cancellation marker (state

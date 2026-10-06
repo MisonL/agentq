@@ -226,6 +226,14 @@ Emit 'env.TEMP'        ([Environment]::GetEnvironmentVariable('TEMP','Process'))
 Emit 'env.TMP'         ([Environment]::GetEnvironmentVariable('TMP','Process'))
 Emit 'env.PATHEXT'     ([Environment]::GetEnvironmentVariable('PATHEXT','Process'))
 Emit 'env.SystemRoot'  ([Environment]::GetEnvironmentVariable('SystemRoot','Process'))
+Emit 'env.USER'        ([Environment]::GetEnvironmentVariable('USER','Process'))
+Emit 'env.LOCALAPPDATA' ([Environment]::GetEnvironmentVariable('LOCALAPPDATA','Process'))
+Emit 'env.HOMEDRIVE'   ([Environment]::GetEnvironmentVariable('HOMEDRIVE','Process'))
+Emit 'env.HOMEPATH'    ([Environment]::GetEnvironmentVariable('HOMEPATH','Process'))
+Emit 'env.Path'        ([Environment]::GetEnvironmentVariable('Path','Process'))
+Emit 'env.ComSpec'     ([Environment]::GetEnvironmentVariable('ComSpec','Process'))
+Emit 'env.SystemDrive' ([Environment]::GetEnvironmentVariable('SystemDrive','Process'))
+Emit 'env.WINDIR'      ([Environment]::GetEnvironmentVariable('WINDIR','Process'))
 # Both aliases must be set from the SAME source field, not left to chance.
 Emit 'env.TEMP_eq_TMP' ([Environment]::GetEnvironmentVariable('TEMP','Process') -ceq [Environment]::GetEnvironmentVariable('TMP','Process'))
 Emit 'env.HOME_eq_USERPROFILE' ([Environment]::GetEnvironmentVariable('HOME','Process') -ceq [Environment]::GetEnvironmentVariable('USERPROFILE','Process'))
@@ -318,6 +326,14 @@ assert_eq 'env.TEMP'        'C:\Users\SidResolved\AppData\Local\Temp'
 assert_eq 'env.TMP'         'C:\Users\SidResolved\AppData\Local\Temp'
 assert_eq 'env.PATHEXT'     '.COM;.EXE;.BAT'
 assert_eq 'env.SystemRoot'  'C:\Windows'
+assert_eq 'env.USER'         'SidResolved'
+assert_eq 'env.LOCALAPPDATA' 'C:\Users\SidResolved\AppData\Local'
+assert_eq 'env.HOMEDRIVE'    'C:'
+assert_eq 'env.HOMEPATH'     '\Users\SidResolved'
+assert_eq 'env.Path'         'C:\Windows;C:\Tools'
+assert_eq 'env.ComSpec'      'C:\Windows\system32\cmd.exe'
+assert_eq 'env.SystemDrive'  'C:'
+assert_eq 'env.WINDIR'       'C:\Windows'
 assert_eq 'env.TEMP_eq_TMP' 'True'
 assert_eq 'env.HOME_eq_USERPROFILE' 'True'
 # The whole point: the ambient HOME must NOT survive.  If the function were a

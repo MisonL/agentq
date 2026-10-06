@@ -80,7 +80,9 @@ expect_rejected 'unknown parameter' \
 # This is the fix for the defect where a read-only handle made FlushFileBuffers
 # fail with ERROR_ACCESS_DENIED and the lock could never be acquired on Windows.
 cases=$((cases + 1))
-access_line=$(grep -nE 'uint access = ' "$asset" | head -1)
+# `|| true`: a renamed access line must reach the diagnostic below, not abort
+# the check with no output (same pipefail class as smoke/06).
+access_line=$(grep -nE 'uint access = ' "$asset" | head -1) || true
 if [ -z "$access_line" ]; then
     printf 'durable-move: could not find the access-mask line in OpenForFlush\n' >&2
     failures=$((failures + 1))

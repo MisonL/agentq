@@ -61,9 +61,17 @@ chmod 700 "$work/agentq-server"
 # the group; `wait`'s missing-task path needs only status -- answer both.
 cat > "$work/pueue" <<'SH'
 #!/bin/sh
+# The task snapshot is seedable: a case that needs VISIBLE tasks writes
+# tasks.json next to this stub (the same pattern smoke/27 uses); otherwise the
+# empty snapshot keeps every other case unchanged.
+self_dir=$(dirname "$0")
 case "$*" in
   *"status --json"*)
-    printf '%s\n' '{"tasks":{},"groups":{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}}'
+    if [ -f "$self_dir/tasks.json" ]; then
+      cat "$self_dir/tasks.json"
+    else
+      printf '%s\n' '{"tasks":{},"groups":{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}}'
+    fi
     ;;
   *"group --json"*)
     printf '%s\n' '{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}'
@@ -291,6 +299,22 @@ assert_rc w5 5
 assert_json w5 '.state == "removed" and .task_id == 1001'
 assert_err_has w5 'was removed before wait'
 assert_counts w5 0 2
+
+# W6. Two visible tasks share the AgentQ label: the server cannot choose
+#     safely, and that is exit 4/ambiguous -- NOT "cannot inspect Pueue", which
+#     claims the inspection failed when it succeeded and the result was merely
+#     ambiguous.  Measured 2026-10-06: six call sites collapsed
+#     find_request_task's rc=4 into the generic exit-2 fail.
+clear_runtime
+cat > "$work/tasks.json" <<'TASKS'
+{"tasks":{"1001":{"id":1001,"created_at":"2026-09-29T00:00:00Z","command":"true","label":"agentq:AQREAD-AMBI-0000001","status":{"Done":{"result":"Success","exit_code":0}},"group":"agentq"},"1002":{"id":1002,"created_at":"2026-09-29T00:00:01Z","command":"true","label":"agentq:AQREAD-AMBI-0000001","status":{"Running":{}},"group":"agentq"}},"groups":{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}}
+TASKS
+put_record AQREAD-AMBI-0000001 accepted 1001 '"2026-09-29T00:00:00Z"'
+run_case w6 lookup AQREAD-AMBI-0000001
+assert_rc w6 4
+assert_json w6 '.state == "ambiguous"'
+assert_err_has w6 'multiple Pueue tasks share the AgentQ label'
+rm -f "$work/tasks.json"
 
 # --------------------------------------------------------------- summary
 if [ "$failures" -ne 0 ]; then

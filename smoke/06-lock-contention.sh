@@ -193,8 +193,12 @@ contender_shell_pid=$!
 # Release the lock only after the contender has been given its full retry
 # window.  Read the budget from the server itself so this check keeps working
 # if the constants change.
-attempts=$(grep -m1 '^lock_acquire_attempts=' "$server" | cut -d= -f2)
-delay=$(grep -m1 '^lock_retry_delay_seconds=' "$server" | cut -d= -f2)
+# `|| true` so a renamed constant leaves the variables empty and the fallback
+# below actually runs; without it pipefail aborted the script before the case
+# (measured 2026-10-06: renaming the constant made this check exit 1 with no
+# output at all, and the designed fallback was unreachable).
+attempts=$(grep -m1 '^lock_acquire_attempts=' "$server" | cut -d= -f2) || true
+delay=$(grep -m1 '^lock_retry_delay_seconds=' "$server" | cut -d= -f2) || true
 case "$attempts" in ''|*[!0-9]*) attempts=30 ;; esac
 case "$delay" in ''|*[!0-9]*) delay=1 ;; esac
 budget=$((attempts * delay))

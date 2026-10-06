@@ -235,9 +235,9 @@ fail_submit=$(run_client submit --workdir "$workdir" --label transport-fail \
 fail_task_id=$(jq -er '.task_id' <<<"$fail_submit")
 fail_wait_status=0
 fail_wait_out=$(run_client wait "$fail_task_id" 2>/dev/null) || fail_wait_status=$?
-if [ "$fail_wait_status" -eq 0 ]; then
-    printf 'wait over ssh exited 0 for a task that exited non-zero: %s\n' \
-        "$(head -c 200 <<<"$fail_wait_out")" >&2
+if [ "$fail_wait_status" -ne 1 ]; then
+    printf 'wait over ssh exited %s for a task that exited 7 (expected 1): %s\n' \
+        "$fail_wait_status" "$(head -c 200 <<<"$fail_wait_out")" >&2
     exit 1
 fi
 if jq -e '.task.status.Done.result == "Success"' <<<"$fail_wait_out" >/dev/null 2>&1; then

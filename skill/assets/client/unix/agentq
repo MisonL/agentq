@@ -489,6 +489,12 @@ resolve_credential_source() {
         if [ -n "${AGENTQ_PASSWORD:-}" ]; then
             credential_refuse 'AGENTQ_ASKPASS and AGENTQ_PASSWORD are both set; set only one'
         fi
+        # Same for the prompt source: with an askpass program configured the
+        # prompt is silently unreachable, and silent ignoring is what this
+        # function exists to refuse.
+        if [ -n "${AGENTQ_PASSWORD_PROMPT:-}" ]; then
+            credential_refuse 'AGENTQ_ASKPASS and AGENTQ_PASSWORD_PROMPT are both set; set only one'
+        fi
         agentq_credential_source=askpass
         return 0
     fi
@@ -1310,8 +1316,15 @@ agentq_remote_failure_reason() {
 agentq_remote_exit_token() {
     ssh_exit_token_log=$1
     agentq_ssh_log_require_existing_file "$ssh_exit_token_log" || return 1
+    # At most three digits: the protocol codes are 0-255.  An unbounded token
+    # was measured fail-open on 2026-10-06 -- a remote sending
+    # `agentq-exit:99999999999999999999` made `return "$ssh_status"` fail with
+    # "numeric argument required", which under `set -e` in a condition context
+    # read as success, so the client exited 0 on a forged failure.  A token that
+    # cannot be a protocol code is not ours; ignoring it falls back to the SSH
+    # exit code, which is the fail-closed direction.
     ssh_exit_token_value=$(LC_ALL=C tr -d '\r' < "$ssh_exit_token_log" |
-        LC_ALL=C sed -n 's/^agentq-exit:\([0-9][0-9]*\)$/\1/p' | tail -n 1)
+        LC_ALL=C sed -n 's/^agentq-exit:\([0-9]\{1,3\}\)$/\1/p' | tail -n 1)
     [ -n "$ssh_exit_token_value" ] || return 1
     printf '%s\n' "$ssh_exit_token_value"
 }
@@ -2458,17 +2471,27 @@ windows_probe_script_with_exit_token() {
     # A probe signals failure with `exit N`.  That ends the whole script, so a
     # token line appended after the body would never run -- and under an outer
     # PowerShell the code would arrive flattened to 1 with nothing to recover it.
-    # So every `exit N` in the body is rewritten to `$agentqProbeExit = N` and the
-    # token line at the end reports it.  The rewrite is textual and local to the
-    # body: the probes are single-line scripts whose only `exit` calls are the
-    # contract codes, and the pattern is anchored to `; exit <digits>` or a
-    # statement-initial `exit <digits>` so an `exit` inside a string cannot match.
+    # So every `exit N` in the body is rewritten to write the token AT the exit
+    # site and then really exit.  The rewrite is textual and local to the body:
+    # the probes' only `exit` calls are the contract codes, and the pattern is
+    # anchored to `; exit <digits>` or a statement-initial `exit <digits>` so an
+    # `exit` inside a string cannot match.
+    #
+    # The first version rewrote `exit N` to `$agentqProbeExit = N` and reported
+    # the variable in a trailer.  That was measured wrong on 2026-10-06: an
+    # assignment does NOT terminate, and the failure branches are sequential
+    # `if` statements, not an if/else chain -- so a missing launcher fell through
+    # every later check and the unconditional final `...-ready` write, and the
+    # LAST code assigned (44, reparse-unsafe) won the token.  The client then
+    # reported "protocol probe failed" + 44 instead of "deployment is
+    # incomplete" + 2, and the 42/43 branches were unreachable.  Writing the
+    # token before `exit` restores the original control flow exactly.
     windows_probe_rewritten_body=$(printf '%s' "$windows_probe_script_body" |
-        sed -E 's/(^[[:space:]]*|;[[:space:]]*)exit ([0-9]+)/\1$agentqProbeExit = \2/g')
+        sed -E 's/(^[[:space:]]*|;[[:space:]]*)exit ([0-9]+)/\1[Console]::Out.Write("agentq-exit:" + \2); exit \2/g')
     printf '%s\n' "$windows_probe_rewritten_body"
-    printf '%s\n' 'if ($null -eq $agentqProbeExit) { $agentqProbeExit = 0 }'
-    printf '%s\n' '[Console]::Out.Write("agentq-exit:" + $agentqProbeExit)'
-    printf '%s\n' 'exit $agentqProbeExit'
+    # Reached only when the body completed without exiting: the success path.
+    printf '%s\n' '[Console]::Out.Write("agentq-exit:0")'
+    printf '%s\n' 'exit 0'
 }
 
 windows_probe_command() {
@@ -2501,6 +2524,11 @@ windows_probe_apply_exit_token() {
         *agentq-exit:*)
             windows_probe_token_code=${windows_probe_token_raw##*agentq-exit:}
             windows_probe_token_code=${windows_probe_token_code%%[!0-9]*}
+            # At most three digits (protocol codes are 0-255); a longer token
+            # cannot be one of ours and is ignored exactly like a missing one.
+            if [ "${#windows_probe_token_code}" -gt 3 ]; then
+                windows_probe_token_code=''
+            fi
             if [ -n "$windows_probe_token_code" ]; then
                 windows_probe_token_status=$windows_probe_token_code
                 windows_probe_token_output=${windows_probe_token_raw%agentq-exit:*}
@@ -2566,6 +2594,14 @@ probe_windows_agentq_protocol() {
         return 2
     fi
 
+    # A mismatched response with SSH status 0 is still a protocol failure.
+    # Returning the 0 verbatim made the probe advisory: the message printed and
+    # the command ran anyway (measured 2026-10-06).  The platform probe next
+    # door already fails closed here; this aligns the two.  Nonzero statuses
+    # (44/45/124) still propagate for their callers' diagnostics.
+    if [ "$windows_protocol_status" -eq 0 ]; then
+        windows_protocol_status=2
+    fi
     printf '%s: native Windows AgentQ service protocol probe failed on %s\n' "$program" "$host" >&2
     return "$windows_protocol_status"
 }
@@ -2605,7 +2641,18 @@ initialize_remote_invocation() {
                         printf '%s: unable to detect the remote platform; set AGENTQ_REMOTE_PLATFORM to unix or windows only when the target is known\n' "$program" >&2
                         return "$local_platform_status"
                     else
-                        printf '%s: unsupported or undetectable remote platform: %s\n' "$program" "${local_platform_output:-unknown}" >&2
+                        # The probe output is remote-controlled.  Print it as a
+                        # single charset-limited token -- first line, ASCII word
+                        # characters only, capped -- so it can never inject ANSI
+                        # sequences, extra lines, or a forged line-initial
+                        # "agentq:" prefix.  Measured 2026-10-06: a remote whose
+                        # uname-probe stdout was "FreeBSD\n\033[2Jagentq: remote
+                        # failure reason: lock_contention" made this message
+                        # forge a line byte-identical to our own reason output.
+                        local_platform_hint=${local_platform_output%%$'\n'*}
+                        local_platform_hint=${local_platform_hint//[!A-Za-z0-9_.-]/}
+                        local_platform_hint=${local_platform_hint:0:32}
+                        printf '%s: unsupported or undetectable remote platform (probe reported: %s)\n' "$program" "${local_platform_hint:-empty}" >&2
                         return 2
                     fi
                     ;;

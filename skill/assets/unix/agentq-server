@@ -1445,19 +1445,47 @@ maintenance_lock_is_stale() {
 }
 
 recover_stale_maintenance_lock() {
+    local lock_pid=''
+    local lock_identity=''
+
     if ! path_chain_is_safe "$maintenance_lock_directory"; then
         printf '%s: refusing to recover an unsafe AgentQ maintenance lock: %s\n' "$program" "$maintenance_lock_directory" >&2
         return 2
     fi
     if maintenance_lock_is_stale; then
+        # Re-confirm immediately before removing.  Between the staleness
+        # decision above and the removal below another process may have
+        # removed and recreated the lock with a LIVE holder; without the
+        # re-read, the ms-wide window deletes that live lock and both holders
+        # believe they own it (measured 2026-10-06 by widening the window with
+        # a sleep; the installer's recover_stale_maintenance_lock has
+        # re-confirmed since 2026-09-24 and smoke/11 pins it with a stateful
+        # `ps` stub -- this server copy went straight to the removal).
         case "$platform_kind" in
             unix)
+                maintenance_lock_pid_path="$maintenance_lock_directory/pid"
+                if [ -e "$maintenance_lock_pid_path" ] || [ -L "$maintenance_lock_pid_path" ]; then
+                    read_lock_metadata "$maintenance_lock_pid_path" ||
+                        fail "cannot re-read the stale AgentQ maintenance lock metadata: $maintenance_lock_directory"
+                    if ! process_is_confirmed_dead "$lock_pid" "$lock_identity"; then
+                        printf '%s: the AgentQ maintenance lock holder could not be re-confirmed dead; refusing to remove it: %s\n' "$program" "$maintenance_lock_directory" >&2
+                        return 2
+                    fi
+                fi
                 if ! remove_runtime_temporary_file "$maintenance_lock_directory/pid" 'stale maintenance lock metadata'; then
                     fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory"
                 fi
                 rmdir -- "$maintenance_lock_directory" 2>/dev/null || fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory"
                 ;;
             windows)
+                if [ -e "$maintenance_lock_directory" ] && [ ! -L "$maintenance_lock_directory" ]; then
+                    read_lock_metadata "$maintenance_lock_directory" ||
+                        fail "cannot re-read the stale AgentQ maintenance lock metadata: $maintenance_lock_directory"
+                    if ! process_is_confirmed_dead "$lock_pid" "$lock_identity"; then
+                        printf '%s: the AgentQ maintenance lock holder could not be re-confirmed dead; refusing to remove it: %s\n' "$program" "$maintenance_lock_directory" >&2
+                        return 2
+                    fi
+                fi
                 if ! remove_runtime_temporary_file "$maintenance_lock_directory" 'stale maintenance lock'; then
                     fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory"
                 fi
@@ -1996,7 +2024,10 @@ normalize_workdir() {
                 *) fail "working directory must be absolute: $input" ;;
             esac
             [ -d "$input" ] || fail "working directory does not exist: $input"
-            (CDPATH=; cd -- "$input" && pwd -P)
+            # The cd can still fail if the directory vanished since the check;
+            # report it here so the caller's `|| return` never swallows a silent
+            # empty path.
+            (CDPATH=; cd -- "$input" && pwd -P) || fail "cannot resolve the working directory: $input"
             ;;
     esac
 }
@@ -2741,7 +2772,10 @@ prune_runtime_temporary_files() {
         "$runtime_directory"/.agentq-request-records.*.json \
         "$runtime_directory"/.agentq-cancellation-markers.*.json \
         "$runtime_directory"/.agentq-request-tombstones-v2.*.new \
-        "$runtime_directory"/.agentq-request-tombstones-pruned-at.*.new; do
+        "$runtime_directory"/.agentq-request-tombstones-pruned-at.*.new \
+        "$runtime_directory"/.agentq-group.*.json \
+        "$runtime_directory"/.agentq-reconcile-status.*.json \
+        "$runtime_directory"/.agentq-log.*.json; do
         path_chain_is_safe "$temporary_path" ||
             fail "invalid AgentQ runtime temporary file path: $temporary_path"
         [ -f "$temporary_path" ] && [ ! -L "$temporary_path" ] ||
@@ -2771,6 +2805,25 @@ prune_runtime_temporary_files() {
                 ;;
             .agentq-cancellation-markers.*.json)
                 temporary_stem=${temporary_name#.agentq-cancellation-markers.}
+                temporary_stem=${temporary_stem%.json}
+                temporary_pid=${temporary_stem%%.*}
+                ;;
+            # These three prefixes were created but never pruned: a SIGKILL
+            # between creation and removal left them in the runtime directory
+            # forever (measured 2026-10-06: `kill -9` during `logs` left
+            # .agentq-log.*.json in place across later runs).
+            .agentq-group.*.json)
+                temporary_stem=${temporary_name#.agentq-group.}
+                temporary_stem=${temporary_stem%.json}
+                temporary_pid=${temporary_stem%%.*}
+                ;;
+            .agentq-reconcile-status.*.json)
+                temporary_stem=${temporary_name#.agentq-reconcile-status.}
+                temporary_stem=${temporary_stem%.json}
+                temporary_pid=${temporary_stem%%.*}
+                ;;
+            .agentq-log.*.json)
+                temporary_stem=${temporary_name#.agentq-log.}
                 temporary_stem=${temporary_stem%.json}
                 temporary_pid=${temporary_stem%%.*}
                 ;;
@@ -4500,7 +4553,14 @@ submit() {
     is_request_id "$request_id" || fail '--request-id must be 16-128 ASCII letters, numbers, dots, underscores, or hyphens and start with a letter or number'
     [ "$#" -gt 0 ] || fail 'submit requires a command after --'
 
-    normalized_workdir=$(normalize_workdir "$workdir")
+    # normalize_workdir reports through `fail`, which inside the command
+    # substitution ends only the subshell -- the assignment would otherwise
+    # silently yield the empty string, and because with_operation_lock calls
+    # the command in an `if` context errexit is disabled for this whole body,
+    # so nothing downstream would stop the empty path from being persisted and
+    # handed to `pueue add --working-directory`.  Measured on 2026-10-06: an
+    # invalid --workdir printed the rejection and still enqueued with "".
+    normalized_workdir=$(normalize_workdir "$workdir") || return $?
     payload=$(request_payload "$normalized_workdir" "$label" "$@")
     task_label=$(request_task_label "$request_id")
 
@@ -4524,6 +4584,11 @@ submit() {
             fi
             reconcile_accepted_rc=0
             record=$(reconcile_accepted_request "$request_id" "$record") || reconcile_accepted_rc=$?
+            if [ "$reconcile_accepted_rc" -eq 4 ]; then
+                jq -cn --arg request_id "$request_id" '{request_id: $request_id, task_id: null, state: "ambiguous"}'
+                printf '%s: multiple Pueue tasks share the AgentQ label for this request; the server cannot choose safely: %s\n' "$program" "$request_id" >&2
+                return 4
+            fi
             if [ "$reconcile_accepted_rc" -ne 0 ] && [ "$reconcile_accepted_rc" -ne 1 ]; then
                 fail 'cannot inspect Pueue while reconciling an AgentQ request'
             fi
@@ -4562,6 +4627,11 @@ submit() {
 
         find_request_task_rc=0
         task=$(find_request_task "$task_label") || find_request_task_rc=$?
+        if [ "$find_request_task_rc" -eq 4 ]; then
+            jq -cn --arg request_id "$request_id" '{request_id: $request_id, task_id: null, state: "ambiguous"}'
+            printf '%s: multiple Pueue tasks share the AgentQ label for this request; the server cannot choose safely: %s\n' "$program" "$request_id" >&2
+            return 4
+        fi
         if [ "$find_request_task_rc" -ne 0 ] && [ "$find_request_task_rc" -ne 1 ]; then
             fail 'cannot inspect Pueue while reconciling an AgentQ request'
         fi
@@ -4606,6 +4676,11 @@ submit() {
             else
                 find_request_task_rc=0
                 task=$(find_request_task "$task_label") || find_request_task_rc=$?
+                if [ "$find_request_task_rc" -eq 4 ]; then
+                    jq -cn --arg request_id "$request_id" '{request_id: $request_id, task_id: null, state: "ambiguous"}'
+                    printf '%s: multiple Pueue tasks share the AgentQ label for this request; the server cannot choose safely: %s\n' "$program" "$request_id" >&2
+                    return 4
+                fi
                 if [ "$find_request_task_rc" -ne 0 ] && [ "$find_request_task_rc" -ne 1 ]; then
                     fail 'cannot inspect Pueue while reconciling an AgentQ request'
                 fi
@@ -4625,6 +4700,11 @@ submit() {
             pueue_add_status=$?
             find_request_task_rc=0
             task=$(find_request_task "$task_label") || find_request_task_rc=$?
+            if [ "$find_request_task_rc" -eq 4 ]; then
+                jq -cn --arg request_id "$request_id" '{request_id: $request_id, task_id: null, state: "ambiguous"}'
+                printf '%s: multiple Pueue tasks share the AgentQ label for this request; the server cannot choose safely: %s\n' "$program" "$request_id" >&2
+                return 4
+            fi
             if [ "$find_request_task_rc" -ne 0 ] && [ "$find_request_task_rc" -ne 1 ]; then
                 fail 'cannot inspect Pueue while reconciling an AgentQ request'
             fi
@@ -4723,6 +4803,11 @@ lookup() {
         verify_group
         reconcile_accepted_rc=0
         record=$(reconcile_accepted_request "$request_id" "$record") || reconcile_accepted_rc=$?
+        if [ "$reconcile_accepted_rc" -eq 4 ]; then
+            jq -cn --arg request_id "$request_id" '{request_id: $request_id, task_id: null, state: "ambiguous"}'
+            printf '%s: multiple Pueue tasks share the AgentQ label for this request; the server cannot choose safely: %s\n' "$program" "$request_id" >&2
+            return 4
+        fi
         if [ "$reconcile_accepted_rc" -ne 0 ] && [ "$reconcile_accepted_rc" -ne 1 ]; then
             fail 'cannot inspect Pueue while reconciling an AgentQ request'
         fi
@@ -4744,6 +4829,11 @@ lookup() {
         verify_group
         find_request_task_rc=0
         task=$(find_request_task "$(jq -r '.task_label' <<<"$record")") || find_request_task_rc=$?
+        if [ "$find_request_task_rc" -eq 4 ]; then
+            jq -cn --arg request_id "$request_id" '{request_id: $request_id, task_id: null, state: "ambiguous"}'
+            printf '%s: multiple Pueue tasks share the AgentQ label for this request; the server cannot choose safely: %s\n' "$program" "$request_id" >&2
+            return 4
+        fi
         if [ "$find_request_task_rc" -ne 0 ] && [ "$find_request_task_rc" -ne 1 ]; then
             fail 'cannot inspect Pueue while reconciling an AgentQ request'
         fi
@@ -4976,7 +5066,16 @@ cancelled_task_replay() {
     local task_id=$1
     local marker
 
-    marker=$(read_cancellation_marker "$task_id") || return 1
+    # Quiet exploratory read: a corrupt marker must not emit the machine
+    # reason line on a call that goes on to succeed -- `fail` inside the
+    # substitution prints message + reason=protocol_error while the caller
+    # treats the marker as absent (measured 2026-10-06).  The marker is
+    # advisory and the success path overwrites it, so a silent fallback
+    # here is the self-healing direction; the redirect is INSIDE the
+    # substitution because an outer one would not suppress it.  The
+    # fail-closed consumer of a corrupt marker is
+    # remove_cancellation_marker_for_task, which keeps the loud read.
+    marker=$(read_cancellation_marker "$task_id" 2>/dev/null) || return 1
     [ "$(jq -r '.state' <<<"$marker")" = requested ] || return 1
     # Pueue reuses numeric task ids, so a marker alone does not prove that the
     # task being asked about is the one that was cancelled.  Pin it to the same
@@ -5007,10 +5106,25 @@ cancel_task() {
         created_at=$(jq -er '.created_at' <<<"$task")
     else
         cancelled_task_replay "$task_id" && return 0
+        # The task is gone, but a marker may still record that the cancellation
+        # outcome was never confirmed.  "unknown AgentQ task id" would
+        # misattribute that -- the id is known (its record or tombstone is on
+        # disk); what is unresolved is whether the cancel took effect.  Report
+        # the degraded contract instead.  Measured 2026-10-06: a pending marker
+        # left by the failed-kill/failed-remove paths reached exactly this line.
+        if marker=$(read_cancellation_marker "$task_id" 2>/dev/null); then
+            if [ "$(jq -r '.state' <<<"$marker")" = pending ]; then
+                requested_at=$(jq -r '.requested_at' <<<"$marker")
+                jq -cn --argjson task_id "$task_id" --arg requested_at "$requested_at" '{task_id: $task_id, state: "cancellation_pending", cancellation_requested_at: $requested_at}'
+                printf '%s: the task is gone while the cancellation outcome remains unresolved: %s\n' "$program" "$task_id" >&2
+                return 4
+            fi
+        fi
         fail "unknown AgentQ task id: $task_id"
     fi
 
-    if marker=$(read_cancellation_marker "$task_id"); then
+    # Quiet exploratory read; see cancelled_task_replay for why.
+    if marker=$(read_cancellation_marker "$task_id" 2>/dev/null); then
         marker_created_at=$(jq -r '.created_at' <<<"$marker")
         if [ "$marker_created_at" = "$created_at" ]; then
             marker_state=$(jq -r '.state' <<<"$marker")

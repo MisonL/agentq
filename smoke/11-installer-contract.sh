@@ -3,7 +3,7 @@
 # case here must be rejected before the installer writes anything, so the whole
 # check runs against a sandbox HOME and a stub PATH.
 #
-# Why this check exists: assets/unix/install-agentq.sh is 2,755 lines -- the
+# Why this check exists: assets/unix/install-agentq.sh is 2,876 lines -- the
 # largest asset in the repo with no behavioural coverage at all.  Before this
 # file, the only thing that had ever looked at it was 01's `bash -n`.  It is the
 # single biggest hole in the suite, and this session's seven defects were six
@@ -21,7 +21,7 @@
 #     a real install, which is out of scope without explicit authorization.
 #   - anything past `prepare_service_stage` (launchctl/systemctl behaviour).
 #     Reaching it requires a successful binary stage and a service to register.
-#   - Windows.  install-agentq.ps1 is a different 2,881-line asset with a
+#   - Windows.  install-agentq.ps1 is a different 2,922-line asset with a
 #     different failure surface; it is not touched here.
 #   - the hash-mismatch case below proves the installer REJECTS a bad binary; it
 #     does not prove it accepts a good one.
@@ -547,6 +547,35 @@ check_case 'downloaded binary hash mismatch' 'sha256 mismatch for' "$status"
 assert_home_clean 'downloaded binary hash mismatch'
 assert_no_package_manager 'downloaded binary hash mismatch'
 
+# --- a network failure must exit 2 with the installer's attribution ----------
+# curl's own exit code (7 connect, 22 HTTP, 28 timeout) used to be returned
+# verbatim, so a network failure was indistinguishable from the installer's
+# documented "rejected before writing" exit 2, and the message carried no
+# installer prefix.  Measured 2026-10-06 with a curl stub exiting 7; no case
+# before this one made curl itself fail (the stub above writes a bad body and
+# exits 0).
+stub_curl_fail="$work/bin-curl-fail"
+mkdir -p "$stub_curl_fail"
+for entry in "$stub_full"/*; do
+    name=${entry##*/}
+    [ "$name" = curl ] || ln -s "$entry" "$stub_curl_fail/$name"
+done
+cat > "$stub_curl_fail/curl" <<'STUB'
+#!/bin/sh
+printf 'curl: (7) Failed to connect to example.invalid port 443\n' >&2
+exit 7
+STUB
+chmod 700 "$stub_curl_fail/curl"
+status=0
+env HOME="$home" PATH="$stub_curl_fail" \
+    /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+check_case 'download network failure' 'failed to download the AgentQ Pueue binary' "$status"
+if ! grep -qF 'curl exit code 7' "$work/err"; then
+    printf '%s\n' 'installer download-failure case: the message does not carry the curl exit code' >&2
+    failures=$((failures + 1))
+fi
+assert_home_clean 'download network failure'
+
 # --- an existing AgentQ path that is not a directory -------------------------
 # A regular file where the installation root belongs.  installer_path_is_safe
 # only rejects symlinks, so this reaches the is-it-a-directory check; a mutation
@@ -649,9 +678,12 @@ assert_home_clean 'lock liveness cannot be re-confirmed'
 # sibling already guarded both directions; this one did not.
 plist_guard_dir="$work/plist-guard"
 mkdir -p "$plist_guard_dir/assets"
-# An unknown placeholder that no sed rule substitutes, structure otherwise intact
-# (so plutil -lint would still pass -- which is exactly why 01 never saw it).
-sed 's/__AGENTQ_HOME_PARENT__/__AGENTQ_UNKNOWN__/' \
+# An unknown placeholder that no sed rule substitutes, ADDED alongside the three
+# known ones so the template-side pre-check (which requires the known tokens to
+# be present) passes and this direction still exercises the post-render scan.
+# Structure otherwise intact, so plutil -lint would still pass -- which is
+# exactly why 01 never saw it.
+sed 's/__AGENTQ_HOME_PARENT__/__AGENTQ_HOME_PARENT__ __AGENTQ_UNKNOWN__/' \
     "$real_assets/com.agentq.pueued.daemon.plist" > "$plist_guard_dir/assets/com.agentq.pueued.daemon.plist"
 python3 - "$installer_source" > "$plist_guard_dir/run.sh" <<'PY'
 import io, sys
@@ -705,6 +737,24 @@ else
         failures=$((failures + 1))
     elif grep -q '__AGENTQ' "$plist_guard_dir/staged-ok.plist"; then
         printf '%s\n' 'installer retained-placeholder: the real template rendered with a leftover placeholder' >&2
+        failures=$((failures + 1))
+    fi
+    # ...and the third direction, added with the template-side pre-check
+    # (2026-10-06): a placeholder DELETED from the template used to render
+    # "cleanly" into a plist with a missing key -- nothing to replace, nothing
+    # left over, plutil-lint passes.  The pre-check must refuse it.
+    sed 's|__AGENTQ_HOME__|/opt/agentq|' \
+        "$real_assets/com.agentq.pueued.daemon.plist" > "$plist_guard_dir/assets/com.agentq.pueued.daemon.plist"
+    cases=$((cases + 1))
+    missing_status=0
+    /bin/sh "$plist_guard_dir/run.sh" "$plist_guard_dir/assets" "$plist_guard_dir/staged-missing.plist" \
+        >"$work/guard-missing.out" 2>"$work/guard-missing.err" || missing_status=$?
+    if [ "$missing_status" -ne 2 ]; then
+        printf 'installer missing-placeholder: expected exit 2, got %s\n' "$missing_status" >&2
+        failures=$((failures + 1))
+    elif ! grep -qF 'service template is missing the __AGENTQ_HOME__ placeholder' "$work/guard-missing.err"; then
+        printf '%s\n' 'installer missing-placeholder: refused, but not for the missing-placeholder reason' >&2
+        sed 's/^/      /' "$work/guard-missing.err" >&2 || true
         failures=$((failures + 1))
     fi
 fi

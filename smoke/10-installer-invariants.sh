@@ -684,6 +684,64 @@ else
     fi
 fi
 
+# --- K2: the same masking shape in ANY finally of EITHER installer -----------
+# Rule K above pins the one site the client installer was fixed at.  Measured
+# 2026-10-06: the SERVER installer carried four more copies of the identical
+# defect (`Install-PueueConfiguration`, `Install-AgentQLauncher`,
+# `Download-VerifiedPueueBinary`, `Install-StageAsset` each threw unconditionally
+# from `finally`), and rule K's single-function anchor could not see them.  The
+# invariant, generalized: a `finally` block that runs a `Remove-*TemporaryFile`
+# cleanup must not throw unconditionally -- it has to record the cleanup failure
+# into a variable ($cleanupError / $cleanupErrors) or gate the throw on the
+# captured exception ($originalError).  The maintenance-lock release finally is
+# deliberately out of scope: it does not call a Remove-*TemporaryFile helper
+# (rule J owns that shape, and its throw is an accepted trade-off).
+k2_blocks=0
+k2_report=''
+for k2_installer in "$server_installer" "$client_installer"; do
+    k2_out=$(awk '
+        function flush() {
+            if (inblock) {
+                k2_blocks++
+                if (code ~ /Remove-[A-Za-z]*TemporaryFile/ && code ~ /(^|[^A-Za-z])throw / &&
+                    code !~ /\$cleanupError/ && code !~ /\$cleanupErrors/ && code !~ /\$originalError/) {
+                    printf "%s:%d\n", FILENAME, start
+                }
+            }
+            inblock = 0
+        }
+        /\} finally \{/ { flush(); inblock = 1; start = NR; depth = 1; code = ""; next }
+        inblock {
+            line = $0
+            sub(/^[ \t]*#.*$/, "", line)
+            code = code line "\n"
+            opens = gsub(/\{/, "{", line); closes = gsub(/\}/, "}", line)
+            depth += opens - closes
+            if (depth <= 0) flush()
+        }
+        END { flush(); printf "__BLOCKS__%d\n", k2_blocks > "/dev/stderr" }
+    ' "$k2_installer" 2>"/tmp/aq-k2-count.$$")
+    k2_blocks=$(sed -n 's/^__BLOCKS__//p' "/tmp/aq-k2-count.$$")
+    rm -f "/tmp/aq-k2-count.$$"
+    if [ -z "$k2_blocks" ] || [ "$k2_blocks" -eq 0 ]; then
+        fail "$k2_installer" "could not extract any finally block; rule K2 cannot conclude"
+    fi
+    if [ -n "$k2_out" ]; then
+        k2_report="$k2_report$k2_out
+"
+    fi
+done
+if [ -n "$k2_report" ]; then
+    while IFS= read -r k2_line; do
+        [ -n "$k2_line" ] || continue
+        k2_file=${k2_line%:*}
+        k2_lineno=${k2_line##*:}
+        fail "$k2_file" "line $k2_lineno: a finally block throws on cleanup failure without recording it or gating on the captured exception; the throw replaces the in-flight error and masks why the install failed"
+    done <<EOF
+$k2_report
+EOF
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'installer-invariants: %s violation(s)\n' "$failures" >&2
     exit 1
