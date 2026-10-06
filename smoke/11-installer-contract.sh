@@ -243,8 +243,8 @@ check_case() {
 
 # A rejected install must leave the user's home exactly as it found it.  This is
 # the property that makes the whole file safe to run: the installer stages into
-# `$HOME/.<name>.stage.$$` and takes a maintenance lock, so a rejection that
-# forgot to clean either would show up here.
+# a mktemp-named directory under $HOME and takes a maintenance lock, so a
+# rejection that forgot to clean either would show up here.
 home_listing() {
     find "$home" -mindepth 1 2>/dev/null | LC_ALL=C sort
 }
@@ -335,6 +335,30 @@ done
 exec /bin/ps "\$@"
 STUB
 chmod 700 "$stub_identity_gone/ps"
+
+# A PATH that records every mkdir operand together with the pid of the shell
+# that invoked it -- that pid IS the installer's $$ -- and then does the real
+# work.  The staging root is the one temporary whose creation the fixture can
+# reach (the transaction fails later, on the pinned hash), so it is the one
+# place the "is this name derivable from the pid" property can be OBSERVED
+# rather than grepped.
+stub_record_mkdir="$work/bin-record-mkdir"
+mkdir -p "$stub_record_mkdir"
+for entry in "$stub_full"/*; do
+    name=${entry##*/}
+    [ "$name" = mkdir ] || ln -s "$entry" "$stub_record_mkdir/$name"
+done
+real_mkdir=$(readlink "$stub_full/mkdir")
+mkdir_log="$work/mkdir-invocations"
+: >"$mkdir_log"
+cat > "$stub_record_mkdir/mkdir" <<STUB
+#!/bin/sh
+for mkdir_argument in "\$@"; do
+    printf '%s\t%s\n' "\$PPID" "\$mkdir_argument" >> "$mkdir_log"
+done
+exec "$real_mkdir" "\$@"
+STUB
+chmod 700 "$stub_record_mkdir/mkdir"
 
 status=0
 
@@ -681,6 +705,150 @@ else
         failures=$((failures + 1))
     elif grep -q '__AGENTQ' "$plist_guard_dir/staged-ok.plist"; then
         printf '%s\n' 'installer retained-placeholder: the real template rendered with a leftover placeholder' >&2
+        failures=$((failures + 1))
+    fi
+fi
+
+# --- installer temporaries are not named after the pid -----------------------
+# Every temporary the installer creates used to be "${destination}.new.$$" -- a
+# pid-derived name paired with a check-then-write (require_installer_absent_path
+# then a cp or a redirect).  The check closes no window, and the name is
+# guessable by anything that can write to the directory.  They are mktemp names
+# now, and these two cases pin that: the first OBSERVES the staging root's real
+# name, the second is a source rule over every site, because only one temporary
+# is reachable in this offline fixture.
+#
+# The observable case reuses the binary-hash-mismatch run below: that one gets
+# all the way to `mkdir "$stage_home"`, so the shim above records the name the
+# installer actually chose, together with the pid of the shell that ran mkdir
+# -- which is the installer's own $$, since mktemp's command substitution is a
+# subshell of it and `exec`/`$( )` both preserve $$.
+status=0
+env HOME="$home" PATH="$stub_record_mkdir" AGENTQ_PUEUE_SOURCE_DIR="$source_dir" \
+    /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+cases=$((cases + 1))
+# The run must reach the mkdir, or this case silently tests nothing.  It fails
+# later, on the pinned hash -- the same rejection the case below asserts.
+if ! grep -qF 'sha256 mismatch for staged asset' "$work/err"; then
+    printf '%s\n' 'installer temp-name case: the run never reached the staging mkdir' >&2
+    sed 's/^/      /' "$work/err" >&2 || true
+    failures=$((failures + 1))
+else
+    stage_line=$(awk -F'\t' -v home="$home" '$2 ~ "^" home "/\\.[^/]*\\.stage" {print; exit}' "$mkdir_log")
+    if [ -z "$stage_line" ]; then
+        printf '%s\n' 'installer temp-name case: no staging root was recorded' >&2
+        sed 's/^/      /' "$mkdir_log" >&2 || true
+        failures=$((failures + 1))
+    else
+        stage_pid=${stage_line%%	*}
+        stage_path=${stage_line#*	}
+        # The name must not be derivable from the pid.  A suffix equal to the
+        # pid is exactly the old "${prefix}.$$" shape; requiring a random tail
+        # instead of merely "not equal to the pid" keeps this honest for a name
+        # like "stage.1234" where 1234 happens not to be this pid.
+        stage_tail=${stage_path##*.}
+        if [ "$stage_tail" = "$stage_pid" ]; then
+            printf 'installer temp-name case: the staging root is named after the pid: %s\n' \
+                "$stage_path" >&2
+            failures=$((failures + 1))
+        elif [ "${#stage_tail}" -lt 6 ]; then
+            printf 'installer temp-name case: the staging root suffix is too short to be random: %s\n' \
+                "$stage_path" >&2
+            failures=$((failures + 1))
+        fi
+    fi
+fi
+assert_home_clean 'installer temp-name case'
+
+# The source rule, which covers the sites this fixture cannot reach: a variable
+# assignment whose value interpolates $$ AND whose name looks like a path the
+# installer creates.  Both halves are needed.  Matching every "$$" would flag
+# the maintenance lock, where $$ is the lock OWNER recorded in the metadata --
+# correct and unrelated; matching every "stage|backup|temporary" would flag the
+# discard helpers, which only name a path they were handed.  The name pattern is
+# the set of variables those sites actually use.
+#
+# This is a source assertion, and it is here because the observable case above
+# can only see one of the seventeen sites -- the other sixteen need a successful
+# download, a prior installation, or a rollback.  It cannot prove the sites are
+# atomic; that is the behavioural half's job for the one it can reach.
+pid_named_paths=$(grep -nE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*([[:space:]]*=[[:space:]]*[^#]*)?\$\$' "$installer_source" |
+    grep -E 'stage|backup|temporary|failed_home|download|disabled' || true)
+cases=$((cases + 1))
+if [ -n "$pid_named_paths" ]; then
+    printf '%s\n' 'installer temp-name rule: a temporary path is still derived from $$:' >&2
+    printf '%s\n' "$pid_named_paths" | sed 's/^/      /' >&2
+    failures=$((failures + 1))
+fi
+
+# The creating helper is the other half of the fix, and the case above cannot
+# see it: a name that is not pid-derived can still be created by a
+# check-then-write.  So this drives the helper itself, extracted from the asset
+# by anchors the way smoke/22 extracts PowerShell functions, and asserts the
+# one property the whole change rests on -- after the call the file EXISTS,
+# because mktemp created it (O_EXCL) rather than merely naming it.  A mutation
+# that swaps the creating form for `mktemp -u` fails here and nowhere else.
+helper_dir="$work/temp-helper"
+mkdir -p "$helper_dir"
+python3 - "$installer_source" > "$helper_dir/run.sh" <<'PY'
+import io, sys
+src = io.open(sys.argv[1], encoding='utf-8').read()
+start = src.index('create_installer_temporary_file() {')
+end = src.index('\nauthorize_macos_root() {', start)
+block = src[start:end]
+sys.stdout.write('''#!/bin/sh
+set -eu
+program=agentq
+run_as_root() { "$@"; }
+# The helpers guard the directory chain before calling mktemp, so the harness
+# needs the real guard.  Extracted from the asset rather than reimplemented --
+# a hand-written stand-in could accept what the asset rejects.
+''')
+guard_start = src.index('installer_path_is_safe() {')
+guard_end = src.index('\ninstaller_regular_file_is_safe() {', guard_start)
+sys.stdout.write(src[guard_start:guard_end])
+sys.stdout.write('\n')
+sys.stdout.write('''installer_directory_is_safe() {
+    installer_directory_path=$1
+    installer_path_is_safe "$installer_directory_path" || return 1
+    [ -d "$installer_directory_path" ] && [ ! -L "$installer_directory_path" ]
+}
+''')
+sys.stdout.write(block)
+sys.stdout.write('''
+directory=$1
+link=$2
+created=$(create_installer_temporary_file "$directory" '.agentq-probe') || exit 3
+[ -e "$created" ] || { printf 'not created: %s\\n' "$created" >&2; exit 4; }
+[ -f "$created" ] && [ ! -L "$created" ] || { printf 'not a regular file: %s\\n' "$created" >&2; exit 5; }
+second=$(create_installer_temporary_file "$directory" '.agentq-probe') || exit 3
+[ "$second" != "$created" ] || { printf 'repeated name: %s\\n' "$second" >&2; exit 6; }
+reserved=$(create_installer_temporary_name "$directory" '.agentq-probe') || exit 3
+[ ! -e "$reserved" ] || { printf 'name-only form created a file: %s\\n' "$reserved" >&2; exit 7; }
+# The directory guard is load-bearing and would otherwise be untested: mktemp
+# itself only guards the final component.  A symlinked directory must be
+# refused by both forms.
+ln -s "$directory" "$link" 2>/dev/null || true
+if create_installer_temporary_file "$link" '.agentq-probe' >/dev/null 2>&1; then
+    printf 'creating form accepted a symlinked directory\\n' >&2; exit 8
+fi
+if create_installer_temporary_name "$link" '.agentq-probe' >/dev/null 2>&1; then
+    printf 'name-only form accepted a symlinked directory\\n' >&2; exit 9
+fi
+printf 'TEMP-HELPER-OK\\n'
+''')
+PY
+# The extractor must find both helpers, or this case silently tests nothing.
+if ! grep -q 'create_installer_temporary_name' "$helper_dir/run.sh"; then
+    printf '%s\n' 'installer temp-helper case: the helpers were not extracted from the installer' >&2
+    failures=$((failures + 1))
+else
+    cases=$((cases + 1))
+    helper_status=0
+    /bin/sh "$helper_dir/run.sh" "$helper_dir" "$helper_dir-link" >"$work/helper.out" 2>"$work/helper.err" || helper_status=$?
+    if [ "$helper_status" -ne 0 ]; then
+        printf 'installer temp-helper: expected exit 0, got %s\n' "$helper_status" >&2
+        sed 's/^/      /' "$work/helper.err" >&2 || true
         failures=$((failures + 1))
     fi
 fi
