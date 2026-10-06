@@ -14,7 +14,7 @@
 # Every rule in this suite that has survived did so because a check re-runs it
 # (01 parity, 10 A-G); this one had none.
 #
-# The five shapes below are the ones that actually leaked.  Each is calibrated
+# The seven shapes below are the ones that actually leaked.  Each is calibrated
 # in BOTH directions by the self-test before the scan is trusted: every rule is
 # required to fire on the shape it exists for AND stay silent on the
 # placeholders that replaced it.  That self-test runs first and its result gates
@@ -23,7 +23,7 @@
 # helpers and then never called them -- a self-test that cannot fail is the same
 # false green it was written to prevent, so it is wired to the exit path.)
 #
-# What this proves: these five shapes are absent from the scanned text.  What it
+# What this proves: these seven shapes are absent from the scanned text.  What it
 # does not prove: that no other shape carries an address -- a host recorded as
 # "the box in the corner" is invisible to a scanner.  That is a deliberate limit,
 # not an oversight.  This is a content scan and says nothing about behaviour.
@@ -64,6 +64,19 @@ RE_R3='[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+'
 RE_R4='@[A-Za-z0-9-]*[0-9][A-Za-z0-9-]*'
 RE_R5='[0-9]{1,3}(_[0-9]{1,3}){3}'
 RE_R6='[A-Za-z0-9][A-Za-z0-9-]*\.(internal|intranet|lan|corp|localdomain|home)([^A-Za-z0-9.-]|$)'
+# R7  an auto-generated Windows computer name: uppercase letters, a hyphen, an
+#     embedded 8-digit date, trailing letters.  Added 2026-10-06: the C3
+#     write-up put the test VM's computer name into PLAN.md and CHANGELOG.md,
+#     and R1-R6 all missed it -- every one of them needs a dot, an `@`, or an
+#     address shape, and this is a bare token.  The negatives below pin the two
+#     edges: the trailing-letter requirement alone keeps dated release tags out
+#     (RELEASE-20260926), while a synthetic task id (AQAAA-00000000000001)
+#     needs BOTH edges removed before it matches -- measured, not assumed.  It
+#     does NOT cover
+#     account names (arbitrary words, removed by reading -- the way the
+#     2026-09-27 cleanup did it) nor lowercase or dateless bare host names;
+#     those stay inside the boundary the header records.
+RE_R7='[A-Z][A-Z0-9]*-20[0-9]{6}[A-Z][A-Z0-9]*'
 # R1 additionally excludes these, which are fixtures rather than hosts.
 RE_R1_ALLOW='^(127\.|0\.0\.0\.0$)'
 
@@ -111,13 +124,14 @@ first_match() {
     R4) got=$(printf '%s' "$line" | grep -oE "$RE_R4" | head -1 || true) ;;
     R5) got=$(printf '%s' "$line" | grep -oE "$RE_R5" | head -1 || true) ;;
     R6) got=$(printf '%s' "$line" | grep -oE "$RE_R6" | head -1 || true) ;;
+    R7) got=$(printf '%s' "$line" | grep -oE "$RE_R7" | head -1 || true) ;;
     esac
     printf '%s' "$got"
 }
 
-# scan_file <path> -- one `grep -n` per rule, so a file costs 5 forks instead of
-# 5 per line.  The per-rule loop is unrolled rather than looped so the rule name
-# and its regex stay adjacent to the code that uses them.
+# scan_file <path> -- one `grep -n` per rule, so a file costs one fork per rule
+# instead of one per line.  The per-rule loop is unrolled rather than looped so
+# the rule name and its regex stay adjacent to the code that uses them.
 scan_file() {
     local file=$1 hits ln tok
     scanned=$((scanned + 1))
@@ -140,7 +154,7 @@ $hits
 EOF
     fi
 
-    for spec in "R2:$RE_R2" "R3:$RE_R3" "R4:$RE_R4" "R5:$RE_R5" "R6:$RE_R6"; do
+    for spec in "R2:$RE_R2" "R3:$RE_R3" "R4:$RE_R4" "R5:$RE_R5" "R6:$RE_R6" "R7:$RE_R7"; do
         rule=${spec%%:*}
         re=${spec#*:}
         hits=$(grep -nE "$re" "$file" 2>/dev/null || true)
@@ -201,6 +215,14 @@ s_benign=$(printf 'task_id=%s records=%s' 4200 1507407)
 s_internal=$(printf '%s.%s' db01 corp)
 s_internal2=$(printf '%s.%s' jump intranet)
 s_reserved_fqdn=$(printf '%s.%s.%s.%s' web01 corp example com)
+# R7.  Built from fragments like the rest: this file must not contain the shape
+# it hunts.  The negatives decide the rule's edges, and both are shapes this
+# repo actually writes: a synthetic task id (uppercase, hyphen, digits -- but
+# the digits are not a date) and a dated release tag (a date, nothing after it).
+s_machine=$(printf '%s-%s%s' EXMPL 2020 0101ABC)
+s_taskid=$(printf '%s-%s' AQAAA 00000000000001)
+s_datedtag=$(printf '%s-%s' RELEASE 20260926)
+s_lowerdate=$(printf '%s-%s%s' agentq 2026 0926abc)
 
 expect fire   R1 "$s_ipv4"        'a bare IPv4 literal'
 expect silent R1 "$s_loopback"    'loopback (07 sandbox sshd)'
@@ -220,6 +242,10 @@ expect fire   R6 "$s_internal2"   'an intranet FQDN under .intranet'
 expect silent R6 "$s_reserved_fqdn" 'a placeholder FQDN under the reserved .example TLD'
 expect silent R6 "$s_mdns"        'the .local sample (R2 territory, not R6)'
 expect silent R6 "$s_benign"      'unrelated numbers'
+expect fire   R7 "$s_machine"     'a date-stamped computer name'
+expect silent R7 "$s_taskid"      'a synthetic task id (digits are not a date)'
+expect silent R7 "$s_datedtag"    'a dated release tag (nothing after the date)'
+expect silent R7 "$s_lowerdate"   'a lowercase dated file name'
 
 if [ "$selftest_failures" -ne 0 ]; then
     printf 'no-host-identifiers: %s self-test failure(s); the scan below would not have been trustworthy\n' \
@@ -243,15 +269,15 @@ fi
 # (measured: loosening R2 with the gate off was not caught by the R1-only canary).
 canary_file=$(mktemp "${TMPDIR:-/tmp}/agentq-smoke-hostid.XXXXXX")
 trap 'rm -f -- "$canary_file"' EXIT
-printf '%s\n' "$s_ipv4" "$s_mdns" "$s_user_fqdn" "$s_user" "$s_flat" "$s_internal" > "$canary_file"
+printf '%s\n' "$s_ipv4" "$s_mdns" "$s_user_fqdn" "$s_user" "$s_flat" "$s_internal" "$s_machine" > "$canary_file"
 canary_failures_before=$failures
 # The canary is expected to be caught, so its report is noise on a green run;
 # swallow it here.  Only the COUNT matters -- if it is short, the message below
 # says which rules went quiet.
 scan_file "$canary_file" 2>/dev/null
 canary_caught=$((failures - canary_failures_before))
-if [ "$canary_caught" -lt 6 ]; then
-    printf 'no-host-identifiers: canary caught %s of 6 rules -- a rule that no longer fires on its own sample means the scan path is broken for it, regardless of what the self-test says\n' \
+if [ "$canary_caught" -lt 7 ]; then
+    printf 'no-host-identifiers: canary caught %s of 7 rules -- a rule that no longer fires on its own sample means the scan path is broken for it, regardless of what the self-test says\n' \
         "$canary_caught" >&2
     exit 1
 fi
@@ -306,5 +332,5 @@ if [ "$memory_state" != scanned ]; then
     exit 0
 fi
 
-printf 'no-host-identifiers checks passed: files=%s rules=6 selftest=calibrated memory=%s violations=0\n' \
+printf 'no-host-identifiers checks passed: files=%s rules=7 selftest=calibrated memory=%s violations=0\n' \
     "$scanned" "$memory_state"
