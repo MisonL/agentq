@@ -1151,6 +1151,81 @@ require_installer_absent_path() {
         fail "$installer_absent_description already exists or is unsafe: $installer_absent_path"
 }
 
+# Whether $1 can only be written through sudo.  Keyed off the directory itself
+# rather than off platform_kind: on macOS the service destination's parent is
+# root-owned while the wrapper's is the user's own, and one flag per call site
+# would have to be re-derived per platform to get that right.
+installer_directory_needs_elevation() {
+    [ -w "$1" ] || printf 'elevated'
+}
+
+# Create an installer temporary inside $1 and print its path; $2 is the name
+# prefix, $3 non-empty when the directory is only reachable through sudo (the
+# macOS LaunchDaemon directory is root-owned).
+#
+# Two shapes, and the difference is load-bearing.  mktemp without -u CREATES the
+# file (O_EXCL, unguessable suffix) and that is what every site whose content the
+# installer itself writes must use: there is then no name to guess and no gap
+# between "the path is absent" and "the bytes land there".  mktemp -u only PRINTS
+# a name, which is right for the sites whose temporary is a rename target or a
+# directory to mkdir -- those operations are already atomic at the final
+# component, so what they needed was an unpredictable name, not an atomic
+# create.
+#
+# Before this, every one of these paths was "${destination}.new.$$": a name
+# derived from the shell's pid, paired with a check-then-write
+# (require_installer_absent_path, then a cp or a redirect).  The check closed no
+# window -- anything able to create the file between the two steps owned the
+# write.  It also broke installs for no reason at all: a temporary left by a
+# killed install collides with a recycled pid, and the absence check then
+# refuses the next install with "already exists or is unsafe".
+#
+# The directory must be the destination's own directory -- the callers move the
+# result into place, and a rename is only atomic within one filesystem.
+create_installer_temporary_file() {
+    installer_temporary_directory=$1
+    installer_temporary_prefix=$2
+    installer_temporary_elevated=${3:-}
+
+    # mktemp guards the final component only; the directory chain is this
+    # installer's own rule.  The callers used to get it from
+    # require_installer_absent_path (installer_path_is_safe walks every
+    # component), so it belongs here now that the guard is gone.
+    #
+    # Reported with return, not fail: these helpers run inside a command
+    # substitution, where fail's `exit 2` would end only the subshell and hand
+    # the caller an empty string.  The caller's own `|| fail` reports it.
+    installer_directory_is_safe "$installer_temporary_directory" || {
+        printf '%s: temporary directory is unsafe: %s\n' "$program" "$installer_temporary_directory" >&2
+        return 1
+    }
+    if [ -n "$installer_temporary_elevated" ]; then
+        run_as_root mktemp "$installer_temporary_directory/$installer_temporary_prefix.XXXXXX"
+    else
+        mktemp "$installer_temporary_directory/$installer_temporary_prefix.XXXXXX"
+    fi
+}
+
+create_installer_temporary_name() {
+    installer_temporary_name_directory=$1
+    installer_temporary_name_prefix=$2
+    installer_temporary_name_elevated=${3:-}
+
+    installer_directory_is_safe "$installer_temporary_name_directory" || {
+        printf '%s: temporary directory is unsafe: %s\n' "$program" "$installer_temporary_name_directory" >&2
+        return 1
+    }
+    # BSD mktemp -u still opens the template (it creates and unlinks), so it
+    # needs write access to the directory exactly like the creating form does.
+    # That is why the root-owned LaunchDaemon directory needs the elevated form
+    # here too, even though nothing is being created.
+    if [ -n "$installer_temporary_name_elevated" ]; then
+        run_as_root mktemp -u "$installer_temporary_name_directory/$installer_temporary_name_prefix.XXXXXX"
+    else
+        mktemp -u "$installer_temporary_name_directory/$installer_temporary_name_prefix.XXXXXX"
+    fi
+}
+
 authorize_macos_root() {
     [ "$platform_kind" = macos ] || return 0
     [ "$(id -u)" -eq 0 ] && return 0
@@ -1220,7 +1295,10 @@ retire_legacy_macos_service_file() {
     [ "$platform_kind" = macos ] || return 0
     [ "$macos_legacy_plist_existed_before" = true ] || return 0
     [ "$macos_legacy_plist_moved" = false ] || return 0
-    macos_legacy_plist_backup="$legacy_service_path.agentq-disabled.$$"
+    # The prefix keeps the whole original name and randomises only the tail, so
+    # the ".agentq-disabled.*" backup shape SKILL.md documents is unchanged.
+    macos_legacy_plist_backup=$(create_installer_temporary_name "$HOME/Library/LaunchAgents" 'com.agentq.pueued.plist.agentq-disabled') ||
+        fail "failed to reserve the legacy macOS AgentQ LaunchAgent backup path"
     if ! move_installer_file "$legacy_service_path" "$macos_legacy_plist_backup" 'legacy macOS AgentQ LaunchAgent'; then
         fail "failed to disable the legacy macOS AgentQ LaunchAgent: $legacy_service_path"
     fi
@@ -1314,14 +1392,14 @@ download_and_verify() {
     destination=$1
     url=$2
     expected_sha256=$3
-    temporary="${destination}.download.$$"
     destination_parent=$(dirname "$destination")
     download_temporary_identity=''
 
     installer_directory_is_safe "$destination_parent" ||
         fail "download destination parent is unsafe: $destination_parent"
     require_installer_stage_file "$destination" 'download destination path'
-    require_installer_absent_path "$temporary" 'download temporary path'
+    temporary=$(create_installer_temporary_file "$destination_parent" '.agentq-download') ||
+        fail "failed to create the AgentQ download temporary in: $destination_parent"
     download_temporary=$temporary
 
     if curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
@@ -1380,9 +1458,11 @@ stage_verified_binary() {
     installer_directory_is_safe "$destination_parent" ||
         fail "staged binary destination parent is unsafe: $destination_parent"
     require_installer_stage_file "$destination" 'staged binary destination path'
-    binary_temporary="${destination}.new.$$"
+    # Created per branch rather than here: the download fallback below never
+    # touches binary_temporary, and a temporary created eagerly would then be
+    # left behind inside the staging tree with its variable already cleared.
+    binary_temporary=''
     binary_temporary_identity=''
-    require_installer_absent_path "$binary_temporary" 'staged binary temporary path'
     if [ -n "$artifact_source_directory" ]; then
         source_path="$artifact_source_directory/$asset_name"
         installer_path_is_safe "$artifact_source_directory" ||
@@ -1390,6 +1470,8 @@ stage_verified_binary() {
         require_installer_stage_file "$source_path" 'staged binary source path'
         actual_sha256=$(sha256_file "$source_path")
         [ "$actual_sha256" = "$expected_sha256" ] || fail "sha256 mismatch for staged asset: $source_path"
+        binary_temporary=$(create_installer_temporary_file "$destination_parent" '.agentq-binary') ||
+            fail "failed to create the staged binary temporary in: $destination_parent"
         if ! cp "$source_path" "$binary_temporary"; then
             if [ -e "$binary_temporary" ] && [ -f "$binary_temporary" ] &&
                 ! [ -L "$binary_temporary" ]; then
@@ -1427,6 +1509,8 @@ stage_verified_binary() {
         source_path=$existing_path
         actual_sha256=$(sha256_file "$source_path")
         if [ "$actual_sha256" = "$expected_sha256" ]; then
+            binary_temporary=$(create_installer_temporary_file "$destination_parent" '.agentq-binary') ||
+                fail "failed to create the staged binary temporary in: $destination_parent"
             if ! cp "$source_path" "$binary_temporary"; then
                 if [ -e "$binary_temporary" ] && [ -f "$binary_temporary" ] &&
                     ! [ -L "$binary_temporary" ]; then
@@ -1506,9 +1590,8 @@ assert_existing_queue_has_no_active_tasks() {
         fi
     fi
 
-    existing_status_temporary_path="$agentq_home/runtime/.agentq-existing-status.$$"
-    require_installer_absent_path "$existing_status_temporary_path" 'existing status temporary path'
-    existing_status_temporary="$existing_status_temporary_path"
+    existing_status_temporary=$(create_installer_temporary_file "$agentq_home/runtime" '.agentq-existing-status') ||
+        fail "failed to create the AgentQ existing status temporary in: $agentq_home/runtime"
     existing_status_temporary_identity=''
     if "$existing_client" --config "$existing_config" status --json > "$existing_status_temporary" 2>/dev/null; then
         if [ -f "$existing_status_temporary" ] && [ ! -L "$existing_status_temporary" ]; then
@@ -1525,8 +1608,12 @@ assert_existing_queue_has_no_active_tasks() {
         existing_state="$agentq_home/data/state.json.gz"
         [ -f "$existing_state" ] || fail "existing AgentQ daemon is unavailable and its compressed state is missing; refuse to overwrite $agentq_home"
         require_command gzip
-        existing_status_temporary="$existing_status_temporary_path"
-        require_installer_absent_path "$existing_status_temporary" 'existing status temporary path'
+        # A second temporary for the decompressed state.  The first one was just
+        # discarded, so this is the same pattern rather than a reuse: gzip
+        # truncates whatever it is given, and a reused path would leave a window
+        # between the discard and the redirect.
+        existing_status_temporary=$(create_installer_temporary_file "$agentq_home/runtime" '.agentq-existing-status') ||
+            fail "failed to create the AgentQ existing status temporary in: $agentq_home/runtime"
         if ! gzip -cd -- "$existing_state" > "$existing_status_temporary"; then
             if [ -f "$existing_status_temporary" ] && [ ! -L "$existing_status_temporary" ]; then
                 existing_status_temporary_identity=$(installer_file_identity "$existing_status_temporary") || true
@@ -1625,16 +1712,16 @@ prepare_service_stage() {
     case "$platform_kind" in
         linux)
             service_destination="$HOME/.config/systemd/user/agentq-pueued.service"
-            service_stage="$agentq_parent/.${agentq_base}.service.stage.$$"
-            require_installer_absent_path "$service_stage" 'service staging path'
+            service_stage=$(create_installer_temporary_file "$agentq_parent" '.agentq-service.stage') ||
+                fail "failed to create the AgentQ service staging path in: $agentq_parent"
             cp "$asset_directory/agentq-pueued.service" "$service_stage"
             chmod 600 "$service_stage"
             require_installer_stage_file "$service_stage" 'service staging path'
             ;;
         macos)
             service_destination="$macos_system_service_directory/com.agentq.pueued.plist"
-            service_stage="$agentq_parent/.${agentq_base}.plist.stage.$$"
-            require_installer_absent_path "$service_stage" 'service staging path'
+            service_stage=$(create_installer_temporary_file "$agentq_parent" '.agentq-plist.stage') ||
+                fail "failed to create the AgentQ service staging path in: $agentq_parent"
             escaped_home=$(printf '%s' "$agentq_home" | sed 's/[\\&|]/\\&/g')
             escaped_user=$(printf '%s' "$(id -un)" | sed 's/[\\&|]/\\&/g')
             escaped_home_parent=$(printf '%s' "$HOME" | sed 's/[\\&|]/\\&/g')
@@ -1745,9 +1832,8 @@ start_managed_daemon() {
 }
 
 verify_health_status() {
-    health_temporary_path="$agentq_home/runtime/.agentq-health-status.$$"
-    require_installer_absent_path "$health_temporary_path" 'health status temporary path'
-    health_temporary="$health_temporary_path"
+    health_temporary=$(create_installer_temporary_file "$agentq_home/runtime" '.agentq-health-status') ||
+        fail "failed to create the AgentQ health status temporary in: $agentq_home/runtime"
     health_temporary_identity=''
 
     if ! "$agentq_home/pueue" --config "$agentq_home/config/pueue.yml" status --json > "$health_temporary"; then
@@ -1767,9 +1853,8 @@ verify_health_status() {
 }
 
 ensure_agentq_group() {
-    group_temporary_path="$agentq_home/runtime/.agentq-group-status.$$"
-    require_installer_absent_path "$group_temporary_path" 'group status temporary path'
-    group_temporary="$group_temporary_path"
+    group_temporary=$(create_installer_temporary_file "$agentq_home/runtime" '.agentq-group-status') ||
+        fail "failed to create the AgentQ group status temporary in: $agentq_home/runtime"
     group_temporary_identity=''
 
     if "$agentq_home/pueue" --config "$agentq_home/config/pueue.yml" group --json > "$group_temporary"; then
@@ -1811,7 +1896,9 @@ replace_service_file() {
     require_installer_stage_file "$service_stage" 'service staging path'
     require_installer_stage_file "$service_destination" 'service destination path'
     if [ -e "$service_destination" ] || [ -L "$service_destination" ]; then
-        service_backup="${service_destination}.agentq-backup.$$"
+        service_backup=$(create_installer_temporary_name "$service_parent_directory" '.agentq-service-backup' \
+            "$(installer_directory_needs_elevation "$service_parent_directory")") ||
+            fail "failed to reserve the AgentQ service backup path in: $service_parent_directory"
         service_backup_identity=''
         require_installer_absent_path "$service_backup" 'service backup path'
         if [ "$platform_kind" = macos ]; then
@@ -1840,9 +1927,9 @@ replace_service_file() {
         previous_service=true
     fi
 
-    service_temporary_path="${service_destination}.new.$$"
-    require_installer_absent_path "$service_temporary_path" 'service temporary path'
-    service_temporary="$service_temporary_path"
+    service_temporary=$(create_installer_temporary_file "$service_parent_directory" '.agentq-service' \
+        "$(installer_directory_needs_elevation "$service_parent_directory")") ||
+        fail "failed to create the AgentQ service temporary in: $service_parent_directory"
     service_temporary_identity=''
     installer_path_is_safe "$service_parent_directory" ||
         fail "service destination parent is unsafe: $service_parent_directory"
@@ -1907,7 +1994,8 @@ replace_wrapper() {
     require_installer_stage_file "$wrapper_destination" 'wrapper destination path'
 
     if [ -e "$wrapper_destination" ] || [ -L "$wrapper_destination" ]; then
-        wrapper_backup="${wrapper_destination}.agentq-backup.$$"
+        wrapper_backup=$(create_installer_temporary_name "$wrapper_parent_directory" '.agentq-wrapper-backup') ||
+            fail "failed to reserve the AgentQ wrapper backup path in: $wrapper_parent_directory"
         wrapper_backup_identity=''
         require_installer_absent_path "$wrapper_backup" 'wrapper backup path'
         if ! mv -- "$wrapper_destination" "$wrapper_backup"; then
@@ -1926,9 +2014,8 @@ replace_wrapper() {
         previous_wrapper=true
     fi
 
-    wrapper_temporary_path="${wrapper_destination}.new.$$"
-    require_installer_absent_path "$wrapper_temporary_path" 'wrapper temporary path'
-    wrapper_temporary="$wrapper_temporary_path"
+    wrapper_temporary=$(create_installer_temporary_file "$wrapper_parent_directory" '.agentq-wrapper') ||
+        fail "failed to create the AgentQ wrapper temporary in: $wrapper_parent_directory"
     wrapper_temporary_identity=''
     installer_path_is_safe "$wrapper_parent_directory" ||
         fail "wrapper destination parent is unsafe: $wrapper_parent_directory"
@@ -1963,17 +2050,25 @@ restore_service_file() {
     [ "$service_replaced" = true ] || [ "$previous_service" = true ] || return 0
     installer_path_is_safe "$service_destination" || return 1
     installer_regular_file_is_safe "$service_destination" || return 1
-    service_restore_temporary_path="${service_destination}.new.$$"
-    installer_path_is_safe "$service_restore_temporary_path" || return 1
-    installer_regular_file_is_safe "$service_restore_temporary_path" || return 1
-    if [ -n "$service_restore_temporary" ]; then
-        [ "$service_restore_temporary" = "$service_restore_temporary_path" ] || return 1
-    else
-        service_restore_temporary="$service_restore_temporary_path"
-        if [ -e "$service_restore_temporary" ] || [ -L "$service_restore_temporary" ]; then
-            service_restore_temporary_identity=$(installer_file_identity "$service_restore_temporary") || return 1
+    # The replacement's temporary used to be recomputed here from the pid
+    # ("${service_destination}.new.$$", the same name replace_service_file
+    # chose).  Its name is mktemp's now, so the variable that holds it is the
+    # only handle -- and an empty value means the replacement never created one
+    # or already moved it into place, which is exactly when there is nothing
+    # here to clean up.
+    service_restore_temporary_path="$service_temporary"
+    if [ -n "$service_restore_temporary_path" ]; then
+        installer_path_is_safe "$service_restore_temporary_path" || return 1
+        installer_regular_file_is_safe "$service_restore_temporary_path" || return 1
+        if [ -n "$service_restore_temporary" ]; then
+            [ "$service_restore_temporary" = "$service_restore_temporary_path" ] || return 1
         else
-            service_restore_temporary_identity=''
+            service_restore_temporary="$service_restore_temporary_path"
+            if [ -e "$service_restore_temporary" ] || [ -L "$service_restore_temporary" ]; then
+                service_restore_temporary_identity=$(installer_file_identity "$service_restore_temporary") || return 1
+            else
+                service_restore_temporary_identity=''
+            fi
         fi
     fi
     if [ "$previous_service" = true ]; then
@@ -2035,17 +2130,22 @@ restore_wrapper() {
     [ "$wrapper_replaced" = true ] || [ "$previous_wrapper" = true ] || return 0
     installer_path_is_safe "$wrapper_destination" || return 1
     installer_regular_file_is_safe "$wrapper_destination" || return 1
-    wrapper_restore_temporary_path="${wrapper_destination}.new.$$"
-    installer_path_is_safe "$wrapper_restore_temporary_path" || return 1
-    installer_regular_file_is_safe "$wrapper_restore_temporary_path" || return 1
-    if [ -n "$wrapper_restore_temporary" ]; then
-        [ "$wrapper_restore_temporary" = "$wrapper_restore_temporary_path" ] || return 1
-    else
-        wrapper_restore_temporary="$wrapper_restore_temporary_path"
-        if [ -e "$wrapper_restore_temporary" ] || [ -L "$wrapper_restore_temporary" ]; then
-            wrapper_restore_temporary_identity=$(installer_file_identity "$wrapper_restore_temporary") || return 1
+    # Same as restore_service_file: the temporary's name is the one
+    # replace_wrapper chose, so it is read from that variable rather than
+    # recomputed.
+    wrapper_restore_temporary_path="$wrapper_temporary"
+    if [ -n "$wrapper_restore_temporary_path" ]; then
+        installer_path_is_safe "$wrapper_restore_temporary_path" || return 1
+        installer_regular_file_is_safe "$wrapper_restore_temporary_path" || return 1
+        if [ -n "$wrapper_restore_temporary" ]; then
+            [ "$wrapper_restore_temporary" = "$wrapper_restore_temporary_path" ] || return 1
         else
-            wrapper_restore_temporary_identity=''
+            wrapper_restore_temporary="$wrapper_restore_temporary_path"
+            if [ -e "$wrapper_restore_temporary" ] || [ -L "$wrapper_restore_temporary" ]; then
+                wrapper_restore_temporary_identity=$(installer_file_identity "$wrapper_restore_temporary") || return 1
+            else
+                wrapper_restore_temporary_identity=''
+            fi
         fi
     fi
     if [ "$previous_wrapper" = true ]; then
@@ -2598,7 +2698,7 @@ ensure_dependency perl perl
 if [ -z "$artifact_source_directory" ]; then
     ensure_dependency curl curl
 fi
-for required_command in awk cp chmod date find grep mkdir mv ps rm sed stat tail tr; do
+for required_command in awk cp chmod date find grep mkdir mktemp mv ps rm sed stat tail tr; do
     require_command "$required_command"
 done
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
@@ -2633,9 +2733,16 @@ assert_existing_queue_has_no_active_tasks
 if [ "$previous_install" = false ] && { [ -e "$wrapper_destination" ] || [ -L "$wrapper_destination" ]; }; then
     fail "refuse to overwrite an existing wrapper without an AgentQ installation: $wrapper_destination"
 fi
-stage_home="$agentq_parent/.${agentq_base}.stage.$$"
-backup_home="$agentq_parent/.${agentq_base}.backup.$$"
-failed_home="$agentq_parent/.${agentq_base}.failed.$$"
+# All three are created by a later operation -- mkdir for the staging root, and
+# a rename for the other two -- and each of those already fails rather than
+# reusing whatever is at the final component, so an unpredictable name is all
+# these need.
+stage_home=$(create_installer_temporary_name "$agentq_parent" ".${agentq_base}.stage") ||
+    fail "failed to reserve the AgentQ staging path in: $agentq_parent"
+backup_home=$(create_installer_temporary_name "$agentq_parent" ".${agentq_base}.backup") ||
+    fail "failed to reserve the AgentQ backup path in: $agentq_parent"
+failed_home=$(create_installer_temporary_name "$agentq_parent" ".${agentq_base}.failed") ||
+    fail "failed to reserve the AgentQ failed-installation path in: $agentq_parent"
 require_installer_absent_path "$stage_home" 'staging path'
 require_installer_absent_path "$backup_home" 'backup path'
 require_installer_absent_path "$failed_home" 'failed-installation path'
