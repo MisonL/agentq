@@ -185,7 +185,7 @@ C1 在主机 A 上实测。**先说清一个我最初搞错的框架**：Windows
 **全部退 0**；而失败/状态路径失真——`lookup` 对 not_found **返回了正确的
 `{"state":"not_found"}` 却退 1**（应退 3）、`lookup` 对 removed 应退 5 却退 **1**、
 `logs`/`remove` 对未知 id 应退 2 却退 **1**。**根因定位到行**：`run_operation_ssh`
-直接取 `$?` 作为远端退出码（`assets/client/unix/agentq:977-987`），**没有**任何
+直接取 `$?` 作为远端退出码（`skill/assets/client/unix/agentq` 的 `run_operation_ssh`；该函数现于 1002 行起，行号按本仓规矩不再引用），**没有**任何
 带外 token——`agentq-exit` 只加在**探针**路径（`windows_probe_apply_exit_token`），
 所以探针能工作、操作路径不能。这**确认**了本节此前的判断（「客户端依赖 `3/4/5/6`
 做恢复判定」），并把「未验证」升级为「真机实测的缺陷」。
@@ -761,7 +761,7 @@ fleet 表），此前写成「下落不明」是我没查就说话，已更正�
 
 **A15（撤销）：不是新发现，`SKILL.md` 早有记录。** 我 2026-09-26 在 macOS 全新安装时
 "发现"了「无 tty 时安装器必然失败」，并重新推导出绕过办法（`sudo` 包装强制 `-A` +
-`SUDO_ASKPASS`）——**但 `SKILL.md` 第 64 行早就写着这件事**，连代码模板、`env_reset`
+`SUDO_ASKPASS`）——**但 `SKILL.md` 的「非交互会话里装 macOS/Linux 服务端」一段早就写着这件事**，连代码模板、`env_reset`
 会清掉 `SUDO_ASKPASS` 的解释、以及「装完立即删除 askpass（含明文密码）」的告警都在。
 更直接的反证：`PLAN.md` 自己记着 2026-09-24 那次主机 C 重装**就是**用这个包装做的。
 **根因是我没先读 `SKILL.md` 就上手试**，浪费了十几轮去重新发现已记录的东西。
@@ -1174,8 +1174,8 @@ VM 名；**其中原账户名早在 2026-09-29 就已进仓**（`C:\Users\<账�
 git 历史里（`d9a0957` 引入计算机名与账户名，`63c6061` 基线提交里已有 2026-09-29 那个账户名），
 经用户授权后用 `git filter-repo --replace-text` 从全部 22 个提交的 blob 中替换掉——逐提交扫描
 零命中、旧对象不可达、工作树与改写前镜像备份逐字节相同（repack 也清掉了库里的不可达对象，
-包括第四节 B1 提到的 2026-09-29 恢复用孤儿提交——它本就不可达、任何一次 `gc` 都会清掉，
-镜像备份里仍可 `git show` 到）；**所有提交哈希因此改变**，本文件的
+包括第四节 B1 提到的 2026-09-29 恢复用孤儿提交——它本就不可达、任何一次 `gc` 都会清掉；
+改写前的镜像备份本身也已按用户要求于同日清理删除，故该孤儿对象现已无处可取）；**所有提交哈希因此改变**，本文件的
 哈希引用已刷新（`0d29338`→`d9a0957`、`31d83f3`→`63c6061`、`d7220c5`→`0bb95d0`）。
 
 ### B4. 覆盖债的第一刀砍哪
@@ -1604,27 +1604,30 @@ pwsh 7.5（引号处理正确，故不复现）。有真机时应补一次直接
 
 ### A23. `wait_reconcile_missing_task` 看似能复用 `load_request_records` —— **否掉，不改**（2026-10-03）
 
+**（2026-10-06 注：本节原先给 `agentq-server` 的函数标了行号，A25/A26 的折叠让它们全部漂移；
+按本仓对无类型 shell 的既有规矩（见 A12）已全部移除，锚点只留函数名。）**
+
 **起因**：本轮补 `smoke/26`（`lookup`/`wait` 的记录读取路径）时注意到，
-`wait_reconcile_missing_task`（`agentq-server:3659`）自己逐文件扫描 `*.json`，
+`wait_reconcile_missing_task`自己逐文件扫描 `*.json`，
 每条记录经 `read_request_record_state_and_body` 调一次 jq，而同文件里早已有聚合加载器
-`load_request_records`（`2280`）——正是 2026-09-30 那次优化（每 record jq 4.05 → 1.05）动过的。
+`load_request_records`——正是 2026-09-30 那次优化（每 record jq 4.05 → 1.05）动过的。
 按 A9/A19 的教训，同一机制抄在多处、只在一处设防，所以看上去是个明显的重复。
 
 **但复用并非行为等价，所以不改。** 两个读取器的判据在 `removed` 这个状态上分岔：
 
 | 读取器 | 判据 | 对 `removed` 记录 |
 | --- | --- | --- |
-| `wait` 逐条扫描 → `read_request_record_state_and_body`（`2445`） | `request_record_filter`（`2144`）**接受** `removed` | 接受，随后 `case` 只匹配 `accepted\|removing`，**跳过** |
-| `load_request_records` → 聚合 | `request_records_filter`（`2218`）的 `valid_request` 只接受 `prepared\|adding\|accepted\|removing`——**排除** `removed` | 整批 `error("invalid AgentQ request record")` → `exit 2` |
+| `wait` 逐条扫描 → `read_request_record_state_and_body` | `request_record_filter`**接受** `removed` | 接受，随后 `case` 只匹配 `accepted\|removing`，**跳过** |
+| `load_request_records` → 聚合 | `request_records_filter`的 `valid_request` 只接受 `prepared\|adding\|accepted\|removing`——**排除** `removed` | 整批 `error("invalid AgentQ request record")` → `exit 2` |
 
 即换成聚合加载器会把 crash-window 状态（本仓最在意的那个状态）从「跳过」变成**致命 exit 2**。
 这正是 `CLAUDE.md` 记的「两处规则不等价，删任何一个都改变行为，而这是安全路径，**不要为提速顺手改**」
 的又一实例。**故保持现状**，并把这个判据差写进 `smoke/26` 的注释，让下一个人不必重推一遍。
 
 **顺带坐实的一处既有重复（非缺陷，仅记录）**：`lookup` 的 `state==removed` 分支
-（`4470`）自己调 `archive_removed_request`，而 `acquire_operation_lock` 会先跑
+自己调 `archive_removed_request`，而 `acquire_operation_lock` 会先跑
 `ensure_request_record_layout → migrate_removed_request_records → repair_removed_request_records`
-（`agentq-server:1627`），后者**自己就归档 `removed` 记录**——所以 lookup 那次调用当前**冗余**。
+，后者**自己就归档 `removed` 记录**——所以 lookup 那次调用当前**冗余**。
 实测：树里放一条 `removed` 记录 + 墓碑，跑 `lookup` 记录数 1→0、墓碑 0→1；把 lookup 的
 `archive_removed_request` 调用去掉（变异 M2），输出与 counts **完全不变**。
 两处归档**语义一致**（都调同一个 `archive_removed_request`），所以不构成正确性缺陷，
@@ -1836,6 +1839,93 @@ M3 把 fixture 到不了的 `health_temporary` 退回 `$$` → **只有 ② 报*
 
 ---
 
+### A28. 七维度全场景审查（2026-10-06，用户指示「使用 agents 全维度全场景审查」）—— **已执行，4 个真实缺陷 + 1 个 P0 级 fail-open 已修**
+
+做法沿用 C5 先例：7 个互不知情的只读审查者各包一个维度——服务端、POSIX 客户端、
+Windows/PowerShell 资产、四个安装器、测试套件、文档一致性、凭据与安全；另派一个
+补漏审查者专查「长期未被执行的检查」（`03` 余项、`04`、`06`、`08`、`09`、`13`、
+`19`–`25`）。**每一条高影响结论都由我本人对代码或实测复核后才动手**——照单采信
+agent 结论会凭空造出不存在的 P0，本轮确实有 5 条被复核推翻（见下）。
+
+#### 已修（每条都有变异证明能红的回归锁）
+
+1. **探针的退出码改写是 fail-open（两个客户端，最高影响）**。A5 的改写把探针体里的
+   `exit N` 替换成**赋值** `$agentqProbeExit = N`，而赋值不终止执行：探针体是顺序
+   `if`（不是 if/else 链），「缺 launcher」的失败分支一路穿透到末尾**无条件**写出的
+   `...-ready`，token 被最后一个赋值覆盖——客户端把「没装」报成「probe failed」，
+   42/43 两个诊断分支不可达。两侧都已改为失败点
+   `[Console]::Out.Write("agentq-exit:N"); exit N`。`smoke/12` 新增两条**行为级**用例，
+   驱动**资产自己的**探针体与改写（回退任一侧即红）。
+2. **同族的四条通道纪律**：token 限 **1–3 位数字**（超长 token 让 POSIX 侧 `return`
+   失败、在条件上下文里被读成成功——fail-open）；**远端探针输出过滤成单 token 再进
+   消息**（首行 + `[A-Za-z0-9_.-]` + 截断——原样回显时远端可用
+   `FreeBSD\n\033[2Jagentq: remote failure reason: ...` 伪造出与客户端自身逐字同形的
+   诊断行）；**捕获文件读取 BOM 感知**（PS 5.1 的 `2>` 与 `1>` 同机制产出带 BOM 的
+   UTF-16LE；UTF-8-only 读取器在真 5.1 上丢 token——两个 PS 客户端的
+   `Get-FileTextOrEmpty` 已改，`smoke/12` 用 UTF-16LE+BOM 夹具钉住）。**待真机**：
+   `2>` 是否真为 UTF-16LE——若否本项降级为非 ASCII mojibake 边界，修复对两种结果
+   都成立。
+3. **服务端 C1：`submit --workdir` 的校验没被接住（fail-open）**。`normalize_workdir`
+   用 `fail` 报错而被 `$( )` 调用（`exit 2` 只终止子 shell），且 `with_operation_lock`
+   用 `if "$@"` 调命令体（条件上下文里 `set -e` 全程失效）——无效 `--workdir` 打出
+   拒绝消息后**照常继续**，以 `"workdir":""` 落盘并把空 `--working-directory` 交给
+   `pueue add`。调用点已改为 `... || return $?`。`smoke/27` S6 钉住（变异：删守卫 →
+   `expected exit 2, got 4` 并打印出落盘的坏记录）。
+4. **rc=4 被六处调用点折叠成 exit 2**：多任务共用同一 AgentQ 标签时
+   `find_request_task` 返回 4（必须停止），六处把它折叠成「cannot inspect Pueue」退 2
+   （可重试语义）。已改为 4/`ambiguous`；`smoke/26` W6 钉住（3381/3440 两处本就正确
+   传播，刻意不动）。
+5. **pending marker 退 2 而非 4**：任务已从 Pueue 消失、cancellation marker 为
+   `pending` 时曾退 2 `unknown AgentQ task id`——id 是已知的，未知的是取消是否生效。
+   现为 4/`cancellation_pending`；`smoke/27` C4 钉住。
+6. **损坏的 cancellation marker 在成功调用上打 `reason=protocol_error`**：探索性读取
+   改为静默回退；fail-closed 的消费者 `remove_cancellation_marker_for_task` 保持响亮。
+7. **维护锁的陈旧恢复补上再确认**（先判死、再读一次、再判死，才删除——毫秒窗口内
+   可能删掉并发进程刚建好的活锁）。安装器自 2026-09-24 就有这一守卫，服务端一直缺。
+8. **POSIX 安装器三处**：下载失败报 `curl exit code N` + URL（原先只有一句「failed to
+   download」）；锁创建失败与锁竞争用不同消息；`required_command` 补 `dirname head id
+   rmdir wc`；渲染前先做模板占位符预检（缺 token 立即拒绝，而非渲染出半成品）。
+   `smoke/11` 20 → 22 例（失败 curl 桩 + 缺占位符第三方向）。
+9. **`install-agentq.ps1` 四处 `finally` 可能替换在途异常**（与规则 J/K 同病）——改为
+   同文件的 `$operationError`/`$cleanupError` 合并写法。`smoke/10` 新增规则 **K2**
+   （按括号深度扫描两个安装器的每个 `finally`；变异还原一处 → 被抓）。
+10. **服务端临时文件清理的 glob 漏三种后缀**（`.agentq-group`/`.agentq-reconcile-status`/
+    `.agentq-log`）——陈旧临时文件永不回收；补上解析分支。
+11. **测试套件自身的六处缺陷**（都是「绿灯但没测到东西」类）：`16` 加「树扫描到 0 个
+    文件即 FAIL」（空目录曾报 `files=17 violations=0` 退 0——17 全来自记忆目录）；
+    `03` 比较时间戳前先断言 `cancellation_requested_at` 存在（两侧同缺时 `null == null`
+    曾恒真通过）；`06`/`23` 常量读取加 `|| true`（常量改名时 `pipefail` 在设计好的
+    回退之前中止、零输出退 1）；`07` 失败任务的 `wait` 从「非 0」收紧为 **`-eq 1`**
+    （沙箱实测 `{"Failed":7}` → exit 1）；`08` 的 walker 补 `--args/--jsonargs` 建模
+    （其后的位置参数是字符串不是文件，服务端 `request_payload` 正是这种形态，旧
+    walker 会对真实提交误报）；`17` 删掉从未被调用、参数还会翻倍的死 `run_client`。
+12. **`smoke/05` 的四个 Windows 桩改为按 stdin 判别探针**（此前平台/协议两个探针
+    在桩里不可区分）；`env`/`cred` 计数改为运行时统计（摘要 `env=15 cred=4`）。
+13. **`.gitignore`**：askpass 模式收窄 + 补 `*.env`/`*.ppk`/`.git-credentials`/
+    `.netrc`/`authorized_keys`/`known_hosts`。
+14. **文档**：`SKILL.md` 的「已消费」措辞修正（tombstone 可重复读）；`CLAUDE.md` 覆盖
+    表 12 行更新 + 新增两段持久规则（探针 token 纪律；服务端 `$( )` 校验纪律）；
+    `PLAN.md`/`HANDOFF.md` 行数与前文修正。
+
+#### 复核后推翻（agent 结论，本人实测否定，未改代码）
+
+- `mktemp -d` 的 0700 权限是**定义行为**，不是缺陷；
+- `.gitignore` 对 `id_ecdsa` 的覆盖是**完整的**（agent 漏看了模式）；
+- zsh nomatch 假设被该 agent **自己**的实验推翻；
+- 安全维度的 I2 与「sshp `--check` 会安装」两条经复核不成立。
+
+#### 记录在案、未修（如实边界）
+
+- 安装器 **W4**：客户端两件套（`agentq`/`sshp`）非成对原子安装——崩在中间会留下
+  半新半旧的一对；修它要引入目录级 staging，属设计变更，留作待定。
+- **W5**、服务端 **I2**、Windows `$PID` 命名、安全 **W1**（文档限定）/ **W2**（边界）、
+  `sshp --check` 语义——均记录在审查输出，不构成本轮修改。
+- 本机 `~/.local/bin/agentq` 是 2026-09-06 装出的旧版本，与仓库资产**不同**——它是
+  本机既有的陈旧部署，不是仓库缺陷；提醒过即可，动它需要授权。
+- **真机实验待授权**：PS 5.1 的 `2>` 重定向是否真产出 UTF-16LE+BOM（与 `1>` 同形）。
+
+---
+
 ## 五、C 类：需要你给范围
 
 这些我无法自己划定边界，需要你明确主机、用户、工作目录、恢复方式和副作用授权。
@@ -1977,7 +2067,7 @@ SSH 走 **2222** 端口
    安装器是否真的能装——那仍需真机。
 
 5. **`01` 只证明能解析，不证明任何分支的行为正确。** `skill/assets/unix/agentq-server`
-   是 **4,937** 行无类型 shell：没有编译器、没有类型系统。（**2026-09-29 起有 git**，
+   是 **5,181** 行无类型 shell：没有编译器、没有类型系统。（**2026-09-29 起有 git**，
    但版本控制不改变这一条——它给的是「改了什么」，不是「改对了没有」。）改它时把
    这一点计入风险。
 
@@ -2077,6 +2167,15 @@ helper **在本文件中确有定义**、规则 F 从「前缀式」收紧为**�
 `6`/`unavailable` 分支，此前无任何用例直达——`04` 走的是另一条路径）。
 另修正一批文档失准（分母、百分比、检查计数、`SKILL.md` 把已修缺陷写成「已知」、
 `PLAN.md` 五处仍说主机 C 缺凭据、Windows 缺陷数「三个」实为四个）。
+
+**A28 七维度审查已执行（2026-10-06，用户指示「使用 agents 全维度全场景审查」）**：
+7 个互不知情的只读审查者（服务端 / POSIX 客户端 / Windows 资产 / 四个安装器 / 测试
+套件 / 文档一致性 / 凭据安全）+ 1 个补漏审查者（专查长期未执行的检查）。每条高影响
+结论都由本人复核后才动手；**复核推翻了 5 条 agent 结论**（`mktemp -d` 0700、`id_ecdsa`
+覆盖、zsh nomatch、安全 I2、sshp `--check`）。**修掉 1 个 P0 级 fail-open（两个客户端
+的探针退出码改写把 `exit` 变成了赋值）+ 服务端 C1 workdir fail-open + rc4 折叠 +
+pending marker + 同族四条通道纪律 + 安装器 8 处（POSIX 4 + PS 4 个 `finally`）
++ 服务端清理 glob + 套件自身 6 处**，全部配变异证明能红的回归锁。详见 A28。
 
 **C2 容器矩阵已执行（2026-09-25）**：本仓**首次跑通 Linux 成功路径**（真实 systemd + 真实
 logind + 真实二进制走内置 SHA 校验，`INSTALLER_EXIT=0`、零残留），外加真实 Linux 协议端到端、
@@ -2185,7 +2284,7 @@ logind + 真实二进制走内置 SHA 校验，`INSTALLER_EXIT=0`、零残留）
   **任何真实远端仍是零覆盖**——桩证明的是 sshp **发出什么**；交互会话本体、
   Windows 路径、远端安装路径都未覆盖（见 `smoke/19` 头注释的边界清单）。
 
-`client/windows/sshp.ps1`（1,114 行）**不再属于「从未被执行过」那一类**：`smoke/20`
+`client/windows/sshp.ps1`（1,125 行，2026-10-06 按当前字节重算）**不再属于「从未被执行过」那一类**：`smoke/20`
 （2026-10-02）在 pwsh 里真跑它 `--check`、捕获它实际发给 ssh 的 argv 并断言往返。
 但要说准：那是**一条路径**的断言（脚本怎么交给 ssh），不是它的本地契约——
 它的参数校验、会话建立、Windows 路径仍未覆盖。

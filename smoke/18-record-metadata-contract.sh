@@ -255,7 +255,9 @@ expect_refused nocreated 'invalid AgentQ request record'
 assert_jq_diagnostics nocreated 1
 
 # 7. An illegal request-id filename (too short for the documented shape).
-case_wellformed short.json "$(record_json short | sed 's/"agentq:short"/"agentq:short"/')"
+# The trigger is the FILENAME being too short for the documented shape; the sed
+# that used to sit here replaced a string with itself (no-op, removed 2026-10-06).
+case_wellformed short.json "$(record_json short)"
 run_case base shortname status
 run_case variant shortname status
 compare_case shortname

@@ -5,18 +5,29 @@
 # for the paths where they would realistically land.
 
 # Credential material, wherever it is staged.
+# The askpass patterns are name-anchored on purpose: a bare `*askpass*` also
+# swallowed ordinary files like notes-about-askpass.md -- silently, which is
+# the same failure mode the .editorconfig asset guard was fixed for.  The
+# client's own temporary wrapper is `agentq-askpass.<random>`.
 .askpass
 .askpass.*
-askpass*
-*askpass*
+askpass
+askpass.*
+agentq-askpass.*
 .aq-bootstrap/
 .env
 .env.*
+*.env
 *.pem
 *.key
+*.ppk
 id_rsa*
 id_ed25519*
 id_ecdsa*
+.git-credentials
+.netrc
+authorized_keys
+known_hosts
 
 # Local agentq state: hosts, request records, tombstones, locks.
 .agentq/

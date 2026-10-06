@@ -181,15 +181,8 @@ EOF
 chmod 700 "$work/askpass.sh"
 : > "$work/askpass.log"
 
-run_client() {
-    env -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD -u AGENTQ_PASSWORD_PROMPT \
-        AGENTQ_SSH="$work/bin/ssh" \
-        AGENTQ_HOST=127.0.0.1 \
-        AGENTQ_REMOTE_PLATFORM=unix \
-        AGENTQ_CONFIG="$work/absent-config" \
-        "$@" \
-        "$client" "$@" >/dev/null 2>&1 || true
-}
+# (A run_client helper used to sit here; it was dead code and its argument
+# handling doubled "$@" -- removed 2026-10-06 rather than left as a trap.)
 
 # --- 1. no source: the passphrase-protected key cannot be used -------------
 # BatchMode=yes disables passphrase querying too, so this must fail on

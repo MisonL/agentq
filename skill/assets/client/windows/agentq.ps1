@@ -710,7 +710,26 @@ function Get-FileTextOrEmpty {
     if ($truncated) {
         $bytesRead = $maximumDiagnosticBytes
     }
-    $text = ([System.Text.UTF8Encoding]::new($false, $false)).GetString($buffer, 0, $bytesRead)
+    # BOM-aware decode.  PowerShell 5.1's `2> $file` redirection (like `1>`)
+    # decodes the child's output through the console code page and rewrites it
+    # as UTF-16LE WITH a BOM (measured for `1>` on 2026-09-21: 1507407 ->
+    # 3014810 bytes; smoke/10 rule B pins the coupling).  A UTF-8-only decode
+    # of such a file yields interleaved NULs, so the `agentq-exit:` token and
+    # the `reason=` line were unreadable on real PS 5.1 -- the A5b channel was
+    # a no-op for this client.  Detect the BOM and decode accordingly; plain
+    # UTF-8 (pwsh 7 redirection) stays byte-identical.
+    $textOffset = 0
+    $textEncoding = [System.Text.UTF8Encoding]::new($false, $false)
+    if ($bytesRead -ge 2 -and $buffer[0] -eq 0xFF -and $buffer[1] -eq 0xFE) {
+        $textEncoding = [System.Text.UnicodeEncoding]::new($false, $false)
+        $textOffset = 2
+    } elseif ($bytesRead -ge 2 -and $buffer[0] -eq 0xFE -and $buffer[1] -eq 0xFF) {
+        $textEncoding = [System.Text.UnicodeEncoding]::new($true, $false)
+        $textOffset = 2
+    } elseif ($bytesRead -ge 3 -and $buffer[0] -eq 0xEF -and $buffer[1] -eq 0xBB -and $buffer[2] -eq 0xBF) {
+        $textOffset = 3
+    }
+    $text = $textEncoding.GetString($buffer, $textOffset, $bytesRead - $textOffset)
     if ($truncated) {
         if (!$text.EndsWith("`n")) {
             $text += [Environment]::NewLine
@@ -1197,7 +1216,11 @@ function Invoke-SshLogged {
                 #     forged 0 silently skips the reconcile.
                 # The POSIX client has always taken the last match; this aligns
                 # the two copies rather than leaving them to disagree.
-                $exitTokenMatches = [regex]::Matches($standardError, '(?m)^agentq-exit:(\d+)\s*$')
+                # At most three digits: the protocol codes are 0-255.  A longer token cannot
+                # be one of ours; leaving it unmatched falls back to the SSH exit
+                # code, which is the fail-closed direction (the POSIX twin was
+                # measured fail-open on a 20-digit token, 2026-10-06).
+                $exitTokenMatches = [regex]::Matches($standardError, '(?m)^agentq-exit:(\d{1,3})\s*$')
                 if ($exitTokenMatches.Count -gt 0) {
                     $exitCode = [int]$exitTokenMatches[$exitTokenMatches.Count - 1].Groups[1].Value
                 }
@@ -1830,8 +1853,8 @@ function Add-ProbeExitToken {
     # A probe signals failure with `exit N`.  That ends the whole script, so a
     # token line appended after the body would never run -- and under an outer
     # PowerShell the code would arrive flattened to 1 with nothing to recover it.
-    # So every `exit N` in the body is rewritten to `$agentqProbeExit = N` and the
-    # token line at the end reports it.  The rewrite is anchored to a statement
+    # So every `exit N` in the body is rewritten to write the token AT the exit
+    # site and then really exit.  The rewrite is anchored to a statement
     # boundary so an `exit` inside a string cannot match.
     # The alternation must allow LEADING INDENTATION before a bare `exit`, not
     # just `^` or `;`.  (?m)^ matches only immediately after a newline, so on an
@@ -1842,7 +1865,17 @@ function Add-ProbeExitToken {
     # them -- exactly the regression this channel exists to close.  `[ \t]*`
     # covers indentation; the `;` alternative still covers the single-line
     # `; exit N` form the platform probe uses.
-    $rewritten = [regex]::Replace($Script, '(?m)(^[ \t]*|;[ \t]*)exit ([0-9]+)', '${1}$agentqProbeExit = $2')
+    #
+    # The first version rewrote `exit N` to `$agentqProbeExit = N` and reported
+    # the variable in a trailer.  That was measured wrong on 2026-10-06: an
+    # assignment does NOT terminate, and the failure branches are sequential
+    # `if` statements, not an if/else chain -- so a missing launcher fell through
+    # every later check and the unconditional final `...-ready` write, and the
+    # LAST code assigned (44, reparse-unsafe) won the token.  The client then
+    # reported "protocol probe failed" + 44 instead of "deployment is
+    # incomplete" + 2, and the 42/43 branches were unreachable.  Writing the
+    # token before `exit` restores the original control flow exactly.
+    $rewritten = [regex]::Replace($Script, '(?m)(^[ \t]*|;[ \t]*)exit ([0-9]+)', '${1}[Console]::Out.Write("agentq-exit:" + $2); exit $2')
     # The probe body travels to `powershell.exe -Command -` on STDIN, and stdin
     # is read in INTERACTIVE mode: a line that opens a block (`if {`, `function
     # {`, `try {`) puts the reader into continuation, and the buffered statement
@@ -1858,9 +1891,9 @@ function Add-ProbeExitToken {
     # POSIX ssh).  The platform probe is single-line and so was never affected --
     # which is why only the protocol probe, and only Windows targets, broke.
     return ($rewritten + "`n" +
-        'if ($null -eq $agentqProbeExit) { $agentqProbeExit = 0 }' + "`n" +
-        '[Console]::Out.Write("agentq-exit:" + $agentqProbeExit)' + "`n" +
-        'exit $agentqProbeExit' + "`n`n")
+        # Reached only when the body completed without exiting: the success path.
+        '[Console]::Out.Write("agentq-exit:0")' + "`n" +
+        'exit 0' + "`n`n")
 }
 
 function Get-WindowsProbeCommand {
@@ -2098,7 +2131,18 @@ function Initialize-RemoteInvocation {
             if (($unixProbe.ExitCode -ne 0) -and ($windowsProbe.ExitCode -ne 0)) {
                 Stop-AgentQ "unable to detect the remote platform; set AGENTQ_REMOTE_PLATFORM to unix or windows only when the target is known"
             }
-            Stop-AgentQ "unsupported or undetectable remote platform: $($unixProbe.Output.Trim())"
+            # The probe output is remote-controlled.  Print it as a single
+            # charset-limited token -- first line, ASCII word characters only,
+            # capped -- so it can never inject ANSI sequences, extra lines, or a
+            # forged line-initial "agentq:" prefix.  Measured on the POSIX twin
+            # (2026-10-06): a remote whose uname-probe stdout was
+            # "FreeBSD\n\033[2Jagentq: remote failure reason: lock_contention"
+            # forged a line byte-identical to the client's own reason output.
+            $unixProbeHint = ($unixProbe.Output -split "`n")[0]
+            $unixProbeHint = ($unixProbeHint -replace '[^A-Za-z0-9_.-]', '')
+            if ($unixProbeHint.Length -gt 32) { $unixProbeHint = $unixProbeHint.Substring(0, 32) }
+            if ([string]::IsNullOrEmpty($unixProbeHint)) { $unixProbeHint = 'empty' }
+            Stop-AgentQ "unsupported or undetectable remote platform (probe reported: $unixProbeHint)"
         }
         "unix" {
             return

@@ -150,9 +150,17 @@ if printf '%s' "$platform_probe_body" | grep -q -- '-EncodedCommand'; then
     failures=$((failures + 1))
 fi
 # Both probes share one command line, so it is measured once (site 1) rather than
-# counted twice; report it here so the four-site layout stays legible.
+# counted twice; report it here so the four-site layout stays legible.  The
+# verdict is recomputed rather than printed as a hard-coded ok -- the first
+# version printed ok here even after site 1 reported OVER (cosmetic, but a
+# reader scanning the table saw a contradiction).
+if [ "${#probe_cmdline}" -gt "$budget" ]; then
+    probe_cmdline_verdict='OVER'
+else
+    probe_cmdline_verdict='ok'
+fi
 printf '%-46s %6s chars  (budget %s)  %s\n' \
-    'POSIX client: Windows platform probe' "${#probe_cmdline}" "$budget" 'ok'
+    'POSIX client: Windows platform probe' "${#probe_cmdline}" "$budget" "$probe_cmdline_verdict"
 
 # 3. POSIX client: the launcher wrapper that carries a real submit's arguments.
 launcher_script=$(extract_between "$posix_client" "windows_launcher_wrapper='" "'"$'\n')

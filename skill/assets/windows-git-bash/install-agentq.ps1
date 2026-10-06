@@ -369,15 +369,32 @@ function Install-PueueConfiguration {
     Assert-NonReparseFilePath -Path $DestinationPath -Description "Pueue configuration destination" -AllowMissing
     $destinationDirectory = Split-Path -Parent $DestinationPath
     $temporaryPath = New-AgentQInstallerTemporaryFile -Directory $destinationDirectory -Prefix "config" -CandidatePath "$DestinationPath.new.$PID"
+    # A `throw` inside a `finally` REPLACES the in-flight exception and aborts
+    # the rest of the block -- so an unconditional cleanup throw here would
+    # mask the real failure (e.g. a checksum mismatch) behind "cleanup
+    # failed".  Merge both errors instead, like the other sites in this file.
+    $operationError = $null
+    $cleanupError = $null
     try {
         [System.IO.File]::WriteAllText($temporaryPath, $rendered, [System.Text.UTF8Encoding]::new($false))
         Assert-NonReparseFilePath -Path $temporaryPath -Description "Pueue configuration temporary file"
         Assert-NonReparseFilePath -Path $DestinationPath -Description "Pueue configuration destination" -AllowMissing
         Move-Item -LiteralPath $temporaryPath -Destination $DestinationPath -Force
+    } catch {
+        $operationError = $_
     } finally {
         if (!(Remove-AgentQInstallerTemporaryFile -Path $temporaryPath -Description "Pueue configuration temporary file")) {
-            throw "Pueue configuration temporary cleanup failed"
+            $cleanupError = "Pueue configuration temporary cleanup failed: $temporaryPath"
         }
+    }
+    if ($null -ne $operationError) {
+        if ($null -ne $cleanupError) {
+            throw "$($operationError.Exception.Message); $cleanupError"
+        }
+        throw $operationError
+    }
+    if ($null -ne $cleanupError) {
+        throw $cleanupError
     }
 }
 
@@ -402,15 +419,32 @@ function Install-AgentQLauncher {
     Assert-NonReparseFilePath -Path $DestinationPath -Description "AgentQ launcher destination" -AllowMissing
     $destinationDirectory = Split-Path -Parent $DestinationPath
     $temporaryPath = New-AgentQInstallerTemporaryFile -Directory $destinationDirectory -Prefix "launcher" -CandidatePath "$DestinationPath.new.$PID"
+    # A `throw` inside a `finally` REPLACES the in-flight exception and aborts
+    # the rest of the block -- so an unconditional cleanup throw here would
+    # mask the real failure (e.g. a checksum mismatch) behind "cleanup
+    # failed".  Merge both errors instead, like the other sites in this file.
+    $operationError = $null
+    $cleanupError = $null
     try {
         [System.IO.File]::WriteAllText($temporaryPath, $rendered, [System.Text.UTF8Encoding]::new($false))
         Assert-NonReparseFilePath -Path $temporaryPath -Description "AgentQ launcher temporary file"
         Assert-NonReparseFilePath -Path $DestinationPath -Description "AgentQ launcher destination" -AllowMissing
         Move-Item -LiteralPath $temporaryPath -Destination $DestinationPath -Force
+    } catch {
+        $operationError = $_
     } finally {
         if (!(Remove-AgentQInstallerTemporaryFile -Path $temporaryPath -Description "AgentQ launcher temporary file")) {
-            throw "AgentQ launcher temporary cleanup failed"
+            $cleanupError = "AgentQ launcher temporary cleanup failed: $temporaryPath"
         }
+    }
+    if ($null -ne $operationError) {
+        if ($null -ne $cleanupError) {
+            throw "$($operationError.Exception.Message); $cleanupError"
+        }
+        throw $operationError
+    }
+    if ($null -ne $cleanupError) {
+        throw $cleanupError
     }
 }
 
@@ -1862,6 +1896,12 @@ function Download-VerifiedPueueBinary {
     Assert-NonReparseFilePath -Path $DestinationPath -Description "verified Pueue destination" -AllowMissing
     $destinationDirectory = Split-Path -Parent $DestinationPath
     $temporaryPath = New-AgentQInstallerTemporaryFile -Directory $destinationDirectory -Prefix "download" -CandidatePath "$DestinationPath.download.$PID"
+    # A `throw` inside a `finally` REPLACES the in-flight exception and aborts
+    # the rest of the block -- so an unconditional cleanup throw here would
+    # mask the real failure (e.g. a checksum mismatch) behind "cleanup
+    # failed".  Merge both errors instead, like the other sites in this file.
+    $operationError = $null
+    $cleanupError = $null
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri $downloadUrl -OutFile $temporaryPath -UseBasicParsing -TimeoutSec 300
@@ -1869,10 +1909,21 @@ function Download-VerifiedPueueBinary {
         Assert-Sha256 -Path $temporaryPath -Expected $ExpectedHash
         Assert-NonReparseFilePath -Path $DestinationPath -Description "verified Pueue destination" -AllowMissing
         Move-Item -LiteralPath $temporaryPath -Destination $DestinationPath -Force
+    } catch {
+        $operationError = $_
     } finally {
         if (!(Remove-AgentQInstallerTemporaryFile -Path $temporaryPath -Description "verified Pueue temporary file")) {
-            throw "verified Pueue temporary cleanup failed"
+            $cleanupError = "verified Pueue temporary cleanup failed: $temporaryPath"
         }
+    }
+    if ($null -ne $operationError) {
+        if ($null -ne $cleanupError) {
+            throw "$($operationError.Exception.Message); $cleanupError"
+        }
+        throw $operationError
+    }
+    if ($null -ne $cleanupError) {
+        throw $cleanupError
     }
 }
 
@@ -1886,15 +1937,32 @@ function Install-StageAsset {
     Assert-NonReparseFilePath -Path $DestinationPath -Description "staged asset destination" -AllowMissing
     $destinationDirectory = Split-Path -Parent $DestinationPath
     $temporaryPath = New-AgentQInstallerTemporaryFile -Directory $destinationDirectory -Prefix "stage" -CandidatePath "$DestinationPath.new.$PID"
+    # A `throw` inside a `finally` REPLACES the in-flight exception and aborts
+    # the rest of the block -- so an unconditional cleanup throw here would
+    # mask the real failure (e.g. a checksum mismatch) behind "cleanup
+    # failed".  Merge both errors instead, like the other sites in this file.
+    $operationError = $null
+    $cleanupError = $null
     try {
         Copy-Item -LiteralPath $SourcePath -Destination $temporaryPath -Force
         Assert-NonReparseFilePath -Path $temporaryPath -Description "staged asset temporary file"
         Assert-NonReparseFilePath -Path $DestinationPath -Description "staged asset destination" -AllowMissing
         Move-Item -LiteralPath $temporaryPath -Destination $DestinationPath -Force
+    } catch {
+        $operationError = $_
     } finally {
         if (!(Remove-AgentQInstallerTemporaryFile -Path $temporaryPath -Description "staged asset temporary file")) {
-            throw "staged asset temporary cleanup failed"
+            $cleanupError = "staged asset temporary cleanup failed: $temporaryPath"
         }
+    }
+    if ($null -ne $operationError) {
+        if ($null -ne $cleanupError) {
+            throw "$($operationError.Exception.Message); $cleanupError"
+        }
+        throw $operationError
+    }
+    if ($null -ne $cleanupError) {
+        throw $cleanupError
     }
 }
 

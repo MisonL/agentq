@@ -1415,7 +1415,12 @@ download_and_verify() {
             }
         fi
         discard_download_temporary || return 1
-        return "$download_status"
+        # The installer's failure contract is exit 2 with a prefixed message.
+        # Returning curl's own code (7 connect, 22 HTTP, 28 timeout, ...) made a
+        # network failure indistinguishable from a rejected install -- measured
+        # 2026-10-06 with a curl stub exiting 7.  curl has already printed its
+        # own --show-error line; this adds the installer's attribution.
+        fail "failed to download the AgentQ Pueue binary: $url (curl exit code $download_status)"
     fi
     require_installer_stage_file "$temporary" 'download temporary path'
     download_temporary_identity=$(installer_file_identity "$temporary") || {
@@ -1725,6 +1730,15 @@ prepare_service_stage() {
             escaped_home=$(printf '%s' "$agentq_home" | sed 's/[\\&|]/\\&/g')
             escaped_user=$(printf '%s' "$(id -un)" | sed 's/[\\&|]/\\&/g')
             escaped_home_parent=$(printf '%s' "$HOME" | sed 's/[\\&|]/\\&/g')
+            # Both directions, like the Windows renderer: first require that the
+            # template still carries every token this sed list substitutes.  A
+            # token deleted from the template would otherwise render "cleanly"
+            # (nothing to replace, nothing left over, plutil-lint passes) into a
+            # plist with a missing key -- measured gap recorded 2026-10-06.
+            for service_placeholder in __AGENTQ_HOME__ __AGENTQ_USER__ __AGENTQ_HOME_PARENT__; do
+                grep -qF "$service_placeholder" "$asset_directory/com.agentq.pueued.daemon.plist" ||
+                    fail "service template is missing the $service_placeholder placeholder: $asset_directory/com.agentq.pueued.daemon.plist"
+            done
             sed -e "s|__AGENTQ_HOME__|$escaped_home|g" \
                 -e "s|__AGENTQ_USER__|$escaped_user|g" \
                 -e "s|__AGENTQ_HOME_PARENT__|$escaped_home_parent|g" \
@@ -2394,7 +2408,12 @@ acquire_maintenance_lock() {
         fail "AgentQ maintenance is already in progress: $maintenance_lock"
     fi
     if ! mkdir -- "$maintenance_lock" 2>/dev/null; then
-        fail "AgentQ maintenance is already in progress: $maintenance_lock"
+        # NOT "already in progress": the existence check above already handled
+        # that case.  Getting here means mkdir itself failed (read-only or full
+        # filesystem, quota), and claiming a lock exists while `find` shows none
+        # sends the operator to clean a lock that is not there (measured
+        # 2026-10-06).
+        fail "failed to create the AgentQ maintenance lock: $maintenance_lock"
     fi
     if ! write_lock_metadata "$maintenance_lock/pid"; then
         if ! remove_uninitialized_maintenance_lock "$maintenance_lock"; then
@@ -2698,7 +2717,7 @@ ensure_dependency perl perl
 if [ -z "$artifact_source_directory" ]; then
     ensure_dependency curl curl
 fi
-for required_command in awk cp chmod date find grep mkdir mktemp mv ps rm sed stat tail tr; do
+for required_command in awk cp chmod date dirname find grep head id mkdir mktemp mv ps rm rmdir sed stat tail tr wc; do
     require_command "$required_command"
 done
 if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then

@@ -67,6 +67,7 @@ assert_credentials() {
     local want=$1
     local label=$2
     shift 2
+    credential_cases=$((credential_cases + 1))
     : > "$work/argv"
     : > "$work/argv.env"
     local status=0
@@ -124,6 +125,7 @@ expect_env_rejected() {
     local label=$2
     shift 2
     local status=0
+    env_rejections=$((env_rejections + 1))
     env -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD -u AGENTQ_PASSWORD_PROMPT \
         AGENTQ_SSH="$work/bin/ssh" AGENTQ_HOST=smoke-host \
         AGENTQ_CONFIG="$work/absent-config" \
@@ -142,6 +144,13 @@ expect_env_rejected() {
 }
 
 failures=0
+# Runtime counters for the two families that used to be literals in the summary
+# line.  Measured 2026-10-06: env=10 under-reported 15 executed env rejections
+# (10 expect_env_rejected calls + the 5-variable loop), and both numbers were
+# untracked literals that no case addition would move -- the same drift class
+# the cases counter was fixed for on 2026-10-05.
+env_rejections=0
+credential_cases=0
 # The count of cases.  It was a literal `16` in the summary line until
 # 2026-10-05, which meant a new case could be added without the reported number
 # moving -- a small false green of its own.  It starts at the 16 pre-existing
@@ -418,6 +427,7 @@ fi
 for variable in AGENTQ_SUBMIT_RETRY_ATTEMPTS AGENTQ_SUBMIT_RETRY_DELAY \
     AGENTQ_OPERATION_RETRY_ATTEMPTS AGENTQ_OPERATION_RETRY_DELAY \
     AGENTQ_PLATFORM_PROBE_TIMEOUT; do
+    env_rejections=$((env_rejections + 1))
     status=0
     env "$variable=0" AGENTQ_SSH="$work/bin/ssh" AGENTQ_HOST=smoke-host \
         "$client" --help >"$work/env.out" 2>"$work/env.err" || status=$?
@@ -686,8 +696,16 @@ case "$last" in
         exit 1
         ;;
     *powershell.exe*)
-        cat > /dev/null
-        printf 'agentq-windows'
+        # Distinguish the two probes by their stdin: the protocol probe's script
+        # carries the ready marker, the platform probe's does not.  Answering
+        # both with the platform marker relied on the old advisory behaviour of
+        # the protocol probe (measured 2026-10-06); a real wrapper emits the
+        # ready marker on success, so the fixture must model that.
+        probe_stdin=$(cat)
+        case "$probe_stdin" in
+            *launcher-ready*) printf 'agentq-windows-launcher-ready' ;;
+            *) printf 'agentq-windows' ;;
+        esac
         printf 'agentq-exit:0'
         exit 0
         ;;
@@ -726,7 +744,20 @@ case "$last" in
         printf 'agentq-exit:3; echo pwned\n' >&2
         exit 1
         ;;
-    *powershell.exe*) cat > /dev/null; printf 'agentq-windows'; printf 'agentq-exit:0'; exit 0 ;;
+    *powershell.exe*)
+        # Distinguish the two probes by their stdin: the protocol probe's script
+        # carries the ready marker, the platform probe's does not.  Answering
+        # both with the platform marker relied on the old advisory behaviour of
+        # the protocol probe (measured 2026-10-06); a real wrapper emits the
+        # ready marker on success, so the fixture must model that.
+        probe_stdin=$(cat)
+        case "$probe_stdin" in
+            *launcher-ready*) printf 'agentq-windows-launcher-ready' ;;
+            *) printf 'agentq-windows' ;;
+        esac
+        printf 'agentq-exit:0'
+        exit 0
+        ;;
 esac
 printf '{"group":"agentq","tasks":{}}'
 exit 0
@@ -774,7 +805,20 @@ case "$last" in
         printf 'agentq-exit:3\n' >&2
         exit 1
         ;;
-    *powershell.exe*) cat > /dev/null; printf 'agentq-windows'; printf 'agentq-exit:0'; exit 0 ;;
+    *powershell.exe*)
+        # Distinguish the two probes by their stdin: the protocol probe's script
+        # carries the ready marker, the platform probe's does not.  Answering
+        # both with the platform marker relied on the old advisory behaviour of
+        # the protocol probe (measured 2026-10-06); a real wrapper emits the
+        # ready marker on success, so the fixture must model that.
+        probe_stdin=$(cat)
+        case "$probe_stdin" in
+            *launcher-ready*) printf 'agentq-windows-launcher-ready' ;;
+            *) printf 'agentq-windows' ;;
+        esac
+        printf 'agentq-exit:0'
+        exit 0
+        ;;
 esac
 printf '{"group":"agentq","tasks":{}}'
 exit 0
@@ -809,7 +853,20 @@ case "$last" in
         printf 'agentq-exit:0\n' >&2
         exit 1
         ;;
-    *powershell.exe*) cat > /dev/null; printf 'agentq-windows'; printf 'agentq-exit:0'; exit 0 ;;
+    *powershell.exe*)
+        # Distinguish the two probes by their stdin: the protocol probe's script
+        # carries the ready marker, the platform probe's does not.  Answering
+        # both with the platform marker relied on the old advisory behaviour of
+        # the protocol probe (measured 2026-10-06); a real wrapper emits the
+        # ready marker on success, so the fixture must model that.
+        probe_stdin=$(cat)
+        case "$probe_stdin" in
+            *launcher-ready*) printf 'agentq-windows-launcher-ready' ;;
+            *) printf 'agentq-windows' ;;
+        esac
+        printf 'agentq-exit:0'
+        exit 0
+        ;;
 esac
 printf '{"group":"agentq","tasks":{}}'
 exit 0
@@ -931,4 +988,4 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 
-printf 'client-contract checks passed: cases=%s env=10 cred=4 stub-ssh=yes reason=forwarded/injection-safe exit-token=last-wins windows-probe=stdin-fed/no-leak windows-submit=payload-delivered/args-checked/no-leak\n' "$cases"
+printf 'client-contract checks passed: cases=%s env=%s cred=%s stub-ssh=yes reason=forwarded/injection-safe exit-token=last-wins windows-probe=stdin-fed/no-leak windows-submit=payload-delivered/args-checked/no-leak\n' "$cases" "$env_rejections" "$credential_cases"

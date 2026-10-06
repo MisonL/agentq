@@ -281,23 +281,36 @@ try {
 exit 45
 "@
 $rewritten = Add-ProbeExitToken -Script $body
-$bare = ([regex]::Matches($rewritten, "(?m)^[ \t]*exit [0-9]+")).Count
-$assigned = ([regex]::Matches($rewritten, "\`$agentqProbeExit = [0-9]+")).Count
-if ($bare -ne 0) {
-    [Console]::Error.WriteLine("probe exit rewrite left $bare bare exit statement(s)")
+# The property, restated for the fixed rewrite (2026-10-06): every `exit N`
+# must have the token write for the SAME code BEFORE it, so no failure path can
+# terminate without emitting its code -- the first fix rewrote exits to
+# assignments, which do not terminate, and the branches fell through to the
+# ready marker.  Counting assignments is no longer the right assertion.
+$exitSites = [regex]::Matches($rewritten, "(?m)(?:^[ \t]*|;[ \t]*)exit ([0-9]+)")
+$bad = 0
+foreach ($m in $exitSites) {
+    $code = $m.Groups[1].Value
+    $before = $rewritten.Substring(0, $m.Index)
+    # Exit sites write the token as a concatenation (`agentq-exit:" + N`); the
+    # success trailer writes it literally (`agentq-exit:0`).  Accept both forms.
+    $byConcat = [regex]::Escape("agentq-exit:`" + " + $code)
+    $byLiteral = [regex]::Escape("agentq-exit:" + $code)
+    if (($before -notmatch $byConcat) -and ($before -notmatch $byLiteral)) { $bad++ }
+}
+if ($bad -ne 0) {
+    [Console]::Error.WriteLine("probe exit rewrite left $bad exit statement(s) without a token write for the same code")
     exit 1
 }
-# 4 from the body plus 1 from the appended token line, which the same rewrite
-# also turns into an assignment (that is what makes the token printable).
-if ($assigned -ne 5) {
-    [Console]::Error.WriteLine("probe exit rewrite assigned $assigned of 5 expected")
+$writes = ([regex]::Matches($rewritten, "agentq-exit:`" \+ (42|43|44|45)")).Count
+if ($writes -ne 4) {
+    [Console]::Error.WriteLine("probe exit rewrite produced $writes exit-site token write(s), expected 4")
     exit 1
 }
-if ($rewritten -notmatch "agentq-exit:") {
-    [Console]::Error.WriteLine("rewritten probe does not emit the agentq-exit token")
+if ($exitSites.Count -ne 5) {
+    [Console]::Error.WriteLine("probe exit rewrite left $($exitSites.Count) exit statement(s), expected 5 (4 sites + the success trailer)")
     exit 1
 }
-"exit-token rewrite ok: assigned=$assigned bare=0"
+"exit-token rewrite ok: sites=$writes trailer=1"
 '
 cases=$((cases + 1))
 status=0
@@ -770,6 +783,118 @@ if [ "$status" -ne 0 ]; then
 elif ! grep -qF 'submit --workdir' "$work/out"; then
     printf '%s\n' 'ps-client --help: usage does not list the submit form' >&2
     failures=$((failures + 1))
+fi
+
+# --- probe failure branches must not fall through to the ready marker ---------
+# Measured 2026-10-06: both clients rewrote `exit N` to `$agentqProbeExit = N`,
+# and an ASSIGNMENT does not terminate.  The probe bodies are sequential `if`
+# statements, so a missing launcher fell through every later check and the
+# unconditional final `...-ready` write, and the LAST code assigned (44) won
+# the token -- the client reported "protocol probe failed" + 44 where the
+# contract says "deployment is incomplete" + 2, and the 42/43 branches were
+# unreachable.  The rewrite now writes the token AT the exit site and exits.
+# These cases drive each asset's OWN body and OWN rewrite (extracted at run
+# time, like the other extraction cases here): a regression in either half is
+# caught, and a source-level assertion could not see this class at all -- the
+# defect lives in what PowerShell does with the rewritten text.
+probe_work="$work/probe"
+mkdir -p "$probe_work"
+python3 - "$root" "$probe_work" <<'PYEXT'
+import io, re, subprocess, sys
+root, out = sys.argv[1], sys.argv[2]
+
+# POSIX asset: its protocol-probe body and its own sed program.
+posix = io.open(root + '/skill/assets/client/unix/agentq', encoding='utf-8').read()
+body = re.search(r"windows_protocol_script='([^']*)'", posix).group(1)
+sedprog = re.search(r"sed -E '(s/.*?)'\)", posix, re.S).group(1)
+rewritten = subprocess.run(['sed', '-E', sedprog], input=body + '\n',
+                           capture_output=True, text=True, check=True).stdout
+io.open(out + '/posix-probe.ps1', 'w').write(
+    rewritten + '[Console]::Out.Write("agentq-exit:0")\n' + 'exit 0\n')
+
+# Windows asset: its body plus the exact regex and replacement of its rewrite.
+win = io.open(root + '/skill/assets/client/windows/agentq.ps1', encoding='utf-8').read()
+seg = win[win.index('function Get-WindowsAgentQProtocolProbeCommand'):]
+body2 = re.search(r"\$script = @'\n(.*?)\n'@", seg, re.S).group(1)
+line = [l for l in win.split('\n') if '[regex]::Replace($Script' in l][0]
+pat = line[line.index("Replace($Script, '") + len("Replace($Script, '"):line.rindex("', '")]
+rep = line[line.rindex("', '") + 4:-2]
+win_ps = ("$body = @'\n" + body2 + "\n'@\n"
+          + "$out = [regex]::Replace($body, '" + pat + "', '" + rep + "')\n"
+          + "$out + \"`n\" + '[Console]::Out.Write(\"agentq-exit:0\")' + \"`n\" + 'exit 0' + \"`n`n\"\n")
+io.open(out + '/win-probe.ps1', 'w').write(win_ps)
+
+# The BOM fixture: what PS 5.1's `2>` redirection writes (UTF-16LE with BOM,
+# measured for `1>` on 2026-09-21: the byte count doubles; smoke/10 rule B pins
+# the same coupling for the installer).  The reader used to be UTF-8-only, so
+# the token and the reason line were unreadable on real PS 5.1.
+io.open(out + '/bom-stderr.bin', 'wb').write(
+    b'\xff\xfe' + 'agentq-exit:3\n'.encode('utf-16-le'))
+fn = re.search(r'function Get-FileTextOrEmpty \{.*?\n\}\n', win, re.S).group(0)
+io.open(out + '/bom-driver.ps1', 'w').write(
+    'function Assert-NonReparseTemporaryFilePath { param([string]$Path) }\n'
+    + fn
+    + '$text = Get-FileTextOrEmpty -Path "' + out + '/bom-stderr.bin" -Bounded\n'
+    + "$m = [regex]::Matches($text, '(?m)^agentq-exit:(\\d{1,3})\\s*$')\n"
+    + 'if ($m.Count -gt 0) { [Console]::Out.Write("token=" + $m[$m.Count - 1].Groups[1].Value) } else { [Console]::Out.Write("token=NONE") }\n')
+print('extracted')
+PYEXT
+if [ ! -s "$probe_work/posix-probe.ps1" ] || [ ! -s "$probe_work/win-probe.ps1" ] || [ ! -s "$probe_work/bom-driver.ps1" ]; then
+    printf '%s\n' 'ps-client: probe/BOM fixture extraction failed; the cases below cannot conclude' >&2
+    failures=$((failures + 1))
+else
+    # Case A: the POSIX asset's own rewrite keeps failure control flow.
+    cases=$((cases + 1))
+    posix_probe_status=0
+    "$pwsh_binary" -NoProfile -NonInteractive -Command - < "$probe_work/posix-probe.ps1" > "$probe_work/posix.out" 2>/dev/null || posix_probe_status=$?
+    posix_probe_out=$(tr -d '\033' < "$probe_work/posix.out" | sed 's/\[?1[lh]//g')
+    case "$posix_probe_out" in
+        *agentq-windows-launcher-missing*agentq-exit:42) ;;
+        *) printf 'POSIX probe (missing launcher) produced %s; expected the missing marker and token 42\n' "$posix_probe_out" >&2
+           failures=$((failures + 1)) ;;
+    esac
+    case "$posix_probe_out" in
+        *ready*) printf '%s\n' 'the POSIX probe fell through to the ready marker after a failure branch' >&2
+                 failures=$((failures + 1)) ;;
+    esac
+    if [ "$posix_probe_status" -ne 42 ]; then
+        printf 'POSIX probe (missing launcher) exited %s, expected 42\n' "$posix_probe_status" >&2
+        failures=$((failures + 1))
+    fi
+
+    # Case B: the Windows asset's own rewrite does the same.  Two stages: the
+    # generator (the asset's regex + replacement) runs under -File so its
+    # multi-line here-string is not swallowed by `-Command -`'s interactive
+    # reader (A20); it prints the rewritten script, a blank line terminates it
+    # for the same reader, and only then is the script executed.
+    cases=$((cases + 1))
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$probe_work/win-probe.ps1" > "$probe_work/win-rewritten.ps1" 2>/dev/null
+    printf '\n' >> "$probe_work/win-rewritten.ps1"
+    win_probe_status=0
+    "$pwsh_binary" -NoProfile -NonInteractive -Command - < "$probe_work/win-rewritten.ps1" > "$probe_work/win.out" 2>/dev/null || win_probe_status=$?
+    win_probe_out=$(tr -d '\033' < "$probe_work/win.out" | sed 's/\[?1[lh]//g')
+    case "$win_probe_out" in
+        *agentq-windows-launcher-missing*agentq-exit:42) ;;
+        *) printf 'Windows probe (missing launcher) produced %s; expected the missing marker and token 42\n' "$win_probe_out" >&2
+           failures=$((failures + 1)) ;;
+    esac
+    case "$win_probe_out" in
+        *ready*) printf '%s\n' 'the Windows probe fell through to the ready marker after a failure branch' >&2
+                 failures=$((failures + 1)) ;;
+    esac
+    if [ "$win_probe_status" -ne 42 ]; then
+        printf 'Windows probe (missing launcher) exited %s, expected 42\n' "$win_probe_status" >&2
+        failures=$((failures + 1))
+    fi
+
+    # Case C: the stderr reader decodes a PS 5.1-shaped UTF-16LE+BOM file.
+    cases=$((cases + 1))
+    bom_out=$("$pwsh_binary" -NoProfile -NonInteractive -File "$probe_work/bom-driver.ps1" 2>/dev/null | tr -d '\r')
+    case "$bom_out" in
+        *token=3*) ;;
+        *) printf 'the stderr reader did not decode a UTF-16LE+BOM capture (got %s; PS 5.1 `2>` writes that shape)\n' "$bom_out" >&2
+           failures=$((failures + 1)) ;;
+    esac
 fi
 
 if [ "$failures" -ne 0 ]; then

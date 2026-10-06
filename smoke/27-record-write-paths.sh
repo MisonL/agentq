@@ -314,6 +314,38 @@ assert_rc r3 2
 assert_err_has r3 'unknown AgentQ task id: 9999'
 assert_reason r3
 
+# S6. An invalid --workdir must refuse BEFORE anything is written.  Measured
+#     2026-10-06: normalize_workdir's `fail` ended only the command-substitution
+#     subshell, and with_operation_lock calls the command in an `if` context, so
+#     errexit was disabled for the whole body -- the rejection printed and the
+#     submit continued, persisting workdir:"" and enqueueing with an empty
+#     working directory.  The call site now checks the assignment explicitly.
+clear_runtime
+write_stub "$empty_tasks"
+run_case s6 submit --workdir /nonexistent/agentq-smoke-workdir --label smoke --request-id "$submit_id" -- true
+assert_rc s6 2
+assert_err_has s6 'working directory does not exist'
+assert_reason s6
+cases=$((cases + 1))
+if [ -e "$work/data/agentq-requests/$submit_id.json" ]; then
+    printf 'write-paths s6: a rejected submit persisted a request record: %s\n' "$(cat "$work/data/agentq-requests/$submit_id.json")" >&2
+    failures=$((failures + 1))
+fi
+
+# C4. The task is gone but the marker says the outcome was never confirmed:
+#     that is the degraded contract (4/cancellation_pending), NOT "unknown
+#     AgentQ task id" -- the id IS known (its record and marker are on disk);
+#     what is unresolved is whether the cancel took effect.  Measured
+#     2026-10-06: a pending marker left by the failed-kill/failed-remove paths
+#     reached the unknown-id fail and the message misattributed it.
+clear_runtime
+write_stub "$empty_tasks"
+printf '{"version":1,"task_id":1001,"created_at":"2026-09-29T00:00:00Z","requested_at":"2026-09-29T00:05:00Z","reason":"kill_unconfirmed","state":"pending"}\n' > "$work/data/agentq-cancellations/1001.json"
+run_case c4 cancel 1001
+assert_rc c4 4
+assert_json c4 '.state == "cancellation_pending"'
+assert_err_has c4 'the task is gone while the cancellation outcome remains unresolved'
+
 clear_runtime
 
 # --------------------------------------------------------------- summary

@@ -283,7 +283,26 @@ function Get-FileTextOrEmpty {
     if ($truncated) {
         $bytesRead = $maximumDiagnosticBytes
     }
-    $text = ([System.Text.UTF8Encoding]::new($false, $false)).GetString($buffer, 0, $bytesRead)
+    # BOM-aware decode.  PowerShell 5.1's `2> $file` redirection (like `1>`)
+    # decodes the child's output through the console code page and rewrites it
+    # as UTF-16LE WITH a BOM (measured for `1>` on 2026-09-21: 1507407 ->
+    # 3014810 bytes; smoke/10 rule B pins the coupling).  A UTF-8-only decode
+    # of such a file yields interleaved NULs, so the `agentq-exit:` token and
+    # the `reason=` line were unreadable on real PS 5.1 -- the A5b channel was
+    # a no-op for this client.  Detect the BOM and decode accordingly; plain
+    # UTF-8 (pwsh 7 redirection) stays byte-identical.
+    $textOffset = 0
+    $textEncoding = [System.Text.UTF8Encoding]::new($false, $false)
+    if ($bytesRead -ge 2 -and $buffer[0] -eq 0xFF -and $buffer[1] -eq 0xFE) {
+        $textEncoding = [System.Text.UnicodeEncoding]::new($false, $false)
+        $textOffset = 2
+    } elseif ($bytesRead -ge 2 -and $buffer[0] -eq 0xFE -and $buffer[1] -eq 0xFF) {
+        $textEncoding = [System.Text.UnicodeEncoding]::new($true, $false)
+        $textOffset = 2
+    } elseif ($bytesRead -ge 3 -and $buffer[0] -eq 0xEF -and $buffer[1] -eq 0xBB -and $buffer[2] -eq 0xBF) {
+        $textOffset = 3
+    }
+    $text = $textEncoding.GetString($buffer, $textOffset, $bytesRead - $textOffset)
     if ($truncated) {
         if (!$text.EndsWith("`n")) {
             $text += [Environment]::NewLine
