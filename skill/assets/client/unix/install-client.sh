@@ -5,7 +5,8 @@ set -eu
 program=${0##*/}
 script_directory=$(unset CDPATH; cd "$(dirname "$0")" && pwd -P)
 destination_directory=${AGENTQ_CLIENT_BIN_DIR:-"$HOME/.local/bin"}
-temporary_path=''
+staged_agentq_path=''
+staged_sshp_path=''
 check_only=false
 
 usage() {
@@ -159,9 +160,14 @@ cleanup_on_exit() {
     client_exit_status=$?
     trap - EXIT HUP INT TERM
     client_cleanup_safe=true
-    if [ -n "$temporary_path" ] && ! remove_client_file "$temporary_path"; then
-        client_cleanup_safe=false
-    fi
+    # Every staged file must be cleared on exit: the installer now stages BOTH
+    # clients before moving EITHER (see the install loop), so two staging paths
+    # can be live at once -- dropping one here would leak it as residue.
+    for client_staging_path in "$staged_agentq_path" "$staged_sshp_path"; do
+        if [ -n "$client_staging_path" ] && ! remove_client_file "$client_staging_path"; then
+            client_cleanup_safe=false
+        fi
+    done
     if [ "$client_cleanup_safe" = false ] && [ "$client_exit_status" -eq 0 ]; then
         client_exit_status=1
     fi
@@ -230,22 +236,45 @@ umask 077
 mkdir -p "$destination_directory" || fail "cannot create destination directory: $destination_directory"
 assert_regular_directory_path "$destination_directory" 'destination directory'
 
+# Stage BOTH clients before moving EITHER.  A per-client stage+move installs
+# agentq first and then runs cp/chmod/mv for sshp -- so a failure on the second
+# client (unreadable asset, full destination) leaves a NEW agentq paired with a
+# STALE sshp, and the pair is only ever read together.  Measured: an asset
+# readable only as 111 passes both prechecks (-f, -x) and fails only at cp --
+# exactly the window this ordering closes.  After this loop every remaining
+# failure is a move failure, and a move either happens or does not; the trap
+# clears any staged file whose move never ran.
 for client in agentq sshp; do
     source_path="$script_directory/$client"
-    temporary_path=$(mktemp "$destination_directory/.${client}.new.XXXXXX") || fail "cannot create temporary client path: $client"
+    staged_path=$(mktemp "$destination_directory/.${client}.new.XXXXXX") || fail "cannot create temporary client path: $client"
     destination_path="$destination_directory/$client"
+    # Register with the exit trap IMMEDIATELY, before cp/chmod: from here until
+    # the variable is cleared this file exists on disk, and any fail() between
+    # now and the commit phase leaves it stranded unless the trap knows it.
+    case "$client" in
+        agentq) staged_agentq_path=$staged_path ;;
+        sshp) staged_sshp_path=$staged_path ;;
+    esac
 
-    assert_regular_file_path "$temporary_path" 'temporary client path'
+    assert_regular_file_path "$staged_path" 'temporary client path'
     assert_regular_file_path "$destination_path" 'client destination path'
-    cp "$source_path" "$temporary_path" || fail "cannot stage client: $client"
-    assert_regular_file_path "$temporary_path" 'temporary client path'
-    chmod 700 "$temporary_path" || fail "cannot set executable mode: $temporary_path"
+    cp "$source_path" "$staged_path" || fail "cannot stage client: $client"
+    assert_regular_file_path "$staged_path" 'temporary client path'
+    chmod 700 "$staged_path" || fail "cannot set executable mode: $staged_path"
     assert_regular_directory_path "$destination_directory" 'destination directory'
-    assert_regular_file_path "$temporary_path" 'temporary client path'
+    assert_regular_file_path "$staged_path" 'temporary client path'
     assert_regular_file_path "$destination_path" 'client destination path'
-    move_client_file "$temporary_path" "$destination_path" 'client' ||
-        fail "cannot install client: $destination_path"
-    temporary_path=''
 done
+
+# Commit phase: two adjacent renames.  Each variable is cleared only AFTER its
+# move succeeds -- clearing first would strand a staged file the trap can no
+# longer see when the move itself fails (mv failures leave the source in
+# place), and the trap is the only thing that cleans it.
+move_client_file "$staged_agentq_path" "$destination_directory/agentq" 'client' ||
+    fail "cannot install client: $destination_directory/agentq"
+staged_agentq_path=''
+move_client_file "$staged_sshp_path" "$destination_directory/sshp" 'client' ||
+    fail "cannot install client: $destination_directory/sshp"
+staged_sshp_path=''
 
 printf '%s\n' "installed AgentQ clients in $destination_directory"

@@ -172,6 +172,50 @@ else
     fi
 fi
 
+# --- W1: a failure on the SECOND client must leave NEITHER client updated ----
+# The install used to stage+move agentq first, then stage+move sshp -- so any
+# failure on the second client (unreadable asset, full destination) left a NEW
+# agentq paired with a STALE sshp, and the pair is only ever read together
+# (PLAN.md A28 W4, the installer half).  Both directions are asserted because
+# either one alone lets a broken installer pass: swapping the pre-existing
+# old content in, or writing nothing at all, are both wrong -- what must hold
+# is "the pair was never observed mixed after an aborted install".
+w1_destination="$work/w1-dest"
+mkdir -p "$w1_destination"
+printf 'OLD-AGENTQ\n' > "$w1_destination/agentq"
+printf 'OLD-SSHP\n' > "$w1_destination/sshp"
+
+# The asset is readable as 111: it PASSES both prechecks (-f and -x both look at
+# mode bits, not at read access -- measured: [ -x ] is true for --x--x--x) and
+# fails only at cp, which is exactly the window the staging order must close.
+chmod 111 "$source_directory/sshp"
+cases=$((cases + 1))
+w1_status=$(run_installer --bin-dir "$w1_destination")
+chmod 700 "$source_directory/sshp"
+if [ "$w1_status" -eq 0 ]; then
+    printf 'install-client (W1): expected a non-zero exit when sshp is unreadable, got 0\n' >&2
+    failures=$((failures + 1))
+fi
+if ! grep -qF 'cannot stage client: sshp' "$work/err"; then
+    printf 'install-client (W1): stderr did not name the second client as the failure\n' >&2
+    head -2 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+if [ "$(cat "$w1_destination/agentq")" != 'OLD-AGENTQ' ]; then
+    printf 'install-client (W1): agentq was updated even though the install aborted on sshp\n' >&2
+    failures=$((failures + 1))
+fi
+if [ "$(cat "$w1_destination/sshp")" != 'OLD-SSHP' ]; then
+    printf 'install-client (W1): sshp changed despite its staging failure\n' >&2
+    failures=$((failures + 1))
+fi
+# And the aborted run must leave no staging residue behind.
+residue=$(find "$w1_destination" -name '.*.new.*' | wc -l | tr -d ' ')
+if [ "$residue" -ne 0 ]; then
+    printf 'install-client (W1): %s staging file(s) left behind after the aborted install\n' "$residue" >&2
+    failures=$((failures + 1))
+fi
+
 # --check against the freshly installed directory: must now match, exit 0.
 cases=$((cases + 1))
 recheck_status=$(run_installer --check --bin-dir "$install_destination")

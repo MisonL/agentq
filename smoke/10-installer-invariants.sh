@@ -643,8 +643,8 @@ else
 fi
 
 # --- RULE K: a cleanup throw must not mask the failure that caused it ---------
-# The client installer's Install-AtomicFile removes its staged temporary and
-# backup in a `finally`.  When that removal fails it has to report something, and
+# The client installer's Install-CommitSet removes its staged temporaries and
+# backups in a `finally`.  When that removal fails it has to report something, and
 # `throw` is the natural choice -- but a `throw` from `finally` replaces the
 # in-flight exception, so an unconditional throw there erases the real error: the
 # operator is told the cleanup failed and never learns that the copy, the reparse
@@ -666,7 +666,7 @@ fi
 # Source-level by necessity, like rule J: this installer cannot run on this host.
 rules_checked=$((rules_checked + 1))
 client_finally=$(awk '
-    /^function Install-AtomicFile/ { in_fn = 1 }
+    /^function Install-CommitSet/ { in_fn = 1 }
     in_fn { print }
     in_fn && /^\}/ { exit }
 ' "$client_installer" | awk '
@@ -674,13 +674,13 @@ client_finally=$(awk '
     capturing { print }
 ')
 if [ -z "$client_finally" ]; then
-    fail "$client_installer" "could not extract Install-AtomicFile its finally block; rule K cannot conclude"
+    fail "$client_installer" "could not extract Install-CommitSet its finally block; rule K cannot conclude"
 else
     cleanup_throw=$(printf '%s\n' "$client_finally" | grep -cE '^\s*throw "Client installer temporary cleanup failed"' || true)
     if [ "$cleanup_throw" -eq 0 ]; then
-        fail "$client_installer" "Install-AtomicFile no longer throws when its temporary cleanup fails; a cleanup failure would pass silently"
+        fail "$client_installer" "Install-CommitSet no longer throws when its temporary cleanup fails; a cleanup failure would pass silently"
     elif ! printf '%s\n' "$client_finally" | grep -qE '\$originalError'; then
-        fail "$client_installer" "Install-AtomicFile throws on cleanup failure without testing a captured exception; the throw replaces the in-flight error and masks why the install failed"
+        fail "$client_installer" "Install-CommitSet throws on cleanup failure without testing a captured exception; the throw replaces the in-flight error and masks why the install failed"
     fi
 fi
 
