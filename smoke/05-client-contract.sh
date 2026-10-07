@@ -150,6 +150,29 @@ failures=0
 # untracked literals that no case addition would move -- the same drift class
 # the cases counter was fixed for on 2026-10-05.
 env_rejections=0
+
+# HOME unset: the client must refuse with its OWN parameter-error shape (exit 2
+# + a message naming the variable), not die at the config_path expansion under
+# `set -u` with bash's raw `HOME: unbound variable` and the generic exit 1
+# (measured 2026-10-07 before the guard).  `env -u HOME` is the only way to
+# reach it; the sandbox HOME elsewhere is deliberate.
+env_rejections=$((env_rejections + 1))
+home_status=0
+env -u HOME -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD -u AGENTQ_PASSWORD_PROMPT \
+    AGENTQ_SSH="$work/bin/ssh" AGENTQ_HOST=smoke-host \
+    AGENTQ_CONFIG="$work/absent-config" \
+    "$client" status >"$work/out" 2>"$work/err" || home_status=$?
+if [ "$home_status" -ne 2 ]; then
+    printf 'client HOME unset: expected exit 2, got %s\n' "$home_status" >&2
+    head -3 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+if ! grep -qF 'HOME is not set' "$work/err"; then
+    printf '%s\n' 'client HOME unset: stderr did not carry the controlled message' >&2
+    head -3 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+
 credential_cases=0
 # The count of cases.  It was a literal `16` in the summary line until
 # 2026-10-05, which meant a new case could be added without the reported number

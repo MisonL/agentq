@@ -4,6 +4,16 @@ set -eu
 
 program=${0##*/}
 stat_flavor=''
+# Guarded BEFORE first use.  Under `set -u` an unset $HOME dies at the
+# config_path expansion below with the raw `HOME: unbound variable` (measured:
+# `env -u HOME … agentq status` exits 1), which names nothing actionable and
+# uses the generic-failure code.  Check it explicitly so the refusal carries
+# the client's own parameter-error shape and exit 2, like every other rejected
+# environment input.
+if [ -z "${HOME:-}" ]; then
+    printf '%s: HOME is not set; export HOME before running agentq\n' "${0##*/}" >&2
+    exit 2
+fi
 config_path=${AGENTQ_CONFIG:-"$HOME/.config/agentq/config"}
 configured_host=''
 config_max_bytes=4096

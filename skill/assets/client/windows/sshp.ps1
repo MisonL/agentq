@@ -1054,11 +1054,20 @@ function Get-UnixSessionCommand {
     # What keeps this shape safe is that the script carries NO double quote at
     # all -- PowerShell 5.1 word-splits a splatted argument only at a `"`, so a
     # script without one survives as a single argument.  The session name is
-    # single-quoted and its value is already restricted to `[A-Za-z0-9_.-]`, so
-    # no quote can enter.  ADDING A DOUBLE QUOTE TO THIS SCRIPT WOULD BREAK IT:
-    # `smoke/20` asserts this argument still round-trips as one argv element.
-    $singleQuote = [string][char]39
-    $escapedSession = $script:SessionName.Replace($singleQuote, $singleQuote + [string][char]34 + $singleQuote + [string][char]34 + $singleQuote)
+    # single-quoted and its value is already restricted to `[A-Za-z0-9_.-]` at
+    # argv parse time, so no quote can enter.  There used to be a single-quote
+    # escape here that doubled `'` as `'""'` -- it would have INSERTED the very
+    # double quotes that break this channel, silently re-opening the A21 word
+    # split the moment it ever ran.  Removed.  If the charset guard is ever
+    # loosened, the failure must be LOUD, so this function refuses a name that
+    # carries any quote rather than transforming it (a `''` rewrite would
+    # silently DROP the quote from the session name -- corruption, not safety).
+    # `smoke/20` asserts this argument still round-trips as one argv element and
+    # that the script still contains no `"`.
+    if ($script:SessionName.Contains([string][char]39) -or $script:SessionName.Contains([string][char]34)) {
+        throw "sshp: the session name may not contain quotes; the charset guard should have refused it earlier."
+    }
+    $escapedSession = $script:SessionName
     return @"
 if command -v tmux >/dev/null 2>&1; then exec tmux new-session -A -s '$escapedSession'; fi
 if command -v screen >/dev/null 2>&1; then exec screen -xRR -S '$escapedSession'; fi
