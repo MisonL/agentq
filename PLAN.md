@@ -1993,8 +1993,18 @@ agent 结论会凭空造出不存在的 P0，本轮确实有 5 条被复核推�
   相似名不误报 / 父目录不可列）。**变异 6/6 被抓**，其中**两个是我第一版检查的假绿**并已修：
   M4（扫描 fail-open）与 M6（两个方向互换）当时**通过**——因为 fixture 的父目录总是存在、
   且只断言了 `refusing to install:` 前缀；现在按**方向**断言消息片段、并加「父目录不可列」一例。
-  **仍未覆盖**：换根本身（两次 `Move-Item` 之间的真实崩溃与恢复）需真机——本检查证明的是
-  **拒绝逻辑**，不是崩溃恢复的端到端。
+  **换根本身已于 2026-10-07 补验（POSIX 侧，容器内真实 systemd；Windows 侧仍需真机）**：
+  在 `jrei/systemd-ubuntu:24.04` 特权容器里以普通用户 `aqtest` 经 `su -`（真实 logind 会话）
+  走完全部三格——① 真实安装 exit 0；② 用坏 `pueue.yml`（daemon 起不来）做**失败升级**：
+  安装器退 2、自动回滚后 server 字节/配置/服务/任务/record 全部复原、零残留；③ **手工制造
+  真崩溃现场**（`mv $HOME/.agentq $HOME/..agentq.backup.CrashSim`）后重跑：安装器按新守卫
+  拒绝（exit 2、什么都没改），**照消息指引恢复**（移回 backup + 重启 daemon）后重跑 exit 0、
+  任务与 record 保留、零残留。③ 还实测出**指引本身缺一步**并已修：崩溃的 run 已把 daemon
+  停掉，「把 backup 移回去」不够——照做会在下一道检查被 `existing AgentQ daemon is
+  unavailable` 拒（两侧同病，Windows 的 `Assert-ManagedPueueConnection` 同样要求活 daemon）；
+  两条消息都补了「and restart the AgentQ daemon (the crashed run stopped it)」，
+  `smoke/11`（+1 例）与 `smoke/13`（driver +1 断言）各自钉住，变异（删掉该句）被抓。
+  **Windows 侧换根本身仍未验证**——`smoke/13` 证明的是拒绝逻辑，不是 Windows 上的崩溃恢复。
   **POSIX 侧同一窗口也已修（2026-10-07，验证 Windows 侧时实测发现）**：`install-agentq.sh`
   的 `mv agentq_home→backup_home` 与 `mv stage_home→agentq_home` 之间是同一个窗口，
   且**此前只被一个不相关的检查偶然挡住**——`previous_install` 因 `[ -e "$agentq_home" ]`
@@ -2010,9 +2020,11 @@ agent 结论会凭空造出不存在的 P0，本轮确实有 5 条被复核推�
   抓到「守卫删除了残留」。
 - 本机 `~/.local/bin/agentq` 与 `sshp` **已于 2026-10-07 重装**（用户「所有权限」授权）：
   逐字节等于 canonical、`--check` 退 0、mode 700、HOME 守卫生效。
-- **真机实验（仍需你点名机器）**：① PS 5.1 的 `2>` 是否真产出 UTF-16LE+BOM
+- **真机实验（缺的是机器名，不是授权）**：① PS 5.1 的 `2>` 是否真产出 UTF-16LE+BOM
   （一条命令即可，结论只影响 BOM 修复的「降级说明」，修复本身对两种结果都成立）；
-  ② W5 的**换根恢复端到端**（拒绝逻辑已离线覆盖，见上）；③ B5 三台重装。
+  ② **Windows** 侧 W5 换根恢复端到端（POSIX 侧已于 2026-10-07 在容器内端到端实测，
+  见「C2 补格」；Windows 侧的拒绝逻辑已由 `smoke/13` 覆盖，缺的是换根崩溃恢复本身）；
+  ③ B5 三台重装。
 
 ---
 
@@ -2024,7 +2036,7 @@ agent 结论会凭空造出不存在的 P0，本轮确实有 5 条被复核推�
 | # | 事项 | 需要你给什么 |
 | --- | --- | --- |
 | C1 | P1-3 整体操作矩阵（**改为三台**、**真实网络中断**；2026-09-22 用户裁定） | **已执行（2026-09-22）**，结果与两个新缺陷见 `CHANGELOG.md`。三台里只有一台跑当前版本。**两项遗留均已消解（2026-09-24）**：① 主机 A 的客户端路径——重装后 `status`/`submit`/`wait`/`logs`/`remove` 五项 exit 0（见 B5-执行）；② 缺陷二已修并验证（见 A6，`smoke/03` 有用例、M3 证明其敏感）。**C1 无遗留** |
-| C2 | 平台/安装矩阵（WSL、arm64、RHEL、Fedora、Alpine、真实升级回滚） | **已执行容器可覆盖的部分（2026-09-24，用户全权授权）**，见下 |
+| C2 | 平台/安装矩阵（WSL、arm64、RHEL、Fedora、Alpine、真实升级回滚） | **已执行容器可覆盖的部分（2026-09-24，用户全权授权）**，见下；**真实升级回滚 2026-10-07 已补验**（见「C2 补格」） |
 | C3 | 原生 Windows 其余边界（NTFS reparse 点语义、registry/profile、跨用户安装/服务身份） | **已执行（2026-10-01 与 2026-10-06，专用测试机）**，三项全部关闭，见下。**用户已声明无生产权限**，故不在生产机上做 |
 | C4 | 真实服务/生产边界（远端服务生命周期、TLS/shared key、生产凭证、发布回滚） | **不是「不做」，是「用户无权授权」**：生产环境属上游，用户是 fork 贡献者，只在私有 CF 上部署测试。此项**不得**记为待办，也不得声称已验证 |
 | C5 | P2-18 外部审查 | **已执行（2026-09-24，用户指示「按正规工程审查做、使用 agents」）**，见下 |
@@ -2058,6 +2070,24 @@ agent 结论会凭空造出不存在的 P0，本轮确实有 5 条被复核推�
   （**这个 rc=1 是真实信号**，安装器据此 `fail` 是对的），必须经 `su -` 才有会话。
   **三轮失败各自报出准确原因、每轮都在写入前停住、回滚干净**——这本身就是安装器
   失败契约的一次真机复核。补齐这两样后**一次通过**。
+
+#### C2 补格（2026-10-07，用户「继续处理完」）—— 真实升级回滚 + W5 换根崩溃端到端
+
+此前记为「WSL 本机也无法伪造」的**真实升级回滚**在容器里是可达的，本次补做。载体：
+`jrei/systemd-ubuntu:24.04`、特权容器 + `--cgroupns=host`、真实 systemd PID 1；普通用户
+`aqtest` 经 `su -` 建真实 logind 会话；`AGENTQ_PUEUE_SOURCE_DIR` 预置真实 Linux 二进制
+（哈希与安装器内置常量逐一相符）。**全部是真实执行**：
+
+| 格 | 做法 | 结果 |
+| --- | --- | --- |
+| **真实安装（基线）** | `install-agentq.sh` exit 0；留一条任务（`preupgrade0000001`）作待保留数据 | 队列 `Running`、service `active`、record=1 |
+| **失败升级 → 自动回滚** | 构造 v2：`pueue.yml` 把 `pueue_directory` 指向一个 daemon 建不出来的路径，其余资产同仓库 | 安装器 `daemon did not become ready` → `installation failed; restoring the previous AgentQ deployment`，**退 2**；回滚后 server **字节回到升级前**（sha 逐字相同）、配置回旧值、service `active`、**任务与 record 全保留**、HOME 与 `/tmp` **零残留**、wrapper 完好 |
+| **回滚后立即重跑** | 干净回滚之后直接再跑一次安装 | exit 0——证明回滚不留残留、**不会误触 W5 守卫** |
+| **W5 崩溃现场端到端** | 手工 `mv $HOME/.agentq $HOME/..agentq.backup.CrashSim`（崩溃的真实状态：daemon 已停、root 缺失、backup 在） | 重跑**按新守卫拒绝**（exit 2、消息点名 backup 与恢复动作、什么都没改）；**照消息指引**（移回 backup + `systemctl --user start`）后重跑 **exit 0**、任务与 record 保留、零残留 |
+| **指引本身实测纠错** | 第一版指引只说「把 backup 移回去」 | 照做后重跑被 `existing AgentQ daemon is unavailable; refuse to overwrite` 拒——崩溃的 run 已停掉 daemon，指引缺一步。两侧消息均已补「and restart the AgentQ daemon (the crashed run stopped it)」，`smoke/11`/`smoke/13` 各钉一句，变异被抓 |
+
+**仍未覆盖**：Windows 侧的换根崩溃与回滚（需真 Windows）；WSL 仍不可伪造（安装器读
+`/proc/version`，runc 拒绝在 `/proc` 内 bind-mount）。
 
 #### C3 执行结果（2026-10-01）—— 专用 Windows 测试机上可做的部分
 
@@ -2266,8 +2296,9 @@ helper **在本文件中确有定义**、规则 F 从「前缀式」收紧为**�
 `sshp --check` 重试预算（`smoke/19` 19 例）、POSIX `HOME` 守卫（`smoke/05` env=16）、
 start-daemon 三处 `exit 2` 死代码（`smoke/22` 59 例）、`sshp.ps1` 自毁
 转义（`smoke/20` 9 例）；`-E` 日志 0600 那项**当天查证后撤回**（前提实测为假，见上）。
-服务端 I2 查实为边界；Windows `$PID` 与 W5 修法、`2>` 实验、
-本机旧客户端、B5 三台重装——**执行均需你点名授权与机器**，见 A28 收尾清单。
+服务端 I2 与 Windows `$PID` 查实为边界；**W5 两侧已修、本机旧客户端已重装**
+（均 2026-10-07，见上）。仅剩 `2>` 实验（需一台 Windows 机）与 B5 三台重装
+（需点名主机）——**缺的是机器名，不是授权**。
 
 **A13 的最后一处消息误导已修（2026-10-07，用户授权「继续」）**：`cancel`/`logs`/`remove`
 把瞬时 Pueue 读失败报成 `unknown AgentQ task id`（`wait` 对同一状况正确报 `6`/`unavailable`）
