@@ -37,7 +37,7 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
 
 1. **P1-3 整体操作矩阵**：在获得明确授权并建立新的证据切片后，补齐真实四机各类
    操作和网络中断变体的矩阵；已证明的 submit-response-loss 范围不得重复执行，
-   也不得升级为整个 P1-3 已完成。
+   也不得升级为整个 P1-3 已完成。（**C1 已于 2026-09-22 执行**：按你的裁定改为**三台**、含真实网络中断，逐项结果（含未跑项）见 `CHANGELOG.md` 该日的 C1 表；两项遗留 2026-09-24 已消解，`PLAN.md` C1 记「无遗留」。）
 2. **原生 Windows 边界**：如确有验收需要，单独验证 Windows PowerShell 5.1、ACL、
    registry/profile、跨用户身份和 PID reuse；本机没有可代替这些证据的验证手段。
    （**PS 5.1、NTFS reparse、registry/profile 与跨用户身份已在专用测试机上验证**：
@@ -50,7 +50,7 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
    才能验证远端服务/队列生命周期、TLS/shared key、生产凭证、发布、回滚和生产接受。
 5. **P2-18 外部审查**：明确审查主体、输入版本、验收标准和授权边界后，另立外部
    approval receipt、live security acceptance 和 final adjudication 证据；目前没有
-   当前授权，也没有可替代它们的现有证据。
+   当前授权，也没有可替代它们的现有证据。（**审查本身已于 2026-09-24 执行**、09-25 收尾：5 名互不知情的独立审查者，产出 A12/A13/A14 与 6 处假绿、全部处置完毕——见 `PLAN.md` C5；本条要求的 approval receipt / live security acceptance / final adjudication 三类正式凭据仍未立。）
 6. **项目版本控制管理**：**已解决**（2026-09-29，用户明确授权）：本仓已 `git init`
    并完成基线提交，`git status` / `git diff` 现在可用。`.gitattributes` 用 `* -text`
    钉住字节一致性（开发机 `core.autocrlf=input` 会把 canonical 资产改坏），
@@ -65,7 +65,7 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
 以下事项不能在交接时被写成“已完成”：
 
 1. P1-3 的整体跨主机完成度。已完成的只是 submit-response-loss 一项，不是整个
-   P1-3 矩阵。
+   P1-3 矩阵。（**注**：C1 已于 2026-09-22 在**三台**上执行完整操作面与真实网络中断变体——逐格证据以 `CHANGELOG.md` 该日的 C1 表为准（表里标 `—` 的格子就是没跑），`PLAN.md` C1 记「无遗留」；本条的告诫（不得超出逐格证据宣称完成）仍然成立。）
 2. 原生 Windows 的其余边界。**已实测（2026-09-21，一台真实 Windows 主机）**：服务端在
    真实 Windows 上跑通完整协议（submit/wait/logs/remove/cancel 两条路径与重放/
    base64 日志/doctor/锁竞争/坏参数退出码/launcher 的 `ArgumentsBase64` 转发）；
