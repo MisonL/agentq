@@ -4200,10 +4200,31 @@ read_cancellation_marker() {
     cancellation_marker_is_valid "$marker_path" "$task_id" || fail "invalid AgentQ cancellation marker: $marker_path"
 }
 
+# compact_task/raw_compact_task exit 4 only when Pueue ANSWERED and this id is
+# not visible; 1 (read failure) and 2/5 (malformed status) mean the task's
+# existence is UNKNOWN.  Folding all of them into "unknown AgentQ task id"
+# tells the caller to fix its arguments when the truth is "Pueue could not be
+# read, retry" -- the same misattribution find_request_task's callers had and
+# the 2026-09-24 fix addressed there (measured 2026-10-07: an injected
+# transient failure on logs/cancel/remove each reported "unknown task id").
+# rc=0 returns so callers can use this as a guard.
+report_compact_task_failure() {
+    local compact_status=$1
+    local task_id=$2
+
+    [ "$compact_status" -ne 0 ] || return 0
+    if [ "$compact_status" -eq 4 ]; then
+        fail "unknown AgentQ task id: $task_id"
+    fi
+    fail "cannot inspect Pueue while reading AgentQ task: $task_id"
+}
+
 require_agentq_task() {
     local task_id=$1
+    local compact_status=0
 
-    compact_task "$task_id" >/dev/null || fail "unknown AgentQ task id: $task_id"
+    compact_task "$task_id" >/dev/null || compact_status=$?
+    report_compact_task_failure "$compact_status" "$task_id"
 }
 
 write_cancellation_marker() {
@@ -4890,6 +4911,7 @@ logs() {
     local tail_lines=200
     local task
     local task_created_at
+    local task_compact_status=0
     shift
 
     if [ "$#" -gt 0 ]; then
@@ -4903,7 +4925,8 @@ logs() {
     fi
 
     ensure_daemon
-    task=$(compact_task "$task_id") || fail "unknown AgentQ task id: $task_id"
+    task=$(compact_task "$task_id") || task_compact_status=$?
+    report_compact_task_failure "$task_compact_status" "$task_id"
     task_created_at=$(jq -er '.created_at | strings' <<<"$task") || fail "invalid creation time for AgentQ task: $task_id"
     if ! task_identity_is_unambiguous "$task"; then
         jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
@@ -5098,6 +5121,7 @@ cancel_task() {
     local marker
     local marker_state=''
     local marker_created_at=''
+    local raw_compact_status=0
 
     ensure_daemon
     # One status call, not two: raw_compact_task already fails for an unknown
@@ -5105,22 +5129,33 @@ cancel_task() {
     if task=$(raw_compact_task "$task_id"); then
         created_at=$(jq -er '.created_at' <<<"$task")
     else
+        # $? is still raw_compact_task's status at the top of the else branch.
+        raw_compact_status=$?
+        # The replay check reads only local marker/record files, so a confirmed
+        # cancel can still be replayed while Pueue is unreadable.
         cancelled_task_replay "$task_id" && return 0
-        # The task is gone, but a marker may still record that the cancellation
-        # outcome was never confirmed.  "unknown AgentQ task id" would
-        # misattribute that -- the id is known (its record or tombstone is on
-        # disk); what is unresolved is whether the cancel took effect.  Report
-        # the degraded contract instead.  Measured 2026-10-06: a pending marker
-        # left by the failed-kill/failed-remove paths reached exactly this line.
-        if marker=$(read_cancellation_marker "$task_id" 2>/dev/null); then
-            if [ "$(jq -r '.state' <<<"$marker")" = pending ]; then
-                requested_at=$(jq -r '.requested_at' <<<"$marker")
-                jq -cn --argjson task_id "$task_id" --arg requested_at "$requested_at" '{task_id: $task_id, state: "cancellation_pending", cancellation_requested_at: $requested_at}'
-                printf '%s: the task is gone while the cancellation outcome remains unresolved: %s\n' "$program" "$task_id" >&2
-                return 4
+        # Only rc=4 proves the task is gone (Pueue answered, id not visible).
+        # On a read failure (1/2/5) we do NOT know that, so the pending-marker
+        # branch below must not claim it -- it would print "the task is gone"
+        # about a task we merely could not look up (2026-10-07).
+        if [ "$raw_compact_status" -eq 4 ]; then
+            # The task is gone, but a marker may still record that the
+            # cancellation outcome was never confirmed.  "unknown AgentQ task
+            # id" would misattribute that -- the id is known (its record or
+            # tombstone is on disk); what is unresolved is whether the cancel
+            # took effect.  Report the degraded contract instead.  Measured
+            # 2026-10-06: a pending marker left by the failed-kill/failed-remove
+            # paths reached exactly this line.
+            if marker=$(read_cancellation_marker "$task_id" 2>/dev/null); then
+                if [ "$(jq -r '.state' <<<"$marker")" = pending ]; then
+                    requested_at=$(jq -r '.requested_at' <<<"$marker")
+                    jq -cn --argjson task_id "$task_id" --arg requested_at "$requested_at" '{task_id: $task_id, state: "cancellation_pending", cancellation_requested_at: $requested_at}'
+                    printf '%s: the task is gone while the cancellation outcome remains unresolved: %s\n' "$program" "$task_id" >&2
+                    return 4
+                fi
             fi
         fi
-        fail "unknown AgentQ task id: $task_id"
+        report_compact_task_failure "$raw_compact_status" "$task_id"
     fi
 
     # Quiet exploratory read; see cancelled_task_replay for why.
@@ -5182,9 +5217,11 @@ remove_task() {
     local removal_status=0
     local request_id
     local record
+    local removable_status=0
 
     ensure_daemon
-    removable_task=$(compact_task "$task_id") || fail "unknown AgentQ task id: $task_id"
+    removable_task=$(compact_task "$task_id") || removable_status=$?
+    report_compact_task_failure "$removable_status" "$task_id"
     if mark_request_removing "$removable_task"; then
         :
     else

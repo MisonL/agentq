@@ -413,7 +413,7 @@ tombstone；重复恰恰累积在 tombstone 一侧。）
 
 这可以**零授权**修（只改 `assets/`，不需要真机），但**必须先钉死行为**：
 
-- `agentq-server` 是 5,181 行无类型 shell，本仓 smoke **抓不到行为回归**
+- `agentq-server` 是 5,323 行无类型 shell，本仓 smoke **抓不到行为回归**
 - 这条路径是安全相关的（那两处 `created_at` 相等判断正是防止 id 复用误判的核心）
 - 所以顺序是：先为 `cancelled_task_replay` / `task_instance_created_at` 写一份
   针对性契约检查（**改之前就要能红**），再改，再复跑
@@ -1049,9 +1049,19 @@ reason，**record 保留、tombstone 未写、任务仍 Running**，Pueue 恢复
 **回归锁**：新增 `smoke/15-transient-pueue-failure`（第 15 项检查）。**红/绿实测**：
 修复前（`1bbfd403`）五条断言全红、消息精确；修复后全绿。
 
-**仍未修**：`cancel`/`logs`/`remove` 路径上同一根因的**消息误导**——它们对活着的任务报
-`unknown AgentQ task id`（exit `2` 传播是正确的，但把"读不出来"说成了"id 不存在"）。
-契约说 exit 2 意味着"改参数"，同一个底层状况在 `wait` 上正确地报 `6`。
+**消息误导已修（2026-10-07，A13 收尾）**：`cancel`/`logs`/`remove` 三个路径此前把
+`compact_task`/`raw_compact_task` 的**任何**失败都报成 `unknown AgentQ task id`——exit `2`
+传播是对的，但把「读不出来」说成了「id 不存在」，与 `wait` 把同一状况报 `6` 自相矛盾。
+两个助手其实早已区分：**rc=4 是 Pueue 应答了、id 确实不可见；rc=1（读失败）与 2/5
+（畸形 status）是存在性未知**——是三个调用点把区别抹平了。现在统一经
+`report_compact_task_failure` 分类（rc=4 保持 `unknown AgentQ task id`、其余报
+`cannot inspect Pueue while reading AgentQ task`，均退 2 + `reason=protocol_error`）。
+顺带修掉同一分支的第二层误导：pending-marker 的「任务已消失」分支原本对**任何** rc 都
+进入——读失败时它会对一个只是没查到的任务宣告「the task is gone」（应是
+`cancellation_pending`）——现闸在 rc=4 上（只在确认不可见时才宣告消失；确认重放仍在
+闸门之前，所以纯本地 marker 重放在 Pueue 读失败时**仍能成功**）。回归锁扩进
+`smoke/15`（第 6 节：三条路径 × 注入一次瞬时失败 + pending-marker 组合），修复前
+**6 红**（实测），5 个变异各被抓住；`03`/`26`/`27` 复跑全绿（rc=4 路径的消息逐字不变）。
 
 **修复前的部署上，一次 Pueue 抖动就可能永久污染一条 request。** 这不是"窗口正常
 关闭"，不要这样解释。
@@ -2067,7 +2077,7 @@ SSH 走 **2222** 端口
    安装器是否真的能装——那仍需真机。
 
 5. **`01` 只证明能解析，不证明任何分支的行为正确。** `skill/assets/unix/agentq-server`
-   是 **5,181** 行无类型 shell：没有编译器、没有类型系统。（**2026-09-29 起有 git**，
+   是 **5,323** 行无类型 shell：没有编译器、没有类型系统。（**2026-09-29 起有 git**，
    但版本控制不改变这一条——它给的是「改了什么」，不是「改对了没有」。）改它时把
    这一点计入风险。
 
@@ -2167,6 +2177,13 @@ helper **在本文件中确有定义**、规则 F 从「前缀式」收紧为**�
 `6`/`unavailable` 分支，此前无任何用例直达——`04` 走的是另一条路径）。
 另修正一批文档失准（分母、百分比、检查计数、`SKILL.md` 把已修缺陷写成「已知」、
 `PLAN.md` 五处仍说主机 C 缺凭据、Windows 缺陷数「三个」实为四个）。
+
+**A13 的最后一处消息误导已修（2026-10-07，用户授权「继续」）**：`cancel`/`logs`/`remove`
+把瞬时 Pueue 读失败报成 `unknown AgentQ task id`（`wait` 对同一状况正确报 `6`/`unavailable`）
+——现经 `report_compact_task_failure` 分类，读失败报 `cannot inspect Pueue while reading
+AgentQ task`，rc=4 保持原消息；pending-marker 分支闸到 rc=4。锁在 `smoke/15` 第 6 节
+（修复前 6 红、5 变异 5/5 被抓）。**A28 记录在案项至此清零可做项**，余下全部需要授权
+（B5 三台重装、真机 `2>` 实验）或属设计决定（W4）。
 
 **A28 七维度审查已执行（2026-10-06，用户指示「使用 agents 全维度全场景审查」）**：
 7 个互不知情的只读审查者（服务端 / POSIX 客户端 / Windows 资产 / 四个安装器 / 测试

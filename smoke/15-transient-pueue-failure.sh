@@ -237,6 +237,132 @@ elif [ "$task_state" != "Running" ] && [ "$task_state" != "Queued" ]; then
     failures=$((failures + 1))
 fi
 
+# --- 6. A transient read failure on logs/cancel/remove must not be reported as
+#        "unknown AgentQ task id" --------------------------------------------
+#
+# Same root cause as the P0 above, on the three paths that resolve a task
+# through compact_task/raw_compact_task instead of find_request_task.  Those
+# helpers distinguish two outcomes: 4 means Pueue ANSWERED and this id is
+# genuinely not visible; 1 (read failure) and 2/5 (malformed status) mean the
+# task's existence is UNKNOWN.  Every call site collapsed all of them into
+# "unknown AgentQ task id", whose documented meaning is an argument error --
+# so a caller was told to fix its arguments when the truth was "Pueue could not
+# be read, retry".  The identical defect was already fixed for find_request_task
+# (see the header) but left on these three paths; measured 2026-10-07.
+probe_request_id="smoke-transient-probe-$$-$(date -u '+%Y%m%dT%H%M%SZ')"
+probe_request_id=${probe_request_id:0:120}
+if ! probe_submit=$("$server" submit --workdir "$workdir" --label transient-probe \
+        --request-id "$probe_request_id" -- sh -c 'sleep 300'); then
+    printf '%s
+' 'submit of the probe task failed' >&2
+    exit 1
+fi
+probe_task_id=$(jq -er '.task_id' <<<"$probe_submit") || {
+    printf 'probe submit returned no task_id: %s\n' "$probe_submit" >&2
+    exit 1
+}
+sleep 2
+
+# One injected failure at the SECOND `status --json` call: call 1 is the
+# ensure_daemon probe, call 2 is the read inside compact_task/raw_compact_task.
+# Failing call 1 instead would make the server reach for launchctl (a real
+# service change).
+for probe_command in logs cancel remove; do
+    printf '2\n' > "$control/status.target"
+    printf '0\n' > "$control/status.count"
+    probe_status=0
+    probe_output=$("$server" "$probe_command" "$probe_task_id" 2>"$work/probe.stderr") || probe_status=$?
+    printf '0\n' > "$control/status.target"
+
+    if grep -q 'unknown AgentQ task id' "$work/probe.stderr"; then
+        note "$probe_command reported a transient Pueue read failure as an unknown task id"
+        failures=$((failures + 1))
+    fi
+    if ! grep -q 'cannot inspect Pueue' "$work/probe.stderr"; then
+        note "$probe_command did not report that Pueue could not be inspected"
+        failures=$((failures + 1))
+    fi
+    if ! grep -qx 'agentq-server: reason=protocol_error' "$work/probe.stderr"; then
+        note "$probe_command did not carry reason=protocol_error"
+        failures=$((failures + 1))
+    fi
+    if [ "$probe_status" -ne 2 ]; then
+        note "$probe_command returned $probe_status after a transient failure; expected 2"
+        failures=$((failures + 1))
+    fi
+done
+
+# A pending cancellation marker must not turn a READ FAILURE into
+# 4/cancellation_pending ("the task is gone while the cancellation outcome
+# remains unresolved").  On a read failure we do not know the task is gone, so
+# the only honest answer is "cannot inspect Pueue".  The rc=4 gate that keeps
+# these apart is load-bearing: without it this case reports the task as gone.
+printf '{"version":1,"task_id":%s,"created_at":"2026-09-29T00:00:00Z","requested_at":"2026-09-29T00:05:00Z","reason":"kill_unconfirmed","state":"pending"}\n' \
+    "$probe_task_id" > "$home/data/agentq-cancellations/$probe_task_id.json"
+printf '2\n' > "$control/status.target"
+printf '0\n' > "$control/status.count"
+marker_status=0
+marker_output=$("$server" cancel "$probe_task_id" 2>"$work/marker.stderr") || marker_status=$?
+printf '0\n' > "$control/status.target"
+rm -f "$home/data/agentq-cancellations/$probe_task_id.json"
+if [ "$marker_status" -ne 2 ]; then
+    note "cancel with a pending marker under a read failure returned $marker_status; expected 2"
+    failures=$((failures + 1))
+fi
+if grep -q 'cancellation_pending' <<<"$marker_output"; then
+    note "cancel claimed the task is gone (cancellation_pending) while Pueue was merely unreadable"
+    failures=$((failures + 1))
+fi
+if ! grep -q 'cannot inspect Pueue' "$work/marker.stderr"; then
+    note 'cancel with a pending marker did not report that Pueue could not be inspected'
+    failures=$((failures + 1))
+fi
+
+# A CONFIRMED-cancel replay must still succeed while Pueue is unreadable: the
+# evidence (marker state "requested" + the instance's recorded creation time)
+# lives entirely in local files, and the caller must not be told "unknown task
+# id" about a cancel it already saw confirmed.  This also locks the gate order:
+# the replay check sits BEFORE the rc=4 gate, and only rc=4 may claim "the task
+# is gone".
+replay_task_id=991177
+replay_request_id="smoke-replay-$$-$(date -u '+%Y%m%dT%H%M%SZ')"
+replay_request_id=${replay_request_id:0:120}
+cat > "$home/data/agentq-requests/.tombstones/$replay_request_id.json" <<TOMBSTONE
+{"version":1,"request_id":"$replay_request_id","task_id":$replay_task_id,"task_created_at":"2026-09-29T00:00:00Z","state":"removed","removed_at":"2026-09-29T01:00:00Z"}
+TOMBSTONE
+printf '{"version":1,"task_id":%s,"created_at":"2026-09-29T00:00:00Z","requested_at":"2026-09-29T00:05:00Z","reason":"kill_confirmed","state":"requested"}\n' \
+    "$replay_task_id" > "$home/data/agentq-cancellations/$replay_task_id.json"
+printf '2\n' > "$control/status.target"
+printf '0\n' > "$control/status.count"
+replay_status=0
+replay_output=$("$server" cancel "$replay_task_id" 2>"$work/replay.stderr") || replay_status=$?
+printf '0\n' > "$control/status.target"
+rm -f "$home/data/agentq-cancellations/$replay_task_id.json" \
+    "$home/data/agentq-requests/.tombstones/$replay_request_id.json"
+if [ "$replay_status" -ne 0 ]; then
+    note "confirmed-cancel replay failed under a transient read failure (exit $replay_status): $(head -c 200 "$work/replay.stderr")"
+    failures=$((failures + 1))
+fi
+if [ "$(jq -r '.reused' <<<"$replay_output" 2>/dev/null)" != true ]; then
+    note "confirmed-cancel replay did not report reused:true: $replay_output"
+    failures=$((failures + 1))
+fi
+
+# The probe task must have survived all three, and logs must work again.
+if ! probe_state=$("$server" status 2>/dev/null | jq -r --argjson id "$probe_task_id" \
+        '.tasks[($id|tostring)].status | keys[0]'); then
+    note 'could not read the probe task state after the injected failures'
+    failures=$((failures + 1))
+elif [ "$probe_state" != "Running" ] && [ "$probe_state" != "Queued" ]; then
+    note "the probe task did not survive the injected failures: state=$probe_state"
+    failures=$((failures + 1))
+fi
+if ! probe_logs=$("$server" logs "$probe_task_id" 2>/dev/null); then
+    note 'logs failed for the probe task after Pueue recovered'
+    failures=$((failures + 1))
+fi
+
+"$server" remove "$probe_task_id" >/dev/null 2>&1 || true
 "$server" remove "$task_id" >/dev/null 2>&1 || true
 
 if [ "$failures" -ne 0 ]; then
