@@ -426,6 +426,54 @@ move_installer_tree() {
     fi
 }
 
+assert_no_crash_leftover_transactions() {
+    # W5 (POSIX half).  The crash window is between `mv agentq_home -> backup_home`
+    # and `mv stage_home -> agentq_home`: $agentq_home is then ABSENT with a
+    # `.${agentq_base}.backup.*` (and possibly `.stage.*`) sibling beside it --
+    # the old queue, data and any credentials still inside the backup.  Without
+    # this guard the re-run treats the machine as a fresh install (previous_install
+    # stays false because `[ -e "$agentq_home" ]` is false), skips
+    # copy_existing_data entirely and moves an EMPTY stage into place: a silent
+    # empty deployment over a stranded previous one.  Measured 2026-10-07 on this
+    # machine: the window is real on POSIX too -- it was only masked in the common
+    # case by the unrelated wrapper check, which refused with a message pointing at
+    # the wrapper instead of at the stranded backup (an operator following that
+    # message would delete the wrapper and fall straight into the empty deploy).
+    #
+    # Both directions refuse: a leftover beside a MISSING root is the empty-deploy
+    # window; a leftover beside a PRESENT root means a run crashed after the swap
+    # or one is in progress -- only the operator can tell which, and the success
+    # path always removes its own backup before exiting, so residue is never
+    # normal.  Nothing is deleted, merged or restored automatically.
+    #
+    # The scan is fail-closed: if find cannot read the parent the guard refuses,
+    # because an unreadable directory would otherwise bypass it exactly as a
+    # missing root does.
+    crash_leftovers=''
+    crash_scan_failed=false
+    for crash_kind in stage backup failed; do
+        crash_matches=$(find "$agentq_parent" -mindepth 1 -maxdepth 1 \
+            -name ".${agentq_base}.${crash_kind}.*" -print 2>/dev/null) || crash_scan_failed=true
+        if [ -n "$crash_matches" ]; then
+            if [ -n "$crash_leftovers" ]; then
+                crash_leftovers="$crash_leftovers
+$crash_matches"
+            else
+                crash_leftovers=$crash_matches
+            fi
+        fi
+    done
+    if [ "$crash_scan_failed" = true ]; then
+        fail "refusing to install: cannot inspect $agentq_parent for leftover AgentQ transaction directories; refusing to risk a silent empty deployment over an unreadable directory. Check permissions and re-run. Nothing was modified."
+    fi
+    [ -n "$crash_leftovers" ] || return 0
+    crash_leftover_list=$(printf '%s\n' "$crash_leftovers" | tr '\n' ' ')
+    if [ ! -e "$agentq_home" ] && [ ! -L "$agentq_home" ]; then
+        fail "refusing to install: AgentQ root $agentq_home is missing but a previous run's transaction residue exists ($crash_leftover_list). A run crashed between moving the old root aside and installing the new one; the previous deployment (queue data and credentials) is still in the .backup directory above. Move it back to $agentq_home to recover, or remove it to confirm a fresh install. Nothing was modified."
+    fi
+    fail "refusing to install: a previous run's transaction residue exists beside the AgentQ root ($crash_leftover_list). Either an install crashed after the swap or another install is in progress; inspect these directories and restore or remove the backup as intended, then re-run. Nothing was modified."
+}
+
 move_installer_file() {
     installer_move_file_source=$1
     installer_move_file_destination=$2
@@ -2657,6 +2705,9 @@ agentq_parent=$(dirname "$agentq_home")
 agentq_base=$(basename "$agentq_home")
 [ "$agentq_parent" = "$HOME" ] || fail "unexpected AgentQ home parent: $agentq_parent"
 installer_directory_is_safe "$agentq_parent" || fail "AgentQ transaction parent is unsafe: $agentq_parent"
+# W5: refuse BEFORE taking the lock or staging anything when a previous run left
+# transaction residue beside the root -- see assert_no_crash_leftover_transactions.
+assert_no_crash_leftover_transactions
 
 case "$(uname -s):$(uname -m)" in
     Linux:x86_64)

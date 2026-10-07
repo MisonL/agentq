@@ -29,7 +29,9 @@ set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 real_assets="$root/skill/assets/unix"
-installer_source="$real_assets/install-agentq.sh"
+# AGENTQ_SMOKE_INSTALLER points this check at a mutated copy of the installer;
+# same convention as smoke/05, smoke/07 and smoke/13.
+installer_source="${AGENTQ_SMOKE_INSTALLER:-$real_assets/install-agentq.sh}"
 
 # The installer refuses any path containing a symlink component
 # (installer_path_is_safe walks every component and rejects a link).  On macOS
@@ -903,8 +905,60 @@ else
     fi
 fi
 
+# --- W5: crash-leftover transactions must be refused, not deployed over -------
+# The crash window is between `mv agentq_home -> backup_home` and `mv stage_home
+# -> agentq_home`.  Measured 2026-10-07: without a guard the re-run treats the
+# machine as fresh (`previous_install` stays false because $agentq_home is gone),
+# skips copy_existing_data and moves an EMPTY stage into place.  In the common
+# case an unrelated wrapper check masked it -- with a message pointing at the
+# wrapper, not the stranded backup.  These cases pin the guard, and each also
+# asserts the residue was NOT deleted: a guard that "fixed" the state by removing
+# the operator's only copy of the queue would be worse than the silent deploy.
+crash_case() {
+    local label=$1 expected=$2 root_present=$3
+    local home_before home_after status=0
+    rm -rf "$home"/..agentq.backup.* "$home"/..agentq.stage.* "$home"/.agentq "$home"/.local
+    mkdir -p "$home/..agentq.backup.SmokeAbC"
+    [ "$root_present" = yes ] && mkdir -p "$home/.agentq"
+    home_before=$(find "$home" -mindepth 1 2>/dev/null | LC_ALL=C sort)
+    env HOME="$home" PATH="$stub_bare" \
+        /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+    check_case "$label" "$expected" "$status"
+    home_after=$(find "$home" -mindepth 1 2>/dev/null | LC_ALL=C sort)
+    if [ "$home_before" != "$home_after" ]; then
+        printf 'installer %s: the guard changed HOME (it must touch nothing):\n' "$label" >&2
+        diff <(printf '%s\n' "$home_before") <(printf '%s\n' "$home_after") | sed 's/^/      /' >&2 || true
+        failures=$((failures + 1))
+    fi
+}
+crash_case 'crash leftover, root missing' \
+    "is missing but a previous run's transaction residue exists" no
+crash_case 'crash leftover, root present' \
+    'exists beside the AgentQ root' yes
+rm -rf "$home"/..agentq.backup.* "$home"/.agentq
+
+# Fail-closed: an UNLISTABLE parent must refuse, not see "no residue" and
+# proceed.  Without this case the fail-open mutation (dropping the `||
+# crash_scan_failed=true`) passes the whole file -- measured: it did.
+rm -rf "$home"/..agentq.backup.* "$home"/..agentq.stage.* "$home"/.agentq
+chmod 000 "$home"
+cases=$((cases + 1))
+scan_status=0
+env HOME="$home" PATH="$stub_bare" \
+    /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || scan_status=$?
+chmod 700 "$home"
+if [ "$scan_status" -ne 2 ]; then
+    printf 'installer unlistable parent: expected exit 2, got %s\n' "$scan_status" >&2
+    sed 's/^/      /' "$work/err" >&2 || true
+    failures=$((failures + 1))
+elif ! grep -qF 'cannot inspect' "$work/err"; then
+    printf 'installer unlistable parent: refused for the wrong reason:\n' >&2
+    sed 's/^/      /' "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'installer-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'installer-contract checks passed: cases=%s sandbox-home=yes stub-path=yes download-path=covered toctou-path=covered plist-placeholder=guarded\n' "$cases"
+printf 'installer-contract checks passed: cases=%s sandbox-home=yes stub-path=yes download-path=covered toctou-path=covered plist-placeholder=guarded crash-leftover=covered\n' "$cases"

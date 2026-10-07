@@ -1190,8 +1190,8 @@ git 历史里（`d9a0957` 引入计算机名与账户名，`63c6061` 基线提�
 
 ### B4. 覆盖债的第一刀砍哪
 
-`unix/install-agentq.sh`（**2,895 行**）和 `windows-git-bash/install-agentq.ps1`
-（**3,072 行**）合计 **5,967 行**，占全仓 22.1%（**26,977 行、23 个资产**），是两个最大的
+`unix/install-agentq.sh`（**2,946 行**）和 `windows-git-bash/install-agentq.ps1`
+（**3,072 行**）合计 **6,018 行**，占全仓 22.3%（**27,028 行、23 个资产**），是两个最大的
 零覆盖资产（B4 当时；两者如今各有一份契约检查）。A1 处理前者。**这几个数字按当前字节重算**
 （原先记 2,755+2,881、后记 2,876+2,922；资产随 A18/A27/W5 等增长后失真，2026-10-06 与
 2026-10-07 两次更正，覆盖表里的 2,424/2,911/496 亦同）。
@@ -1995,6 +1995,19 @@ agent 结论会凭空造出不存在的 P0，本轮确实有 5 条被复核推�
   且只断言了 `refusing to install:` 前缀；现在按**方向**断言消息片段、并加「父目录不可列」一例。
   **仍未覆盖**：换根本身（两次 `Move-Item` 之间的真实崩溃与恢复）需真机——本检查证明的是
   **拒绝逻辑**，不是崩溃恢复的端到端。
+  **POSIX 侧同一窗口也已修（2026-10-07，验证 Windows 侧时实测发现）**：`install-agentq.sh`
+  的 `mv agentq_home→backup_home` 与 `mv stage_home→agentq_home` 之间是同一个窗口，
+  且**此前只被一个不相关的检查偶然挡住**——`previous_install` 因 `[ -e "$agentq_home" ]`
+  为假而保持 false，随后 wrapper 检查以 `refuse to overwrite an existing wrapper` 拒绝，
+  **消息指向 wrapper 而非残留的 backup**；操作者照字面删掉 wrapper 再重跑就落进静默空部署
+  （实测：wrapper 缺失时安装器继续走到 staging，残留原封不动）。新增
+  `assert_no_crash_leftover_transactions`（与 Windows 侧对称：两方向都拒、不删不并不恢复、
+  扫描 fail-closed），调用点在 `installer_directory_is_safe "$agentq_parent"` 之后、取锁与
+  staging **之前**。**残留名是双点前缀 `..agentq.{stage,backup,failed}.*`**（`agentq_base`
+  本身是 `.agentq`）——`smoke/11` 25 例（23→25），变异 5/5 被抓；其中 **M4（扫描 fail-open）
+  第一版没抓到**（fixture 父目录恒可列），补「父目录 chmod 000」一例后被抓；**M5 我第一版写成了
+  坏变异**（glob 用单点 `.agentq.stage.*`、匹配不到真实的双点名，等于什么都没测），改正后
+  抓到「守卫删除了残留」。
 - 本机 `~/.local/bin/agentq` 与 `sshp` **已于 2026-10-07 重装**（用户「所有权限」授权）：
   逐字节等于 canonical、`--check` 退 0、mode 700、HOME 守卫生效。
 - **真机实验（仍需你点名机器）**：① PS 5.1 的 `2>` 是否真产出 UTF-16LE+BOM
