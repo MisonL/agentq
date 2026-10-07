@@ -2288,6 +2288,80 @@ function Remove-SafeTransactionDirectory {
     return $true
 }
 
+function Find-AgentQCrashLeftovers {
+    # W5: a crash BETWEEN `Move-Item root -> backup` and `Move-Item stage -> root`
+    # leaves the root ABSENT with `.AgentQ.backup.<pid>` (and possibly
+    # `.AgentQ.stage.<pid>`) beside it -- old queue, shared secret and certs still
+    # inside the backup.  The re-run's preflight then sees a missing root, skips
+    # hash / active-task / Copy-AgentQData entirely, builds a fresh stage and moves
+    # it into place: a silent EMPTY deployment, with the old one stranded.  This
+    # returns that residue so the caller can REFUSE instead of deploying over it.
+    #
+    # Returns every directory directly under $ParentDirectory whose name matches
+    # `.<rootName>.<kind>.<token>` with kind in stage|backup|failed.  `-Force` is
+    # required: every candidate name is dot-prefixed.  A FAILED scan returns a
+    # `scan-failed` entry rather than an empty list: silence here would let an
+    # unreadable directory bypass the guard the same way a missing root does.
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ParentDirectory,
+        [Parameter(Mandatory = $true)]
+        [string]$RootName
+    )
+
+    $found = @()
+    try {
+        $pattern = '^\.' + [regex]::Escape($RootName) + '\.(stage|backup|failed)\.'
+        foreach ($candidate in @(Get-ChildItem -LiteralPath $ParentDirectory -Directory -Force -ErrorAction Stop)) {
+            if ($candidate.Name -notmatch $pattern) {
+                continue
+            }
+            $found += [pscustomobject]@{
+                Path = $candidate.FullName
+                Kind = $Matches[1]
+            }
+        }
+    } catch {
+        $found += [pscustomobject]@{
+            Path = $ParentDirectory
+            Kind = 'scan-failed'
+        }
+    }
+    return $found
+}
+
+function Assert-NoCrashLeftoverTransactions {
+    # The refusal half of W5 (see Find-AgentQCrashLeftovers).  Both directions
+    # refuse: a leftover beside a MISSING root is the silent-empty-deploy window;
+    # a leftover beside a PRESENT root means a run crashed after the swap or one
+    # is in progress -- only the operator can tell which, and the success path
+    # always deletes its own backup before exiting, so residue is never normal.
+    # Nothing is deleted, merged or restored automatically; the message names the
+    # paths and the recovery move.
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ParentDirectory,
+        [Parameter(Mandatory = $true)]
+        [string]$RootName,
+        [Parameter(Mandatory = $true)]
+        [string]$RootDirectory
+    )
+
+    $leftovers = @(Find-AgentQCrashLeftovers -ParentDirectory $ParentDirectory -RootName $RootName)
+    if ($leftovers.Count -eq 0) {
+        return
+    }
+    $leftoverPaths = ($leftovers | ForEach-Object { $_.Path }) -join ', '
+    if (@($leftovers | Where-Object { $_.Kind -eq 'scan-failed' }).Count -gt 0) {
+        throw "refusing to install: cannot inspect $ParentDirectory for leftover AgentQ transaction directories. Refusing to risk a silent empty deployment over an unreadable directory; check permissions and re-run. Nothing was modified."
+    }
+    $rootItem = Get-Item -LiteralPath $RootDirectory -Force -ErrorAction SilentlyContinue
+    if ($null -eq $rootItem) {
+        throw "refusing to install: AgentQ root $RootDirectory is missing but a previous run's transaction residue exists ($leftoverPaths). A run crashed between moving the old root aside and installing the new one; the previous deployment (queue data, shared secret, certificates) is still in the .backup directory above. Move it back to $RootDirectory to recover, or remove it to confirm a fresh install. Nothing was modified."
+    }
+    throw "refusing to install: a previous run's transaction residue exists beside the AgentQ root ($leftoverPaths). Either an install crashed after the swap or another install is in progress; inspect these directories and restore or remove the backup as intended, then re-run. Nothing was modified."
+}
+
 function Get-ProcessIdentityState {
     param([string]$ProcessId)
 
@@ -2744,6 +2818,14 @@ $newConfigPath = Join-Path $configDirectory "pueue.yml"
 $newLauncherPath = Join-Path $rootDirectory "agentq-launcher.ps1"
 $newStartupPath = Join-Path $rootDirectory "agentq-start-daemon.ps1"
 
+# W5: refuse BEFORE preflight when a previous run left transaction residue
+# behind.  The crash window is between `Move-Item root -> backup` and
+# `Move-Item stage -> root`: the root is then ABSENT, and without this guard the
+# block below treats the machine as a fresh install and moves an EMPTY stage into
+# the root while the old queue and credentials (data\shared_secret, certs\) sit
+# stranded in `.AgentQ.backup.<pid>`.  See Assert-NoCrashLeftoverTransactions for
+# both refusal directions and the recovery guidance.
+Assert-NoCrashLeftoverTransactions -ParentDirectory $parentDirectory -RootName $rootName -RootDirectory $rootDirectory
 $existingRootItem = Get-Item -LiteralPath $rootDirectory -Force -ErrorAction SilentlyContinue
 if (($null -ne $existingRootItem) -and !$existingRootItem.PSIsContainer) {
     throw "Existing AgentQ root is not a directory: $rootDirectory"
