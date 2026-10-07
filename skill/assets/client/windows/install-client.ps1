@@ -231,64 +231,101 @@ function New-InstallerTemporaryFile {
     throw "Unable to create a unique client installer temporary file"
 }
 
-function Install-AtomicFile {
+function Install-CommitSet {
+    # Pair-atomic commit (PLAN.md A28 W4, the installer half): stage EVERYTHING
+    # first, then replace destinations in one commit phase.  Per-item
+    # stage+replace installs agentq and then fails on sshp, leaving a NEW agentq
+    # paired with a STALE sshp -- and the pair is only ever read together.  A
+    # failure INSIDE the commit phase cannot be made atomic without transactional
+    # filesystem support; what this bounds is the crash/failure window to the
+    # replacements themselves (adjacent [File] calls), instead of every copy,
+    # chmod/ACL and replace of the remaining items.  On the known Windows failure
+    # modes -- source asset missing/unreadable, ACL write denied -- the throw
+    # happens during staging and NEITHER destination moves.  That is the
+    # property smoke/25 asserts; the residue of a mid-commit crash is caught by
+    # --check (one side drifted) and a rerun heals both.
     param(
-        [string]$SourcePath,
-        [string]$DestinationPath
+        [array]$Items
     )
 
-    $sourceItem = Get-Item -LiteralPath $SourcePath -Force -ErrorAction SilentlyContinue
-    if ($null -eq $sourceItem) {
-        throw "Client asset is missing: $SourcePath"
-    }
-    Assert-NonReparsePathChain -Path $SourcePath -Description "client source file"
-    if ($sourceItem.PSIsContainer) {
-        throw "Client asset is not a file: $SourcePath"
-    }
-
-    $destinationItem = Get-Item -LiteralPath $DestinationPath -Force -ErrorAction SilentlyContinue
-    if ($null -ne $destinationItem) {
-        Assert-NonReparsePathChain -Path $DestinationPath -Description "client destination file"
-        if ($destinationItem.PSIsContainer) {
-            throw "Client destination is not a file: $DestinationPath"
-        }
-    }
-    Assert-NonReparsePathChain -Path $DestinationDirectory -Description "client destination directory"
-    Assert-NonReparsePathChain -Path $DestinationPath -Description "client destination file"
-
-    $temporaryPath = $null
-    $backupPath = $null
-    $cleanupFailed = $false
+    $staged = [System.Collections.Generic.List[object]]::new()
+    $stagedTemporaryPaths = [System.Collections.Generic.List[string]]::new()
     $originalError = $null
     try {
-        $temporaryPath = New-InstallerTemporaryFile -Directory $DestinationDirectory -Prefix "stage"
-        Assert-NonReparsePathChain -Path $SourcePath -Description "client source file"
-        Assert-NonReparsePathChain -Path $DestinationDirectory -Description "client destination directory"
-        Assert-NonReparsePathChain -Path $temporaryPath -Description "client temporary file"
-        Copy-Item -LiteralPath $SourcePath -Destination $temporaryPath -Force
-        Assert-NonReparsePathChain -Path $DestinationDirectory -Description "client destination directory"
-        Assert-NonReparsePathChain -Path $temporaryPath -Description "client temporary file"
-        if ($null -ne $destinationItem) {
-            $backupPath = New-InstallerTemporaryFile -Directory $DestinationDirectory -Prefix "backup"
-            Assert-NonReparsePathChain -Path $DestinationPath -Description "client destination file"
-            Assert-NonReparsePathChain -Path $backupPath -Description "client backup file"
-            [System.IO.File]::Replace($temporaryPath, $DestinationPath, $backupPath)
-        } else {
-            Assert-NonReparsePathChain -Path $DestinationPath -Description "client destination file"
-            [System.IO.File]::Move($temporaryPath, $DestinationPath)
+        foreach ($item in $Items) {
+            $sourcePath = $item.SourcePath
+            $destinationPath = $item.DestinationPath
+            $sourceItem = Get-Item -LiteralPath $sourcePath -Force -ErrorAction SilentlyContinue
+            if ($null -eq $sourceItem) {
+                throw "Client asset is missing: $sourcePath"
+            }
+            Assert-NonReparsePathChain -Path $sourcePath -Description "client source file"
+            if ($sourceItem.PSIsContainer) {
+                throw "Client asset is not a file: $sourcePath"
+            }
+            $destinationItem = Get-Item -LiteralPath $destinationPath -Force -ErrorAction SilentlyContinue
+            if ($null -ne $destinationItem) {
+                Assert-NonReparsePathChain -Path $destinationPath -Description "client destination file"
+                if ($destinationItem.PSIsContainer) {
+                    throw "Client destination is not a file: $destinationPath"
+                }
+            }
+            Assert-NonReparsePathChain -Path $DestinationDirectory -Description "client destination directory"
+            $temporaryPath = New-InstallerTemporaryFile -Directory $DestinationDirectory -Prefix "stage"
+            Assert-NonReparsePathChain -Path $temporaryPath -Description "client temporary file"
+            [void]$stagedTemporaryPaths.Add($temporaryPath)
+            Copy-Item -LiteralPath $SourcePath -Destination $temporaryPath -Force
+            if ($item.PSObject.Properties["Prepare"] -and $null -ne $item.Prepare) {
+                & $item.Prepare $temporaryPath
+            }
+            # Prepare/PostCommit are optional per-item hooks (only the Git Bash
+            # shims carry them).  Under StrictMode a missing property THROWS on
+            # access, so both are copied through a property-existence guard --
+            # measured 2026-10-07: reading $item.PostCommit unconditionally
+            # broke the plain .ps1/.cmd items.
+            $entry = [ordered]@{
+                TemporaryPath      = $temporaryPath
+                DestinationPath    = $destinationPath
+                DestinationExisted = ($null -ne $destinationItem)
+                Description        = $item.Description
+            }
+            if ($item.PSObject.Properties["PostCommit"]) {
+                $entry["PostCommit"] = $item.PostCommit
+            }
+            [void]$staged.Add([pscustomobject]$entry)
+        }
+
+        for ($index = 0; $index -lt $staged.Count; $index++) {
+            $entry = $staged[$index]
+            Assert-NonReparsePathChain -Path $entry.DestinationPath -Description "client destination file"
+            if ($entry.DestinationExisted) {
+                $backupPath = New-InstallerTemporaryFile -Directory $DestinationDirectory -Prefix "backup"
+                Assert-NonReparsePathChain -Path $backupPath -Description "client backup file"
+                [System.IO.File]::Replace($entry.TemporaryPath, $entry.DestinationPath, $backupPath)
+                if (!(Remove-InstallerTemporaryFile -Path $backupPath -Description "client backup file")) {
+                    throw "Client installer temporary cleanup failed"
+                }
+            } else {
+                [System.IO.File]::Move($entry.TemporaryPath, $entry.DestinationPath)
+            }
+            # Post-replace work (the ACL) runs inside the commit phase on
+            # purpose: the file must not become visible as committed before its
+            # protection lands.
+            if ($entry.PSObject.Properties["PostCommit"] -and $null -ne $entry.PostCommit) {
+                & $entry.PostCommit $entry.DestinationPath
+            }
         }
     } catch {
         $originalError = $_
         throw
     } finally {
-        foreach ($pathAndDescription in @(
-            @($temporaryPath, "client temporary file"),
-            @($backupPath, "client backup file")
-        )) {
-            $path = $pathAndDescription[0]
-            $description = $pathAndDescription[1]
-            if (![string]::IsNullOrWhiteSpace($path) -and
-                !(Remove-InstallerTemporaryFile -Path $path -Description $description)) {
+        $cleanupFailed = $false
+        foreach ($temporaryPath in $stagedTemporaryPaths) {
+            # Commit moves the staged file away, so a path that no longer exists
+            # was consumed by a successful replace -- that is success, not
+            # residue, and Remove-InstallerTemporaryFile already treats a missing
+            # path that way.
+            if (!(Remove-InstallerTemporaryFile -Path $temporaryPath -Description "client temporary file")) {
                 $cleanupFailed = $true
             }
         }
@@ -411,11 +448,17 @@ if ($Check) {
 Assert-NonReparsePathChain -Path $DestinationDirectory -Description "client destination directory"
 [System.IO.Directory]::CreateDirectory($DestinationDirectory) | Out-Null
 Assert-NonReparsePathChain -Path $DestinationDirectory -Description "client destination directory"
+
+$clientCommitItems = [System.Collections.Generic.List[object]]::new()
 foreach ($client in @("agentq", "sshp")) {
     foreach ($extension in @(".ps1", ".cmd")) {
         $sourcePath = Join-Path $scriptDirectory ($client + $extension)
         $destinationPath = Join-Path $DestinationDirectory ($client + $extension)
-        Install-AtomicFile -SourcePath $sourcePath -DestinationPath $destinationPath
+        [void]$clientCommitItems.Add([pscustomobject]@{
+                SourcePath       = $sourcePath
+                DestinationPath  = $destinationPath
+                Description      = $client + $extension
+            })
     }
 }
 
@@ -485,15 +528,27 @@ function Set-ClientLauncherAcl {
     }
 }
 
+# Set-ClientLauncherAcl is defined before it is REFERENCED here, but the
+# [pscustomobject] scriptblock below only runs it during Install-CommitSet --
+# by then the function exists.
 $gitBashPath = Resolve-GitBashPath
 if ($null -ne $gitBashPath) {
     foreach ($client in @("agentq", "sshp")) {
         $shimSourcePath = Join-Path $scriptDirectory ($client + ".bash")
         $shimPath = Join-Path $DestinationDirectory $client
-        Install-AtomicFile -SourcePath $shimSourcePath -DestinationPath $shimPath
-        Set-ClientLauncherAcl -Path $shimPath
+        [void]$clientCommitItems.Add([pscustomobject]@{
+                SourcePath    = $shimSourcePath
+                DestinationPath = $shimPath
+                Description   = $client
+                Prepare       = { param($path) Set-ClientLauncherAcl -Path $path }
+            })
     }
 }
+
+# ONE commit for all four/five client files: every source is readable and every
+# stage completes before any destination moves, and the only per-item work left
+# inside the commit is the replacement itself plus the ACL that must land with it.
+Install-CommitSet -Items $clientCommitItems.ToArray()
 
 if (!$SkipPathUpdate) {
     Add-DirectoryToUserPath -Path $DestinationDirectory

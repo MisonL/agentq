@@ -159,9 +159,104 @@ if [ -n "$(find "$check_destination" -mindepth 1 -print -quit)" ]; then
     failures=$((failures + 1))
 fi
 
+# --- W4: pair-atomic staging, driven on the extracted function -----------------
+# The install used to stage+replace each client in turn, so a failure on the
+# second client left a NEW first client paired with a STALE second -- and the
+# pair is only ever read together (PLAN.md A28 W4).  The fix stages EVERY item
+# before replacing ANY.  The installer's platform gate makes the whole file
+# unrunnable here, but Install-CommitSet is pure .NET: extract it (plus the two
+# temporary-file helpers and the reparse guard it calls) and drive it directly.
+# Same technique as smoke/22/23 -- and it is the only way to give this invariant
+# a behavioural lock without a Windows host.
+extract_script="$work/extract.ps1"
+cat > "$extract_script" <<'EXTRACT'
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+$installerPath = $args[0]
+$workDir = $args[1]
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($installerPath, [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { [Console]::Error.WriteLine("installer did not parse"); exit 3 }
+$wanted = @("Test-NonReparsePathChain", "Assert-NonReparsePathChain",
+    "Remove-InstallerTemporaryFile", "New-InstallerTemporaryFile", "Install-CommitSet")
+$functions = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
+$source = [System.Text.StringBuilder]::new()
+foreach ($name in $wanted) {
+    $match = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+    if ($null -eq $match) { [Console]::Error.WriteLine("missing function: $name"); exit 3 }
+    [void]$source.AppendLine($match.Extent.Text)
+}
+$script:Program = "agentq-client-installer"
+Invoke-Expression $source.ToString()
+
+$dir = Join-Path $workDir "dest"
+[System.IO.Directory]::CreateDirectory($dir) | Out-Null
+# Install-CommitSet reads the script-scope $DestinationDirectory (the installer
+# sets it at the top from the -DestinationDirectory parameter); the driver must
+# provide the same environment, or every call dies with "variable not set" --
+# which the failure-path try/catch below would have swallowed as the expected
+# throw, a false green the happy path then caught.  Measured 2026-10-07.
+$DestinationDirectory = $dir
+function Write-File([string]$path, [string]$content) {
+    [System.IO.File]::WriteAllText($path, $content)
+}
+# Two "clients", each with a pre-existing OLD destination.
+$newA = Join-Path $workDir "new-a"; $newB = Join-Path $workDir "new-b"
+Write-File $newA "NEW-A"
+Write-File $newB "NEW-B"
+$dstA = Join-Path $dir "a"; $dstB = Join-Path $dir "b"
+Write-File $dstA "OLD-A"
+Write-File $dstB "OLD-B"
+
+# Item B's source is a directory: staging B must fail AFTER A is staged but
+# BEFORE any replace -- so neither destination may change.
+$badB = Join-Path $workDir "bad-b"
+[System.IO.Directory]::CreateDirectory($badB) | Out-Null
+$items = @(
+    [pscustomobject]@{ SourcePath = $newA; DestinationPath = $dstA; Description = "a" },
+    [pscustomobject]@{ SourcePath = $badB; DestinationPath = $dstB; Description = "b" }
+)
+$failed = $false
+$failureMessage = ""
+try { Install-CommitSet -Items $items } catch { $failed = $true; $failureMessage = $_.Exception.Message }
+if (!$failed) { [Console]::Error.WriteLine("PAIR: a failing second stage did not throw"); exit 1 }
+# Pin WHY it threw: an unrelated throw (undefined variable, path guard) would
+# also leave both destinations unchanged and fake a pass.
+if ($failureMessage -notlike "*Client asset is not a file*") {
+    [Console]::Error.WriteLine("PAIR: the failure was not the staged one: $failureMessage"); exit 1
+}
+if ((Get-Content -Raw $dstA) -ne "OLD-A") { [Console]::Error.WriteLine("PAIR: first client was replaced despite the second failing"); exit 1 }
+if ((Get-Content -Raw $dstB) -ne "OLD-B") { [Console]::Error.WriteLine("PAIR: second client changed despite its stage failing"); exit 1 }
+$residue = @(Get-ChildItem -LiteralPath $dir -Force | Where-Object { $_.Name -ne "a" -and $_.Name -ne "b" })
+if ($residue.Count -ne 0) { [Console]::Error.WriteLine("PAIR: $($residue.Count) staging file(s) left behind"); exit 1 }
+
+# And the happy path commits BOTH.
+$goodItems = @(
+    [pscustomobject]@{ SourcePath = $newA; DestinationPath = $dstA; Description = "a" },
+    [pscustomobject]@{ SourcePath = $newB; DestinationPath = $dstB; Description = "b" }
+)
+Install-CommitSet -Items $goodItems
+if ((Get-Content -Raw $dstA) -ne "NEW-A") { [Console]::Error.WriteLine("PAIR: happy path did not commit the first client"); exit 1 }
+if ((Get-Content -Raw $dstB) -ne "NEW-B") { [Console]::Error.WriteLine("PAIR: happy path did not commit the second client"); exit 1 }
+$residue = @(Get-ChildItem -LiteralPath $dir -Force | Where-Object { $_.Name -ne "a" -and $_.Name -ne "b" })
+if ($residue.Count -ne 0) { [Console]::Error.WriteLine("PAIR: happy path left $($residue.Count) staging file(s)"); exit 1 }
+[Console]::Out.WriteLine("PAIR-OK")
+EXTRACT
+
+cases=$((cases + 1))
+pair_status=0
+pair_out=$("$pwsh_binary" -NoProfile -NonInteractive -File "$extract_script" "$installer" "$work" 2>"$work/pair.err") || pair_status=$?
+if [ "$pair_status" -ne 0 ] || [ "$pair_out" != "PAIR-OK" ]; then
+    printf 'ps-client-installer (W4 pair): the staging invariant failed: %s
+'         "$(strip_ansi "$work/pair.err" | head -2 | tr '
+' ' ')" >&2
+    failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'ps-client-installer-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'ps-client-installer-contract checks passed: cases=%s pwsh=%s staging=NOT-covered(needs-Windows)\n' \
+printf 'ps-client-installer-contract checks passed: cases=%s pwsh=%s pair-atomic=covered staging=NOT-covered(needs-Windows)\n' \
     "$cases" "$("$pwsh_binary" -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()' 2>/dev/null || printf 'unknown')"
