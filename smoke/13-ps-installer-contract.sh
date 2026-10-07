@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Smoke: assets/windows-git-bash/install-agentq.ps1 -- its parameter contract and
-# its platform gate.  This file is the second-largest asset in the repo (2,922
+# its platform gate.  This file is the second-largest asset in the repo (3,072
 # lines) and, before this check, nothing had ever executed it: 01 parses it with
 # the PowerShell AST and 10 asserts four source-level invariants about it, but
-# neither runs it.
+# neither runs it.  (2026-10-07: it gained the W5 crash-leftover guard, which IS
+# driven here -- see the W5 section at the bottom.)
 #
 # THE LIMIT, stated up front because it decides what this file is allowed to
 # claim.  Measured on this machine: with ANY argument combination the installer
@@ -21,7 +22,9 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-installer="$root/skill/assets/windows-git-bash/install-agentq.ps1"
+# AGENTQ_SMOKE_INSTALLER points this check at a mutated copy of the installer;
+# same convention as smoke/05 and smoke/07 (their AGENTQ_SMOKE_CLIENT).
+installer="${AGENTQ_SMOKE_INSTALLER:-$root/skill/assets/windows-git-bash/install-agentq.ps1}"
 stage_source="$root/skill/assets/windows-git-bash"
 pwsh_binary=$(command -v pwsh || true)
 
@@ -132,9 +135,127 @@ if [ "$stage_before" != "$stage_after" ]; then
     failures=$((failures + 1))
 fi
 
+# --- W5: crash-leftover detection, driven on the extracted functions ----------
+# The installer's platform gate makes the whole file unrunnable here, but
+# Find-AgentQCrashLeftovers / Assert-NoCrashLeftoverTransactions are pure .NET:
+# extract them (same AST technique as smoke/22/23/25) and drive them against a
+# real directory tree.  This is the only way to give the W5 refusal a behavioural
+# lock without a Windows host, and it is the half that CAN be verified off-box --
+# the swap itself still needs Windows.
+extract_script="$work/w5-extract.ps1"
+cat > "$extract_script" <<'EXTRACT'
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+$installerPath = $args[0]
+$workDir = $args[1]
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($installerPath, [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { [Console]::Error.WriteLine("installer did not parse"); exit 3 }
+$wanted = @("Find-AgentQCrashLeftovers", "Assert-NoCrashLeftoverTransactions")
+$functions = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
+$source = [System.Text.StringBuilder]::new()
+foreach ($name in $wanted) {
+    $match = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+    if ($null -eq $match) { [Console]::Error.WriteLine("missing function: $name"); exit 3 }
+    [void]$source.AppendLine($match.Extent.Text)
+}
+Invoke-Expression $source.ToString()
+
+$parent = Join-Path $workDir "programdata"
+$root = Join-Path $parent "AgentQ"
+[System.IO.Directory]::CreateDirectory($parent) | Out-Null
+
+function Reset-Tree {
+    foreach ($d in @(Get-ChildItem -LiteralPath $parent -Force -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+function Expect-Refusal([string]$label, [string]$fragment) {
+    # Assert the DIRECTION, not just that something was thrown: the two refusal
+    # messages carry different recovery guidance (move the backup back vs. inspect
+    # a concurrent/crashed run), so a swapped condition must fail here.  Measured:
+    # asserting only the "refusing to install:" prefix let a swapped-condition
+    # mutation pass (mutation M6) -- a false green this fragment check closes.
+    try {
+        Assert-NoCrashLeftoverTransactions -ParentDirectory $parent -RootName "AgentQ" -RootDirectory $root
+    } catch {
+        if ($_.Exception.Message -notlike "refusing to install:*") {
+            [Console]::Error.WriteLine("W5 ${label}: threw, but not the controlled refusal: $($_.Exception.Message)"); exit 1
+        }
+        if ($_.Exception.Message -notlike "*$fragment*") {
+            [Console]::Error.WriteLine("W5 ${label}: refused for the wrong reason (wanted *$fragment*): $($_.Exception.Message)"); exit 1
+        }
+        return
+    }
+    [Console]::Error.WriteLine("W5 ${label}: did NOT refuse"); exit 1
+}
+function Expect-Pass([string]$label) {
+    try {
+        Assert-NoCrashLeftoverTransactions -ParentDirectory $parent -RootName "AgentQ" -RootDirectory $root
+    } catch {
+        [Console]::Error.WriteLine("W5 ${label}: refused a clean tree: $($_.Exception.Message)"); exit 1
+    }
+}
+
+# 1. Clean tree, no root: a genuine fresh install must PROCEED (this is the
+#    direction that keeps a guard from being "refuse everything").
+Reset-Tree
+Expect-Pass "clean-no-root"
+
+# 2. Clean tree WITH a root: a normal upgrade must PROCEED.
+Reset-Tree
+[System.IO.Directory]::CreateDirectory($root) | Out-Null
+Expect-Pass "clean-with-root"
+
+# 3. THE DEFECT: root missing, `.AgentQ.backup.1234` present -> refuse.
+Reset-Tree
+[System.IO.Directory]::CreateDirectory((Join-Path $parent ".AgentQ.backup.1234")) | Out-Null
+Expect-Refusal "missing-root-with-backup" "is missing but a previous run's transaction residue exists"
+
+# 4. A stage leftover beside a missing root -> refuse.
+Reset-Tree
+[System.IO.Directory]::CreateDirectory((Join-Path $parent ".AgentQ.stage.999")) | Out-Null
+Expect-Refusal "missing-root-with-stage" "is missing but a previous run's transaction residue exists"
+
+# 5. Residue beside a PRESENT root -> refuse too (crash after swap / concurrent).
+Reset-Tree
+[System.IO.Directory]::CreateDirectory($root) | Out-Null
+[System.IO.Directory]::CreateDirectory((Join-Path $parent ".AgentQ.backup.4242")) | Out-Null
+Expect-Refusal "present-root-with-backup" "exists beside the AgentQ root"
+
+# 6. A directory that merely LOOKS similar must NOT be flagged: no leading dot,
+#    or a different root name.  Guards against a too-loose pattern.
+Reset-Tree
+[System.IO.Directory]::CreateDirectory($root) | Out-Null
+[System.IO.Directory]::CreateDirectory((Join-Path $parent "AgentQ.backup.7")) | Out-Null
+[System.IO.Directory]::CreateDirectory((Join-Path $parent ".OtherRoot.backup.7")) | Out-Null
+Expect-Pass "lookalike-not-flagged"
+
+# 7. The scan itself must FAIL CLOSED: if the parent cannot be listed (here it
+#    does not exist), the guard must refuse rather than see "no residue" and
+#    proceed.  A `-ErrorAction SilentlyContinue` here would let an unreadable
+#    directory bypass the guard exactly as a missing root does.
+Reset-Tree
+Remove-Item -LiteralPath $parent -Recurse -Force -ErrorAction SilentlyContinue
+Expect-Refusal "unlistable-parent" "cannot inspect"
+[System.IO.Directory]::CreateDirectory($parent) | Out-Null
+
+[Console]::Out.WriteLine("W5-OK")
+EXTRACT
+
+cases=$((cases + 1))
+w5_status=0
+w5_out=$("$pwsh_binary" -NoProfile -NonInteractive -File "$extract_script" "$installer" "$work" 2>"$work/w5.err") || w5_status=$?
+if [ "$w5_status" -ne 0 ] || [ "$w5_out" != "W5-OK" ]; then
+    printf 'ps-installer (W5 crash-leftover): the guard failed: %s\n' \
+        "$(head -2 "$work/w5.err" | tr '\n' ' ')" >&2
+    failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'ps-installer-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'ps-installer-contract checks passed: cases=%s pwsh=%s staging=NOT-covered(needs-Windows)\n' \
+printf 'ps-installer-contract checks passed: cases=%s pwsh=%s crash-leftover=covered staging=NOT-covered(needs-Windows)\n' \
     "$cases" "$("$pwsh_binary" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')"
