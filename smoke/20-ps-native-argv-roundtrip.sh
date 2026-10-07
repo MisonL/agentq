@@ -262,6 +262,29 @@ else
     fi
 fi
 
+# A session name carrying a quote must be REFUSED before ssh is ever invoked.
+# The charset guard (`^[A-Za-z0-9_.-]+$`) is the single authority that keeps the
+# raw session command quote-free; Get-UnixSessionCommand additionally throws if
+# a quote ever reaches it.  This case pins BOTH layers as "refuse" without
+# over-specifying which one fires: if the guard is ever loosened AND the
+# self-defeating `'"'"'` escaping comes back, the client would invoke ssh with a
+# double quote inside the raw argument -- exactly the A21 word-split -- and
+# this case turns red because ssh got called at all.  (Measured before the fix:
+# that escaping produced `"` bytes in the command; removed 2026-10-07.)
+mkdir -p "$work/tmp2q"
+rm -f "$work/argv-quote"
+cases=$((cases + 1))
+quote_status=0
+PS_ARGV_OUT="$work/argv-quote" SSHP_SSH="$stub" TMPDIR="$work/tmp2q"     "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_client" smoke-host "quo'te"     >"$work/o2q" 2>"$work/e2q" || quote_status=$?
+if [ "$quote_status" -eq 0 ]; then
+    printf 'ps-native-argv: sshp.ps1 session: a quoted session name was accepted (exit 0)\n' >&2
+    failures=$((failures + 1))
+fi
+if [ -e "$work/argv-quote" ]; then
+    printf 'ps-native-argv: sshp.ps1 session: a quoted session name reached ssh; the raw session argument can only stay one argv element while it contains no double quote\n' >&2
+    failures=$((failures + 1))
+fi
+
 # The probe channel must also DO something: decode it and require the markers
 # the client matches on to be present.  A channel that carries a perfectly
 # intact script that prints nothing would pass check_roundtrip.

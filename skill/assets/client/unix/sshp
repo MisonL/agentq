@@ -4,6 +4,12 @@ set -eu
 
 program=${0##*/}
 reconnect_delay=${SSHP_RECONNECT_DELAY:-2}
+# --check is the non-interactive, read-only probe.  The interactive session path
+# may reconnect forever (a human is watching and can Ctrl-C), but --check has no
+# terminal and no human: a remote that accepts the TCP connection and then drops
+# it would spin `while :` forever.  Cap the reconnect attempts for --check only;
+# the interactive path keeps its unbounded retry.
+check_reconnect_attempts=3
 ssh_binary=${SSHP_SSH:-}
 sshp_noninteractive_output_limit=65536
 ssh_runtime_directory=''
@@ -980,6 +986,7 @@ install_remote_unix() {
 prepare_remote() {
     allow_install=$1
     installation_attempted=0
+    reconnect_attempts=0
     probe_diagnostic_file="$ssh_runtime_directory/probe.stderr"
     install_diagnostic_file="$ssh_runtime_directory/install.stderr"
 
@@ -1002,6 +1009,11 @@ prepare_remote() {
         else
             unix_probe_status=$?
             if [ "$unix_probe_status" -eq 255 ] && ssh_transport_error "$probe_diagnostic_file"; then
+                reconnect_attempts=$((reconnect_attempts + 1))
+                if [ "$check_only" = true ] && [ "$reconnect_attempts" -gt "$check_reconnect_attempts" ]; then
+                    printf '%s\n' "$program: SSH transport stayed down after $check_reconnect_attempts reconnect attempts; giving up (--check does not retry forever)." >&2
+                    return 255
+                fi
                 printf '%s\n' "$program: initial SSH transport lost; reconnecting in ${reconnect_delay}s..." >&2
                 sleep "$reconnect_delay"
                 continue
@@ -1067,6 +1079,11 @@ prepare_remote() {
         else
             windows_probe_status=$?
             if [ "$windows_probe_status" -eq 255 ] && ssh_transport_error "$probe_diagnostic_file"; then
+                reconnect_attempts=$((reconnect_attempts + 1))
+                if [ "$check_only" = true ] && [ "$reconnect_attempts" -gt "$check_reconnect_attempts" ]; then
+                    printf '%s\n' "$program: SSH transport stayed down after $check_reconnect_attempts reconnect attempts; giving up (--check does not retry forever)." >&2
+                    return 255
+                fi
                 printf '%s\n' "$program: initial SSH transport lost; reconnecting in ${reconnect_delay}s..." >&2
                 sleep "$reconnect_delay"
                 continue

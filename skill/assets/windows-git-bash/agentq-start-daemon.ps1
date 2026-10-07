@@ -3,6 +3,7 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $env:MSYS_NO_PATHCONV = "1"
 
+$script:StartDaemonProgram = "agentq-start-daemon.ps1"
 $rootDirectory = $PSScriptRoot
 $configPath = Join-Path $rootDirectory "config\pueue.yml"
 $clientPath = Join-Path $rootDirectory "pueue.exe"
@@ -199,11 +200,18 @@ function Assert-AgentQRequiredFile {
         Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
     }
     if ($null -eq $item) {
-        Write-Error "Required AgentQ path is missing: $requiredPath"
+        # stderr, not Write-Error: under $ErrorActionPreference = "Stop" (set at
+        # the top of this script) Write-Error THROWS, so the process exits with
+        # PowerShell's terminating-error code and the `exit 2` below was dead
+        # code -- the documented parameter-error contract never held.  The only
+        # caller treats any non-zero the same, so this changes nothing for it
+        # and makes the stated contract true (measured 2026-10-07: a script with
+        # EAP=Stop + Write-Error exits 1 and never reaches the next line).
+        [Console]::Error.WriteLine("{0}: Required AgentQ path is missing: {1}", $script:StartDaemonProgram, $requiredPath)
         exit 2
     }
     if (!(Test-NonReparseWindowsRequiredFilePath -Path $Path)) {
-        Write-Error "$Description is not a regular non-reparse file: $Path"
+        [Console]::Error.WriteLine("{0}: {1} is not a regular non-reparse file: {2}", $script:StartDaemonProgram, $Description, $Path)
         exit 2
     }
 }
@@ -252,7 +260,7 @@ function Test-ManagedDaemonProcess {
 }
 
 if (Test-ManagedDaemonProcess -Path $daemonPath) {
-    Write-Error "AgentQ Pueue daemon process is already running but unavailable; refusing to start a second daemon"
+    [Console]::Error.WriteLine("{0}: AgentQ Pueue daemon process is already running but unavailable; refusing to start a second daemon", $script:StartDaemonProgram)
     exit 2
 }
 

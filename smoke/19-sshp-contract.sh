@@ -308,6 +308,49 @@ if [ "$calls_made" -ne 2 ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# --check must NOT retry a persistently-dropped transport forever.  The
+# interactive session path may (a human is watching and can Ctrl-C), but --check
+# is the non-interactive, read-only probe: a remote that accepts the TCP
+# connection and then drops it would spin the `while :` reconnect loop with no
+# terminal and no human.  The stub now fails EVERY call with 255 + a transport
+# line, so an unbounded loop would never return; the assertion is "returns 255
+# after a bounded number of calls".
+# ---------------------------------------------------------------------------
+# Every call needs its own transport line: the stub writes logfile-lines line N
+# to the -E file on call N (past the end it writes nothing), and sshp only
+# reconnects when the -E log actually shows a transport error.
+transport_line='ssh: connect to host smoke-host port 22: Connection refused'
+# The stub repeats the LAST responses line past the end, so a single "255" line
+# makes every call fail; logfile-lines, though, is read per call index, so it
+# needs one transport line per call.
+printf '255	\n255	__SSHP_READY__:Linux\n' > "$work/responses"
+printf '%s\n' "$transport_line" "$transport_line" "$transport_line" "$transport_line" "$transport_line" > "$work/logfile-lines"
+: > "$work/count"
+rm -f "$work"/argv.*
+printf '%s' "$work" > "$work/stubdir"
+cases=$((cases + 1))
+check_loop_status=0
+if SSHP_STUB_DIR="$stub_dir" SSHP_SSH="$work/bin/ssh" HOME="$home" TMPDIR="$work/tmp"         PATH="$work/bin:/usr/bin:/bin" SSHP_RECONNECT_DELAY=0         /bin/sh "$client" --check smoke-host >"$work/out" 2>"$work/err"; then check_loop_status=0; else check_loop_status=$?; fi
+if [ "$check_loop_status" -ne 255 ]; then
+    printf 'sshp-contract: --check transport loop: expected exit 255 after a bounded retry budget, got %s (an unbounded --check would hang here)\n' \
+        "$check_loop_status" >&2
+    failures=$((failures + 1))
+fi
+if ! grep -qF -- '--check does not retry forever' "$work/err"; then
+    printf '%s\n' 'sshp-contract: --check transport loop: did not report the bounded-retry give-up' >&2
+    failures=$((failures + 1))
+fi
+check_loop_calls=$(cat "$work/count" 2>/dev/null || printf '0')
+check_loop_calls=${check_loop_calls:-0}
+# 1 initial + at most the --check budget (3); a policy that gave up immediately
+# would be 1, and an unbounded one would never reach this line.
+if [ "$check_loop_calls" -lt 2 ] || [ "$check_loop_calls" -gt 4 ]; then
+    printf 'sshp-contract: --check transport loop: made %s ssh call(s); expected between 2 and 4\n' \
+        "$check_loop_calls" >&2
+    failures=$((failures + 1))
+fi
+
+# ---------------------------------------------------------------------------
 # The option set sshp sends.  Read out of the recorded argv rather than out of
 # the source: a source-level assertion cannot tell whether the options were
 # actually passed to ssh.

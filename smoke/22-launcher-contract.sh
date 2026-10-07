@@ -435,6 +435,68 @@ if [ "$missing_status" -ne 2 ]; then
     failures=$((failures + 1))
 fi
 
+# --- start-daemon's failure CONTRACT must actually reach `exit 2` -------------
+# The three refusal sites in agentq-start-daemon.ps1 were `Write-Error` +
+# `exit 2` -- but the script sets $ErrorActionPreference = "Stop", so Write-Error
+# THROWS and the process exits with PowerShell's terminating-error code instead;
+# the `exit 2` was dead code and the documented parameter-error contract never
+# held (measured on a minimal script 2026-10-07: EAP=Stop + Write-Error exits 1
+# and never reaches the next statement).  The fix writes to stderr with
+# [Console]::Error and then `exit 2`.  This drives the REAL function in a real
+# child pwsh -- the only way to observe the process exit code, because dot-sourcing
+# runs the exit in the driver's session (a trap smoke/12 already documented).
+sd_driver="$work/sd-contract.ps1"
+cat > "$sd_driver" <<'PS1'
+param([string]$StartDaemonPath, [string]$WorkDirectory)
+$ErrorActionPreference = "Stop"
+function Get-Fn([string]$src, [string]$name) {
+    $pattern = '(?s)function ' + [regex]::Escape($name) + ' \{.*?\n\}\n'
+    $m = [regex]::Match($src, $pattern)
+    if (-not $m.Success) { throw "could not extract function $name" }
+    return $m.Value
+}
+$sdSrc = Get-Content -Raw $StartDaemonPath
+$script:StartDaemonProgram = "agentq-start-daemon.ps1"
+foreach ($n in @('Test-NonReparseWindowsRequiredFilePath', 'Assert-AgentQRequiredFile')) {
+    Invoke-Expression (Get-Fn $sdSrc $n)
+}
+if ($args.Count -eq 1 -and $args[0] -eq "missing") {
+    # The refusal itself: a path that does not exist must exit 2 from THIS
+    # process with the documented message on stderr -- not throw out of
+    # Write-Error under EAP=Stop.
+    Assert-AgentQRequiredFile -Path (Join-Path $WorkDirectory "no-such-file") -Description "Required AgentQ path"
+    exit 0
+}
+$existing = Join-Path $WorkDirectory "sd-existing.bin"
+Set-Content -Path $existing -Value 'x' -NoNewline
+Assert-AgentQRequiredFile -Path $existing -Description "Required AgentQ path"
+exit 0
+PS1
+cases=$((cases + 1))
+sd_status=0
+"$pwsh_binary" -NoProfile -NonInteractive -File "$sd_driver" -StartDaemonPath "$start_daemon" -WorkDirectory "$work/pw" missing \
+    >"$work/sd.out" 2>"$work/sd.err" || sd_status=$?
+if [ "$sd_status" -ne 2 ]; then
+    printf 'launcher-contract: start-daemon contract: a missing required path must exit 2, got %s (Write-Error under EAP=Stop exits 1 -- the contract was dead code)\n' "$sd_status" >&2
+    sed 's/^/    stderr: /' "$work/sd.err" | head -3 >&2 || true
+    failures=$((failures + 1))
+fi
+if ! grep -qF 'Required AgentQ path is missing' "$work/sd.err"; then
+    printf '%s\n' 'launcher-contract: start-daemon contract: stderr does not carry the refusal message' >&2
+    failures=$((failures + 1))
+fi
+# The other direction: a good path must still pass (a function that always
+# exits 2 would satisfy both assertions above).
+cases=$((cases + 1))
+sd_ok_status=0
+"$pwsh_binary" -NoProfile -NonInteractive -File "$sd_driver" -StartDaemonPath "$start_daemon" -WorkDirectory "$work/pw" \
+    >"$work/sd.ok.out" 2>"$work/sd.ok.err" || sd_ok_status=$?
+if [ "$sd_ok_status" -ne 0 ]; then
+    printf 'launcher-contract: start-daemon contract: a valid required path must exit 0, got %s\n' "$sd_ok_status" >&2
+    sed 's/^/    stderr: /' "$work/sd.ok.err" | head -3 >&2 || true
+    failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'launcher-contract: %s failure(s)\n' "$failures" >&2
     exit 1
