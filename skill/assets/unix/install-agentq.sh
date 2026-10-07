@@ -469,7 +469,7 @@ $crash_matches"
     [ -n "$crash_leftovers" ] || return 0
     crash_leftover_list=$(printf '%s\n' "$crash_leftovers" | tr '\n' ' ')
     if [ ! -e "$agentq_home" ] && [ ! -L "$agentq_home" ]; then
-        fail "refusing to install: AgentQ root $agentq_home is missing but a previous run's transaction residue exists ($crash_leftover_list). A run crashed between moving the old root aside and installing the new one; the previous deployment (queue data and credentials) is still in the .backup directory above. Move it back to $agentq_home to recover, or remove it to confirm a fresh install. Nothing was modified."
+        fail "refusing to install: AgentQ root $agentq_home is missing but a previous run's transaction residue exists ($crash_leftover_list). A run crashed between moving the old root aside and installing the new one; the previous deployment (queue data and credentials) is still in the .backup directory above. Move it back to $agentq_home and restart the AgentQ daemon (the crashed run stopped it) before re-running, or remove it to confirm a fresh install. Nothing was modified."
     fi
     fail "refusing to install: a previous run's transaction residue exists beside the AgentQ root ($crash_leftover_list). Either an install crashed after the swap or another install is in progress; inspect these directories and restore or remove the backup as intended, then re-run. Nothing was modified."
 }

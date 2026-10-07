@@ -2357,7 +2357,7 @@ function Assert-NoCrashLeftoverTransactions {
     }
     $rootItem = Get-Item -LiteralPath $RootDirectory -Force -ErrorAction SilentlyContinue
     if ($null -eq $rootItem) {
-        throw "refusing to install: AgentQ root $RootDirectory is missing but a previous run's transaction residue exists ($leftoverPaths). A run crashed between moving the old root aside and installing the new one; the previous deployment (queue data, shared secret, certificates) is still in the .backup directory above. Move it back to $RootDirectory to recover, or remove it to confirm a fresh install. Nothing was modified."
+        throw "refusing to install: AgentQ root $RootDirectory is missing but a previous run's transaction residue exists ($leftoverPaths). A run crashed between moving the old root aside and installing the new one; the previous deployment (queue data, shared secret, certificates) is still in the .backup directory above. Move it back to $RootDirectory and restart the AgentQ daemon (the crashed run stopped it) before re-running, or remove it to confirm a fresh install. Nothing was modified."
     }
     throw "refusing to install: a previous run's transaction residue exists beside the AgentQ root ($leftoverPaths). Either an install crashed after the swap or another install is in progress; inspect these directories and restore or remove the backup as intended, then re-run. Nothing was modified."
 }

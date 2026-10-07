@@ -212,6 +212,10 @@ Expect-Pass "clean-with-root"
 Reset-Tree
 [System.IO.Directory]::CreateDirectory((Join-Path $parent ".AgentQ.backup.1234")) | Out-Null
 Expect-Refusal "missing-root-with-backup" "is missing but a previous run's transaction residue exists"
+# ...and the recovery guidance must name the daemon restart (a crashed run has
+# already stopped the daemon, so moving the backup back alone leaves the operator
+# stuck on the NEXT check).  Same measured reason as smoke/11.
+Expect-Refusal "missing-root-names-daemon-restart" "restart the AgentQ daemon"
 
 # 4. A stage leftover beside a missing root -> refuse.
 Reset-Tree

@@ -933,6 +933,12 @@ crash_case() {
 }
 crash_case 'crash leftover, root missing' \
     "is missing but a previous run's transaction residue exists" no
+# The recovery guidance must name the daemon restart: a crashed run has already
+# stopped the daemon, so "move the backup back" alone leaves the operator stuck
+# on the NEXT check (`daemon is unavailable`).  Measured in a real systemd
+# container 2026-10-07.
+crash_case 'crash leftover names the daemon restart' \
+    'restart the AgentQ daemon' no
 crash_case 'crash leftover, root present' \
     'exists beside the AgentQ root' yes
 rm -rf "$home"/..agentq.backup.* "$home"/.agentq
