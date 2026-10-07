@@ -599,6 +599,52 @@ fi
 rm -f "$home/.agentq"
 assert_home_clean 'existing AgentQ path is not a directory'
 
+# --- an existing installation whose daemon is DOWN ----------------------------
+# The refusal must say what to DO, not only what it will not do: the W5 crash
+# recovery path leads an operator here if they move the backup back but forget
+# to restart the daemon, and a bare "daemon is unavailable" leaves them with no
+# next step.  Platform is stubbed to Linux on purpose -- on Darwin the installer
+# takes the offline-state-migration branch instead and never reaches this
+# message.  The client is a stub that always fails, modelling "no daemon".
+mkdir -p "$home/.agentq/config" "$home/.agentq/runtime"
+cat >"$home/.agentq/pueue" <<'CLIENT'
+#!/bin/sh
+exit 1
+CLIENT
+chmod 700 "$home/.agentq/pueue"
+printf 'shared:\n  pueue_directory: ~/.agentq/data\n' >"$home/.agentq/config/pueue.yml"
+# On the Linux branch the installer also requires systemctl (for linger and the
+# user unit) BEFORE it reaches the daemon check; a recording-failing stub would
+# put it on the wrong failure, so this case gets a PATH with a systemctl that
+# succeeds -- the case must die on the DAEMON message, not on a missing command.
+stub_linux="$work/bin-linux"
+mkdir -p "$stub_linux"
+for entry in "$stub_full"/*; do
+    name=${entry##*/}
+    [ "$name" = systemctl ] || ln -s "$entry" "$stub_linux/$name"
+done
+for linux_command in systemctl loginctl; do
+    cat >"$stub_linux/$linux_command" <<'LINUXCMD'
+#!/bin/sh
+# `loginctl show-user ... -p Linger --value` must print something the installer
+# accepts; `yes` short-circuits the enable path.
+case "$*" in
+    *Linger*) printf 'yes\n' ;;
+esac
+exit 0
+LINUXCMD
+    chmod 700 "$stub_linux/$linux_command"
+done
+printf 'Linux\nx86_64\n' >"$platform_file"
+status=0
+env HOME="$home" PATH="$stub_linux" \
+    /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+printf 'Darwin\narm64\n' >"$platform_file"
+check_case 'existing daemon down' \
+    'start it and re-run' "$status"
+rm -rf "$home/.agentq"
+assert_home_clean 'existing daemon down' 
+
 # --- a stale maintenance lock that cannot be recovered -----------------------
 # A lock whose holder is confirmed dead, but whose directory cannot be removed
 # (an unexpected extra entry).  Recovery must fail loudly rather than proceed to

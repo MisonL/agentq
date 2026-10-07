@@ -1680,7 +1680,7 @@ assert_existing_queue_has_no_active_tasks() {
         if [ -f "$existing_status_temporary" ] && [ ! -L "$existing_status_temporary" ]; then
             existing_status_temporary_identity=$(installer_file_identity "$existing_status_temporary") || true
         fi
-        fail "existing AgentQ daemon is unavailable; refuse to overwrite $agentq_home"
+        fail "existing AgentQ daemon is unavailable; start it and re-run (the installer must confirm the queue is idle before replacing a deployment), or restore the deployment manually; refusing to overwrite $agentq_home"
     fi
     require_installer_existing_file "$existing_status_temporary" 'existing status temporary path'
     jq -e '
