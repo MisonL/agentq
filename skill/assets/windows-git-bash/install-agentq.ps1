@@ -576,7 +576,7 @@ function Assert-ManagedPueueConnection {
     )
 
     if (!(Test-PueueConnection -ClientPath $ClientPath -ConfigPath $ConfigPath)) {
-        throw "$Description AgentQ daemon is unavailable: $DaemonPath"
+        throw "$Description AgentQ daemon is unavailable; start it and re-run (the installer must confirm the queue is idle before replacing a deployment), or restore the deployment manually: $DaemonPath"
     }
     if (!(Test-ManagedPueueProcess -DaemonPath $DaemonPath)) {
         throw "$Description AgentQ endpoint is not served by the expected daemon: $DaemonPath"
