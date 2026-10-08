@@ -15,7 +15,7 @@ PASS checks: N ran, N skipped, N partial, N failed (Ns)
 
 - Checks skipped, and why:
 - Anything that could not be verified on this machine (if it stays open, it
-  belongs in PLAN.md):
+  belongs in docs/PLAN.md):
 
 ## Checklist
 

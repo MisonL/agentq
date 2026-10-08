@@ -2,7 +2,7 @@
 # Smoke: what the two PowerShell clients SEND to ssh must survive PowerShell
 # 5.1's native-argument quoting.
 #
-# Why this check exists (PLAN.md A21): both Windows clients build a shell script
+# Why this check exists (docs/PLAN.md A21): both Windows clients build a shell script
 # and hand it to ssh as a single argv element:
 #
 #     $sshArguments += @("--", $script:TargetHost, $RemoteCommand)
@@ -31,7 +31,7 @@
 # measured directly on a real PS 5.1.19041 machine (2026-10-08): all six
 # calibration rows reproduce argc-for-argc, the pre-fix splat payload splits into
 # exactly the arguments the model predicts (byte-for-byte), and the clients'
-# current payloads arrive byte-identical (see PLAN.md A21, "直接测量").  The
+# current payloads arrive byte-identical (see docs/PLAN.md A21, "直接测量").  The
 # calibration rows are re-checked on every run and the check refuses a verdict
 # if they stop holding.
 #

@@ -26,7 +26,7 @@
 # that loop cannot be reached from a synthetic runtime and this check does NOT
 # claim it.  In particular W5 is NOT a lock against reusing `load_request_records`
 # here: that refactor's behaviour difference on `removed` records is masked by the
-# same repair pass, so it is a design caveat (see PLAN.md), not something a case
+# same repair pass, so it is a design caveat (see docs/PLAN.md), not something a case
 # can catch.
 #
 # Everything asserted here was measured on the real server first, not imagined.

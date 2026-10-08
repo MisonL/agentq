@@ -78,7 +78,7 @@ RE_R5='[0-9]{1,3}(_[0-9]{1,3}){3}'
 RE_R6='[A-Za-z0-9][A-Za-z0-9-]*\.(internal|intranet|lan|corp|localdomain|home)([^A-Za-z0-9.-]|$)'
 # R7  an auto-generated Windows computer name: uppercase letters, a hyphen, an
 #     embedded 8-digit date, trailing letters.  Added 2026-10-06: the C3
-#     write-up put the test VM's computer name into PLAN.md and CHANGELOG.md,
+#     write-up put the test VM's computer name into docs/PLAN.md and CHANGELOG.md,
 #     and R1-R6 all missed it -- every one of them needs a dot, an `@`, or an
 #     address shape, and this is a bare token.  The negatives below pin the two
 #     edges: the trailing-letter requirement alone keeps dated release tags out

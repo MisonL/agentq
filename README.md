@@ -110,14 +110,19 @@ Sync the *whole* directory, not just `assets/`: the previous rule synced only
 
 ## Documentation
 
+Start here:
+
 | File | What it is |
 | --- | --- |
-| [`SKILL.md`](skill/SKILL.md) | Protocol contract and operating instructions — the authoritative reference for exit codes, `cancel` semantics, and Windows terminal behaviour |
-| [`CLAUDE.md`](CLAUDE.md) | Development order: what is verified, what is not, and the boundaries that are not todos |
-| [`PLAN.md`](PLAN.md) | The single authoritative list of open work |
-| [`HANDOFF.md`](HANDOFF.md) | Operating rules and limits |
+| [`skill/SKILL.md`](skill/SKILL.md) | Protocol contract and operating instructions — the authoritative reference for exit codes, `cancel` semantics, and Windows terminal behaviour |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to contribute: the development loop, the load-bearing rules, and the full documentation map |
 | [`CHANGELOG.md`](CHANGELOG.md) | One line per change, each with its verification result |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to contribute: the development loop, the load-bearing rules, and the documentation map |
+
+The maintainer documents — [`CLAUDE.md`](CLAUDE.md), [`docs/PLAN.md`](docs/PLAN.md)
+and [`docs/HANDOFF.md`](docs/HANDOFF.md) — serve this repository's own maintenance
+workflow. [`CONTRIBUTING.md`](CONTRIBUTING.md#documentation-map) is the authority
+map: it lists every document, what each is authoritative for, and which one wins
+when two disagree.
 
 ## Verification status
 

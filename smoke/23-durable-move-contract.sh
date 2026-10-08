@@ -6,7 +6,7 @@
 # at it except 01's AST parse.  It is the asset where the FIRST native-Windows
 # defect of this project lived -- the one that, in the field, made the operation
 # lock un-acquirable on Windows and surfaced ~85s later as the misleading
-# "AgentQ operation is already in progress" (CLAUDE.md, PLAN.md A5's sibling).
+# "AgentQ operation is already in progress" (CLAUDE.md, docs/PLAN.md A5's sibling).
 #
 # WHAT RUNS HERE: the parameter contract (four measured messages, exactly as
 # smoke/13 does for the installer).  On this machine every valid invocation dies

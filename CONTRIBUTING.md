@@ -79,12 +79,12 @@ Each document has one job. Where two disagree, the one whose job it is wins.
 | [`skill/SKILL.md`](skill/SKILL.md) | The protocol contract: exit codes, `cancel` semantics, Windows terminal behaviour, installation steps |
 | [`README.md`](README.md) | The front door: what this is, how to install it, how to run the tests |
 | [`CLAUDE.md`](CLAUDE.md) | Development order: what is verified, what is not, and each check's coverage boundary |
-| [`PLAN.md`](PLAN.md) | **The only authoritative list of open work** |
-| [`HANDOFF.md`](HANDOFF.md) | Operating rules and limits |
+| [`docs/PLAN.md`](docs/PLAN.md) | **The only authoritative list of open work** |
+| [`docs/HANDOFF.md`](docs/HANDOFF.md) | Operating rules and limits |
 | [`CHANGELOG.md`](CHANGELOG.md) | One line per change, each with its verification result |
 
-A todo anywhere else — in a `HANDOFF.md` history section, in a `CHANGELOG.md`
-process note — is history, not a task. `PLAN.md` is the list.
+A todo anywhere else — in a `docs/HANDOFF.md` history section, in a `CHANGELOG.md`
+process note — is history, not a task. `docs/PLAN.md` is the list.
 
 ## Versioning and releases
 
@@ -108,12 +108,12 @@ success messages print the AgentQ version rather than Pueue's.
   and which checks were skipped and why. "Tests pass" without the summary line
   is not a result.
 - If part of the change could not be verified on your machine, say so and put
-  the unverified part in `PLAN.md`. This project would rather record a boundary
+  the unverified part in `docs/PLAN.md`. This project would rather record a boundary
   than claim coverage it does not have.
 
 ## Language
 
 Outward-facing files (`README.md`, `CONTRIBUTING.md`, `LICENSE`) are English.
-The internal working documents (`CLAUDE.md`, `PLAN.md`, `HANDOFF.md`,
+The internal working documents (`CLAUDE.md`, `docs/PLAN.md`, `docs/HANDOFF.md`,
 `CHANGELOG.md`, `SKILL.md`) and the smoke checks' output are Chinese; that is
 deliberate, not a translation backlog.
