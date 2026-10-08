@@ -176,7 +176,7 @@ fi
 # The install used to stage+move agentq first, then stage+move sshp -- so any
 # failure on the second client (unreadable asset, full destination) left a NEW
 # agentq paired with a STALE sshp, and the pair is only ever read together
-# (PLAN.md A28 W4, the installer half).  Both directions are asserted because
+# (docs/PLAN.md A28 W4, the installer half).  Both directions are asserted because
 # either one alone lets a broken installer pass: swapping the pre-existing
 # old content in, or writing nothing at all, are both wrong -- what must hold
 # is "the pair was never observed mixed after an aborted install".

@@ -162,7 +162,7 @@ fi
 # --- W4: pair-atomic staging, driven on the extracted function -----------------
 # The install used to stage+replace each client in turn, so a failure on the
 # second client left a NEW first client paired with a STALE second -- and the
-# pair is only ever read together (PLAN.md A28 W4).  The fix stages EVERY item
+# pair is only ever read together (docs/PLAN.md A28 W4).  The fix stages EVERY item
 # before replacing ANY.  The installer's platform gate makes the whole file
 # unrunnable here, but Install-CommitSet is pure .NET: extract it (plus the two
 # temporary-file helpers and the reparse guard it calls) and drive it directly.

@@ -27,7 +27,7 @@
 #
 # WHAT THIS DOES NOT COVER: whether the command actually runs, whether the
 # chosen limit is right for a host we have not measured, or the exit-code
-# behaviour of each DefaultShell (see PLAN.md A5b -- an outer PowerShell flattens
+# behaviour of each DefaultShell (see docs/PLAN.md A5b -- an outer PowerShell flattens
 # non-zero exit codes to 1, which this check cannot see).
 set -euo pipefail
 
@@ -239,7 +239,7 @@ check_site 'Windows client: launcher argument wrapper' "$win_launcher_len"
 #
 # The command line is `printf %s <b64> | base64 -d | sh`, so the length is the
 # fixed prefix plus the base64 of the UTF-8 script.  The sshp SESSION command is
-# deliberately NOT base64-wrapped (it needs a tty on stdin, see PLAN.md A21) and
+# deliberately NOT base64-wrapped (it needs a tty on stdin, see docs/PLAN.md A21) and
 # is not measured here for the same reason it is not wrapped.
 unix_cmdline_len() {
     python3 - "$sshp_client" "$1" <<'PYEOF5'
@@ -266,7 +266,7 @@ if [ "$failures" -ne 0 ]; then
     printf '\n%s remote command line(s) exceed the budget.\n' "$failures" >&2
     printf '%s\n' 'A command over the limit is TRUNCATED by the remote shell, not rejected:' >&2
     printf '%s\n' 'for an -EncodedCommand payload the base64 is cut mid-stream and the' >&2
-    printf '%s\n' 'client reports a protocol-probe failure. See PLAN.md A5.' >&2
+    printf '%s\n' 'client reports a protocol-probe failure. See docs/PLAN.md A5.' >&2
     exit 1
 fi
 
