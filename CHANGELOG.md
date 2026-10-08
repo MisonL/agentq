@@ -6,6 +6,9 @@
 YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 ```
 
+2026-10-08  `smoke/11` 的 fixture 自检注释写「all twelve cases」，而该检查现报 `cases=27`——改为不计数措辞（「every case below」），这类注释里的陈旧计数与文档数字同一类，改为免疫漂移的写法而不是再写一个会过期的数
+  |  `smoke/11` 复跑 → `cases=27 ... crash-leftover=covered`；注释变更，行为断言未动
+
 2026-10-08  `PLAN.md` 两处 C2/C5 执行日期与同文件其余处矛盾（§8 写 2026-09-25，C 表行与小节标题写 2026-09-24）——按会话时间戳核实：C5 派发在本地 09-24 23:06（`15:06Z`）、成文 09-25 00:32（`16:32Z`），C2 该轮 63 次 docker 调用全落在本地 09-24 23:01–23:46；两处均改为 09-24 并注明与 `CHANGELOG.md` 署名日期（成文时间）的差异，记忆文件同一日期一并订正
   |  `smoke/16` 复跑 → `files=82 rules=7 selftest=calibrated violations=0`；纯文档变更，`skill/` 未动
 
