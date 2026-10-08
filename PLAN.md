@@ -2106,6 +2106,49 @@ agent 结论会凭空造出不存在的 P0，本轮确实有 5 条被复核推�
 ④ `& $exe @splat` 在真 PS 5.1 上的直接测量（见 A21「直接测量」：六行 argc 6/6、
 修复前形态按模型预测裂开、修复后载荷逐字节完好）。
 
+### A29. 公开仓库标准化（2026-10-08，用户指示「项目体系标准化处理」）—— **①②④已完成；③ CI 已写，未经 Actions 实跑**
+
+**决策（用户在本会话选定）**：面向 = 四个子项全做**参考主流开源项目**；发布目标 =
+**公开仓库**；许可证 = **代码自研、自定 → 选定 MIT**；路线 = **「薄壳加装」**（保留本仓
+五份内部工作文档的职责与结构，只加对外层）。**明确不做**：拆分或重写 `CLAUDE.md`、
+`PLAN.md`、`HANDOFF.md`、`CHANGELOG.md`——它们服务的是本仓的 agent 工作流，重组收益低、
+风险高（跨文档职责边界与计数已被反复踩过）。**语言**：对外层（`README`/`CONTRIBUTING`/
+`LICENSE`）英文，内部工作文档保持中文。
+
+**② 版本与发布（已完成）**：`agentq_version='0.1.0'` 与 `$agentqVersion = "0.1.0"` 从
+Pueue 的 `release_version='4.0.4'` 拆出（该值此前被两处安装器当成 AgentQ 版本打印）；
+`smoke/01` 新增**三方一致性**规则（两个安装器 + `README.md`，另加「成功行必须插值
+AgentQ 版本」——回退成 `release_version` 时三处定义仍然一致，值相等抓不到那个形态）。
+**bump 规则**：部署单元字节变即 bump（文档变更不 bump）。**发布物** = git tag + Release
+notes 指向 `CHANGELOG.md` 条目，无二进制产物。
+
+**①④ 文档与流程收口 / 对外协作面（已完成）**：`LICENSE`（MIT；版权人按 git 身份写
+`MisonL`，用户可改）、`CONTRIBUTING.md`（三步循环、沙箱跑法、七条承重规则、文档权威边界
+表、版本纪律、PR 要求）、`README.md` 的 License/Contributing/Documentation 三处、`CHANGELOG.md`
+顶部「怎么读」段、`.github/` 的 PR 模板 + 两枚 issue 模板 + `SECURITY.md`（私下报告渠道，
+不引导公开 issue）。
+
+**③ 质量门禁自动化（已写，未实跑）**：`.github/workflows/ci.yml` 三个 job——ubuntu 用
+`sandbox.sh up` 把需要真实运行时的 6 个检查也跑起来（`run-tests.sh` **SKIP 时退 0**，所以
+每个 job 断言摘要形状而不是只信退出码）；macOS 跑 `--quick`（唯一有 `plutil -lint` 的平台）；
+windows-latest 用 `AGENTQ_SMOKE_PWSH=powershell.exe` 跑 PS 5.1 客户端契约（pwsh 7 不复现本仓
+踩过的两个 5.1 缺陷）。另有 `.github/workflows/release.yml`：`v*` tag 的版本值必须等于
+安装器里记录的值。**本仓尚无 git remote，两个 workflow 都从未被 Actions 执行过**——这是
+已知边界，不是「已验证」。
+
+**未定/后续**：`CHANGELOG.md` 条目是否显式带版本号（当前由 `smoke/01` 三方一致性 + tag
+门禁间接覆盖）；把 CI 首次实跑的结果回填到本条。
+
+### A30. `doctor` 报告 AgentQ 自身版本 —— **待做（用户 2026-10-08 已同意，单列一次改动）**
+
+现在运行期无法知道部署的是哪个 AgentQ 版本：`doctor` 的 `pueue=`/`pueued=` 是**队列实现**
+的版本（B2 的刻意选择）。做法：服务端加 `agentq_version` 常量（**A 类里唯一触碰
+`skill/assets/agentq-server` 的条目**，canonical 两处同步改、`cmp` 必须为 0），`doctor` 在
+stderr 多报一行 `agentq=`；`smoke/03` 的 doctor 断言相应加一条；`SKILL.md` 的 doctor 段与
+`CLAUDE.md` 的 doctor/版本段落同步。**范围检查**：客户端只透传 doctor 的 stderr（不解析
+`pueue=` 行），所以两份客户端不动；`smoke/01` 的三方一致性规则随之扩为**四方**（加服务端
+常量）。
+
 ---
 
 ## 五、C 类：需要你给范围
@@ -2353,6 +2396,12 @@ crash-window 自愈的承重路径）；动 26 个 `stat`（TOCTOU 守卫）；�
 
 已完成（本会话）：A1、A2、A3、A4（零授权项），A5、A6（零授权、只改 `assets/`），
 A7（零授权、只改 `smoke/`），B2、B3、B4（用户已授权），**C1（三台，用户已裁定范围）**。
+
+**A29 公开仓库标准化（2026-10-08，用户指示）**：用户选定「薄壳加装」路线、公开仓库、
+MIT、四子项全做。①②④ 已完成（版本 0.1.0 与 Pueue 4.0.4 拆开并加 `smoke/01` 三方一致性
+规则；`LICENSE`/`CONTRIBUTING`/`README`/`CHANGELOG` 头部/`.github` 模板与 `SECURITY.md`）；
+③ 的 `ci.yml`/`release.yml` **已写但从未被 Actions 实跑**（本仓尚无 remote）——见 A29。
+**A30（`doctor` 报 AgentQ 版本）已获用户同意、单列一次改动，尚未实施**。
 **A8 已执行（2026-09-24）**：主机 A/B 只读核查后**无需清理**（无可 `remove` 对象），
 主机 C 后经用户提供凭据补盘（其队列已空，见 A8 续查）——详见 A8 那节。执行过程中撞出并修复了 A5a 引入的 P0 回归
 （POSIX 客户端连不上任何 Windows 主机）。

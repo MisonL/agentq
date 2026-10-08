@@ -14,6 +14,12 @@
 #   .cmd assets   -> structural check: no CRLF assumptions, and every .cmd must
 #                    delegate to the .ps1 beside it with the same flags
 #   canonical     -> assets/unix/agentq-server == assets/windows-git-bash/agentq
+#   version       -> AgentQ's own version is one X.Y.Z recorded in the POSIX
+#                    installer, the Windows installer and README.md, and both
+#                    success lines interpolate it -- not Pueue's release_version
+#   tools         -> every probe tool is inventoried; one that is missing turns
+#                    the summary into skipped(tool-...), which run-tests.sh
+#                    routes to its PART bucket instead of a green ok
 #
 # These are syntax and shape checks, not behaviour.  A .cmd can be
 # well-formed and still wrong; a plist can parse and still be rejected by
@@ -108,8 +114,48 @@ else
     # Do not let a missing OR broken parser read as "the .ps1 assets were
     # checked".  These are distinct states: absent means the check could not run
     # here, unusable means the environment is broken -- and the latter already
-    # counted a failure above.
-    ps_summary="skipped(pwsh-$pwsh_state)"
+    # counted a failure above.  "skipped(tool-absent)" names the tool inventory
+    # below as the reason, so the summary line points at what is missing.
+    case $pwsh_state in
+        absent) ps_summary='skipped(tool-absent)' ;;
+        *) ps_summary="skipped(pwsh-$pwsh_state)" ;;
+    esac
+fi
+
+# --- tool inventory ----------------------------------------------------------
+# Each probe silently stops checking something when its tool is missing, and
+# "the check ran" then depends on the environment, not on the assets -- the
+# same shape as the pwsh case above, which this project has now hit in four
+# different tools (pwsh, pyyaml, zsh, xmllint).  So every tool this check needs
+# is probed once and reported in the summary line as tool_full=N/M; when one is
+# missing the summary carries skipped(tool-<names>), which run-tests.sh routes
+# to its PART bucket (an honest "ran, but not fully") instead of a green ok.
+# plutil is deliberately NOT in this list: it only exists on macOS, the plist
+# loop documents "plutil -lint where available", and the macOS CI job is where
+# that lint runs.  Counting it here would mark every Linux run partial by
+# design and drown out the real gaps.
+tool_total=0
+tool_present=0
+tool_missing=
+tool_note() {
+    local label=$1
+    shift
+    tool_total=$((tool_total + 1))
+    if "$@" >/dev/null 2>&1; then
+        tool_present=$((tool_present + 1))
+    else
+        tool_missing="$tool_missing,$label"
+    fi
+}
+tool_note pwsh test "$pwsh_state" = usable
+tool_note xmllint command -v xmllint
+tool_note zsh command -v zsh
+tool_note pyyaml python3 -c 'import yaml'
+tool_note cmp command -v cmp
+tool_note find command -v find
+tool_summary=0
+if [ -n "$tool_missing" ]; then
+    tool_summary="skipped(tool-${tool_missing#,})"
 fi
 
 # --- .plist: XML well-formedness, and plutil -lint where available -----------
@@ -244,6 +290,79 @@ if ! cmp -s "$root/skill/assets/unix/agentq-server" "$root/skill/assets/windows-
     printf '%s\n' 'canonical server parity FAILED: assets/unix/agentq-server != assets/windows-git-bash/agentq' >&2
     failures=$((failures + 1))
 fi
+
+# --- AgentQ's own version: one value, three records --------------------------
+# The 2026-10-08 defect this replaces: both installers printed Pueue's
+# release_version (the value that builds the download URL) as AgentQ's own, and
+# nothing noticed because nothing read either value.  The three records must
+# agree and be X.Y.Z.  The success lines must interpolate the AgentQ value --
+# a revert to release_version leaves all three definitions agreeing, so the
+# values alone cannot catch that shape.  Same lesson as rule E for the launcher
+# protocol: one mechanism copied into several files stays consistent only if a
+# check compares the copies.
+version_summary=0
+version_posix_line=$(grep -m1 '^agentq_version=' "$root/skill/assets/unix/install-agentq.sh" || true)
+version_posix=${version_posix_line#agentq_version=}
+version_posix=${version_posix#\'}
+version_posix=${version_posix%\'}
+version_windows_line=$(grep -m1 '^\$agentqVersion = ' "$root/skill/assets/windows-git-bash/install-agentq.ps1" || true)
+version_windows=${version_windows_line#* = }
+version_windows=${version_windows#\"}
+version_windows=${version_windows%\"}
+version_readme_line=$(grep -m1 '^\*\*Version:\*\* ' "$root/README.md" || true)
+version_readme=${version_readme_line#\*\*Version:\*\* }
+version_readme=${version_readme%% *}
+
+version_recorded=
+version_check_record() {
+    # $1 label, $2 value
+    if [ -z "$2" ]; then
+        printf 'version FAILED: no AgentQ version recorded for the %s\n' "$1" >&2
+        failures=$((failures + 1))
+        return
+    fi
+    if ! printf '%s' "$2" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+        printf 'version FAILED: the %s records "%s", which is not X.Y.Z\n' "$1" "$2" >&2
+        failures=$((failures + 1))
+        return
+    fi
+    version_recorded="$version_recorded $2"
+}
+version_check_record 'POSIX installer' "$version_posix"
+version_check_record 'Windows installer' "$version_windows"
+version_check_record 'README' "$version_readme"
+
+version_unique_count=0
+if [ -n "$version_recorded" ]; then
+    version_unique_count=$(printf '%s\n' $version_recorded | sort -u | grep -c . || true)
+fi
+if [ -z "$version_recorded" ]; then
+    printf '%s\n' 'version FAILED: no version was extracted from any of the three files; refusing to report a pass' >&2
+    failures=$((failures + 1))
+elif [ "$version_unique_count" -ne 1 ]; then
+    printf 'version FAILED: the three records disagree -- POSIX installer "%s", Windows installer "%s", README "%s"\n' \
+        "$version_posix" "$version_windows" "$version_readme" >&2
+    failures=$((failures + 1))
+else
+    version_summary=$version_posix
+fi
+
+version_posix_success=$(grep -m1 -F 'installed at' "$root/skill/assets/unix/install-agentq.sh" || true)
+case $version_posix_success in
+    *'${agentq_version}'*) ;;
+    *)
+        printf '%s\n' 'version FAILED: install-agentq.sh success line does not interpolate ${agentq_version} -- the 2026-10-08 defect printed Pueue release_version there' >&2
+        failures=$((failures + 1))
+        ;;
+esac
+version_windows_success=$(grep -m1 -F 'installed at' "$root/skill/assets/windows-git-bash/install-agentq.ps1" || true)
+case $version_windows_success in
+    *'$agentqVersion'*) ;;
+    *)
+        printf '%s\n' 'version FAILED: install-agentq.ps1 success line does not interpolate $agentqVersion -- the 2026-10-08 defect printed Pueue releaseVersion there' >&2
+        failures=$((failures + 1))
+        ;;
+esac
 
 # --- config-file path patterns must still point at real files ----------------
 # .gitattributes and .editorconfig name paths in order to protect them, and a
@@ -382,5 +501,7 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'syntax-and-parity checks passed: shell=%s ps1=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok\n' \
-    "$shell_count" "$ps_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns"
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s' \
+    "$shell_count" "$ps_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total")
+[ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
+printf '%s\n' "$summary"

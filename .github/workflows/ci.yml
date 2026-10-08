@@ -1,0 +1,139 @@
+# The quality gate.  Each job runs what only that platform can run:
+#
+#   linux   - the full suite with a real Pueue runtime (sandbox.sh downloads a
+#             pueue binary and verifies it against the SHA built into the
+#             installer, then starts pueued) and a user-level sshd
+#   macos   - the quick suite, on the only platform that has plutil -lint
+#   windows - the PowerShell client checks under real PowerShell 5.1, not pwsh 7
+#             (AGENTQ_SMOKE_PWSH=powershell.exe); pwsh 7 does not reproduce the
+#             PS 5.1 quoting and `-Command -` behaviours this project has
+#             already shipped fixes for
+#
+# run-tests.sh exits 0 when checks skip -- skipping is a property of the
+# environment, not of the code under test (its own comment says so).  So no job
+# here trusts an exit code alone: each one asserts the shape of the summary.
+# The tag-vs-version gate lives in release.yml.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install check dependencies
+        # smoke/01 parses the .yml assets (pyyaml), re-parses the shell assets
+        # under zsh, and lints the plists (xmllint); 07 and 17 start their own
+        # sshd on a high port, which needs the binary and its privilege
+        # separation directory.  pwsh and jq are already on the runner image.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxml2-utils openssh-server python3-yaml zsh
+          sudo mkdir -p /run/sshd
+      - name: Run the full suite against a real runtime
+        run: |
+          ./sandbox.sh up
+          status=0
+          AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq ./run-tests.sh >smoke.log 2>&1 || status=$?
+          cat smoke.log
+          exit "$status"
+      - name: Assert the full suite really ran
+        if: always()
+        run: |
+          if [ ! -f smoke.log ]; then
+            echo 'no smoke.log -- the suite did not run' >&2
+            exit 1
+          fi
+          # This runner provides every tool the suite can use, so any SKIP or
+          # PART line means the gate got weaker, not that the environment is
+          # minimal.
+          if grep -E '^(SKIP|PART) ' smoke.log; then
+            echo 'a check skipped or was only partially verified on a runner that provides everything' >&2
+            exit 1
+          fi
+          grep -qE '^PASS checks: [0-9]+ ran, 0 skipped, 0 partial, 0 failed' smoke.log
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure pyyaml for the .yml assets
+        # smoke/01's tool inventory reports skipped(tool-pyaml) without it and
+        # the summary assertion below turns red -- which is the point of the
+        # inventory: a missing parser must not read as a green parse.
+        run: python3 -m pip install --user --quiet pyyaml
+      - name: Run the quick suite
+        run: |
+          status=0
+          ./run-tests.sh --quick >smoke.log 2>&1 || status=$?
+          cat smoke.log
+          exit "$status"
+      - name: Assert the assets were really checked
+        if: always()
+        run: |
+          if [ ! -f smoke.log ]; then
+            echo 'no smoke.log -- the suite did not run' >&2
+            exit 1
+          fi
+          # ps1=7: the PowerShell parser ran over all seven .ps1 assets.
+          # tool_full=6/6: no probe tool (pwsh, xmllint, zsh, pyyaml, cmp,
+          # find) was missing.  A `skipped(` marker means part of 01 did not
+          # run and the job must not read as green.
+          grep -qE 'ps1=7 .*tool_full=6/6' smoke.log
+          if grep -q 'skipped(' smoke.log; then
+            echo 'part of the quick suite did not run' >&2
+            exit 1
+          fi
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      # Real Windows PowerShell 5.1.  This is the only CI place these checks
+      # meet the interpreter whose behaviours they exist to pin down.
+      AGENTQ_SMOKE_PWSH: powershell.exe
+    steps:
+      - uses: actions/checkout@v4
+      - name: PowerShell 5.1 client contracts
+        shell: bash
+        run: |
+          # Actions runs bash without a profile, so Git's /usr/bin is not
+          # ahead of System32 -- and C:\Windows\System32\find.exe shadows GNU
+          # find inside these scripts.  Measured on a real Windows host; the
+          # supported entry point adjusts PATH for the same reason.
+          export PATH="/usr/bin:$PATH"
+          fail=0
+          for check in 12-ps-client-contract 20-ps-native-argv-roundtrip 22-launcher-contract 23-durable-move-contract; do
+            log="smoke-$check.log"
+            status=0
+            "./smoke/$check.sh" >"$log" 2>&1 || status=$?
+            printf '\n===== %s (exit %s) =====\n' "$check" "$status"
+            cat "$log"
+            if [ "$status" -ne 0 ]; then fail=1; fi
+            if grep -q 'SKIPPED' "$log"; then
+              echo "$check skipped -- it must run here" >&2
+              fail=1
+            fi
+          done
+          exit "$fail"
+      - name: Assert PS 5.1 was the interpreter
+        if: always()
+        shell: bash
+        run: |
+          # The ps51 token is what makes this job meaningful: without it the
+          # same run under pwsh 7 would look identical and prove nothing about
+          # 5.1.  smoke/12 prints it; the other three have no pwsh-7 blind spot
+          # of this shape.
+          grep -q 'ps51=covered' smoke-12-ps-client-contract.log
