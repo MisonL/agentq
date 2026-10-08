@@ -83,7 +83,7 @@ POSIX 客户端的探针都是单行、不受影响，所以**只有「Windows �
 
 - 先对新主机运行 `agentq --host <ssh-host> doctor`（注意 `doctor` 不是只读的，见「发现与前置条件」段）。
 - 若服务端未部署，说明缺少兼容 AgentQ 服务端，并询问用户是否允许自动安装所需依赖和服务；收到明确确认前不得改变目标机。
-- **本项目不支持跨版本互操作，这是刻意的决定，不是遗漏。** 服务端与客户端之间没有协议版本协商字段，`doctor` 报的 `pueue=`/`pueued=` 是队列实现的版本，不是 AgentQ 自己的协议版本。部署单元就是 `skill/assets/` 下那 23 个文件的同一版本；**不得只升级服务端或只升级客户端**，必须整体替换。若将来需要跨版本互操作，先加协商字段再谈。
+- **本项目不支持跨版本互操作，这是刻意的决定，不是遗漏。** 服务端与客户端之间没有协议版本协商字段——`doctor` 的 `agentq=` 只是**信息行**，报告这台机上部署的是哪个 AgentQ 版本（用于发现「只升了一侧」这类部署漂移），它**不参与任何协商**；`pueue=`/`pueued=` 则是队列实现的版本。部署单元就是 `skill/assets/` 下那 23 个文件的同一版本；**不得只升级服务端或只升级客户端**，必须整体替换。若将来需要跨版本互操作，先加协商字段再谈。
 - 服务端可以使用任意持久化队列实现，但远端受管入口必须保持本 Skill 的命令、JSON 和失败退出码契约。Unix 入口是 `~/.local/bin/agentq`；Windows 的客户端-facing 入口是受保护的 `C:\ProgramData\AgentQ\agentq-launcher.ps1`，由它再执行同目录的 `agentq`。
 - 服务端部署完成后，先验证 `doctor`，再提交一个无副作用的短命令，并确认 `submit`、`status`、`logs` 与 `wait` 都符合协议。
 - 使用随 Skill 提供的安装资产时，先将对应平台目录完整暂存到目标机，再运行安装器。Windows 使用 `assets/windows-git-bash/install-agentq.ps1`；Linux/macOS 使用 `assets/unix/install-agentq.sh`。安装器只在队列没有活动或非终态任务时更新；历史 `Done` 记录会随数据目录保留。Pueue 二进制必须通过内置 SHA-256 校验后才会启用。
