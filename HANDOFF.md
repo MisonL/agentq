@@ -43,8 +43,9 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
    （**PS 5.1、NTFS reparse、registry/profile 与跨用户身份已在专用测试机上验证**：
    前者见 `smoke/12` 的 `ps51=covered` 与 `PLAN.md` A5b 的
    `DefaultShell=powershell.exe` 真机列，后三者见 `PLAN.md` C3 执行结果。）
-3. **平台和安装矩阵**：arm64/Fedora/Alpine 与真实升级回滚已于 2026-10-07 前后补验
-   （见 `PLAN.md` C2 表与「C2 补格」）；**仍未证明**：WSL（runc 拒绝 bind-mount
+3. **平台和安装矩阵**：容器可覆盖的部分已补验——arm64 与 Alpine 失败模式 **2026-09-24**、
+   Fedora 完整安装+协议 **2026-09-30**、真实升级回滚 **2026-10-07**（见 `PLAN.md` C2 表与
+   「C2 补格」）；**仍未证明**：WSL（runc 拒绝 bind-mount
    `/proc/version`，不可伪造）、原生包管理器的权限/网络/特权组合。
 4. **真实服务与生产边界**：在得到精确主机、用户、工作目录、恢复方式和副作用授权后，
    才能验证远端服务/队列生命周期、TLS/shared key、生产凭证、发布、回滚和生产接受。

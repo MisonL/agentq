@@ -6,6 +6,9 @@
 YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 ```
 
+2026-10-08  `HANDOFF.md` 第 3 条把 arm64/Alpine、Fedora 与真实升级回滚笼统写成「2026-10-07 前后补验」，与 `PLAN.md` C2 表里三个不同日期不符——改为逐项点名（09-24 arm64/Alpine 失败模式、09-30 Fedora 完整安装、10-07 升级回滚），与 C2 表和 `CHANGELOG.md` 各自条目对齐
+  |  `smoke/16` 复跑 → `files=82 rules=7 selftest=calibrated violations=0`；纯文档变更，`skill/` 未动
+
 2026-10-08  `smoke/11` 的 fixture 自检注释写「all twelve cases」，而该检查现报 `cases=27`——改为不计数措辞（「every case below」），这类注释里的陈旧计数与文档数字同一类，改为免疫漂移的写法而不是再写一个会过期的数
   |  `smoke/11` 复跑 → `cases=27 ... crash-leftover=covered`；注释变更，行为断言未动
 
