@@ -27,8 +27,8 @@ skill/
     client/unix/       POSIX agentq, sshp, install-client.sh
     client/windows/    PowerShell / CMD / Git Bash clients and installer
     unix/              agentq-server, install-agentq.sh, pueue.yml, systemd/launchd units
-    windows-git-bash/  agentq-server (byte-identical to the unix copy), launcher,
-                       start-daemon, installer
+    windows-git-bash/  agentq (the server, byte-identical to the unix copy),
+                       durable-move, launcher, start-daemon, installer
 ```
 
 `skill/` mirrors `~/.agents/skills/agentq/` one for one, so installing is a
