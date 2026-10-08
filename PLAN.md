@@ -513,7 +513,7 @@ AgentQ 的元数据，`remove` 会自行归档，手动删会破坏实例绑定�
 | --- | --- | --- | --- |
 | 主机 A（Windows） | tombstone 1 个 | Pueue 最大 id **274**；task 275 已不在队列，只剩 `.tombstones/aq-c1-A-direct-1790070893.json` | **0** |
 | 主机 B（Linux） | 任务 840 + record 1 + tombstone 1 | Pueue 最大 id **838**；839/840 **两条都已是 tombstone**（`state: removed`，`removed_at` = 09-22 09:03:57Z / 14:35:18Z） | **0** |
-| 主机 C（macOS） | 全部 15 个任务 | **未能盘查**：端口通但公钥被拒（`Permission denied (publickey,password,...)`） | 待定 |
+| 主机 C（macOS） | 全部 15 个任务 | **当日未能盘查**：端口通但公钥被拒（`Permission denied (publickey,password,...)`） | **0**（当日的「待定」已消解：后经用户提供凭据补盘，队列已空——见 A8 续查） |
 
 **所以没有执行任何队列 mutation**——A/B 都没有可 `remove` 的对象。PLAN.md 原先那句
 "主机 B 任务 840 还在队列"**已过时**：840 在那之后已被正常 `remove` 归档。
@@ -2433,7 +2433,7 @@ A5b 随之修复并经两列双向验证——见 A5b 正文与本节 A5b 行。
 
 | 项 | 需要什么 |
 | --- | --- |
-| ~~**B1 `git init`**~~ | **已完成**（2026-09-29，用户明确授权）：`git init` + `.gitattributes`(`* -text`，护住 canonical 字节) + `.gitignore`(机制挡凭据) + 基线提交与改动提交分离。**B 项至此全部收口**（2026-10-08 补注：B5 另有新一轮三台重装待点名机器，见 B5） |
+| ~~**B1 `git init`**~~ | **已完成**（2026-09-29，用户明确授权）：`git init` + `.gitattributes`(`* -text`，护住 canonical 字节) + `.gitignore`(机制挡凭据) + 基线提交与改动提交分离。**B 项至此全部收口** |
 | ~~**B2 协议版本协商**~~ | **已选 (b) 并完成**（2026-09-22）：`SKILL.md` 与 `CLAUDE.md` 各写明是决定而非遗漏 |
 | ~~**B3 `2` 的机读化**~~ | **已实现**（2026-09-22）：服务端 7 处 `reason=` 行，两端客户端转发为 `remote failure reason:` |
 | ~~**B4 覆盖债第一刀**~~ | 已完成：`smoke/13-ps-installer-contract` |
