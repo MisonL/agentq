@@ -25,12 +25,15 @@
 #
 # What it proves: the bytes the client hands to ssh, as they would be re-parsed
 # by PS 5.1 + the CRT, still form exactly one argument with identical content.
-# What it does NOT prove: PowerShell 5.1's behaviour itself.  The model is
-# calibrated against six measurements taken on PS 5.1.19041 (five from smoke/09
-# plus one for the multi-line case below), but no PS 5.1 executes here -- pwsh
-# 7.5 is running, and pwsh quotes correctly, which is why this defect was
-# invisible on macOS.  The calibration rows are re-checked on every run and the
-# check refuses a verdict if they stop holding.
+# What it does NOT prove at runtime: PowerShell 5.1's behaviour itself -- no
+# PS 5.1 executes here; pwsh 7.5 is running, and pwsh quotes correctly, which is
+# why this defect was invisible on macOS.  The model itself has since been
+# measured directly on a real PS 5.1.19041 machine (2026-10-08): all six
+# calibration rows reproduce argc-for-argc, the pre-fix splat payload splits into
+# exactly the arguments the model predicts (byte-for-byte), and the clients'
+# current payloads arrive byte-identical (see PLAN.md A21, "直接测量").  The
+# calibration rows are re-checked on every run and the check refuses a verdict
+# if they stop holding.
 #
 # The sshp SESSION command is the one argument deliberately left RAW, and it has
 # its own four cases at the end: the base64 channel would hand tmux/screen a
