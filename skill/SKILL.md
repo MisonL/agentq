@@ -17,7 +17,8 @@ description: 将任意授权命令提交到已配置的远程主机并持久化�
 - **Windows 目标的远端终端不止一种（2026-09-22 实测）。**
 Windows 上 sshd 用 `<DefaultShell> <DefaultShellCommandOption> "<cmd>"` 解析客户端发来的
 命令，而 `DefaultShell` 可以是 `cmd.exe`、`powershell.exe` 或 Git Bash——**每一种都是
-不同的解析器**，三者的命令行长度上限不同（实测 8,125 / 8,155 / 8,176），且
+不同的解析器**，三者的命令行长度上限不同（实测 `cmd.exe` 8,155、`powershell.exe` 8,125、
+Git Bash 8,176），且
 `DefaultShell=powershell.exe` 时**外层 PowerShell 会把内层程序的非零退出码压平为 1**
 （实测范围是**全部协议码**：`2/3/4/5/6/42/124` 一律变 1，只有 0/1 保留），
 使 `42-45`（launcher 契约）与客户端依赖 `3/4/5/6` 的恢复判定都失真。这两点**两条路径都已修**：
@@ -83,7 +84,7 @@ POSIX 客户端的探针都是单行、不受影响，所以**只有「Windows �
 - 先对新主机运行 `agentq --host <ssh-host> doctor`（注意 `doctor` 不是只读的，见「发现与前置条件」段）。
 - 若服务端未部署，说明缺少兼容 AgentQ 服务端，并询问用户是否允许自动安装所需依赖和服务；收到明确确认前不得改变目标机。
 - **本项目不支持跨版本互操作，这是刻意的决定，不是遗漏。** 服务端与客户端之间没有协议版本协商字段，`doctor` 报的 `pueue=`/`pueued=` 是队列实现的版本，不是 AgentQ 自己的协议版本。部署单元就是 `skill/assets/` 下那 23 个文件的同一版本；**不得只升级服务端或只升级客户端**，必须整体替换。若将来需要跨版本互操作，先加协商字段再谈。
-- 服务端可以使用任意持久化队列实现，但远端受管入口必须保持本 Skill 的命令、JSON 和失败退出码契约。Unix 入口是 `~/.local/bin/agentq`；Windows 客户端应调用受保护的 `C:\ProgramData\AgentQ\agentq`。
+- 服务端可以使用任意持久化队列实现，但远端受管入口必须保持本 Skill 的命令、JSON 和失败退出码契约。Unix 入口是 `~/.local/bin/agentq`；Windows 的客户端-facing 入口是受保护的 `C:\ProgramData\AgentQ\agentq-launcher.ps1`，由它再执行同目录的 `agentq`。
 - 服务端部署完成后，先验证 `doctor`，再提交一个无副作用的短命令，并确认 `submit`、`status`、`logs` 与 `wait` 都符合协议。
 - 使用随 Skill 提供的安装资产时，先将对应平台目录完整暂存到目标机，再运行安装器。Windows 使用 `assets/windows-git-bash/install-agentq.ps1`；Linux/macOS 使用 `assets/unix/install-agentq.sh`。安装器只在队列没有活动或非终态任务时更新；历史 `Done` 记录会随数据目录保留。Pueue 二进制必须通过内置 SHA-256 校验后才会启用。
 - **非交互会话里装 macOS/Linux 服务端：`sudo -v` 需要 tty，直接跑会失败。** 预热的凭据（先 `sudo -S -v`）在安装器进程里**不被沿用**，实测仍报 `a terminal is required to read the password`；后台刷新时间戳的循环反而会把凭据提前用掉。可行做法是给安装器一个**只带 `-A` 的 sudo 包装**并配 `SUDO_ASKPASS`，安装结束**立即删除**（askpass 脚本含明文密码）：
@@ -136,7 +137,7 @@ POSIX 客户端的探针都是单行、不受影响，所以**只有「Windows �
 - Windows 安装器 `Copy-VerifiedPueueBinary` 使用强制项读取 staged/existing binary 来源；断裂或其他 reparse 来源不会因 `Test-Path` 返回 false 而被静默 fallback 或覆盖。
 - Windows 安装器 `Restore-Transaction` 使用强制项读取 candidate/failed/backup/restored root；断裂或其他 reparse 路径不会被 rollback 当作不存在而静默继续。
 - Windows 安装器主流程使用强制项读取 existing root、legacy config 与 transaction/legacy-backup 路径；断裂或其他 reparse 路径不会因 `Test-Path` 返回 false 而绕过既有路径链校验或冲突检查。
-- macOS 无 GUI 安装使用系统 LaunchDaemon：安装器在交互式 SSH 中请求 sudo，将带 `UserName`、`HOME` 和 `WorkingDirectory` 的 `com.agentq.pueued.plist` 安装到 `/Library/LaunchDaemons`，以目标用户身份运行 Pueued，并在 `system/com.agentq.pueued` 中 bootstrap/kickstart。旧 `~/Library/LaunchAgents/com.agentq.pueued.plist` 只在确认队列没有活动或非终态任务后停用并保留为 `.agentq-disabled.*` 备份，避免 GUI 登录产生重复服务；**安装期的 sudo 密码**只在 sudo 提示符中输入，不写入命令、环境变量或日志。（这是 sudo 的密码，与下面 ssh 认证用的凭据是两回事。）迁移后用 `agentq --host <ssh-host> doctor` 验证，`doctor` 会报告实际使用的 `launchd_domain=system`。非交互 AgentQ 请求不会自动提示 sudo，也不会把服务降级为前台 SSH。
+- macOS 无 GUI 安装使用系统 LaunchDaemon：安装器在交互式 SSH 中请求 sudo，将带 `UserName`、`HOME` 和 `WorkingDirectory` 的 `com.agentq.pueued.plist` 安装到 `/Library/LaunchDaemons`，以目标用户身份运行 Pueued，并在 `system/com.agentq.pueued` 中 bootstrap/kickstart。旧 `~/Library/LaunchAgents/com.agentq.pueued.plist` 只在确认队列没有活动或非终态任务后停用并保留为 `com.agentq.pueued.plist.agentq-disabled.*` 备份（原名保留在前缀里），避免 GUI 登录产生重复服务；**安装期的 sudo 密码**只在 sudo 提示符中输入，不写入命令、环境变量或日志。（这是 sudo 的密码，与下面 ssh 认证用的凭据是两回事。）迁移后用 `agentq --host <ssh-host> doctor` 验证，`doctor` 会报告实际使用的 `launchd_domain=system`。非交互 AgentQ 请求不会自动提示 sudo，也不会把服务降级为前台 SSH。
 - Windows 安装器会从 Git for Windows 注册表、PATH 和常见安装目录解析 `bin/bash.exe` 与 `usr/bin/bash.exe`，将实际 runtime 路径渲染进 Pueue 配置，不依赖固定的默认安装目录；发现的 launcher/runtime 文件及其每个现有父级和祖先必须是普通非 reparse 路径。安装启动并建立 `agentq` group 后，会提交无副作用的 `printf` Shell smoke，检查 `wait`、任务结果和日志哨兵，删除 smoke 任务并再次确认没有活动或非终态任务；原有历史 `Done` 记录不会被删除。Pueue data/certificate 目录及其凭据文件的每个现有父级和祖先也必须是普通非 reparse 路径。
 - Windows 安装器 `Resolve-GitBashPaths` 对每个 launcher/runtime 候选先做强制项读取；真正缺失或不完整的候选继续作为发现失败处理，但已观察到的 reparse 文件或父级路径会立即进入完整路径链校验并显式拒绝，不会被 `Test-Path` 误判为缺失后静默跳过。
 - Windows 安装器 `Test-PueueConnection` 在允许缺失的路径链校验后再次强制读取 client/config；真正缺失仍返回不可连接，已观察到的 reparse 路径会显式拒绝，不会被 `Test-Path` 误判为缺失后静默跳过。
@@ -162,7 +163,7 @@ agentq [--host <ssh-host>] doctor
 - AgentQ/SSHP 调用端在 SSH 退出码为 `0` 后仍必须验证响应结构；malformed JSON、缺少协议字段或不符合操作契约的日志/状态不得被报告为成功。失败诊断只能保留操作名、错误类别和响应字节数等元数据，禁止回显或持久化原始响应内容。OpenSSH `-E` 日志和子进程 stderr 同样只在最终调用端显示安全类别与字节数；原始内容只在受保护的短生命周期临时文件中供 transport 分类使用，并在操作结束时清理。SSHP 的交互链路也保留内部原文供分类，但最终用户输出只显示脱敏元数据。
 - 同一个请求 ID 只能对应完全相同的工作目录、标签和命令。重复提交会返回原任务而不会重复入队；参数不同、已移除，或返回 `state: "ambiguous"` / `"removing"` 时必须停止，不得换新 ID 重试同一命令。
 - 仅当本地 OpenSSH 的错误日志确认网络传输故障且提交以 `255` 退出时，客户端才会使用同一请求 ID 查询 `lookup` 并有限重试；远端命令的 `exit 255`、认证、主机密钥和配置错误会直接返回。重试耗尽时，运行 `agentq --host <host> lookup <request-id>` 恢复；`not_found` 表示服务端没有该请求记录，`not_started` 表示已有持久化请求记录但尚未观察到 Pueue 任务，两者都不是完成结果且只可用相同参数、相同请求 ID 重试。两者退出码均为 `3`；`ambiguous` 的退出码为 `4`，表示服务端无法安全判断，必须停止；`removing` 同样以 `4` 退出，表示删除意图已持久化但任务仍可见，不得重新提交或报告为已删除，只有再次明确执行 `remove` 才会继续删除；`removed` 的退出码为 `5`，表示该 ID 已移除、在 tombstone 保留期内**可以重复读到**（不是一次性消费）。
-- `lookup`、`status`、`logs` 和 `wait` 在同样确认的传输故障下会有限重试；这些调用只读取、等待或完成已持久化的删除归档，绝不新建请求、取消任务或删除仍可见的任务。**`doctor` 不在这一列：它会先确保 Pueue 守护进程在运行，若守护进程未启动，会尝试启动它（macOS `launchctl kickstart`、Linux `systemctl --user start agentq-pueued.service`）——那是服务变更，成功路径还会改写 request record。** 要只读地探查一台主机，不要走 AgentQ 协议：直接 ssh 过去看 `~/.local/bin/agentq` 在不在、版本多少。`cancel` 与 `remove` 不自动重试，因为响应丢失后无法把副作用与失败安全地区分；先用 `status`、`logs` 或 `lookup` 重新确认。
+- `lookup`、`status`、`logs`、`wait` 与 `doctor` 在同样确认的传输故障下都会有限重试；前四者只读取、等待或完成已持久化的删除归档，绝不新建请求、取消任务或删除仍可见的任务。**但 `doctor` 不是只读的：它会先确保 Pueue 守护进程在运行，若守护进程未启动，会尝试启动它（macOS `launchctl kickstart`、Linux `systemctl --user start agentq-pueued.service`）——那是服务变更，成功路径还会改写 request record。** 要只读地探查一台主机，不要走 AgentQ 协议：直接 ssh 过去看 `~/.local/bin/agentq` 在不在、版本多少。`cancel` 与 `remove` 不自动重试，因为响应丢失后无法把副作用与失败安全地区分；先用 `status`、`logs` 或 `lookup` 重新确认。
 - 处于删除恢复中的可见任务会在 `status`、`logs` 和 `wait` 的 `task.agentq.removal_pending` 中标为 `true`。若 Pueue 任务已不存在但 tombstone 尚未写入，后续安全读取会归档为 `removed`；读取操作不会删除仍可见的任务。
 - `status`、`logs` 和 `wait` 返回任务状态。`logs` 的常规响应使用字符串字段 `output`；若响应包含 `output_encoding: "base64"`，应先解码 `output_base64`，因为目标任务输出并非 UTF-8。解析 JSON 后再呈现日志，避免把 JSON 转义的 `\n` 原样当日志内容展示。
 - 正常的 `wait` 输出 `{task: ...}`；任务失败时，它自身也必须以非零退出码结束。检查退出码和 `task.status.Done.result`，两者均不能省略。若任务在等待期间被移除，`wait` 输出 `{task_id, state: "removed"}` 并以 `5` 退出；若服务端无法确认最终状态，输出 `{task_id, state: "unavailable"}` 并以 `6` 退出。这两种状态都不能报告为任务完成。

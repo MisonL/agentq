@@ -43,9 +43,9 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
    （**PS 5.1、NTFS reparse、registry/profile 与跨用户身份已在专用测试机上验证**：
    前者见 `smoke/12` 的 `ps51=covered` 与 `PLAN.md` A5b 的
    `DefaultShell=powershell.exe` 真机列，后三者见 `PLAN.md` C3 执行结果。）
-3. **平台和安装矩阵**：容器可覆盖的部分已补验——arm64 与 Alpine 失败模式 **2026-09-24**、
-   Fedora 完整安装+协议 **2026-09-30**、真实升级回滚 **2026-10-07**（见 `PLAN.md` C2 表与
-   「C2 补格」）；**仍未证明**：WSL（runc 拒绝 bind-mount
+3. **平台和安装矩阵**：容器可覆盖的部分已补验——arm64 安装+协议、Alpine 失败模式
+   **2026-09-24**、Fedora 完整安装+协议 **2026-09-30**、真实升级回滚 **2026-10-07**
+   （见 `PLAN.md` C2 表与「C2 补格」）；**仍未证明**：WSL（runc 拒绝 bind-mount
    `/proc/version`，不可伪造）、原生包管理器的权限/网络/特权组合。
 4. **真实服务与生产边界**：在得到精确主机、用户、工作目录、恢复方式和副作用授权后，
    才能验证远端服务/队列生命周期、TLS/shared key、生产凭证、发布、回滚和生产接受。
@@ -71,10 +71,11 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
    真实 Windows 上跑通完整协议（submit/wait/logs/remove/cancel 两条路径与重放/
    base64 日志/doctor/锁竞争/坏参数退出码/launcher 的 `ArgumentsBase64` 转发）；
    原生 PowerShell 5.1 的客户端坏参数路径亦已在 Windows 11 虚拟机实测。过程中
-   发现并修复了四个 Windows 专属缺陷（`FlushFileBuffers` 访问掩码、jq 的 POSIX
-   路径参数、PowerShell 5.1 词分割脚本参数，以及 `chmod` 在 `noacl` 挂载上的静默
-   空操作），详见 `CHANGELOG.md` 与 `smoke/08`、`smoke/09`、`smoke/10`。
-   第四项已修：客户端安装器改走 ACL（`Set-ClientLauncherAcl`，含 `Get-Acl` 读回
+   发现并修复了多个 Windows 专属缺陷（含服务端：`FlushFileBuffers` 访问掩码、jq 的
+   POSIX 路径参数；安装器：1 MiB 上限、控制台代码页解码、由修复本身引入的
+   PowerShell 5.1 词分割脚本参数；客户端安装器：`chmod` 在 `noacl` 挂载上的静默
+   空操作），详见 `CHANGELOG.md` 与 `smoke/08`、`smoke/09`、`smoke/10`、`smoke/23`。
+   `chmod` 那一项已修：客户端安装器改走 ACL（`Set-ClientLauncherAcl`，含 `Get-Acl` 读回
    校验），`chmod` 已从该资产移除。**registry/profile 与跨用户安装/服务身份已于
    2026-10-06 实测**（专用测试机；见 `PLAN.md` C3 执行结果），不再是未验证项。**NTFS reparse 点语义已于 2026-10-01 实测**（专用测试机上从发行版资产经
    AST 抽出 `Test-NonReparseWindowsFilePath` 逐字执行，8/8 符合预期、变异 3/3 被抓；
@@ -92,7 +93,11 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
 
 ## 三、操作规则
 
-- 新主机先运行：`agentq --host <host> doctor`。
+- 新主机先运行：`agentq --host <host> doctor`——但 `doctor` **不是只读的**：daemon
+  未运行时它会启动服务（macOS 走 `launchctl kickstart`、Linux 走 `systemctl --user
+  start`），成功路径还会改写 request record。只读探查请直接 ssh 看
+  `~/.local/bin/agentq` 是否存在；对真实远端跑 `doctor`/`status`/`lookup` 前，先确认
+  该机 `pueued` 已在运行（细节见 `CLAUDE.md` 操作边界）。
 - AgentQ 任务只走 JSON 协议：`submit -> status/logs -> wait`，需要停止时才
   `cancel`，确认终态且不再需要日志时才 `remove`。
 - SSHP 只承载人类交互会话，不用来代替 AgentQ 任务。

@@ -1344,7 +1344,8 @@ retire_legacy_macos_service_file() {
     [ "$macos_legacy_plist_existed_before" = true ] || return 0
     [ "$macos_legacy_plist_moved" = false ] || return 0
     # The prefix keeps the whole original name and randomises only the tail, so
-    # the ".agentq-disabled.*" backup shape SKILL.md documents is unchanged.
+    # the "com.agentq.pueued.plist.agentq-disabled.*" backup shape SKILL.md
+    # documents is unchanged.
     macos_legacy_plist_backup=$(create_installer_temporary_name "$HOME/Library/LaunchAgents" 'com.agentq.pueued.plist.agentq-disabled') ||
         fail "failed to reserve the legacy macOS AgentQ LaunchAgent backup path"
     if ! move_installer_file "$legacy_service_path" "$macos_legacy_plist_backup" 'legacy macOS AgentQ LaunchAgent'; then
