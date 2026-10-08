@@ -1991,8 +1991,13 @@ windows-latest 用 `AGENTQ_SMOKE_PWSH=powershell.exe` 跑 PS 5.1 客户端契约
 安装器里记录的值。**本仓尚无 git remote，两个 workflow 都从未被 Actions 执行过**——这是
 已知边界，不是「已验证」。
 
-**未定/后续**：`CHANGELOG.md` 条目是否显式带版本号（当前由 `smoke/01` 版本一致性 + tag
-门禁间接覆盖）；把 CI 首次实跑的结果回填到本条。
+**两个「未定」已裁定（2026-10-09，用户「同意」）**：
+- **CHANGELOG 条目不显式带版本号**——沿用现格式（日期 · 改了什么 · 验证）；版本与条目的
+  对应关系由 tag + `release.yml` 的门禁承担（release notes 指向该版本的 CHANGELOG 条目）。
+  理由：`smoke/01` 已钉四方版本一致，条目里再写一遍版本就是第二个需要同步的真相源。
+- **LICENSE 版权人保持 `MisonL`**（即 git 身份，`a-class.md` ①④ 原本的写法），不改。
+
+**后续**：把 CI 首次实跑的结果回填到本条（推送后执行）。
 
 ### A30. `doctor` 报告 AgentQ 自身版本 —— **已完成（2026-10-08，用户同意后单列一次改动）**
 
