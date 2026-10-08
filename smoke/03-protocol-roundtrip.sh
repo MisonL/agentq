@@ -630,6 +630,23 @@ grep -q '^pueued=' "$work/doctor.err" || {
         "$(head -c 200 "$work/doctor.err")" >&2
     exit 1
 }
+# AgentQ's own version, distinct from the queue implementation's two lines
+# above.  Asserted against the constant in the server asset being run, so this
+# cannot pass with a stale or hardcoded literal -- and smoke/01 keeps that
+# constant in step with the two installers and README.md.
+agentq_recorded=$(grep -m1 '^agentq_version=' "$server" || true)
+agentq_recorded=${agentq_recorded#agentq_version=}
+agentq_recorded=${agentq_recorded#\'}
+agentq_recorded=${agentq_recorded%\'}
+if [ -z "$agentq_recorded" ]; then
+    printf '%s\n' 'the server asset records no agentq_version constant; doctor cannot report one' >&2
+    exit 1
+fi
+grep -qx "agentq=$agentq_recorded" "$work/doctor.err" || {
+    printf 'doctor did not report the AgentQ version (expected agentq=%s): %s\n' \
+        "$agentq_recorded" "$(head -c 200 "$work/doctor.err")" >&2
+    exit 1
+}
 jq -e 'type == "object" and (.group | type == "object")' <<<"$doctor_out" >/dev/null || {
     printf 'doctor did not end with a usable queue status: %s\n' \
         "$(head -c 200 <<<"$doctor_out")" >&2

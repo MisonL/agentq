@@ -15,8 +15,9 @@
 #                    delegate to the .ps1 beside it with the same flags
 #   canonical     -> assets/unix/agentq-server == assets/windows-git-bash/agentq
 #   version       -> AgentQ's own version is one X.Y.Z recorded in the POSIX
-#                    installer, the Windows installer and README.md, and both
-#                    success lines interpolate it -- not Pueue's release_version
+#                    installer, the Windows installer, the server and README.md,
+#                    and both success lines interpolate it -- not Pueue's
+#                    release_version
 #   tools         -> every probe tool is inventoried; one that is missing turns
 #                    the summary into skipped(tool-...), which run-tests.sh
 #                    routes to its PART bucket instead of a green ok
@@ -291,12 +292,13 @@ if ! cmp -s "$root/skill/assets/unix/agentq-server" "$root/skill/assets/windows-
     failures=$((failures + 1))
 fi
 
-# --- AgentQ's own version: one value, three records --------------------------
+# --- AgentQ's own version: one value, four records ---------------------------
 # The 2026-10-08 defect this replaces: both installers printed Pueue's
 # release_version (the value that builds the download URL) as AgentQ's own, and
-# nothing noticed because nothing read either value.  The three records must
-# agree and be X.Y.Z.  The success lines must interpolate the AgentQ value --
-# a revert to release_version leaves all three definitions agreeing, so the
+# nothing noticed because nothing read either value.  The four records -- the
+# two installers, the server (doctor reports it as agentq=) and README.md --
+# must agree and be X.Y.Z.  The success lines must interpolate the AgentQ value:
+# a revert to release_version leaves all four definitions agreeing, so the
 # values alone cannot catch that shape.  Same lesson as rule E for the launcher
 # protocol: one mechanism copied into several files stays consistent only if a
 # check compares the copies.
@@ -309,6 +311,10 @@ version_windows_line=$(grep -m1 '^\$agentqVersion = ' "$root/skill/assets/window
 version_windows=${version_windows_line#* = }
 version_windows=${version_windows#\"}
 version_windows=${version_windows%\"}
+version_server_line=$(grep -m1 '^agentq_version=' "$root/skill/assets/unix/agentq-server" || true)
+version_server=${version_server_line#agentq_version=}
+version_server=${version_server#\'}
+version_server=${version_server%\'}
 version_readme_line=$(grep -m1 '^\*\*Version:\*\* ' "$root/README.md" || true)
 version_readme=${version_readme_line#\*\*Version:\*\* }
 version_readme=${version_readme%% *}
@@ -330,6 +336,7 @@ version_check_record() {
 }
 version_check_record 'POSIX installer' "$version_posix"
 version_check_record 'Windows installer' "$version_windows"
+version_check_record 'server' "$version_server"
 version_check_record 'README' "$version_readme"
 
 version_unique_count=0
@@ -337,11 +344,11 @@ if [ -n "$version_recorded" ]; then
     version_unique_count=$(printf '%s\n' $version_recorded | sort -u | grep -c . || true)
 fi
 if [ -z "$version_recorded" ]; then
-    printf '%s\n' 'version FAILED: no version was extracted from any of the three files; refusing to report a pass' >&2
+    printf '%s\n' 'version FAILED: no version was extracted from any of the four files; refusing to report a pass' >&2
     failures=$((failures + 1))
 elif [ "$version_unique_count" -ne 1 ]; then
-    printf 'version FAILED: the three records disagree -- POSIX installer "%s", Windows installer "%s", README "%s"\n' \
-        "$version_posix" "$version_windows" "$version_readme" >&2
+    printf 'version FAILED: the four records disagree -- POSIX installer "%s", Windows installer "%s", server "%s", README "%s"\n' \
+        "$version_posix" "$version_windows" "$version_server" "$version_readme" >&2
     failures=$((failures + 1))
 else
     version_summary=$version_posix

@@ -651,6 +651,8 @@ mutation。（`record 7` 是 `aq-c1-q..q7`，`task_id` 全是 16——那是我�
 
 已核实：`agentq-server` 里 `protocol_version` / `api_version` / `"version"`
 **零命中**。`doctor` 报的是 `pueue=`/`pueued=`，不是协议自己的版本。
+（**2026-10-08 补**：`doctor` 现在另报一行 `agentq=`——部署单元自身的版本，见 A30。
+它仍是**信息行**：两侧都不解析、不据此拒绝，B2 的「无协商」结论不变。）
 
 后果：部署单元被隐式定义为「23 个文件同一版本」，而系统**没有任何机制**发现或
 拒绝版本不匹配的一对。今天不咬人（没有升级故事），但这是典型的「默默成立、
@@ -2117,7 +2119,8 @@ agent 结论会凭空造出不存在的 P0，本轮确实有 5 条被复核推�
 
 **② 版本与发布（已完成）**：`agentq_version='0.1.0'` 与 `$agentqVersion = "0.1.0"` 从
 Pueue 的 `release_version='4.0.4'` 拆出（该值此前被两处安装器当成 AgentQ 版本打印）；
-`smoke/01` 新增**三方一致性**规则（两个安装器 + `README.md`，另加「成功行必须插值
+`smoke/01` 新增**版本一致性**规则（两个安装器 + `README.md`——当次为三方，同日 A30 后
+扩为四方，见下；另加「成功行必须插值
 AgentQ 版本」——回退成 `release_version` 时三处定义仍然一致，值相等抓不到那个形态）。
 **bump 规则**：部署单元字节变即 bump（文档变更不 bump）。**发布物** = git tag + Release
 notes 指向 `CHANGELOG.md` 条目，无二进制产物。
@@ -2136,18 +2139,20 @@ windows-latest 用 `AGENTQ_SMOKE_PWSH=powershell.exe` 跑 PS 5.1 客户端契约
 安装器里记录的值。**本仓尚无 git remote，两个 workflow 都从未被 Actions 执行过**——这是
 已知边界，不是「已验证」。
 
-**未定/后续**：`CHANGELOG.md` 条目是否显式带版本号（当前由 `smoke/01` 三方一致性 + tag
+**未定/后续**：`CHANGELOG.md` 条目是否显式带版本号（当前由 `smoke/01` 版本一致性 + tag
 门禁间接覆盖）；把 CI 首次实跑的结果回填到本条。
 
-### A30. `doctor` 报告 AgentQ 自身版本 —— **待做（用户 2026-10-08 已同意，单列一次改动）**
+### A30. `doctor` 报告 AgentQ 自身版本 —— **已完成（2026-10-08，用户同意后单列一次改动）**
 
-现在运行期无法知道部署的是哪个 AgentQ 版本：`doctor` 的 `pueue=`/`pueued=` 是**队列实现**
-的版本（B2 的刻意选择）。做法：服务端加 `agentq_version` 常量（**A 类里唯一触碰
-`skill/assets/agentq-server` 的条目**，canonical 两处同步改、`cmp` 必须为 0），`doctor` 在
-stderr 多报一行 `agentq=`；`smoke/03` 的 doctor 断言相应加一条；`SKILL.md` 的 doctor 段与
-`CLAUDE.md` 的 doctor/版本段落同步。**范围检查**：客户端只透传 doctor 的 stderr（不解析
-`pueue=` 行），所以两份客户端不动；`smoke/01` 的三方一致性规则随之扩为**四方**（加服务端
-常量）。
+此前运行期无法知道部署的是哪个 AgentQ 版本：`doctor` 的 `pueue=`/`pueued=` 是**队列实现**
+的版本（B2 的刻意选择）。**已做**：`agentq-server` 加 `agentq_version='0.1.0'` 常量（canonical
+两处同步改、`cmp`=0 已验），`doctor` 在 stderr 首行多报 `agentq=<版本>`；`smoke/03` 的 doctor
+断言新增一条——**必须与服务端资产里的常量逐字一致**（不是「有 agentq= 行就行」，硬编码字面量
+或陈旧值都会被抓，常量缺失也单独报错）；`smoke/01` 的三方一致性规则随之**扩为四方**（加服务端
+常量，两条成功行插值断言不变）；`SKILL.md` 的 B2 段、`CLAUDE.md` 的操作边界与 `03` 行、
+`CONTRIBUTING.md` 的资源段落同步改写——措辞一律点明 `agentq=` 是**信息行、不参与协商**，
+B2「无协议版本协商字段」的结论不变。**范围检查**：两份客户端只透传 doctor 的 stderr、不解析
+任何 `=` 行，实测无需改动。
 
 ---
 
@@ -2398,10 +2403,11 @@ crash-window 自愈的承重路径）；动 26 个 `stat`（TOCTOU 守卫）；�
 A7（零授权、只改 `smoke/`），B2、B3、B4（用户已授权），**C1（三台，用户已裁定范围）**。
 
 **A29 公开仓库标准化（2026-10-08，用户指示）**：用户选定「薄壳加装」路线、公开仓库、
-MIT、四子项全做。①②④ 已完成（版本 0.1.0 与 Pueue 4.0.4 拆开并加 `smoke/01` 三方一致性
+MIT、四子项全做。①②④ 已完成（版本 0.1.0 与 Pueue 4.0.4 拆开并加 `smoke/01` 版本一致性
 规则；`LICENSE`/`CONTRIBUTING`/`README`/`CHANGELOG` 头部/`.github` 模板与 `SECURITY.md`）；
 ③ 的 `ci.yml`/`release.yml` **已写但从未被 Actions 实跑**（本仓尚无 remote）——见 A29。
-**A30（`doctor` 报 AgentQ 版本）已获用户同意、单列一次改动，尚未实施**。
+**A30（`doctor` 报 AgentQ 版本）已完成**（服务端常量 + doctor 的 `agentq=` 行 + `smoke/03`
+逐字断言 + `smoke/01` 扩为四方 + 四份文档同步）。
 **A8 已执行（2026-09-24）**：主机 A/B 只读核查后**无需清理**（无可 `remove` 对象），
 主机 C 后经用户提供凭据补盘（其队列已空，见 A8 续查）——详见 A8 那节。执行过程中撞出并修复了 A5a 引入的 P0 回归
 （POSIX 客户端连不上任何 Windows 主机）。

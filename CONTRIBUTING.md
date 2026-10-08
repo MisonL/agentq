@@ -39,8 +39,9 @@ every check still passes.
 
 - **The deployment unit is all 23 assets at one version.** Never upgrade the
   server alone, or a client alone. There is no protocol version negotiation
-  field; `doctor`'s `pueue=` and `pueued=` output is the queue implementation's
-  version, not AgentQ's.
+  field: `doctor`'s `agentq=` line is informational (it says which AgentQ
+  version is deployed, so a one-sided upgrade is visible) and `pueue=`/`pueued=`
+  is the queue implementation's version. Neither negotiates anything.
 - **`skill/assets/unix/agentq-server` and `skill/assets/windows-git-bash/agentq`
   must stay byte-identical.** `cmp` must return 0 at all times; check `01`
   enforces it.
@@ -88,9 +89,9 @@ process note — is history, not a task. `PLAN.md` is the list.
 ## Versioning and releases
 
 AgentQ carries its own version, separate from Pueue's. The value is recorded in
-the two installers and in `README.md`; check `01` asserts those copies agree and
-that both installers' success messages print the AgentQ version rather than
-Pueue's.
+the two installers, in the server (which `doctor` reports as `agentq=`) and in
+`README.md`; check `01` asserts those copies agree and that both installers'
+success messages print the AgentQ version rather than Pueue's.
 
 - The version denotes **the deployment unit**: any change to the bytes under
   `skill/assets/` bumps it; documentation-only changes do not.
