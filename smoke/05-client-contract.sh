@@ -14,7 +14,7 @@
 # that neither leaves a temporary behind.  Those are behavioural assertions, and
 # they exist because a static check (smoke/14) can confirm the client still
 # emits `-Command -` / `-EncodedCommand` while the bytes it feeds are empty.
-# See CLAUDE.md's 05 row for the regression that made this necessary.
+# See docs/验证状态与测试覆盖边界.md's 05 row for the regression that made this necessary.
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)

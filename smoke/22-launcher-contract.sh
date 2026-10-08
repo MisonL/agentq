@@ -3,7 +3,7 @@
 # on this machine.
 #
 # Why this check exists: at 430 lines it is the LARGEST asset in the repo that no
-# check has ever executed (CLAUDE.md's "no check has ever executed it" table; 01
+# check has ever executed (docs/验证状态与测试覆盖边界.md's "no check has ever executed it" table; 01
 # parses it with the PowerShell AST, 10 asserts a couple of source invariants
 # about the launcher protocol, but neither runs a line of it).  It is also one of
 # the THREE copies of the launcher payload protocol that smoke/10's rule E keeps

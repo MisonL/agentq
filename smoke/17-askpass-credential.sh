@@ -17,7 +17,7 @@
 #     not).  A real account password cannot be verified here: a non-root sshd on
 #     macOS cannot read the password hash (getpwnam().pw_passwd is '********',
 #     there is no /etc/shadow, /usr/sbin/sshd has no setuid bit), and UsePAM yes
-#     requires root.  See CLAUDE.md's row for this check.
+#     requires root.  See docs/验证状态与测试覆盖边界.md's row for this check.
 #   * Windows, or any remote host.
 set -euo pipefail
 

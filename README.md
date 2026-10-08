@@ -126,7 +126,7 @@ when two disagree.
 
 ## Verification status
 
-This is a working tool, not a finished product. Read `CLAUDE.md`'s coverage
+This is a working tool, not a finished product. Read `docs/验证状态与测试覆盖边界.md`'s coverage
 table before trusting any claim about it — it records, per check, what is
 proven and what is not. In particular:
 
