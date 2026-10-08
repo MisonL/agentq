@@ -210,7 +210,7 @@ chmod 700 "$assets/install-agentq.sh"
 # it.  Prove that once, up front, by asserting the run fails on something LATE
 # (dependency resolution) rather than on a missing asset.  If a future asset is
 # added to the required list and not copied here, this catches it immediately
-# instead of letting all twelve cases report the same wrong message.
+# instead of letting every case below report the same wrong message.
 status=0
 env HOME="$home" PATH="$stub_bare" \
     /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
