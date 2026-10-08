@@ -5,11 +5,52 @@
 [`../PLAN.md`](../PLAN.md)。引用 `PLAN.md A5a`、`PLAN.md A28 W5` 即指本文件中
 对应的条目（`W1`–`W6` 是 A28 那次审查的子编号）。
 
-（以下 A1–A8 原为 `PLAN.md` §三「A 类：现在就能做（零授权）」；A9 起按时间追加。）
+（以下 A1–A8 原为**拆分前的** `PLAN.md` §三「A 类：现在就能做（零授权）」；A9 起按时间追加。
+本文件的标题不带节号——它是归档，不是 `docs/PLAN.md` 的一节。
 
 ---
 
-## 三、A 类：现在就能做（零授权）
+<!-- toc -->
+- A1. `install-agentq.sh` 的契约检查
+- A2. `05-client-contract` 补 `.ps1` 契约
+- A3. `run-tests.sh` 的 SKIP 语义
+- A4. 文档整理
+- A5. Windows 远端终端兼容性
+- A6. `task_instance_created_at` 的"取第一条匹配"
+- A7. 把 C1 的网络中断变体固化成可重复的检查
+- A8. 清理 C1 在三台上留下的队列残留
+- A9. 目标机只有密码认证时连不上，且报错把人指错方向
+- A10. 两份 POSIX 安装器的搬移语义没有护栏
+- A11. 主机 C 端到端
+- A12. 一次瞬时 Pueue 读取失败会把**仍在运行**的任务归档成 `removed`
+- A13. 平台探针绕过了 stderr 捕获-脱敏纪律
+- A14. Windows 客户端的 exit-token 改写对多行探针**静默失效**
+- A15. 无 tty 时装 macOS/Linux 服务端并非新发现
+- A16. Windows 客户端缺 `BatchMode` 认证提示
+- A17. 脱敏不变量已静默失效：仓库里重新出现 7 个地址
+- A18. AgentQ 支持密码认证
+- A19. `DefaultShell=cmd.exe` 的 Windows 目标根本连不上
+- A20. Windows 客户端的探针被 `-Command -` 静默吞掉
+- A21. 两个 Windows 客户端把 unix 远端脚本作为 **ssh 的原生参数**发出
+- A22. POSIX 安装器渲染 launchd plist 时**不检查占位符是否被替换**
+- A23. `wait_reconcile_missing_task` 看似能复用 `load_request_records`
+- A24. `submit`/`cancel`/`remove` 的记录读取路径覆盖
+- A25. 折叠 `repair_removed_request_records` 的逐条 jq
+- A26. 折叠 `wait` 恢复与 cancel 重放路径的逐条 jq
+- A27. POSIX 安装器的 17 处临时路径由 `$$` 派生 + 检查与写入非原子
+- A28. 七维度全场景审查（2026-10-06，用户指示「使用 agents 全维度全场景审查」）—— **已执行，4 个真实缺陷 + 1 个 P0 级 fail-open 已修**
+- A29. 公开仓库标准化（2026-10-08，用户指示「项目体系标准化处理」）—— **①②④已完成；③ CI 已写，未经 Actions 实跑**
+- A30. `doctor` 报告 AgentQ 自身版本
+<!-- /toc -->
+
+
+
+
+
+
+
+
+## A 类：现在就能做（零授权）
 
 只改 `smoke/` 与文档，不碰 `assets/`，不触任何真实主机。
 
@@ -782,6 +823,178 @@ launcher 状态。成功路径（`0`）不受压平影响，所以这只伤诊�
 回归锁：`smoke/12` 新增用例，断言「改写后不得残留裸 `exit N`、4 个码必须都变成赋值、
 且必须含 `agentq-exit:`」。**红/绿实测**：修复前（`c93c0093`）报「3 个裸 exit 残留」，修复后绿。
 
+### A15. 无 tty 时装 macOS/Linux 服务端并非新发现 —— **撤销，不是缺陷**
+我 2026-09-26 在 macOS 全新安装时"发现"了「无 tty 时安装器必然失败」，并重新推导出绕过办法（`sudo` 包装强制 `-A` +
+`SUDO_ASKPASS`）——**但 `SKILL.md` 的「非交互会话里装 macOS/Linux 服务端」一段早就写着这件事**，连代码模板、`env_reset`
+会清掉 `SUDO_ASKPASS` 的解释、以及「装完立即删除 askpass（含明文密码）」的告警都在。
+更直接的反证：`PLAN.md` 自己记着 2026-09-24 那次主机 C 重装**就是**用这个包装做的。
+**根因是我没先读 `SKILL.md` 就上手试**，浪费了十几轮去重新发现已记录的东西。
+教训记在此而非删掉了事：本项目说「完整语义以 `SKILL.md` 为准」，**动手前先读它**。
+（我推出来的机制解释——子 shell/tty 绑定、而非 umask 本身——与 `SKILL.md` 的
+`env_reset` 说法**不同**。两者都能解释现象，但我**没有**去验证哪个是真的；
+`SKILL.md` 的说法来自实测，应以它为准。不要把我这段当证据。）
+
+### A16. Windows 客户端缺 `BatchMode` 认证提示 —— **已修（2026-09-27，零授权）**
+POSIX 客户端在认证类失败时多打一行（点名 `BatchMode=yes` 与可行做法，见 A9），
+**Windows 客户端没有**（实测 `grep -c` = 0），而它同样在两处硬编码 `BatchMode=yes`
+（`agentq.ps1:775`、`:1013`）。`PLAN.md` 此前只记了 `sshp` 不加提示的理由（人类交互终端），
+**漏记了 Windows 客户端这一处**。实测证据：新装的 Windows 客户端在认证失败时输出
+`SSH diagnostic omitted for safety (class=authentication, 31 bytes)` 后接
+`unable to detect the remote platform; set AGENTQ_REMOTE_PLATFORM ...`——**分类器是对的**
+（`authentication`，旧版会报 `class=ssh`，这顺带**真机验证了** A9 记录的「Windows 分类器已改
+但未在真机验证」），**但提示缺失**，操作者仍会被指向 `AGENTQ_REMOTE_PLATFORM` 这个
+救不了缺密钥的方向。修法与 A9 相同（在 `Write-Diagnostics` 里按 class 追加），
+但要跑全套件并配 `smoke/12` 用例。
+
+**已修（2026-09-27，零授权，只改 `skill/assets/client/windows/agentq.ps1` + `smoke/12`）**：在
+`Write-Diagnostics` 里，打印完 class 行之后按 `$diagnosticClass -eq "authentication"` 追加一行，
+文案与 POSIX 端**逐字相同**，并点名 `$script:TargetHost`（不点名主机，操作者不知道该装哪把钥匙）。
+位置同样在 `Write-Diagnostics` 内而非调用方决策点——调用方是在命令替换里调探针的，
+到决策点 class 与日志都已不在手上（与 A9 同一个理由）。
+
+**回归锁 `smoke/12` 新增一组用例（32 个用例，原 31）**：四个诊断串各跑一遍
+`Write-Diagnostics`（捕获 `[Console]::Error` 到 `StringWriter`），断言**两个方向**——
+`Permission denied` 与 `Host key verification failed.` 必须打出提示**且提示里含目标主机名**，
+`Connection refused` 与空串**必须不打**。第二个方向不是凑数：提示若对所有 class 都打，
+就会退化成操作者学会跳过的噪音，那正是原提示失去价值的路径。
+
+**红/绿实测**：删掉提示行 → 用例报红且消息精确（`auth hint case permission: expected hint=True got=False`、
+`hint does not name the target host`、`hostkey` 同）；恢复 → 绿。**变异 5/5 有效者被抓**，
+另有 **1 个无效变异如实记录**：把 `-eq "authentication"` 改成 `-eq "Authentication"` 报 MISSED，
+查证为**变异无效**而非检查盲——PowerShell 的 `-eq` **本身大小写不敏感**（实测
+`"authentication" -eq "Authentication"` 为真，`-ceq` 才是敏感的），该改动行为完全不变。
+换成真正改变行为的两个变异（把条件收窄成只认 `Permission denied`、把 class 计算替换成常量）
+后**均被抓**。
+
+**主机 C（macOS）仍落后一个修订**：装的是 `4,736 行 / e3b132af`，差的就是 **A12 那个
+P0 修复**（瞬时 Pueue 读取失败会把活着的任务归档成 `removed`）与 A13（探针 stderr）。
+所以**在修复前的部署上，一次 Pueue 抖动就可能永久污染一条 request**。
+按本仓「不得只升级服务端或只升级客户端、必须整体替换」的硬约束，要修就得整体重装——那是安装/服务变更，**需要明确授权**。
+**2026-09-26 用户决定：macOS 主机以新那台（用户当次会话给出的地址）为准，原那台不再追。**
+所以当前有效机群是主机 A（Windows）、主机 B（Linux）、主机 C（macOS）三台，
+**均已 `97088c62` / `4,798 行`，无 A12 P0**。
+原那台 macOS 上的 `e3b132af` 仍带 P0，但它已不在用户的机群内——**这不是「已修复」，
+是「不在范围内」**，若将来重新启用它，需先升级。
+
+**地址更正（2026-09-24，我先前记错了，在此更正）：当时的主机 C 是原那台 macOS，
+不是后来新给的那台。** 证据是 C1 记录里的原文（`HOST=<user>@<host>`）：C1 的主机 C 矩阵
+（15 个 Done 任务、`cancel` 两条路径、三类网络中断变体）全部跑在原那台上，那个用户就是
+我在 C1 之前装上去的（系统级 LaunchDaemon、macOS 15.7.7 / Intel i5-10500）。我上一轮把它
+误标成新那台，是因为把**自己在 A8 轮的一句错误复述**当成了原始记录——**这是"从自己的旧结论里取证据"
+而不是回查原始记录**，正是本项目反复出现的那类错误。
+
+**新给的那台 macOS（record 35884）实测是一台干净新机**：macOS 15.7.9 / x86_64，`/Users` 下
+只有该机用户与另一个用户目录（**没有原那台的用户**），全盘（`/usr/local`、`/opt`、`/Users`）
+找不到任何 `agentq*`/`pueue*`，无 launchd 条目、无进程、不在 PATH、无 `~/.agentq`。
+**所以它没有 15 个任务，也没有可清理的残留**——那 15 个任务在原那台上。
+
+**凭据状态**：你给的那组账号 + 密码在新那台上**有效**（我已用它完成只读盘查）；在原那台上
+**被拒**——`Permission denied`，试了两个用户名。所以**当时主机 C 仍缺凭据**，A8/B5 当时
+仍未完成。
+
+**已实测排除的假设**：新那台的 sudo 需要密码（`sudo: a password is required`），
+但我没有做任何提权尝试，也没有对它做任何写操作——只跑了只读的 `ls`/`find`/`ps`/`command -v`。
+
+**主机 B 不需要 sudo 密码**（我先前那句是错的）：Linux 路径的服务全部走
+`systemctl --user`，`run_as_root` 的调用点全在 `platform_kind = macos` 分支里；
+`ensure_linux_linger` 只在 linger 为 `no` 时才需要提权，而该机实测已是 `yes`。
+所以主机 B 是纯用户级安装，**零提权**。数据（`shared_secret`、`certs`、258 个 Done 记录）
+完整保留，无事务残留，服务 active。
+
+**主机 A 重装撞出一个真实的 Windows 缺陷（本仓第 7 个，只有真机能撞到）。**
+第一次运行安装器在第 453 行失败：
+
+```
+if (!$applied.AccessRulesProtected -or !$ownerRule) {
+```
+
+`AccessRulesProtected` **不是** .NET ACL 对象的属性，真名是 `AreAccessRulesProtected`。
+在 `Set-StrictMode -Version Latest` 下读不存在的属性**抛错**（不是返回 `$null`），
+所以 ACL 校验那步让每次安装都死在该行。**客户端安装器 `install-client.ps1:471` 一直是拼对的**
+——两份拷贝不一致，而只有客户端那份在真机上被跑过。**安装器回滚干净**：服务端仍是
+4,715 行 / `e114e2b8`，launcher 未变，`pueued` 仍在跑，无事务残留。修好后重跑成功。
+
+**为什么现有检查都抓不到它**：`smoke/13` 在 macOS 上第一条语句就死（`Resolve-GitBashPaths`
+报 `Windows Principal functionality is not supported on this platform`），根本不执行那一行；
+`smoke/10` 的规则 D 只要求 `Set-Acl` 之后**有** `Get-Acl` 读回——读回确实存在，规则满足。
+故新增**规则 F**：ACL 对象的属性名必须在允许集内。**变异 2/2 被抓**（服务端/客户端各一），
+基线绿。**一个自己踩的坑如实记录**：规则 F 第一版用了 `\b`，而 **BSD awk（macOS）不支持 `\b`**
+——匹配返回 `RSTART=0`，规则**静默通过了它本该抓的那个缺陷**；去掉 `\b` 后正常
+（`[A-Za-z]*` 本身已是贪婪）。第二版又把合法的 `AccessControlType`（`AccessRule` 的属性，
+不是 ACL 对象的）报成违规 4 处，已加进允许集。
+
+**主机 A 的端到端验证被我自己的孤儿进程反复阻塞——同一个错误我犯了多次，如实记录。**
+形态与 A8 完全相同：我用本地 `timeout` 包住远端的 `status`，超时后**本地** ssh 被杀，
+但**远端 `bash.exe ./agentq status` 继续运行**并持有 operation lock。第一次（PID 98392）
+我按 A8 规则**不手动删锁**（持有者活着），实测该进程 **CPU 两次读数完全相同、20 秒采样
+不变、子进程已消失**——已冻结在向断裂的 stdout 管道写入，**永远不会自己退出、也就永远
+不会释放锁**。处理方式：**只终止我自己的冻结进程，绝不碰锁目录**（AgentQ 元数据），
+交给服务端自己的陈旧锁恢复逻辑（`smoke/03` 钉的正是这条路径）——实测该逻辑**确实生效**
+（下一次操作越过了获取阶段，锁转为新持有者）。
+
+**但我随后又犯了两次同样的错误**（一次仍是本地 `timeout`，一次是我在说「不再并发」
+之后又并发启动了一个直接调用），累计留下多个孤儿：实测采样后清掉 3 个冻结的
+（CPU 20 秒内不变），保留在跑的。**根因是我自己的操作纪律，不是产品缺陷**：
+远端操作必须允许它自己跑完，任何本地超时都会制造一个永久持锁的孤儿。
+**已改**：最后一次改用**不设本地超时**的方式，并停止一切并发。
+
+**那项"8 分钟未返回"的观察已查明成因，且不是缺陷——但成因和我先写的那句相反，
+在此更正。** 我原先写「`compact_status` 先做 `prepare_request_metadata_files`、
+**然后**才取锁」。读调用链后确认**顺序是反的**：`status_with_operation_lock` →
+`with_operation_lock status` → `acquire_operation_lock` **先拿锁**，拿到之后才
+执行 `status()`，而 `compact_status` 里的 `prepare_request_metadata_files`
+（遍历 273 条 record、每条多次 jq）在**锁内**。所以 N 个并发 `status` 不是「各自
+先全量扫描再排队」，而是**在锁内串行做 N 次全量扫描**——同样的分钟级后果，但机制
+不同：**是锁把扫描串行化了**，不是扫描发生在锁之前。后者读起来像「锁没起作用」，
+与事实相反。
+
+**主机 A 的端到端验证已完成（2026-09-24 补测，严格无并发、无本地 `timeout`）：**
+
+| 操作 | 退出码 | 耗时 | 结果 |
+| --- | ---: | ---: | --- |
+| `status`（默认探针超时 30s） | **0** | 363s | 147,911 字节合法 JSON、273 个任务、stderr 全空 |
+| `submit` | **0** | 285s | `task_id=275`、`reused:false` |
+| `wait` | **0** | 332s | 调用退出码 **与** `task.status.Done.result == "Success"` 两项都核对 |
+| `logs --tail all` | **0** | 323s | `output` 字段存在，且与提交的标记**逐字节相同** |
+| `remove` | **0** | 233s | `{"task_id":275,"removed":true}`；其后锁目录已释放、任务已从 Pueue 消失 |
+
+**那两次 30 秒探针超时是我自己造成的，已实测排除。** 主机 A 上**手动照客户端方式**
+（同一组 ssh 选项、脚本经 stdin）跑平台探针与协议探针，各轮均 **2 秒**返回正确 token
+（`agentq-windows` / `agentq-windows-launcher-ready`，含 `agentq-exit:0`）。超时期间
+该机 **load=42**、积压 **14 个 `bash.exe`**——正是我留下的孤儿把机器压垮，探针被
+拖过 30s 预算。孤儿清空后默认超时**一次通过**。**探针、长度、退出码 token 三条契约
+在真机上均无缺陷**；30s 这个默认值在这台机器上偏紧，但那是负载的函数，不是缺陷。
+
+**另一处更正：Windows 上服务端文件叫 `agentq`，不叫 `agentq-server`。** 我先前用
+`/c/ProgramData/AgentQ/agentq-server` 探测，得到「MISSING」，一度以为部署不见了——
+实际是我记错了名字（仓库里该资产是 `skill/assets/windows-git-bash/agentq`）。实测
+`sha256 = e3b132afc2ec624cbdd49a11d042111f6e673b47f0ae932a2f126a8d223f2af7`，
+**与仓库逐字节相同**，部署完好。
+
+**结论：主机 A 重装与端到端均已完成。** 安装器 exit 0、`updated_atomically:true`、
+服务端逐字节等于仓库、`pueued` 在跑、无事务残留。
+
+**第二轮重装（2026-10-08，用户点名机器）——三台全部完成，仓库此前的 A28/W4/W5/C2 各轮改动
+至此全部上线**：三台各走官方安装器升到当前 `9721403c` / 5,332 行，升级后各自端到端
+`submit→wait(退 0, `Done.result=Success`)→logs→remove` 全通、队列与 record 零丢失。
+
+| 主机 | 升级方式 | 结果 |
+| --- | --- | --- |
+| 主机 A（Windows） | `install-agentq.ps1 -StageDirectory` | `INSTALLER_EXIT=0`、`updated_atomically:true`；服务端 `9721403c`、`pueue status` rc=0 |
+| 主机 B（Linux） | `install-agentq.sh` + `AGENTQ_PUEUE_SOURCE_DIR` | `INSTALLER_EXIT=0`（"AgentQ 4.0.4 installed"）；`service: active` |
+| 主机 C（macOS） | `install-agentq.sh` + 文档化的非 TTY sudo 通道 | `installer_rc=0`；LaunchDaemon 重启后 daemon 在跑（新 pid） |
+
+**主机 B 首试被内置 SHA 校验拒**（`sha256 mismatch for staged asset:
+…/pueue-x86_64-unknown-linux-musl`）：`AGENTQ_PUEUE_SOURCE_DIR` 指向的文件必须用**平台资产名**
+（该机 `~/.agentq/pueue` 名字不符）——改用 `~/aq-pueue-src/pueue-x86_64-unknown-linux-musl`
+（从该机既有二进制复制，哈希与安装器内置常量逐一相符）后通过。**这次失败是校验按设计
+工作的证据**，不是缺陷。
+
+**同轮主机 A 的 Windows 客户端也补齐到 canonical**（部署单元规则：客户端与服务端同批）：
+`agentq.ps1` `bf61bf00`→`20bad08c`、`sshp.ps1` `dc317937`→`62bf0754`、Git Bash 启动器
+`35d6a030`→`240a7bf8`；`-Check` 先报三处漂移、安装后 `-Check` 退 0、六个入口逐字节相符、
+`.local\bin` 零残留。
+
 ### A17. 脱敏不变量已静默失效：仓库里重新出现 7 个地址 —— **已修（2026-09-27，零授权，`assets/` 零改动）**
 
 **这条不是新规则，是一条旧规则的回归。** 规则写在 `CLAUDE.md` 的操作边界里（「仓库与记忆里
@@ -845,21 +1058,9 @@ VM 名；**其中原账户名早在 2026-09-29 就已进仓**（`C:\Users\<账�
 git 历史里（`d9a0957` 引入计算机名与账户名，`63c6061` 基线提交里已有 2026-09-29 那个账户名），
 经用户授权后用 `git filter-repo --replace-text` 从全部 22 个提交的 blob 中替换掉——逐提交扫描
 零命中、旧对象不可达、工作树与改写前镜像备份逐字节相同（repack 也清掉了库里的不可达对象，
-包括第四节 B1 提到的 2026-09-29 恢复用孤儿提交——它本就不可达、任何一次 `gc` 都会清掉；
+包括 `b-class.md` 的 B1 提到的 2026-09-29 恢复用孤儿提交——它本就不可达、任何一次 `gc` 都会清掉；
 改写前的镜像备份本身也已按用户要求于同日清理删除，故该孤儿对象现已无处可取）；**所有提交哈希因此改变**，本文件的
 哈希引用已刷新（`0d29338`→`d9a0957`、`31d83f3`→`63c6061`、`d7220c5`→`0bb95d0`）。
-
-### B4. 覆盖债的第一刀砍哪 —— **已完成（2026-09-22）**
-
-`unix/install-agentq.sh`（**2,946 行**）和 `windows-git-bash/install-agentq.ps1`
-（**3,072 行**）合计 **6,018 行**，占全仓 22.3%（**27,028 行、23 个资产**），是两个最大的
-零覆盖资产（B4 当时；两者如今各有一份契约检查）。A1 处理前者。**这几个数字按当前字节重算**
-（原先记 2,755+2,881、后记 2,876+2,922；资产随 A18/A27/W5 等增长后失真，2026-10-06 与
-2026-10-07 两次更正，覆盖表里的 2,424/2,911/496 亦同）。
-
-**`install-agentq.ps1` 已完成（B4，2026-09-22）：新增 `smoke/13-ps-installer-contract`。**
-它需要的证据和 A1 不同：`.ps1` 的参数契约能在 `pwsh` 上测，但 PS 5.1 专有行为
-只能在真机测，所以该检查的边界同样写死。
 
 ### A18. AgentQ 支持密码认证 —— **已实现（2026-09-28，零授权，纯客户端）**
 
@@ -1759,11 +1960,11 @@ agent 结论会凭空造出不存在的 P0，本轮确实有 5 条被复核推�
 **2026-10-08 第二次追加（用户指示「有些文档内容太长了，可读性比较差，拆分一下」）**：
 上面那条「明确不做：拆分或重写」被用户当日的新指示**显式覆盖**，拆分已执行（全部正文
 逐字保留，拆分即纯搬移）：`CLAUDE.md` 818 → 357 行——实测证据与覆盖表、防假绿与沙箱
-跑法拆入 `docs/验证状态与测试覆盖边界.md`，性能事实拆入 `docs/性能事实.md`；**「操作
+跑法拆入 `docs/verification-status.md`，性能事实拆入 `docs/performance.md`；**「操作
 边界」留在 `CLAUDE.md`**（凭据、主机授权、「`doctor` 不是只读」这类安全规则必须在
 每次会话自动加载的文件里）。`docs/PLAN.md` 2,577 → 477 行——A 类记录拆入
-`docs/plan/a-class.md`、B 类拆入 `docs/plan/b-class.md`，C 类留在本文件；第七节的
-「性能事实」并入 `docs/性能事实.md`，消掉它与 `CLAUDE.md` 段的重复。**引用约定不变**：
+`docs/plan/a-class.md`、B 类拆入 `docs/plan/b-class.md`，C 类留在本文件；的「性能事实」一节（拆分前编号为第七节）的
+「性能事实」并入 `docs/performance.md`，消掉它与 `CLAUDE.md` 段的重复。**引用约定不变**：
 `PLAN.md A21`/`PLAN.md A28 W5` 这类按「文档名 + 条目号」的引用仍然有效（`docs/PLAN.md`
 的「条目记录在哪」写明记录在哪个文件），因此 `skill/assets/` 内 6 处注释无需改动、
 部署版本不 bump；活文档里的指针已同步改到新路径。

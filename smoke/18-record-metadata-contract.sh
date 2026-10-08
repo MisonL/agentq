@@ -6,7 +6,7 @@
 # left a legal `state: "removed"` record unarchived forever -- ran the whole
 # suite green (17 ran, 0 failed).  Another that dropped the per-record binding
 # check silently ACCEPTED a record whose filename and internal `request_id`
-# disagreed, also green.  `docs/验证状态与测试覆盖边界.md` has said all along that smoke proves
+# disagreed, also green.  `docs/verification-status.md` has said all along that smoke proves
 # parsing and bad-argument rejection but "does not prove any branch behaves
 # correctly"; this is that gap, pinned.
 #

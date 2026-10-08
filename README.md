@@ -118,15 +118,16 @@ Start here:
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to contribute: the development loop, the load-bearing rules, and the full documentation map |
 | [`CHANGELOG.md`](CHANGELOG.md) | One line per change, each with its verification result |
 
-The maintainer documents — [`CLAUDE.md`](CLAUDE.md), [`docs/PLAN.md`](docs/PLAN.md)
-and [`docs/HANDOFF.md`](docs/HANDOFF.md) — serve this repository's own maintenance
+The maintainer documents — [`CLAUDE.md`](CLAUDE.md), [`docs/PLAN.md`](docs/PLAN.md),
+[`docs/HANDOFF.md`](docs/HANDOFF.md), [`docs/verification-status.md`](docs/verification-status.md)
+and [`docs/performance.md`](docs/performance.md) — serve this repository's own maintenance
 workflow. [`CONTRIBUTING.md`](CONTRIBUTING.md#documentation-map) is the authority
 map: it lists every document, what each is authoritative for, and which one wins
 when two disagree.
 
 ## Verification status
 
-This is a working tool, not a finished product. Read `docs/验证状态与测试覆盖边界.md`'s coverage
+This is a working tool, not a finished product. Read `docs/verification-status.md`'s coverage
 table before trusting any claim about it — it records, per check, what is
 proven and what is not. In particular:
 

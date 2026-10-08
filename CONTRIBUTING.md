@@ -81,6 +81,8 @@ Each document has one job. Where two disagree, the one whose job it is wins.
 | [`CLAUDE.md`](CLAUDE.md) | Development order: the entry point — what is verified, what is not, and the boundaries that are not todos |
 | [`docs/PLAN.md`](docs/PLAN.md) | **The only authoritative list of open work**; A/B entry records live in `docs/plan/` |
 | [`docs/HANDOFF.md`](docs/HANDOFF.md) | Operating rules and limits |
+| [`docs/verification-status.md`](docs/verification-status.md) | What is verified and what is not: the per-check coverage table, the false-green guards, the sandbox how-to |
+| [`docs/performance.md`](docs/performance.md) | Subprocess and timing facts for `status` — read before touching a hot path |
 | [`CHANGELOG.md`](CHANGELOG.md) | One line per change, each with its verification result |
 
 A todo anywhere else — in a `docs/HANDOFF.md` history section, in a `CHANGELOG.md`
@@ -115,6 +117,6 @@ success messages print the AgentQ version rather than Pueue's.
 
 Outward-facing files (`README.md`, `CONTRIBUTING.md`, `LICENSE`) are English.
 The internal working documents (`CLAUDE.md`, `docs/PLAN.md`, `docs/HANDOFF.md`,
-`docs/验证状态与测试覆盖边界.md`, `docs/性能事实.md`, `docs/plan/`, `CHANGELOG.md`,
+`docs/verification-status.md`, `docs/performance.md`, `docs/plan/`, `CHANGELOG.md`,
 `SKILL.md`) and the smoke checks' output are Chinese; that is
 deliberate, not a translation backlog.

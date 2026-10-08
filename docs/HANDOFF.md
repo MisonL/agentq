@@ -7,6 +7,15 @@
 
 ---
 
+<!-- toc -->
+- 一、当前结论
+- 二、明确未完成、取消或未授权事项
+- 三、操作规则
+- 四、关键当前文件
+<!-- /toc -->
+
+
+
 ## 一、当前结论
 
 - AgentQ 的本地开发和可靠性完善工作完成过一次有界收口，当时 7 项核心动态检查、
@@ -125,11 +134,11 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
 - 开发入口与流程：`CLAUDE.md`
 - 日常验证：`run-tests.sh`（`--quick` 只跑 `01`）
 - 冒烟检查：`smoke/` 下的 28 项，逐项的「覆盖什么 / 不覆盖什么」以
-  `docs/验证状态与测试覆盖边界.md`为准——本文件不再复制那份清单（复制过一次就漂移过一次）
+  `docs/verification-status.md`为准——本文件不再复制那份清单（复制过一次就漂移过一次）
 - `03`/`04`/`06`/`07` 需要 `AGENTQ_SMOKE_HOME` 指向含真实 `pueue` 的运行时，否则 SKIP；
   `03` 还要求它本身是可用运行时（`config/pueue.yml` + 已在运行的 `pueued`）。
   仓库根的 `./sandbox.sh up` 可一键搭出这个运行时（`up` / `status` / `down`），
   它打印的 `AGENTQ_SMOKE_HOME` 形如 `/tmp/aqsb/home/.agentq`
-- 覆盖边界与假绿防护：见 `docs/验证状态与测试覆盖边界.md`
+- 覆盖边界与假绿防护：见 `docs/verification-status.md`
 - 变更记录：`CHANGELOG.md`
 - 产品本体：`skill/`（25 个文件 = `SKILL.md` + `agents/` + `assets/` 23 个资产），与全局 Skill 目录结构一一对应

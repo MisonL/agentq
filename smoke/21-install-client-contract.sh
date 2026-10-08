@@ -5,7 +5,7 @@
 # coverage at all.  The other two already have contract checks -- install-agentq.sh
 # has smoke/11, install-agentq.ps1 has smoke/13 -- and this one, 251 lines, had
 # only 01's `sh -n`.  It sits in the "no check has ever executed it" table in
-# docs/验证状态与测试覆盖边界.md, and unlike the two Windows-only assets left there it is fully
+# docs/verification-status.md, and unlike the two Windows-only assets left there it is fully
 # runnable on this machine, so leaving it uncovered was a choice, not a limit.
 #
 # Shape, borrowed from 11/13: assert the CONTRACT.  Unlike install-agentq.sh
@@ -156,7 +156,7 @@ else
     done
     # Mode 700: the installer does `chmod 700` on each staged file.  Asserted
     # because that is the step whose Windows counterpart was a silent no-op
-    # (docs/验证状态与测试覆盖边界.md: chmod on noacl mounts); on POSIX it must actually take.
+    # (docs/verification-status.md: chmod on noacl mounts); on POSIX it must actually take.
     for client in agentq sshp; do
         mode=$(stat -f '%Lp' "$install_destination/$client" 2>/dev/null || stat -c '%a' "$install_destination/$client")
         if [ "$mode" != "700" ]; then
