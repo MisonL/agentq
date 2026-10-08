@@ -134,7 +134,7 @@ if [ "$skipped" -ne 0 ] || [ "$partial" -ne 0 ]; then
     printf '\n%s checks: %s ran, %s skipped, %s partial, %s failed (%ss)\n' \
         "$verdict" "$ran" "$skipped" "$partial" "$failures" "$elapsed"
     printf '%s\n' "NOT A FULL PASS: $skipped check(s) skipped and $partial check(s) only partially verified."
-    printf '%s\n' 'Set AGENTQ_SMOKE_HOME to a runtime containing pueue to run them (see docs/验证状态与测试覆盖边界.md).'
+    printf '%s\n' 'Set AGENTQ_SMOKE_HOME to a runtime containing pueue to run them (see docs/verification-status.md).'
 else
     printf '\n%s checks: %s ran, %s skipped, %s partial, %s failed (%ss)\n' \
         "$verdict" "$ran" "$skipped" "$partial" "$failures" "$elapsed"

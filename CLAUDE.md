@@ -1,5 +1,16 @@
 # AgentQ — 开发秩序
 
+<!-- toc -->
+- 这个项目是什么
+- 日常开发流程
+- 协议契约
+- 改完 skill/ 必须同步全局 Skill 目录
+- 操作边界
+- 实测证据与测试覆盖
+<!-- /toc -->
+
+
+
 ## 这个项目是什么
 
 AgentQ 是基于 SSH + Pueue 4.0.4 的远端任务队列。真正被使用的东西只有
@@ -351,8 +362,8 @@ diff -rq /Volumes/Work/code/agentq/skill "$SKILL_DIR"   # 必须无输出
 以下内容已拆分为独立文件（2026-10-08，用户指示「文档太长、可读性差、拆分」），
 正文逐字未变：
 
-- [`docs/验证状态与测试覆盖边界.md`](docs/验证状态与测试覆盖边界.md) —— 哪些结论已
+- [`docs/verification-status.md`](docs/verification-status.md) —— 哪些结论已
   实测、哪些没有，以及 **`smoke/` 二十八项检查各自证明什么 / 不证明什么** 的覆盖表、
   `run-tests.sh` 的防假绿机制与沙箱跑法。**改 `skill/assets/` 或声称任何覆盖前必读。**
-- [`docs/性能事实.md`](docs/性能事实.md) —— `status` 的子进程与耗时事实、历次实测，
+- [`docs/performance.md`](docs/performance.md) —— `status` 的子进程与耗时事实、历次实测，
   改热点路径前先读。
