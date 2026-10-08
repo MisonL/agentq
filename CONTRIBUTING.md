@@ -78,8 +78,8 @@ Each document has one job. Where two disagree, the one whose job it is wins.
 | --- | --- |
 | [`skill/SKILL.md`](skill/SKILL.md) | The protocol contract: exit codes, `cancel` semantics, Windows terminal behaviour, installation steps |
 | [`README.md`](README.md) | The front door: what this is, how to install it, how to run the tests |
-| [`CLAUDE.md`](CLAUDE.md) | Development order: what is verified, what is not, and each check's coverage boundary |
-| [`docs/PLAN.md`](docs/PLAN.md) | **The only authoritative list of open work** |
+| [`CLAUDE.md`](CLAUDE.md) | Development order: the entry point — what is verified, what is not, and the boundaries that are not todos |
+| [`docs/PLAN.md`](docs/PLAN.md) | **The only authoritative list of open work**; A/B entry records live in `docs/plan/` |
 | [`docs/HANDOFF.md`](docs/HANDOFF.md) | Operating rules and limits |
 | [`CHANGELOG.md`](CHANGELOG.md) | One line per change, each with its verification result |
 
@@ -115,5 +115,6 @@ success messages print the AgentQ version rather than Pueue's.
 
 Outward-facing files (`README.md`, `CONTRIBUTING.md`, `LICENSE`) are English.
 The internal working documents (`CLAUDE.md`, `docs/PLAN.md`, `docs/HANDOFF.md`,
-`CHANGELOG.md`, `SKILL.md`) and the smoke checks' output are Chinese; that is
+`docs/验证状态与测试覆盖边界.md`, `docs/性能事实.md`, `docs/plan/`, `CHANGELOG.md`,
+`SKILL.md`) and the smoke checks' output are Chinese; that is
 deliberate, not a translation backlog.

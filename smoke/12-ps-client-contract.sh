@@ -6,7 +6,7 @@
 # Why this check exists: before it, assets/client/windows/agentq.ps1 had no
 # executable coverage anywhere in the suite.  01 parses it with the PowerShell
 # AST, and 10 asserts two source-level invariants about it, but nothing had ever
-# RUN it.  Its bad-argument contract was recorded in CLAUDE.md prose as "13 cases
+# RUN it.  Its bad-argument contract was recorded in docs/验证状态与测试覆盖边界.md prose as "13 cases
 # measured on a Windows 11 VM" -- a real measurement, but not a re-runnable one.
 #
 # THE LIMIT, stated up front because it is the whole point of this file's
@@ -14,7 +14,7 @@
 # PowerShell 5.1.  pwsh does NOT reproduce the two PS 5.1 defects this project
 # has actually been bitten by -- the native-argument word-splitting that
 # smoke/09 models, and the -EncodedCommand path.  So this check proves the
-# contract holds under pwsh.  It does NOT close the PS 5.1 gap, and the CLAUDE.md
+# contract holds under pwsh.  It does NOT close the PS 5.1 gap, and the docs/验证状态与测试覆盖边界.md
 # note about the VM measurement stays the only PS 5.1 evidence there is.
 set -euo pipefail
 
