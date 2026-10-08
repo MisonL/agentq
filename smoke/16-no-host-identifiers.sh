@@ -27,6 +27,10 @@
 # does not prove: that no other shape carries an address -- a host recorded as
 # "the box in the corner" is invisible to a scanner.  That is a deliberate limit,
 # not an oversight.  This is a content scan and says nothing about behaviour.
+# One rule carries a scoped exemption rather than a file exemption: R4 stands
+# down inside .github/workflows/ only -- the `uses: owner/repo@vN` construct --
+# and the scope of that exemption is pinned in both directions below, so
+# widening it fails the self-test instead of silently blinding a rule.
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -44,6 +48,14 @@ memory_dir="$HOME/.claude/projects/-Volumes-Work-code-agentq/memory"
 # R4  @a-bareword-containing-a-digit -- catches the serial-number host name that
 #     R3 misses (no dot).  Deliberately narrower than "@any bareword": the
 #     synthetic fixture `smokeuser@smoke-host` in 05 is legitimate.
+#     Skipped under .github/workflows/ and nowhere else -- see r4_path_exempt
+#     below.  A workflow pins its actions as `uses: owner/repo@vN`: the `@` is
+#     syntax and the digit is a version, which is exactly this rule's shape.
+#     Measured 2026-10-08: the repository's own four new CI reference lines were
+#     four R4 violations.  The exemption is by path and construct, never by
+#     exempting a file: R1-R3 and R5-R7 stay active in workflow files (an
+#     address or an ssh URL pasted into one still fires) and R4 stays active
+#     everywhere else -- the canary below runs outside .github and proves it.
 # R5  an address flattened into an identifier -- the private-key filename shape.
 #     No `\b`: it fails between `_` and a digit, which is how the first version
 #     of this rule matched nothing at all while reporting a clean tree.
@@ -129,6 +141,20 @@ first_match() {
     printf '%s' "$got"
 }
 
+# r4_path_exempt <path-relative-to-root> -- R4 only, only for workflow files.
+# The path is matched relative to the scan root, so moving the repository cannot
+# change the verdict, and the pattern is exactly one directory deep: widening it
+# to `.github/*` or to `*` is caught by the scope self-test, not left to trust.
+# Boundary, recorded: a DOTTED action pin (`owner/repo@v<major>.<minor>`) would fire R3
+# instead of R4; if one is ever added, the check goes red and the operator
+# judges it then rather than this rule silently widening now.
+r4_path_exempt() {
+    case $1 in
+        .github/workflows/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # scan_file <path> -- one `grep -n` per rule, so a file costs one fork per rule
 # instead of one per line.  The per-rule loop is unrolled rather than looped so
 # the rule name and its regex stay adjacent to the code that uses them.
@@ -157,6 +183,9 @@ EOF
     for spec in "R2:$RE_R2" "R3:$RE_R3" "R4:$RE_R4" "R5:$RE_R5" "R6:$RE_R6" "R7:$RE_R7"; do
         rule=${spec%%:*}
         re=${spec#*:}
+        if [ "$rule" = R4 ] && r4_path_exempt "${file#"$root"/}"; then
+            continue
+        fi
         hits=$(grep -nE "$re" "$file" 2>/dev/null || true)
         [ -n "$hits" ] || continue
         while IFS= read -r ln; do
@@ -246,6 +275,30 @@ expect fire   R7 "$s_machine"     'a date-stamped computer name'
 expect silent R7 "$s_taskid"      'a synthetic task id (digits are not a date)'
 expect silent R7 "$s_datedtag"    'a dated release tag (nothing after the date)'
 expect silent R7 "$s_lowerdate"   'a lowercase dated file name'
+
+# The R4 path exemption's SCOPE, pinned in both directions: the workflows
+# directory is exempt, and nothing else is.  Without this, widening the pattern
+# to `.github/*` or to `*` would leave every sample above green -- they all run
+# through first_match, which never sees a path.
+expect_path() { # expect_path <exempt|active> <path> <what>
+    local want=$1 path=$2 what=$3
+    if r4_path_exempt "$path"; then
+        [ "$want" = exempt ] || {
+            printf 'self-test: the R4 path exemption covers %s (%s) but must not\n' "$path" "$what" >&2
+            selftest_failures=$((selftest_failures + 1))
+        }
+    else
+        [ "$want" = active ] || {
+            printf 'self-test: the R4 path exemption misses %s (%s)\n' "$path" "$what" >&2
+            selftest_failures=$((selftest_failures + 1))
+        }
+    fi
+}
+expect_path exempt .github/workflows/ci.yml      'a workflow file (uses: owner/repo@vN)'
+expect_path active .github/SECURITY.md           'a community file under .github'
+expect_path active .github/ISSUE_TEMPLATE/bug_report.md 'an issue template under .github'
+expect_path active smoke/16-no-host-identifiers.sh 'the check itself'
+expect_path active CHANGELOG.md                  'a root document'
 
 if [ "$selftest_failures" -ne 0 ]; then
     printf 'no-host-identifiers: %s self-test failure(s); the scan below would not have been trustworthy\n' \

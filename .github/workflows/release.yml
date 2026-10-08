@@ -1,0 +1,33 @@
+# Release gate: a v* tag must carry the version the deployment unit records.
+# smoke/01 already asserts the records agree with each other (the POSIX
+# installer, the Windows installer, and README.md); this adds the one thing a
+# checkout cannot check against itself -- agreement with the tag being pushed.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  tag-matches-recorded-version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the tag with the recorded version
+        run: |
+          set -eu
+          version_line=$(grep -m1 '^agentq_version=' skill/assets/unix/install-agentq.sh || true)
+          recorded=${version_line#agentq_version=}
+          recorded=${recorded#\'}
+          recorded=${recorded%\'}
+          tag_version=${GITHUB_REF_NAME#v}
+          printf 'tag=%s recorded=%s\n' "$tag_version" "$recorded"
+          if [ -z "$recorded" ]; then
+            echo 'no agentq_version found in the installer -- refusing to pass' >&2
+            exit 1
+          fi
+          if [ "$tag_version" != "$recorded" ]; then
+            echo "tag $GITHUB_REF_NAME does not match the recorded version $recorded" >&2
+            exit 1
+          fi

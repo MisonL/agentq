@@ -2,6 +2,9 @@
 
 Remote task queue over SSH, backed by [Pueue](https://github.com/Nukesor/pueue) 4.0.4.
 
+**Version:** 0.1.0 — the deployment unit (`skill/assets/`, 23 files) ships as one
+version; releases are tagged in git and recorded in `CHANGELOG.md`.
+
 Submit a command to a remote host and keep tracking it after your terminal closes.
 Tasks live in the remote queue, so a dropped connection does not kill them.
 
@@ -114,6 +117,7 @@ Sync the *whole* directory, not just `assets/`: the previous rule synced only
 | [`PLAN.md`](PLAN.md) | The single authoritative list of open work |
 | [`HANDOFF.md`](HANDOFF.md) | Operating rules and limits |
 | [`CHANGELOG.md`](CHANGELOG.md) | One line per change, each with its verification result |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to contribute: the development loop, the load-bearing rules, and the documentation map |
 
 ## Verification status
 
@@ -132,5 +136,9 @@ proven and what is not. In particular:
 
 ## License
 
-No license has been chosen yet. Until one is added, this code is
-all-rights-reserved by default.
+MIT — see [`LICENSE`](LICENSE).
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). In short: change something under
+`skill/`, run `./run-tests.sh`, and append a line to `CHANGELOG.md`.

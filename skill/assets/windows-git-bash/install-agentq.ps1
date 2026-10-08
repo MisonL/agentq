@@ -18,6 +18,7 @@ $expectedClientHash = "28b0756d54ec16ce13d78b251d086aa62e0057089cb27f793cd649f97
 $expectedDaemonHash = "aafa05e2f26cda9aff3eeb9be261e8f9f67752d1e9bb7fbcb47318e35c52ab1d"
 $releaseVersion = "4.0.4"
 $releaseBaseUrl = "https://github.com/Nukesor/pueue/releases/download/v$releaseVersion"
+$agentqVersion = "0.1.0"
 $clientAssetName = "pueue-x86_64-pc-windows-msvc.exe"
 $daemonAssetName = "pueued-x86_64-pc-windows-msvc.exe"
 $gitBashPath = $null
@@ -3025,6 +3026,10 @@ try {
     if (!(Remove-SafeTransactionDirectory -Path $backupRootDirectory -Description "backup AgentQ root")) {
         throw "backup AgentQ root cleanup failed: $backupRootDirectory"
     }
+
+    # Mirror of the POSIX installer's success line.  It goes to stderr: this
+    # block's stdout is the machine-readable JSON result, and callers parse it.
+    [Console]::Error.WriteLine("AgentQ $agentqVersion installed at $rootDirectory")
 
     [pscustomobject]@{
         root = $rootDirectory

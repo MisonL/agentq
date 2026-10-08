@@ -4,6 +4,7 @@ set -eu
 
 program=${0##*/}
 release_version='4.0.4'
+agentq_version='0.1.0'
 asset_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 agentq_home=${AGENTQ_HOME:-"$HOME/.agentq"}
 artifact_source_directory=${AGENTQ_PUEUE_SOURCE_DIR:-}
@@ -2944,4 +2945,4 @@ existing_status_temporary_identity=''
 group_temporary=''
 group_temporary_identity=''
 
-printf '%s\n' "AgentQ ${release_version} installed at $agentq_home"
+printf '%s\n' "AgentQ ${agentq_version} installed at $agentq_home"
