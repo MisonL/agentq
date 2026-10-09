@@ -55,14 +55,24 @@ jobs:
             echo 'no smoke.log -- the suite did not run' >&2
             exit 1
           fi
-          # This runner provides every tool the suite can use, so any SKIP or
-          # PART line means the gate got weaker, not that the environment is
-          # minimal.
-          if grep -E '^(SKIP|PART) ' smoke.log; then
-            echo 'a check skipped or was only partially verified on a runner that provides everything' >&2
+          # At most one structural skip is allowed here, and it is named:
+          # smoke/16 also scans the machine-local memory directory
+          # ($HOME/.claude/projects/...), which a checkout cannot provide -- it
+          # is private per-developer state that must NOT be committed, so an
+          # empty stand-in directory would be a fake green, not a fix.  The
+          # check itself still runs its REPO half (the half that matters in CI:
+          # the leak rules against checked-in content) and reports the memory
+          # half as NOT-verified.  Any OTHER skip or partial -- including a
+          # different reason from 16 -- goes red.  The summary may read 0 or 1
+          # skipped: 0 when a self-hosted runner happens to have the memory
+          # directory, 1 on a hosted runner (where it never exists); either way
+          # the line above already pins that no OTHER check skipped.
+          if grep -E '^(SKIP|PART) ' smoke.log \
+               | grep -vE '^SKIP +16-no-host-identifiers +.*memory directory not present'; then
+            echo 'a check skipped or was only partially verified beyond the one named structural skip' >&2
             exit 1
           fi
-          grep -qE '^PASS checks: [0-9]+ ran, 0 skipped, 0 partial, 0 failed' smoke.log
+          grep -qE '^PASS checks: [0-9]+ ran, [01] skipped, 0 partial, 0 failed' smoke.log
 
   macos:
     runs-on: macos-latest
