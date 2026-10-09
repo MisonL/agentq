@@ -147,9 +147,20 @@ B 类（B1–B5）在 [`plan/b-class.md`](plan/b-class.md)。本文件保留规�
 | **指引本身实测纠错** | 第一版指引只说「把 backup 移回去」 | 照做后重跑被 `existing AgentQ daemon is unavailable; refuse to overwrite` 拒——崩溃的 run 已停掉 daemon，指引缺一步。两侧消息均已补「and restart the AgentQ daemon (the crashed run stopped it)」，`smoke/11`/`smoke/13` 各钉一句，变异被抓 |
 
 **Windows 侧的换根崩溃已于 2026-10-08 在专用测试机补验**（两方向拒绝 + 恢复 + 经
-launcher 端到端，见 W5 条目末；Windows 侧**升级回滚**仍未单独构造）；**WSL 已于
-2026-10-09 在真实 WSL2 上补验并关闭**（见上「两格明确不可达」一节——容器里仍不可
-伪造，真机上可以）。
+launcher 端到端，见 W5 条目末）。**Windows 侧的升级回滚已于 2026-10-10 在同一台专用
+测试机上补验并关闭**（此前只记「仍未单独构造」）：构造 v2——`pueue.yml` 把
+`pueue_directory`/`runtime_directory` 指向一个**父级是普通文件**的路径
+（`C:\Windows\Temp\aqblocker`，先写成一个文件），`mkdir` 必然失败、daemon 起不来。
+实测结果：安装器 **exit 1**、stderr 同时含 `did not become ready` 与
+`restoring the previous deployment`；回滚后 **server 哈希逐字回到升级前**
+（`10710f70…`）、**config 哈希逐字回到升级前**、**record 数不变（1）**、**Pueue 任务数
+不变（1）**、`C:\ProgramData` 下 **零 `.AgentQ.*` 残留**；回滚后的部署**功能正常**——
+经受保护 launcher 走完整协议 `submit→wait(Success)→logs(ROLLBACK-E2E-OK)→remove→wait(5)`
+全通。**注意一个真实的坑（首次尝试得到的是假结论）**：第一版「坏配置」把路径指向
+`C:\NoSuchRoot\...`，而 pueued **会把不存在的目录建出来**，于是安装**成功**、看起来
+「回滚没触发」——**必须让路径真的不可建**（父级是文件）才构成回滚触发条件。
+**WSL 已于 2026-10-09 在真实 WSL2 上补验并关闭**（见上「两格明确不可达」一节——容器里
+仍不可伪造，真机上可以）。
 
 #### C3 执行结果（2026-10-01）—— 专用 Windows 测试机上可做的部分
 
