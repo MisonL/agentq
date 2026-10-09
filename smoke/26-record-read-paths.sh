@@ -316,6 +316,87 @@ assert_json w6 '.state == "ambiguous"'
 assert_err_has w6 'multiple Pueue tasks share the AgentQ label'
 rm -f "$work/tasks.json"
 
+# ------------------------------------------------- native-Windows jq (CRLF)
+# W7. A jq whose stdout is in TEXT MODE writes CRLF.  That is not a quirk of a
+#     bad build: the jq a Windows user gets from chocolatey is a native Windows
+#     binary, and every newline it prints is `\r\n` (measured 2026-10-10 on a
+#     real Windows host, jq-1.7.1).  `$( )` strips only the FINAL newline, so
+#     every INTERIOR line keeps its `\r`; the scan loops then read `275\r`,
+#     which is_task_id rejects, and a task that was REMOVED comes back as
+#     `invalid AgentQ task id` with exit 2 instead of 5.
+#
+#     Found on that real host: `wait` on a removed task failed with
+#     `invalid AgentQ task id: 275` while `lookup` (a single-file read, whose
+#     `$( )` strips the only newline) returned 5 correctly.  The defect predates
+#     this session -- the aggregate scans that carry it landed in 76b9cfe and
+#     shipped in every release since -- and no macOS or Linux check could see
+#     it, because a POSIX jq writes LF.
+#
+#     The shim is faithful, not a mock of the failure: it runs the REAL jq and
+#     appends CR to each of its output lines, which is exactly what text mode
+#     does.  Both directions are asserted below (the same tombstone case with
+#     and without the shim), so a fix that broke ordinary jq would be caught
+#     too.
+windows_jq_directory="$work/bin-windows-jq"
+mkdir -p "$windows_jq_directory"
+# Resolve the real jq ONCE, here, before the shim exists: the shim's own PATH
+# lookup would find itself (measured: the first draft recursed and hung).
+real_jq=$(command -v jq)
+[ -n "$real_jq" ] || { printf '%s\n' 'read-paths: jq is required for the CRLF case' >&2; exit 1; }
+cat > "$windows_jq_directory/jq" <<SH
+#!/bin/sh
+# Native-Windows jq: real jq, CRLF stdout.  The real binary is resolved from a
+# fixed absolute path, never from PATH -- resolving it through PATH would find
+# THIS script and recurse (measured: the first draft of this shim did exactly
+# that and hung).
+#
+# CR on every line EXCEPT the last, which is the shape that actually reaches the
+# server on the real host.  A text-mode jq writes \r\n on all lines, but the
+# consumer reads it through \$( ), and MSYS bash's \$( ) strips a trailing
+# \r\n as a unit -- so the LAST line's \r never survives while every INTERIOR
+# one does.  Appending CR to all lines (the first draft) is NOT faithful: it
+# leaves a trailing \r that the real path cannot produce, which made this case
+# pass against two probe bugs that were fatal on the real host (a single-line
+# probe and an ends-with case pattern).  Measured on the real host: the probe
+# output there was \`a \\r \\n b\`, i.e. interior CR only.
+"$real_jq" "\$@" | sed '\$!s/\$/\r/'
+exit "\${PIPESTATUS[0]:-0}"
+SH
+chmod 700 "$windows_jq_directory/jq"
+
+# The baseline first: without the shim the tombstone case must already pass, or
+# the CRLF case below would be proving nothing about CR.
+clear_runtime
+put_tombstone AQREAD-WTOMB-00000001 1001
+run_case w7base wait 1001
+assert_rc w7base 5
+assert_json w7base '.state == "removed" and .task_id == 1001'
+
+# Same state, CRLF jq.  Before the fix this was exit 2 with
+# `invalid AgentQ task id: 1001`; it must be identical to the baseline.
+clear_runtime
+put_tombstone AQREAD-WTOMB-00000001 1001
+run_case_with_windows_jq() {
+    local label=$1
+    shift
+    local rc=0
+    ( cd "$work" && PATH="$windows_jq_directory:$PATH" "$work/agentq-server" "$@" ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+run_case_with_windows_jq w7crlf wait 1001
+assert_rc w7crlf 5
+assert_json w7crlf '.state == "removed" and .task_id == 1001'
+
+# And the RECORD scan (the other aggregate reader) under the same shim: an
+# accepted record whose task vanished must still archive and report removed.
+clear_runtime
+put_record AQREAD-WCRLF-00000001 accepted 1001 '"2026-09-29T00:00:00Z"'
+run_case_with_windows_jq w7record wait 1001
+assert_rc w7record 5
+assert_json w7record '.state == "removed" and .task_id == 1001'
+assert_err_has w7record 'was removed before wait'
+
 # --------------------------------------------------------------- summary
 if [ "$failures" -ne 0 ]; then
     printf 'read-paths checks FAILED: cases=%s failures=%s\n' "$cases" "$failures" >&2

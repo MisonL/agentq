@@ -2,7 +2,7 @@
 
 Remote task queue over SSH, backed by [Pueue](https://github.com/Nukesor/pueue) 4.0.4.
 
-**Version:** 0.1.1 — the deployment unit (`skill/assets/`, 23 files) ships as one
+**Version:** 0.1.2 — the deployment unit (`skill/assets/`, 23 files) ships as one
 version; releases are tagged in git and recorded in `CHANGELOG.md`.
 
 Submit a command to a remote host and keep tracking it after your terminal closes.
