@@ -52,6 +52,80 @@ work=$(mktemp -d /tmp/agentq-smoke-psargv.XXXXXX)
 work=$(unset CDPATH; cd -- "$work" && pwd -P)
 trap 'rm -rf -- "$work"' EXIT
 
+# --- the ssh stub: a script on POSIX hosts, a native recorder on Windows -----
+# The client under test is a Windows PowerShell on the Windows CI job, and it
+# cannot execute the shebang stub the POSIX hosts use: Get-Item cannot resolve
+# the MSYS path (the client stops at "SSHP_SSH is not an executable file") and
+# CreateProcess cannot run a `#!/bin/sh` file even with a correct path -- which
+# is why the first real CI run reported "the client invoked ssh but recorded no
+# argv" (37810470283).  There the stub is a native recorder compiled with the
+# framework csc: the same technique PLAN.md A21 used to measure these payloads
+# on a real PS 5.1 host.  That matters here -- the point of the check is the
+# argv a NATIVE ssh.exe would receive, so routing it through a batch file's
+# re-parse would measure the wrong thing.
+#
+# Both forms read the same two variables from the client's environment:
+# PS_ARGV_OUT (NUL-separated argv, `>`-truncated so the last call wins) and
+# PS_STUB_REPLY (the answer the client validates).  The POSIX stub's reply moved
+# from baked-in text to $PS_STUB_REPLY so there is one contract, not two.
+stub_windows=0
+stub_exe=""
+if [ -n "${AGENTQ_SMOKE_PWSH:-}" ] && command -v cygpath >/dev/null 2>&1; then
+    stub_windows=1
+    stub_exe="$work/stub-ssh.exe"
+    stub_cs="$work/stub-ssh.cs"
+    cat > "$stub_cs" <<'CS'
+using System;
+using System.IO;
+using System.Text;
+
+// Stand-in for ssh.exe: records the argv it was handed (NUL-separated, like the
+// sh stub) and answers with PS_STUB_REPLY.
+internal static class StubSsh {
+    private static int Main(string[] args) {
+        string argvPath = Environment.GetEnvironmentVariable("PS_ARGV_OUT");
+        if (!string.IsNullOrEmpty(argvPath)) {
+            using (FileStream stream = new FileStream(argvPath, FileMode.Create, FileAccess.Write)) {
+                foreach (string argument in args) {
+                    byte[] bytes = Encoding.UTF8.GetBytes(argument);
+                    stream.Write(bytes, 0, bytes.Length);
+                    stream.WriteByte(0);
+                }
+            }
+        }
+        string reply = Environment.GetEnvironmentVariable("PS_STUB_REPLY");
+        if (reply != null) {
+            byte[] bytes = Encoding.UTF8.GetBytes(reply + "\n");
+            Stream stdout = Console.OpenStandardOutput();
+            stdout.Write(bytes, 0, bytes.Length);
+            stdout.Flush();
+        }
+        return 0;
+    }
+}
+CS
+    csc="/c/Windows/Microsoft.NET/Framework64/v4.0.30319/csc.exe"
+    if [ ! -x "$csc" ]; then
+        printf 'ps-native-argv: the framework csc.exe is missing at %s; the native ssh stub cannot be built\n' "$csc" >&2
+        exit 1
+    fi
+    # MSYS2_ARG_CONV_EXCL stops Git Bash from rewriting /nologo and /out: into
+    # paths; the file arguments are handed over in Windows form instead.
+    MSYS2_ARG_CONV_EXCL='*' "$csc" /nologo "/out:$(cygpath -w "$stub_exe")" "$(cygpath -w "$stub_cs")" >/dev/null 2>&1 || {
+        printf 'ps-native-argv: csc.exe could not build the native ssh stub\n' >&2
+        exit 1
+    }
+fi
+
+# win_path <path> -- the Windows form under Windows PowerShell, unchanged else.
+win_path() {
+    if [ "$stub_windows" = 1 ]; then
+        cygpath -w "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # crt_parse <string> -> "<argc>\n<arg1>\x01<arg2>\x01..."
 #
@@ -121,14 +195,24 @@ fi
 
 # A recording stub ssh: writes each argument NUL-separated, answers the way the
 # case asks.  Answering matters -- the client validates the reply.
+#
+# make_stub <path> writes the POSIX stub script and ECHOES the path the client
+# must be handed ($SSHP_SSH/$AGENTQ_SSH): that path is this script on POSIX
+# hosts, and the native recorder's Windows form under Windows PowerShell (the
+# recorder is shared -- its behaviour is driven entirely by the environment).
 make_stub() {
-    local path=$1 reply=$2
+    local path=$1
     {
         printf '%s\n' '#!/bin/sh'
         printf '%s\n' 'for a in "$@"; do printf "%s\\0" "$a"; done > "$PS_ARGV_OUT"'
-        printf 'printf %s\n' "'${reply}\\n'"
+        printf '%s\n' 'printf "%s\\n" "$PS_STUB_REPLY"'
     } > "$path"
     chmod 700 "$path"
+    if [ "$stub_windows" = 1 ]; then
+        cygpath -w "$stub_exe"
+    else
+        printf '%s' "$path"
+    fi
 }
 
 failures=0
@@ -184,11 +268,15 @@ PY
 # --- sshp.ps1: the unix probe command ---------------------------------------
 # Reached on every invocation (--check included), so this is not a corner.
 sshp_client="$root/skill/assets/client/windows/sshp.ps1"
+# Windows PowerShell 5.1 rejects a POSIX path for -File (pwsh 7.5 accepts it), so
+# under it the client path is handed over in Windows form.  Same switch as
+# smoke/12's client_arg.
+sshp_client_arg=$(win_path "$sshp_client")
 stub="$work/ssh-sshp"
-make_stub "$stub" '__SSHP_READY__:Linux'
+stub_ssh=$(make_stub "$stub")
 mkdir -p "$work/tmp1"
-PS_ARGV_OUT="$work/argv-sshp" SSHP_SSH="$stub" TMPDIR="$work/tmp1" \
-    "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_client" --check smoke-host \
+PS_ARGV_OUT="$(win_path "$work/argv-sshp")" SSHP_SSH="$stub_ssh" PS_STUB_REPLY='__SSHP_READY__:Linux' TMPDIR="$work/tmp1" \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_client_arg" --check smoke-host \
     >"$work/o1" 2>"$work/e1" || true
 check_roundtrip 'sshp.ps1 unix probe' "$sshp_client" "$work/argv-sshp" 'base64 -d | sh'
 
@@ -209,8 +297,8 @@ check_roundtrip 'sshp.ps1 unix probe' "$sshp_client" "$work/argv-sshp" 'base64 -
 # same splat path.  The stub overwrites its argv file each call, so the file
 # holds the LAST call -- which for this run is the session command, not the probe.
 mkdir -p "$work/tmp1s"
-PS_ARGV_OUT="$work/argv-session" SSHP_SSH="$stub" TMPDIR="$work/tmp1s" \
-    "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_client" smoke-host smoke-session \
+PS_ARGV_OUT="$(win_path "$work/argv-session")" SSHP_SSH="$stub_ssh" PS_STUB_REPLY='__SSHP_READY__:Linux' TMPDIR="$work/tmp1s" \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_client_arg" smoke-host smoke-session \
     >"$work/o1s" 2>"$work/e1s" || true
 cases=$((cases + 1))
 python3 - "$work/argv-session" <<'PY' > "$work/session.txt" 2>/dev/null || true
@@ -278,7 +366,9 @@ mkdir -p "$work/tmp2q"
 rm -f "$work/argv-quote"
 cases=$((cases + 1))
 quote_status=0
-PS_ARGV_OUT="$work/argv-quote" SSHP_SSH="$stub" TMPDIR="$work/tmp2q"     "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_client" smoke-host "quo'te"     >"$work/o2q" 2>"$work/e2q" || quote_status=$?
+PS_ARGV_OUT="$(win_path "$work/argv-quote")" SSHP_SSH="$stub_ssh" PS_STUB_REPLY='__SSHP_READY__:Linux' TMPDIR="$work/tmp2q" \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_client_arg" smoke-host "quo'te" \
+    >"$work/o2q" 2>"$work/e2q" || quote_status=$?
 if [ "$quote_status" -eq 0 ]; then
     printf 'ps-native-argv: sshp.ps1 session: a quoted session name was accepted (exit 0)\n' >&2
     failures=$((failures + 1))
@@ -318,12 +408,13 @@ fi
 # itself must NOT appear on the command line (that is the whole point).  The
 # decode below proves the channel still carries the script intact.
 agentq_client="$root/skill/assets/client/windows/agentq.ps1"
+agentq_client_arg=$(win_path "$agentq_client")
 stub2="$work/ssh-agentq"
-make_stub "$stub2" '{"ok":true}'
+stub2_ssh=$(make_stub "$stub2")
 mkdir -p "$work/tmp2"
-PS_ARGV_OUT="$work/argv-agentq" AGENTQ_SSH="$stub2" AGENTQ_CONFIG="$work/no-config" \
+PS_ARGV_OUT="$(win_path "$work/argv-agentq")" AGENTQ_SSH="$stub2_ssh" PS_STUB_REPLY='{"ok":true}' AGENTQ_CONFIG="$work/no-config" \
     AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix TMPDIR="$work/tmp2" \
-    "$pwsh_binary" -NoProfile -NonInteractive -File "$agentq_client" status \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$agentq_client_arg" status \
     >"$work/o2" 2>"$work/e2" || true
 check_roundtrip 'agentq.ps1 unix operation' "$agentq_client" "$work/argv-agentq" 'base64 -d | sh'
 

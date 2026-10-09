@@ -73,7 +73,16 @@ jobs:
         # smoke/01's tool inventory reports skipped(tool-pyaml) without it and
         # the summary assertion below turns red -- which is the point of the
         # inventory: a missing parser must not read as a green parse.
-        run: python3 -m pip install --user --quiet pyyaml
+        #
+        # A throwaway venv, not `pip install --user`: Homebrew's python3 on this
+        # runner is externally managed (PEP 668), so `--user` is refused with
+        # `error: externally-managed-environment` and the job dies before the
+        # suite starts.  The venv is added to PATH so the `python3` that
+        # smoke/01 probes for is the one that has pyyaml.
+        run: |
+          python3 -m venv "$RUNNER_TEMP/aq-venv"
+          "$RUNNER_TEMP/aq-venv/bin/pip" install --quiet pyyaml
+          echo "$RUNNER_TEMP/aq-venv/bin" >> "$GITHUB_PATH"
       - name: Run the quick suite
         run: |
           status=0

@@ -621,7 +621,14 @@ stub_linux="$work/bin-linux"
 mkdir -p "$stub_linux"
 for entry in "$stub_full"/*; do
     name=${entry##*/}
-    [ "$name" = systemctl ] || ln -s "$entry" "$stub_linux/$name"
+    # systemctl and loginctl are replaced by stubs below; never symlink them.
+    # On Linux loginctl exists on the host, so the symlink would be created and
+    # the `cat >` heredoc would then write THROUGH it to /usr/bin/loginctl
+    # (Permission denied) instead of creating a file in $stub_linux.
+    case "$name" in
+        systemctl|loginctl) continue ;;
+    esac
+    ln -s "$entry" "$stub_linux/$name"
 done
 for linux_command in systemctl loginctl; do
     cat >"$stub_linux/$linux_command" <<'LINUXCMD'
