@@ -132,6 +132,46 @@ build_stub_path "$stub_bare" no
 build_stub_path "$stub_pkgmgr" no
 build_stub_path "$stub_full" yes
 
+# The installer's Darwin branch runs `require_command launchctl plutil chown`
+# before it reaches ANY of the refusal cases below, and this fixture pins the
+# platform to Darwin on every host -- the messages under test are the macOS ones
+# (measured: the Linux CI job reported eleven cases dying on
+# `required command is missing: launchctl`, none of them on its own assertion).
+# build_stub_path symlinks whatever the host provides, so a macOS host supplies
+# the real commands and is unchanged; a Linux host provides neither launchctl nor
+# plutil (chown it has), and every Darwin-platform case stopped at the preamble.
+# A stub is created only where the host has nothing to link.
+for stub in "$stub_bare" "$stub_pkgmgr" "$stub_full"; do
+    if [ ! -e "$stub/launchctl" ]; then
+        cat > "$stub/launchctl" <<'STUB'
+#!/bin/sh
+# This host has no launchd.  The reachable installer code only ASKS whether
+# com.agentq.pueued is loaded (bootstrap_existing_macos_service's `print`), and
+# on a machine with no AgentQ the answer is "no such service" -- which is exit
+# nonzero.  Anything else is a state change this fixture does not model, so it
+# refuses loudly instead of pretending it worked.
+case "${1:-}" in
+    print) exit 3 ;;
+    *) printf 'launchctl stub: this fixture does not model %s; failing rather than pretending it succeeded\n' "${1:-}" >&2; exit 1 ;;
+esac
+STUB
+        chmod 700 "$stub/launchctl"
+    fi
+    if [ ! -e "$stub/plutil" ]; then
+        cat > "$stub/plutil" <<'STUB'
+#!/bin/sh
+# Reached only by prepare_service_stage, which sits behind a successful
+# download+verify of pueue/pueued -- out of scope for this offline fixture, so
+# no case runs this.  It exists for the preamble's `require_command plutil`, and
+# it refuses rather than reporting a lint it cannot perform: a stub that said
+# "valid" would make a broken plist look checked.
+printf '%s\n' 'plutil stub: this fixture host has no plutil; -lint is not modelled' >&2
+exit 1
+STUB
+        chmod 700 "$stub/plutil"
+    fi
+done
+
 # Recording stubs for every package manager the installer knows about, installed
 # only into the two PATHs that are meant to have them.
 package_log="$work/package-manager-invocations"
@@ -706,9 +746,18 @@ if [ ! -d "$home/.agentq.maintenance.lock" ]; then
     printf '%s\n' 'installer unconfirmable-lock case: removed a lock it could not re-confirm' >&2
     failures=$((failures + 1))
 fi
-if [ "$(cat "$ps_query_counter" 2>/dev/null)" -lt 2 ]; then
+unlistable_count=$(cat "$ps_query_counter" 2>/dev/null || true)
+if [ "${unlistable_count:-0}" -lt 2 ]; then
     # If only one identity query happened the shim never got the chance to lie,
     # and this case silently degraded into the ordinary stale-lock case.
+    # `${var:-0}` so an EMPTY or missing counter file reaches `[` as `0`, not as
+    # a bare `[: integer expression expected` diagnostic -- measured twice: the
+    # Linux CI run (37810470283) printed `[: : integer expression expected` when
+    # every case died earlier on the missing launchctl and the counter file was
+    # never written; the root-in-container run printed no diagnostic at all (root
+    # ignores chmod 000, the unlistable case fails differently but the counter
+    # still fills).  Both forms are properties of THIS fixture's shell, not of
+    # the installer, so neither should be able to reach the report.
     printf '%s\n' 'installer unconfirmable-lock case: the re-confirmation was never attempted' >&2
     failures=$((failures + 1))
 fi
