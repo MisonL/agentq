@@ -23,8 +23,13 @@ set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 source_directory="$root/skill/assets/client/unix"
-installer="$source_directory/install-client.sh"
-[ -f "$installer" ] || { printf '%s\n' 'install-client-contract: missing installer asset' >&2; exit 1; }
+# AGENTQ_SMOKE_INSTALLER points this check at a mutated copy of the installer;
+# same convention as smoke/05, smoke/07, smoke/11 and smoke/13.  The installer
+# resolves its two client assets from ITS OWN directory, so the installer under
+# test is staged into a directory that also holds the canonical clients --
+# $source_directory keeps pointing at the real assets for the byte comparisons.
+installer_source="${AGENTQ_SMOKE_INSTALLER:-$source_directory/install-client.sh}"
+[ -f "$installer_source" ] || { printf '%s\n' 'install-client-contract: missing installer asset' >&2; exit 1; }
 
 # The installer rejects any path containing a symlink component
 # (assert_no_symlink_path_chain walks every component and rejects a link).  On
@@ -35,6 +40,13 @@ work=$(mktemp -d /tmp/agentq-smoke-installclient.XXXXXX)
 work=$(unset CDPATH; cd -- "$work" && pwd -P)
 cleanup_sandbox() { rm -rf -- "$work"; }
 trap cleanup_sandbox EXIT HUP INT TERM
+
+installer_directory="$work/installer"
+mkdir -p "$installer_directory"
+cp "$installer_source" "$installer_directory/install-client.sh"
+cp "$source_directory/agentq" "$source_directory/sshp" "$installer_directory/"
+chmod 700 "$installer_directory/install-client.sh" "$installer_directory/agentq" "$installer_directory/sshp"
+installer="$installer_directory/install-client.sh"
 
 # A sandbox HOME so a run that forgets --bin-dir cannot touch the real ~/.local/bin.
 # The installer defaults the destination to "$HOME/.local/bin", so this matters.
@@ -195,10 +207,13 @@ printf 'OLD-SSHP\n' > "$w1_destination/sshp"
 # The asset is readable as 111: it PASSES both prechecks (-f and -x both look at
 # mode bits, not at read access -- measured: [ -x ] is true for --x--x--x) and
 # fails only at cp, which is exactly the window the staging order must close.
-chmod 111 "$source_directory/sshp"
+# It is the SANDBOX copy that is chmodded, not the repo asset: the installer under
+# test reads its clients from its own directory ($installer_directory), and the
+# real assets stay untouched so the byte comparisons above remain canonical.
+chmod 111 "$installer_directory/sshp"
 cases=$((cases + 1))
 w1_status=$(run_installer --bin-dir "$w1_destination")
-chmod 700 "$source_directory/sshp"
+chmod 700 "$installer_directory/sshp"
 if [ "$w1_status" -eq 0 ]; then
     printf 'install-client (W1): expected a non-zero exit when sshp is unreadable, got 0\n' >&2
     failures=$((failures + 1))
@@ -258,6 +273,44 @@ fi
 # reported every client as drifted would pass the assertion above.
 if grep -qF 'client does not match canonical asset: agentq' "$work/err"; then
     printf 'install-client --check (drift): reported the un-drifted client as well\n' >&2
+    failures=$((failures + 1))
+fi
+
+# --- refusing to overwrite a co-located server wrapper -------------------------
+# This installer's default destination ($HOME/.local/bin/agentq) is EXACTLY
+# where install-agentq.sh puts its exec wrapper.  On a host that runs both, a
+# plain install used to replace the 60-byte wrapper with the 175 KB client,
+# silently, exit 0 -- measured 2026-10-09 on WSL, after which the remote
+# agentq_run exec'd the client itself and every protocol call died with exit 2
+# and empty output.  This is the only writer that can create that state, so it
+# is the one that must refuse; the wrapper is recognizable as the one file
+# containing the wrapper marker.  Assert three things: non-zero exit, the message
+# names the conflict, and the wrapper bytes are untouched.
+co_destination="$work/co-located"
+mkdir -p "$co_destination"
+cp "$root/skill/assets/unix/agentq" "$co_destination/agentq"
+wrapper_before=$(shasum -a 256 <"$co_destination/agentq")
+cases=$((cases + 1))
+co_status=$(run_installer --bin-dir "$co_destination")
+if [ "$co_status" -eq 0 ]; then
+    printf 'install-client (co-located wrapper): expected a non-zero exit, got 0\n' >&2
+    failures=$((failures + 1))
+fi
+if ! grep -qF 'holds the AgentQ server wrapper' "$work/err"; then
+    printf 'install-client (co-located wrapper): stderr did not name the wrapper conflict\n' >&2
+    head -2 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+wrapper_after=$(shasum -a 256 <"$co_destination/agentq")
+if [ "$wrapper_before" != "$wrapper_after" ]; then
+    printf 'install-client (co-located wrapper): modified the wrapper it refused\n' >&2
+    failures=$((failures + 1))
+fi
+# Nothing else may appear either: the guard runs before staging, so a stray
+# temp file here would mean the installer started work it had already refused.
+residue=$(find "$co_destination" -mindepth 1 ! -name agentq -print -quit)
+if [ -n "$residue" ]; then
+    printf 'install-client (co-located wrapper): left files beside the refused wrapper\n' >&2
     failures=$((failures + 1))
 fi
 

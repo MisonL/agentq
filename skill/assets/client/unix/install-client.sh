@@ -236,6 +236,22 @@ umask 077
 mkdir -p "$destination_directory" || fail "cannot create destination directory: $destination_directory"
 assert_regular_directory_path "$destination_directory" 'destination directory'
 
+# A host that runs the AgentQ SERVER and a client together has both of them
+# aimed at "$HOME/.local/bin/agentq": install-agentq.sh puts its exec wrapper
+# there, and this installer's default destination is the same path.  Installing
+# the client therefore used to replace the wrapper silently -- exit 0, the
+# 60-byte wrapper gone, a 175 KB client in its place -- after which the remote
+# `agentq_run` exec'd the CLIENT on the target and every protocol call died with
+# exit 2 and empty output (measured 2026-10-09 on a WSL host).  This is the only
+# file that can clobber the wrapper, so this is where it must stop.  The wrapper
+# is recognizable: it is the one asset whose body execs agentq/agentq-server,
+# and no client or server asset contains that fragment (measured: 1 / 0 / 0).
+client_conflict_path="$destination_directory/agentq"
+if [ -f "$client_conflict_path" ] && [ ! -L "$client_conflict_path" ] &&
+    grep -q 'agentq/agentq-server' "$client_conflict_path" 2>/dev/null; then
+    fail "destination holds the AgentQ server wrapper, not a client (a co-located server install owns this path); install the clients elsewhere with --bin-dir: $client_conflict_path"
+fi
+
 # Stage BOTH clients before moving EITHER.  A per-client stage+move installs
 # agentq first and then runs cp/chmod/mv for sshp -- so a failure on the second
 # client (unreadable asset, full destination) leaves a NEW agentq paired with a

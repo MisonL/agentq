@@ -4,7 +4,7 @@ set -eu
 
 program=${0##*/}
 release_version='4.0.4'
-agentq_version='0.1.0'
+agentq_version='0.1.1'
 asset_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 agentq_home=${AGENTQ_HOME:-"$HOME/.agentq"}
 artifact_source_directory=${AGENTQ_PUEUE_SOURCE_DIR:-}
@@ -2802,8 +2802,30 @@ fi
 authorize_macos_root
 bootstrap_existing_macos_service
 assert_existing_queue_has_no_active_tasks
-if [ "$previous_install" = false ] && { [ -e "$wrapper_destination" ] || [ -L "$wrapper_destination" ]; }; then
-    fail "refuse to overwrite an existing wrapper without an AgentQ installation: $wrapper_destination"
+if [ -e "$wrapper_destination" ] || [ -L "$wrapper_destination" ]; then
+    # The wrapper path belongs to the wrapper.  On a host that runs both the
+    # server and a client it is also install-client.sh's default destination, so
+    # the path can be holding an AgentQ CLIENT instead -- and an upgrade would
+    # then move that client into a backup and write the wrapper over it,
+    # discarding an install the operator made on purpose (measured 2026-10-09 on
+    # a WSL host; install-client.sh now refuses to create the state, this is the
+    # repair path for a host that already reached it).  Refuse and name it.
+    #
+    # The predicate is POSITIVE -- "this is a client" -- not "this is not a
+    # wrapper".  A wrapper whose content differs from this version's (an older
+    # deployment) is a legitimate upgrade source, and the backup-then-replace
+    # below handles it correctly; refusing every non-matching file would turn a
+    # working upgrade into a hard stop.  `agentq_client` appears only in the
+    # client asset (measured: 32 occurrences there, 0 in the wrapper and 0 in
+    # agentq-server).
+    if [ "$previous_install" = true ] && [ -f "$wrapper_destination" ] &&
+        [ ! -L "$wrapper_destination" ] &&
+        grep -q 'agentq_client' "$wrapper_destination" 2>/dev/null; then
+        fail "the wrapper path holds an AgentQ client, not the wrapper -- installing over it would discard that client; remove or relocate it (or reinstall the clients with a different --bin-dir), then re-run: $wrapper_destination"
+    fi
+    if [ "$previous_install" = false ]; then
+        fail "refuse to overwrite an existing wrapper without an AgentQ installation: $wrapper_destination"
+    fi
 fi
 # All three are created by a later operation -- mkdir for the staging root, and
 # a rename for the other two -- and each of those already fails rather than

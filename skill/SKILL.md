@@ -12,7 +12,7 @@ description: 将任意授权命令提交到已配置的远程主机并持久化�
 ## 调用端与终端
 
 - 每个本地登录用户分别安装客户端、保存 SSH 配置和设置默认主机；不要把一个用户的 `~/.ssh`、`~/.config/agentq/config` 或 `~/.local/bin` 当作其他用户的配置。AgentQ 只使用 SSH 认证实际选择的远端登录用户；同一 IP 的不同用户名是不同的服务、任务和会话域。
-- macOS、Linux 和 WSL 使用 `assets/client/unix/install-client.sh`。它将 POSIX `agentq` 与 `sshp` 安装到当前用户的 `~/.local/bin`；二者是 `/bin/sh` 脚本，可从 `sh`、`bash`、`zsh` 或其他 POSIX shell 直接执行。使用 `install-client.sh --check [--bin-dir <directory>]` 可只读核对目标目录中的两个客户端是否逐字节匹配 canonical 资产：匹配返回 `0`，缺失或漂移返回 `1`，不安全路径或协议参数错误返回 `2`；该模式不会创建、替换或删除文件。安装器不修改 shell 启动文件；若该目录不在 PATH，先以绝对路径调用或在用户已确认后更新其 shell 配置。
+- macOS、Linux 和 WSL 使用 `assets/client/unix/install-client.sh`。它将 POSIX `agentq` 与 `sshp` 安装到当前用户的 `~/.local/bin`；二者是 `/bin/sh` 脚本，可从 `sh`、`bash`、`zsh` 或其他 POSIX shell 直接执行。使用 `install-client.sh --check [--bin-dir <directory>]` 可只读核对目标目录中的两个客户端是否逐字节匹配 canonical 资产：匹配返回 `0`，缺失或漂移返回 `1`，不安全路径或协议参数错误返回 `2`；该模式不会创建、替换或删除文件。安装器不修改 shell 启动文件；若该目录不在 PATH，先以绝对路径调用或在用户已确认后更新其 shell 配置。**该默认目标 `~/.local/bin/agentq` 与服务端 wrapper 同路径**：在同时运行 AgentQ 服务端的主机上，安装器会**拒绝**覆盖那个 wrapper 并以 `2` 退出（实测 2026-10-09：此前是静默覆盖、退 0，之后远端 `agentq_run` 执行到客户端自身、所有协议调用以 `2` 与空输出失败）；这类主机要用 `--bin-dir` 把客户端装到别的目录，例如 `--bin-dir ~/.local/agentq-client`。
 - POSIX `agentq` 客户端需要本机 `jq`（或 `AGENTQ_JQ` 指向可执行解析器）来验证成功响应；缺少解析器时必须显式失败，不能把未校验的 stdout 当成成功结果。
 - **Windows 目标的远端终端不止一种（2026-09-22 实测）。**
 Windows 上 sshd 用 `<DefaultShell> <DefaultShellCommandOption> "<cmd>"` 解析客户端发来的

@@ -690,7 +690,72 @@ printf 'Darwin\narm64\n' >"$platform_file"
 check_case 'existing daemon down' \
     'start it and re-run' "$status"
 rm -rf "$home/.agentq"
-assert_home_clean 'existing daemon down' 
+assert_home_clean 'existing daemon down'
+
+# --- an AgentQ client occupying the wrapper path on an UPGRADE ----------------
+# install-agentq.sh and install-client.sh both default the wrapper/client path to
+# $HOME/.local/bin/agentq.  install-client.sh now refuses to clobber the wrapper,
+# but a host that already reached that state (measured 2026-10-09 on WSL: the
+# wrapper was silently replaced by the client, and every remote protocol call
+# then died) needs the server installer to refuse the REPAIR path too -- an
+# upgrade would otherwise move the client into a backup and write the wrapper
+# over it, discarding an install the operator made on purpose.
+#
+# Reaching the guard needs previous_install=true, which needs the queue check to
+# pass: a status stub that exits 0 AND prints a valid empty-task body (an `exit 0`
+# alone writes nothing, and the installer's jq filter rejects empty input as an
+# invalid state -- measured while writing this case), plus a pid file holding a
+# confirmed-DEAD pid (same idiom as the stale-lock case below -- a dead pid skips
+# the live-process command check instead of failing it, so no sleeper has to be
+# kept alive or reaped).
+mkdir -p "$home/.agentq/config" "$home/.agentq/runtime"
+cat >"$home/.agentq/pueue" <<'CLIENT'
+#!/bin/sh
+printf '%s\n' '{"tasks":{}}'
+exit 0
+CLIENT
+chmod 700 "$home/.agentq/pueue"
+printf 'installed\n' >"$home/.agentq/pueued"
+chmod 700 "$home/.agentq/pueued"
+printf 'shared:\n  pueue_directory: ~/.agentq/data\n' >"$home/.agentq/config/pueue.yml"
+( exit 0 ) &
+dead_wrapper_pid=$!
+wait "$dead_wrapper_pid" 2>/dev/null || true
+printf '%s\n' "$dead_wrapper_pid" >"$home/.agentq/runtime/pueued.pid"
+mkdir -p "$home/.local/bin"
+# The CLIENT asset, not the wrapper: the state under test is "install-client.sh
+# was run on a server host and put its 175 KB client where the wrapper belongs".
+cp "$root/skill/assets/client/unix/agentq" "$home/.local/bin/agentq"
+wrapper_before=$(shasum -a 256 <"$home/.local/bin/agentq")
+status=0
+env HOME="$home" PATH="$stub_full" \
+    /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+check_case 'client occupying the wrapper path on upgrade' \
+    'the wrapper path holds an AgentQ client' "$status"
+wrapper_after=$(shasum -a 256 <"$home/.local/bin/agentq")
+if [ "$wrapper_before" != "$wrapper_after" ]; then
+    printf '%s\n' 'installer client-wrapper case: modified the file it refused to replace' >&2
+    failures=$((failures + 1))
+fi
+
+# The OTHER direction, and the reason the predicate is positive ("this is a
+# client") rather than negative ("this is not this version's wrapper"): an older
+# deployment's wrapper has DIFFERENT bytes and is a perfectly legitimate upgrade
+# source -- backup-then-replace handles it.  A guard written as "refuse anything
+# that is not the current wrapper" would turn every such upgrade into a hard
+# stop.  The fixture is a wrapper from an older layout: it execs the server from
+# a different path, so it lacks the current wrapper's exact marker while still
+# being a wrapper, not a client.  The installer must get PAST the guard and die
+# later, on the binary stage, not on the wrapper refusal.
+printf '#!/bin/sh\nexec "$HOME/.agentq/bin/agentq-server" "$@"\n' \
+    >"$home/.local/bin/agentq"
+status=0
+env HOME="$home" PATH="$stub_full" AGENTQ_PUEUE_SOURCE_DIR="$source_dir" \
+    /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+check_case 'stale wrapper on upgrade is not refused' \
+    'sha256 mismatch for staged asset' "$status"
+rm -rf "$home/.agentq" "$home/.local"
+assert_home_clean 'stale wrapper on upgrade is not refused'
 
 # --- a stale maintenance lock that cannot be recovered -----------------------
 # A lock whose holder is confirmed dead, but whose directory cannot be removed
