@@ -296,7 +296,8 @@ A7（零授权、只改 `smoke/`），B2、B3、B4（用户已授权），**C1�
 **A29 公开仓库标准化（2026-10-08，用户指示）**：用户选定「薄壳加装」路线、公开仓库、
 MIT、四子项全做。①②④ 已完成（版本 0.1.0 与 Pueue 4.0.4 拆开并加 `smoke/01` 版本一致性
 规则；`LICENSE`/`CONTRIBUTING`/`README`/`CHANGELOG` 头部/`.github` 模板与 `SECURITY.md`）；
-③ 的 `ci.yml`/`release.yml` **已写但从未被 Actions 实跑**（本仓尚无 remote）——见 A29。
+③ 的 `ci.yml`/`release.yml` 已实跑：`ci` 三平台全绿（run 37894054291，2026-10-09；首跑三平台全红，
+三次失败全是 fixture 的可移植性问题、无一是资产缺陷，逐条见 A29 ③），`release` 在 tag `v0.1.0` 上成功。
 **A30（`doctor` 报 AgentQ 版本）已完成**（服务端常量 + doctor 的 `agentq=` 行 + `smoke/03`
 逐字断言 + `smoke/01` 扩为四方 + 四份文档同步）。
 **A8 已执行（2026-09-24）**：主机 A/B 只读核查后**无需清理**（无可 `remove` 对象），

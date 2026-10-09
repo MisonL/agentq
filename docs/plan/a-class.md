@@ -39,7 +39,7 @@
 - A26. 折叠 `wait` 恢复与 cancel 重放路径的逐条 jq
 - A27. POSIX 安装器的 17 处临时路径由 `$$` 派生 + 检查与写入非原子
 - A28. 七维度全场景审查（2026-10-06，用户指示「使用 agents 全维度全场景审查」）—— **已执行，4 个真实缺陷 + 1 个 P0 级 fail-open 已修**
-- A29. 公开仓库标准化（2026-10-08，用户指示「项目体系标准化处理」）—— **①②④已完成；③ CI 已写，未经 Actions 实跑**
+- A29. 公开仓库标准化（2026-10-08，用户指示「项目体系标准化处理」）—— **①②③④ 全部完成（③ CI 三平台实跑全绿，2026-10-09）**
 - A30. `doctor` 报告 AgentQ 自身版本
 <!-- /toc -->
 
@@ -1940,7 +1940,7 @@ agent 结论会凭空造出不存在的 P0，本轮确实有 5 条被复核推�
 ④ `& $exe @splat` 在真 PS 5.1 上的直接测量（见 A21「直接测量」：六行 argc 6/6、
 修复前形态按模型预测裂开、修复后载荷逐字节完好）。
 
-### A29. 公开仓库标准化（2026-10-08，用户指示「项目体系标准化处理」）—— **①②④已完成；③ CI 已写，未经 Actions 实跑**
+### A29. 公开仓库标准化（2026-10-08，用户指示「项目体系标准化处理」）—— **①②③④ 全部完成（③ CI 三平台实跑全绿，2026-10-09）**
 
 **决策（用户在本会话选定）**：面向 = 四个子项全做**参考主流开源项目**；发布目标 =
 **公开仓库**；许可证 = **代码自研、自定 → 选定 MIT**；路线 = **「薄壳加装」**（保留本仓
@@ -1983,13 +1983,12 @@ notes 指向 `CHANGELOG.md` 条目，无二进制产物。
 顶部「怎么读」段、`.github/` 的 PR 模板 + 两枚 issue 模板 + `SECURITY.md`（私下报告渠道，
 不引导公开 issue）。
 
-**③ 质量门禁自动化（已写，未实跑）**：`.github/workflows/ci.yml` 三个 job——ubuntu 用
-`sandbox.sh up` 把需要真实运行时的 6 个检查也跑起来（`run-tests.sh` **SKIP 时退 0**，所以
-每个 job 断言摘要形状而不是只信退出码）；macOS 跑 `--quick`（唯一有 `plutil -lint` 的平台）；
-windows-latest 用 `AGENTQ_SMOKE_PWSH=powershell.exe` 跑 PS 5.1 客户端契约（pwsh 7 不复现本仓
-踩过的两个 5.1 缺陷）。另有 `.github/workflows/release.yml`：`v*` tag 的版本值必须等于
-安装器里记录的值。**本仓尚无 git remote，两个 workflow 都从未被 Actions 执行过**——这是
-已知边界，不是「已验证」。
+**③ 质量门禁自动化（已完成，2026-10-09 三平台实跑全绿）**：`.github/workflows/ci.yml`
+三个 job——ubuntu 用 `sandbox.sh up` 把需要真实运行时的 6 个检查也跑起来（`run-tests.sh`
+**SKIP 时退 0**，所以每个 job 断言摘要形状而不是只信退出码）；macOS 跑 `--quick`（唯一有
+`plutil -lint` 的平台）；windows-latest 用 `AGENTQ_SMOKE_PWSH=powershell.exe` 跑 PS 5.1
+客户端契约（pwsh 7 不复现本仓踩过的两个 5.1 缺陷）。另有 `.github/workflows/release.yml`：
+`v*` tag 的版本值必须等于安装器里记录的值。
 
 **两个「未定」已裁定（2026-10-09，用户「同意」）**：
 - **CHANGELOG 条目不显式带版本号**——沿用现格式（日期 · 改了什么 · 验证）；版本与条目的
@@ -1997,7 +1996,55 @@ windows-latest 用 `AGENTQ_SMOKE_PWSH=powershell.exe` 跑 PS 5.1 客户端契约
   理由：`smoke/01` 已钉四方版本一致，条目里再写一遍版本就是第二个需要同步的真相源。
 - **LICENSE 版权人保持 `MisonL`**（即 git 身份，`a-class.md` ①④ 原本的写法），不改。
 
-**后续**：把 CI 首次实跑的结果回填到本条（推送后执行）。
+**③ 实跑结果（2026-10-09；本条 2026-10-08 记的「本仓尚无 git remote」已随之作废，remote =
+公开仓库 `MisonL/agentq`）**：首推后连跑三次才全绿。三次失败**没有一次是资产缺陷**——全部是
+fixture 在 CI 平台上的可移植性问题（本地 macOS 套件结构上看不见它们），这本身就是这条门禁
+存在的理由：
+
+| run | commit | linux | macos | windows |
+| ---: | --- | --- | --- | --- |
+| 37810470283 | `c8ee821` | FAIL（11/16/21/22） | FAIL（pyyaml） | FAIL（12/20/22） |
+| 37883261752 | `e74761c` | FAIL（11 + 16 结构跳过） | 绿 | 绿 |
+| **37894054291** | `fc1e55a` | **绿**（`28 ran, 1 skipped, 0 failed`, 492s） | **绿**（quick, 5s） | **绿**（`ps51=covered`） |
+
+- **首跑（37810470283）三平台全红**，根因分三类：
+  - **linux 四项**：`21` 的模式断言在 GNU 上 `stat -f` 是 `--file-system` 且**成功**，BSD 优先的
+    `||` 回退因此永不触发、`700` 被吞进多行文件系统块（`mode is <block> 700, expected 700`）；
+    `11` 的桩目录符号链接循环只排除 `systemctl`，而 Linux 上 `loginctl` 存在，随后的 `cat >` heredoc
+    穿过链接写进真实 `/usr/bin/loginctl`（`smoke/11: line 627: .../bin-linux/loginctl: Permission denied`）；
+    **同一检查**还因 fixture 把平台钉在 Darwin（被测的消息是 macOS 的）而在 Linux 宿主上缺 `launchctl`，
+    多条用例的断言「stderr 不含预期的拒绝消息」于是全部改成收到 `required command is missing: launchctl`；
+    `22` 用 `sh` 跑 launcher 生成的 runtime 脚本，而该脚本是 bash（`set -o pipefail`），`sh` 在
+    Debian/Ubuntu 上是 dash、退 2 且 argv 全空。
+  - **linux `16` 是一次误报**：仓库扫描命中 `CHANGELOG.md:11 R4 @v*`——那条 A29 条目里写了 tag
+    引用 `@v<0.1.0>`，被 R4（`@` 紧跟含数字的裸词，抓序列号主机名用）当成主机名。修法是把那句话
+    改写成 `@` 与 `v0.1.0` 不相邻（`CHANGELOG.md` 是 R4 的 active 路径、无豁免，豁免只按
+    `path+construct` 给 `.github/workflows/` 下的 `uses: owner/repo@vN`）。
+  - **macos 一项**：`pip install --user pyyaml` 撞 **PEP 668**（`error: externally-managed-environment`），
+    job 在套件启动前就死——改为一次性 venv + `GITHUB_PATH`。
+  - **windows 三项，同一根因**（fixture 把 POSIX 假设带进原生 PowerShell）：`22` 生成的 `driver.ps1`
+    是无 BOM 的 UTF-8，PS 5.1 把无 BOM 的 `.ps1` 按 ANSI/CP1252 **在解析期**读，`任务`（UTF-8
+    `E4 BB BB E5 8A A1`）逐字节重解码成 `ä»»åŠ¡`（CI 报 `expected [任务], got [ä»»åŠ¡]`；pwsh 7 假定
+    UTF-8 把这个 bug 藏住了）；`12`/`20` 的 ssh 桩是 `#!/bin/sh` 脚本、路径又是 MSYS 形式，原生 PS
+    既解析不了（`Get-Item` 失败 → `AGENTQ_SSH is not an executable file: /c/Users/...`）也执行不了
+    （`CreateProcess` 不认 shebang）。修法：`.cmd` 桩 + `cygpath -w`、用框架 `csc.exe` 编译的**原生
+    argv recorder**（本仓在真实 Windows 测试 VM 上已用过的手法，见 A21）、以及给生成的驱动写 UTF-8 BOM。
+- **二跑（37883261752）只剩 linux `11`**：实测 `installer-contract: 11 failure(s)`，失败行与首跑同形
+  ——断言收到的是 `required command is missing: launchctl`（上一轮只排除了 `loginctl`、没补 `launchctl`
+  桩），另有计数器比较的裸空串打印 `[: : integer expression expected`（`unlistable_count=$(...)` 失败后
+  为空）——改为 `${unlistable_count:-0}`。
+  修法：宿主缺命令时才补 `launchctl`/`plutil` 桩（`launchctl print` 答「未加载」，其余动作与
+  `plutil -lint` **拒绝而非谎报成功**——谎报会让坏 plist 看起来被检查过）。**在 Debian 容器以非 root
+  复现验证**：`cases=27` 与 macOS 逐用例同结果（root 复跑唯一失败即「假定非 root」这条 fixture 边界，
+  root 无视 `chmod 000`）。
+- **三跑（37894054291）全绿**。`16` 在托管 runner 上必然 SKIP——它还要扫机器本地记忆目录
+  （`$HOME/.claude/projects/...`），checkout 拿不到、也不该伪造（空目录假绿）——所以 `ci.yml` 把
+  **这一个**跳过**按名字**放行、其余任何 SKIP/PART 一律红；它的仓库那一半（真正要在 CI 里守的
+  防泄漏扫描）照常跑。
+
+**仍未验证的边界**：`release.yml` 至今**只在 2026-10-09 的 tag `v0.1.0` 上跑过一次**（成功，9s），
+此后未再触发——它只在打 tag 时运行、与 `ci.yml` 无关，本条不声称它已在别的版本上验证。CI 覆盖的是
+**托管 runner 的 GitHub Actions 环境**，不代表自建 runner、也不代表别的发行版/架构。
 
 ### A30. `doctor` 报告 AgentQ 自身版本 —— **已完成（2026-10-08，用户同意后单列一次改动）**
 
