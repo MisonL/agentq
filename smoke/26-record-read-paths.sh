@@ -359,8 +359,20 @@ cat > "$windows_jq_directory/jq" <<SH
 # pass against two probe bugs that were fatal on the real host (a single-line
 # probe and an ends-with case pattern).  Measured on the real host: the probe
 # output there was \`a \\r \\n b\`, i.e. interior CR only.
-"$real_jq" "\$@" | sed '\$!s/\$/\r/'
-exit "\${PIPESTATUS[0]:-0}"
+#
+# No \${PIPESTATUS[...]}: this is \`#!/bin/sh\`, which is dash on Debian/Ubuntu,
+# where PIPESTATUS is a bashism and expands to a "Bad substitution" error.
+# (Measured: the bash-only form passed on macOS and failed the linux CI job with
+# \`Bad substitution\` -- the same platform-portability class the CI gate exists
+# to catch.)  jq runs first into a temp file so its OWN status is what the shim
+# returns -- the server uses \`jq -e\` predicates, and returning sed's status
+# instead would make a false predicate look true.
+output_file=\$(mktemp)
+"$real_jq" "\$@" > "\$output_file"
+status=\$?
+sed '\$!s/\$/\r/' "\$output_file"
+rm -f "\$output_file"
+exit "\$status"
 SH
 chmod 700 "$windows_jq_directory/jq"
 
