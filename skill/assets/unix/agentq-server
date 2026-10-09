@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.1'
+agentq_version='0.1.2'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -346,6 +346,56 @@ ensure_runtime_dependencies() {
     # (This is the same `$( )` trap CLAUDE.md records three times; here it is the
     # pipeline form of it.)
     jq_preserves_integer_digits >/dev/null 2>&1 || true
+
+    install_jq_line_ending_shim
+}
+
+# A native-Windows jq (the chocolatey build a Windows user gets) writes CRLF,
+# because its stdout is in text mode.  `$( )` strips only the FINAL newline, so
+# every `x=$(jq ...)` keeps a trailing \r and every `read` of a multi-line jq
+# output keeps an interior one.  A scalar comparison then fails on the invisible
+# byte -- measured 2026-10-10 on a real Windows host: `wait` on a REMOVED task
+# returned exit 2 `invalid AgentQ task id: 275` instead of exit 5, and the same
+# store's record-archive path reported `cannot archive a non-removed AgentQ
+# request`.  Both are silent on macOS and Linux, where jq writes LF.
+#
+# The shim is a `jq` FUNCTION that strips CR from jq's stdout and preserves its
+# exit status, so `-e` predicates and `>/dev/null` callers keep working.  It is
+# defined ONLY when the probe shows the local jq really emits CR: on a POSIX jq
+# this function is never defined and every call stays a direct exec (measured
+# 2026-10-10: the wrapper costs ~35% per call, so paying it on Linux/macOS to
+# guard a Windows-only defect would be a real regression).
+#
+# Why a function and not `command jq ... | tr -d '\r'` at each call site: there
+# are 226 jq invocations and 17 sites that compare a jq scalar to a literal.
+# Fixing them one at a time would miss some and let new code reintroduce the
+# class; one definition cannot drift from itself.
+install_jq_line_ending_shim() {
+    local probe
+    # The probe MUST emit more than one line.  A single-line probe cannot see
+    # this defect at all: `$( )` strips the trailing `\r\n` as a unit, so
+    # `$(jq -rn '"x"')` is clean even on a text-mode jq -- measured on the real
+    # Windows host: a single-line probe reported "no CR" while a two-line probe
+    # on the same jq reported the `\r`.  Only an INTERIOR newline keeps its
+    # `\r` through `$( )`, and an interior newline needs at least two lines.
+    probe=$(command jq -rn '"agentq-probe", "agentq-probe"' 2>/dev/null) || return 0
+    case "$probe" in
+        *$'\r'*) ;;
+        *) return 0 ;;
+    esac
+    jq() {
+        local output status
+        output=$(command jq "$@") && status=0 || status=$?
+        # `$( )` strips ALL trailing newlines, so a multi-line consumer (a
+        # `while read` loop) would silently lose its last line.  Re-append one
+        # when jq produced any output; an empty result stays empty so callers
+        # that test `[ -z "$x" ]` are unaffected.  Measured: without this, a
+        # three-line jq output fed to `while read` yielded two lines.
+        output=${output//$'\r'/}
+        [ -z "$output" ] || output=$output$'\n'
+        printf '%s' "$output"
+        return "$status"
+    }
 }
 
 is_task_id() {
