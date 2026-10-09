@@ -64,7 +64,18 @@ cases=0
 # Extraction is by function-name regex so it keeps working as the file changes;
 # if a function is renamed the extraction fails loudly rather than testing air.
 driver="$work/driver.ps1"
-cat > "$driver" <<'PS1'
+# Written WITH a UTF-8 BOM, and that is load-bearing on Windows PowerShell 5.1:
+# a BOM-less .ps1 is read as the ANSI codepage (CP1252 on the CI runner), so the
+# non-ASCII literals below (decoded.unicode0/1) were re-decoded byte-wise at
+# PARSE time and reached the decoder as mojibake -- `任务` -> `ä»»åŠ¡` -- which
+# is exactly what the first real CI run reported (run 37810470283, windows job).
+# pwsh 7 assumes UTF-8 and hid this; the BOM is the signal 5.1 honours.  The
+# EMIT side needed nothing: the mojibake reached the shell as well-formed UTF-8
+# for both literals, so the runner's stdout already carries UTF-8 and only the
+# parse side was wrong -- no [Console]::OutputEncoding pin, because none was
+# measured broken.
+printf '\xEF\xBB\xBF' > "$driver"
+cat >> "$driver" <<'PS1'
 param([string]$LauncherPath, [string]$StartDaemonPath, [string]$WorkDirectory)
 $ErrorActionPreference = "Stop"
 
@@ -347,6 +358,12 @@ assert_eq 'env.ambient_home_ignored' 'True'
 # plain bash and runs here.  It is the other half of the payload protocol: the
 # decoder above proves the base64 arrives intact, this proves the arguments then
 # reach the server as separate argv elements with spaces and quotes preserved.
+#
+# Run it with BASH, not `sh`.  The script's shebang is `#!/usr/bin/env bash` and
+# the launcher executes it via git-bash; it uses `set -o pipefail` and `${!name-}`,
+# which dash rejects with exit 2.  `sh` is bash on macOS but dash on Debian/Ubuntu,
+# so invoking it as `sh` was a macOS-only false green.
+runtime_bash=${AGENTQ_SMOKE_BASH:-bash}
 runtime_script="$work/runtime.sh"
 python3 - "$launcher" > "$runtime_script" <<'PY'
 import io, re, sys
@@ -389,7 +406,7 @@ run_runtime() {
             export "AGENTQ_ARGUMENT_$i=$a"
             i=$((i + 1))
         done
-        sh "$runtime_script"
+        "$runtime_bash" "$runtime_script"
     ) >"$work/runtime.out" 2>"$work/runtime.err" || status=$?
     printf '%s' "$status"
 }
@@ -428,7 +445,7 @@ fi
 # A missing count must also exit 2, not run with an empty argument vector.
 cases=$((cases + 1))
 missing_status=0
-(export PATH="$stub_dir:$PATH"; export AGENTQ_SERVER_PATH="$stub_dir/fakeserver"; sh "$runtime_script") \
+(export PATH="$stub_dir:$PATH"; export AGENTQ_SERVER_PATH="$stub_dir/fakeserver"; "$runtime_bash" "$runtime_script") \
     >"$work/missing.out" 2>&1 || missing_status=$?
 if [ "$missing_status" -ne 2 ]; then
     printf 'launcher-contract runtime: missing count gave exit %s, expected 2\n' "$missing_status" >&2
@@ -446,7 +463,13 @@ fi
 # child pwsh -- the only way to observe the process exit code, because dot-sourcing
 # runs the exit in the driver's session (a trap smoke/12 already documented).
 sd_driver="$work/sd-contract.ps1"
-cat > "$sd_driver" <<'PS1'
+# BOM for the same reason as driver.ps1 above: this file is executed by whatever
+# PowerShell the run selected, and on Windows PowerShell 5.1 a BOM-less .ps1 is
+# read as ANSI.  No literal here is non-ASCII today, so the BOM is prophylactic
+# -- it keeps the rule "a generated .ps1 that 5.1 will parse is written UTF-8"
+# true without anyone having to remember it when the first accent is added.
+printf '\xEF\xBB\xBF' > "$sd_driver"
+cat >> "$sd_driver" <<'PS1'
 param([string]$StartDaemonPath, [string]$WorkDirectory)
 $ErrorActionPreference = "Stop"
 function Get-Fn([string]$src, [string]$name) {

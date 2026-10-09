@@ -621,19 +621,41 @@ fi
 # A stub ssh on AGENTQ_SSH emits two tokens (0 then 3) and exits 1.  The real
 # Invoke-SshLogged is driven, and its ExitCode must be 3 (the last), not 0 (the
 # first) and not 1 (the ssh code).
+#
+# Two stubs, keyed off whether the client path had to be converted to Windows
+# form (the same condition as the -File conversion above).  Under Windows
+# PowerShell the shebang script is unusable twice over: Get-Item cannot resolve
+# the MSYS path, so the client stops at "AGENTQ_SSH is not an executable file:
+# /c/Users/..." (measured on the first real CI run, 37810470283), and
+# CreateProcess cannot execute a `#!/bin/sh` file even with a correct path.  So
+# there the stub is a .cmd.  It needs no argument handling at all -- everything
+# Invoke-SshLogged passes is ignored, exactly as the sh stub ignores it -- which
+# is why the batch file contains no %* to be re-expanded.
 exit_token_dir="$work/exit-token-ssh"
 mkdir -p "$exit_token_dir"
-cat > "$exit_token_dir/ssh" <<'STUB'
+if [ "$client_arg" != "$client" ]; then
+    exit_token_stub="$exit_token_dir/ssh.cmd"
+    printf '%s\r\n' \
+        '@echo off' \
+        'echo agentq-exit:0 1>&2' \
+        'echo agentq-exit:3 1>&2' \
+        'exit /b 1' > "$exit_token_stub"
+    exit_token_ssh=$(cygpath -w "$exit_token_stub")
+else
+    exit_token_stub="$exit_token_dir/ssh"
+    cat > "$exit_token_stub" <<'STUB'
 #!/bin/sh
 cat > /dev/null 2>&1 || true
 printf 'agentq-exit:0\n' >&2
 printf 'agentq-exit:3\n' >&2
 exit 1
 STUB
-chmod 700 "$exit_token_dir/ssh"
+    chmod 700 "$exit_token_stub"
+    exit_token_ssh="$exit_token_stub"
+fi
 exit_token_probe='
 . "'"$client_arg"'" 2>$null
-$env:AGENTQ_SSH = "'"$exit_token_dir"'/ssh"
+$env:AGENTQ_SSH = "'"$exit_token_ssh"'"
 $script:SshPath = Resolve-SshPath
 $script:RemotePlatform = "windows"
 $script:TargetHost = "smoke-host"

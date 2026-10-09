@@ -157,8 +157,15 @@ else
     # Mode 700: the installer does `chmod 700` on each staged file.  Asserted
     # because that is the step whose Windows counterpart was a silent no-op
     # (docs/verification-status.md: chmod on noacl mounts); on POSIX it must actually take.
+    #
+    # Probe the stat flavour rather than trying one then the other with `||`:
+    # on GNU, `stat -f` is `--file-system` and SUCCEEDS, printing a multi-line
+    # filesystem block, so a `||` fallback never fires and the mode "700" is
+    # swallowed inside that block.  Same order agentq-server's detect_stat_flavor
+    # uses -- GNU first, since BSD's stat rejects `-c`.
     for client in agentq sshp; do
-        mode=$(stat -f '%Lp' "$install_destination/$client" 2>/dev/null || stat -c '%a' "$install_destination/$client")
+        target="$install_destination/$client"
+        mode=$(stat -c '%a' -- "$target" 2>/dev/null || stat -f '%Lp' "$target" 2>/dev/null)
         if [ "$mode" != "700" ]; then
             printf 'install-client (install): %s mode is %s, expected 700\n' "$client" "$mode" >&2
             failures=$((failures + 1))
