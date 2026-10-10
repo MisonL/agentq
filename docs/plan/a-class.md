@@ -2114,6 +2114,53 @@ Windows-only 分支。
 **顺带把 RHEL 格执行并记录**（见 `PLAN.md` C2 表）：`rockylinux/rockylinux:9` + 本地构建的
 systemd 镜像（Red Hat 官方 `ubi9-init` 在本网络不可达，故基于官方 Rocky 基底自建；**刻意不预装
 jq/perl**，让安装器真正走 `dnf install -y` 分支）。装机 `INSTALLER_EXIT=0`、二进制哈希与内置
-常量逐一相符、部署的服务端与仓库当前版本**逐字节相同**（`10710f70…`）、unit `active`+`enabled`、
+常量逐一相符、部署的服务端与仓库当前版本**逐字节相同**（`c3628935…`，0.1.3；此处原写 `10710f70…` 是 0.1.2 的哈希，2026-10-10 收口时改正）、unit `active`+`enabled`、
 linger `yes`；协议 `submit→wait(Success)→logs→remove→wait(5)` 全通、失败任务 `wait=1/Failed:7`、
 `cancel` 已结束任务 `2/task_not_running`。
+
+### A32. `smoke/03` 清理只对 `sleep 60` 的 blocker 调 `remove` —— **已修（2026-10-10，零授权；`962207b` 的 linux job 偶发红灯暴露）**
+
+**现象**：`962207b`（A31 那次提交）的 linux job 报
+`FAIL 03-protocol-roundtrip exit=1`，**致败的**一行是
+**`cleanup left an active request record for task(s): 5`**（同块里的
+`agentq-server: task 6 was removed before wait` 是例行输出，绿跑同样打印它）。同一 commit 跑
+`gh run rerun --failed` 三平台**全绿**（`PASS checks: 29 ran, 1 skipped, 0 failed (505s)`），
+本机连跑 3 次也全绿——**是偶发，不是 A31 引入的回归**（A31 的两处改动在 jq 1.7 上语义
+逐字等价，而 CI 用的正是 1.7）。
+
+**根因（实测，可复现）**：`smoke/03` 的两处清理循环对每个 id 只调 `remove`，而这些
+blocker 是 `sleep 60`、清理时**仍在 Running**，而 **Pueue 拒绝删除运行中的任务**。
+沙箱实测：`./pueue --config … remove <running-id>` 立即返回
+`The command failed for tasks: <id>`、exit 1（0.03s——不是「等一等就好」的慢路径），
+服务端侧 `agentq-server remove <running-id>` 同样退 1（本机 ~3.4s/次）。于是循环在
+**整个重试预算内反复尝试一个必然失败的删除**，成败完全取决于 blocker 何时自然睡醒。
+
+**为什么本机一直绿、CI 却红了一次**：预算是**次数**（`40`）不是**秒**，换算成多少
+墙钟全看机器。本机插桩实测：旧代码两个 id 分别要 **8 次**和 **15 次** `remove` 才归档，
+清理段约 100s（> 60s，所以 blocker 总能先睡醒，本机必绿）。CI 那次插不了桩，只能推断：
+失败的那次运行整套 385s（重跑 505s），检查在**第一次**清理就放弃、没走到后面还含一个
+`sleep 60` 的歧义用例。**「CI 每轮调用比本机快」是推断，未在 CI 上插桩验证**；可确证的
+结构性缺陷只有「预算按次数而非按秒」这一条。近 30 次 CI 历史里这是**唯一**一次该行
+（前 5 次成功运行均无此文本），属低频抖动，不是新缺陷。
+
+**修法**（`smoke/03` 两处清理循环，各加一行）：`remove` 之前先对同一 id 调 `cancel`——
+这正是 `SKILL.md` 工作流的顺序（先 cancel 停止、任务结束后再 remove）；`cancel` 对
+已移除/已结束的 id 退 2，此处属预期、被忽略。清理不再依赖 `sleep 60` 自然结束。
+**为什么不是调大预算或把 sleep 调短**：那两者都只是把窗口挪一挪，仍绑定时钟；cancel
+是**结构性**消除对 blocker 生命周期的依赖。
+
+**承重证明（A/B，同一预算=3 轮）**：把两处循环的重试预算从 40 缩到 3——
+- 旧代码（HEAD 版，仅 remove）当场复现 CI 原话
+  `cleanup left an active request record for task(s): 7`；
+- 新代码（先 cancel）同预算下 `protocol-roundtrip checks passed: … cancel-running=ok
+  cancel-queued=queued_removed/5 … ambiguous-id=unavailable/6`。
+
+**修后实测**：本机共 5 次全绿（3 次连跑 + 2 次插桩），每次清理后零活跃 record；
+逐 id 插桩显示每个 id **恰好 1 次**尝试即归档，清理段 32–51s（余下是本机每次服务端
+调用 ~3.4s 的固定开销，**不是在等 sleep**）。
+
+**边界**：`skill/` 零改动——这是**测试脚本**的缺陷，不是部署资产的缺陷，故无版本号变化、
+无 canonical 对、无同步要求。`smoke/15` 与 `smoke/07` 各自用了 `sleep 300`/`sleep 120`
+的 probe，但它们的运行时是**各自独立的临时目录**并在 EXIT trap 里连 pueued 一起杀掉，
+不共享状态，不受本条影响；本仓其余检查没有同形的「清理循环只调 remove」模式（已 grep 确认）。
+

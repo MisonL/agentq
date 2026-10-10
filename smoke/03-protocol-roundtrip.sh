@@ -570,14 +570,26 @@ jq -e '.state == "removed"' <<<"$queued_lookup" >/dev/null || {
     exit 1
 }
 
-# Clean up every task this case created.  `remove` (not `cancel`) is what
-# archives the request record; leaving the records behind would let them
-# accumulate on a long-lived runtime, and because Pueue reuses numeric task ids
-# a later run can then see two active records sharing one id and get a genuine
-# "ambiguous AgentQ identity" failure.
+# Clean up every task this case created.  `remove` is what archives the request
+# record; leaving the records behind would let them accumulate on a long-lived
+# runtime, and because Pueue reuses numeric task ids a later run can then see
+# two active records sharing one id and get a genuine "ambiguous AgentQ
+# identity" failure.
 #
-# A single `remove` is not enough for the blocker that was RUNNING when the
-# victim was cancelled: cancelling it races the in-flight kill, and the record
+# But Pueue REFUSES to remove a task that is still Running (measured on the
+# local sandbox: `pueue remove <id>` against a Running task returns
+# `The command failed for tasks: <id>`, exit 1, instantly -- it is not a slow
+# path that a retry loop can wait out).  The blockers here are `sleep 60`, so a
+# remove-only loop keeps re-attempting an impossible removal for its whole
+# budget while the task is alive, then reports "cleanup left an active request
+# record".  That is how the Linux CI job flaked (2026-10-10: one record still
+# active when the 40x0.5s budget expired; the rerun and three local runs
+# passed).  Land each task in a terminal state FIRST, via `cancel` --
+# the documented order (SKILL.md workflow: cancel to stop, remove once finished)
+# -- then the existing remove loop.  `cancel` on an already-removed or
+# already-finished id exits 2, which is expected here and ignored.
+#
+# A single `remove` after cancel can still race the in-flight kill: the record
 # is left in `removing` (exit 4) rather than archived.  That is exactly the
 # documented meaning of `removing` -- the intent is persisted and only another
 # explicit `remove` continues it -- so retry until the record is gone.
@@ -596,6 +608,7 @@ record_still_active() {
 
 cleanup_remaining=''
 for id in $cancel_cleanup_ids; do
+    "$server" cancel "$id" >/dev/null 2>&1 || true
     for _ in $(seq 1 40); do
         record_still_active "$id" || break
         "$server" remove "$id" >/dev/null 2>&1 || true
@@ -726,8 +739,11 @@ grep -q 'ambiguous AgentQ identity' "$work/ambiguous.err" || {
 }
 
 # Clean up: the planted record is gone, so the id is unambiguous again and the
-# task can be removed normally.  Assert on the records themselves rather than on
-# remove's exit code -- a server that wrongly reported success could not fake it.
+# task can be removed normally.  Cancel FIRST for the same reason as the loop
+# above -- this task is `sleep 60` and still Running, and Pueue will not remove
+# a running task.  Assert on the records themselves rather than on remove's exit
+# code -- a server that wrongly reported success could not fake it.
+"$server" cancel "$ambiguous_task_id" >/dev/null 2>&1 || true
 for _ in $(seq 1 40); do
     record_still_active "$ambiguous_task_id" || break
     "$server" remove "$ambiguous_task_id" >/dev/null 2>&1 || true

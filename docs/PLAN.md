@@ -71,7 +71,7 @@ CHANGELOG 里的过程记录）都是历史，不是任务。
 **节号**：本文件的 「一、二、三、四、五、六」 是它自己的节号；A/B 两类记录的标题
 不带节号——它们已归档到 `docs/plan/`，原先在 `PLAN.md` 里的 §三/§四 是拆分前的编号。
 
-**条目记录在哪**：A 类（A1–A31）的完整记录在 [`plan/a-class.md`](plan/a-class.md)，
+**条目记录在哪**：A 类（A1–A32）的完整记录在 [`plan/a-class.md`](plan/a-class.md)，
 B 类（B1–B5）在 [`plan/b-class.md`](plan/b-class.md)。本文件保留规划原则、C 类
 （需要你给范围，正文仍在本文件）、取消清单、警告清单与执行状态。引用 `PLAN.md A21`
 或 `PLAN.md B5` 即指对应记录文件中的那一条——**记录文件里没有待办，只有已归档条目
@@ -341,7 +341,15 @@ MIT、四子项全做。①②④ 已完成（版本 0.1.0 与 Pueue 4.0.4 拆�
 升到 **0.1.2**（服务端哈希三台一致 = `10710f70`，等于仓库资产），各自端到端验证
 （Windows 走受保护 launcher、macOS 走 system LaunchDaemon、Linux 走 systemd user unit），
 过程中在真机上暴露并修掉两个缺陷（wrapper/客户端路径冲突、原生 Windows jq 的 CRLF，见
-`CHANGELOG.md` 2026-10-10 两条）。
+`CHANGELOG.md` 2026-10-10 两条）。**第四轮（2026-10-10 晚，A31 之后）**：仓库升到 **0.1.3**
+（A31 的 jq 1.6 修复）后，**两台可达主机已升级并端到端验证**——Windows 主机（受保护 launcher，
+`INSTALLER_EXIT=0`、`updated_atomically:true`、`scheduled_task` State=3）与 Linux 主机
+（systemd user unit，`INSTALLER_EXIT=0`）均报 `agentq=0.1.3`、服务端哈希 `c3628935…` = 仓库资产、
+协议面 `submit→wait(Success)→logs→lookup→remove→wait(5)`、失败任务 `wait=1/Failed`、
+`cancel` 已结束任务 `2/reason=task_not_running` 全通；两台的**客户端本已是仓库字节**
+（Linux `client/unix/agentq`、Windows `client/windows/*` 哈希逐字相符），故仅服务端侧替换即达
+同一部署单元。**第三台本轮从本机网络不可达**（ssh 超时），**其身份未从历史推断**（按操作边界），
+故**未升级、状态未知**——需要时由用户当次点名该主机
 
 **C5 外部审查已执行（2026-09-24 23:06 本地派发 5 个审查者，跨本地午夜收尾；`CHANGELOG.md` 该条按成文时间署 2026-09-25）**：5 个互不
 知情的独立审查者，产出 **3 个真实缺陷（A12 P0 / A13 / A14，全部已修并配回归锁）**，以及
