@@ -213,7 +213,7 @@ UTF-16LE（三组读字节全为 `FF FE` 开头），BOM 感知读取是**必需
 
 ### 这套检查不证明什么
 
-**这套检查无法发现行为回归。** `skill/assets/unix/agentq-server` 是 5,388 行无类型
+**这套检查无法发现行为回归。** `skill/assets/unix/agentq-server` 是 5,395 行无类型
 shell，没有编译器、没有类型系统。**2026-09-29 起已纳入 git**（用户明确授权的一次性动作；此前本仓刻意不做版本控制，`.gitattributes` 用 `* -text` 钉住字节一致性，`.gitignore` 用机制挡住凭据落库）。smoke 证明的是：能解析、两条
 canonical 资产一致、坏参数被正确拒绝、命令集合没漂移。它不证明任何分支的
 行为正确。
