@@ -2159,6 +2159,11 @@ blocker 是 `sleep 60`、清理时**仍在 Running**，而 **Pueue 拒绝删除�
 逐 id 插桩显示每个 id **恰好 1 次**尝试即归档，清理段 32–51s（余下是本机每次服务端
 调用 ~3.4s 的固定开销，**不是在等 sleep**）。
 
+**CI 上的旁证（非隔离测量）**：新 commit 的 linux 全量 `29 ran, 1 skipped, 0 failed
+(344s)`（run 38051114066），而**同一 runner 类型**上旧代码的 linux 全量是 505s（`962207b`
+的 rerun）与 513s（`2a30705`）。这 ~160s 的缩短与「旧清理在等 `sleep 60` blocker 睡醒」
+一致；runner 负载会波动，故只作旁证，不作隔离证据。
+
 **边界**：`skill/` 零改动——这是**测试脚本**的缺陷，不是部署资产的缺陷，故无版本号变化、
 无 canonical 对、无同步要求。`smoke/15` 与 `smoke/07` 各自用了 `sleep 300`/`sleep 120`
 的 probe，但它们的运行时是**各自独立的临时目录**并在 EXIT trap 里连 pueued 一起杀掉，
