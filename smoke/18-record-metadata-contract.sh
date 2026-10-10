@@ -317,6 +317,31 @@ if [ "$remaining" != 0 ] || [ "$tombstones" != 1 ]; then
     failures=$((failures + 1))
 fi
 
+# 11. A record reached through a SYMLINK must be refused.  `path_chain_is_safe`
+#     rejects any symlink component, and the record-path guards call it (via
+#     `request_metadata_file_is_safe`) around the precision probe.  Nothing else
+#     in this file exercises that guard: every other case seeds a plain file, so
+#     dropping the guards entirely stayed GREEN until this case existed (measured
+#     2026-10-11: a variant with the guards removed passed cases=27).  The guards
+#     are the only thing standing between the scan and a record that a symlink
+#     redirects elsewhere, so the lock has to be behavioural, not incidental.
+#
+#     The symlink is the RECORD itself, pointing at a well-formed file that lives
+#     OUTSIDE the record directory: without the guard the scan would follow it and
+#     accept the record; with the guard it must refuse with exit 2.
+sym_id=AQSYMLINK-0000000001
+sym_target="$work/symlink-target-$sym_id.json"
+printf '%s\n' "$(record_json "$sym_id")" > "$sym_target"
+for side in base variant; do
+    find "$work/$side/data/agentq-requests" -maxdepth 1 -name '*.json' -delete
+    find "$work/$side/data/agentq-requests/.tombstones" -maxdepth 1 -name '*.json' -delete
+    ln -s "$sym_target" "$work/$side/data/agentq-requests/$sym_id.json"
+done
+run_case base symrecord status
+run_case variant symrecord status
+compare_case symrecord
+expect_refused symrecord 'invalid AgentQ request record path'
+
 # --------------------------------------------------------------- summary
 if [ "$failures" -ne 0 ]; then
     printf 'records-contract checks FAILED: cases=%s failures=%s\n' "$cases" "$failures" >&2

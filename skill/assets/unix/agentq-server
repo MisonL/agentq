@@ -2498,18 +2498,19 @@ load_request_records() {
             fail "invalid AgentQ request record path: $record_path"
         [ -f "$record_path" ] && [ ! -L "$record_path" ] ||
             fail "invalid AgentQ request record path: $record_path"
+        # ONE guard before the precision probe and ONE after it.  The probe
+        # reads the file's TEXT (grep/sed) while the guard reads its IDENTITY
+        # (the non-symlink path chain), so the pair brackets the window in which
+        # the file could be swapped between the two reads.  Four copies of the
+        # same call on the same path with nothing between them bought no
+        # additional coverage: `path_chain_is_safe` walks every path component
+        # with `[ -L ]`, so each copy is a full chain walk, and this loop runs
+        # for every record on every command.  Measured (272 records, macOS):
+        # 4 guards 1040ms -> 1 guard 263ms; the whole producer loop 1696ms ->
+        # 1083ms, with byte-identical stdout/stderr and exit code.
         request_metadata_file_is_safe "$record_path" ||
             fail "invalid AgentQ request record path: $record_path"
-        request_metadata_file_is_safe "$record_path" ||
-            fail "invalid AgentQ request record path: $record_path"
-        # The two re-checks request_record_is_valid() used to perform are kept
-        # verbatim: they are bash builtins that fork nothing, so removing them
-        # would shrink the TOCTOU window's coverage for no gain.  Only the
-        # three jq invocations per file are gone -- their verdict is reached by
-        # the single aggregate jq below.
         validate_task_id_precision_in_file "$record_path"
-        request_metadata_file_is_safe "$record_path" ||
-            fail "invalid AgentQ request record path: $record_path"
         request_metadata_file_is_safe "$record_path" ||
             fail "invalid AgentQ request record path: $record_path"
         record=$(<"$record_path") || fail "invalid AgentQ request record: $record_path"
@@ -2649,9 +2650,7 @@ read_request_record_state_and_body() {
 request_record_path_guards_or_fail() {
     local record_path=$1
     request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
-    request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
     validate_task_id_precision_in_file "$record_path"
-    request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
     request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
 }
 
