@@ -410,7 +410,7 @@ tombstone；重复恰恰累积在 tombstone 一侧。）
 
 这可以**零授权**修（只改 `assets/`，不需要真机），但**必须先钉死行为**：
 
-- `agentq-server` 是 5,388 行无类型 shell，本仓 smoke **抓不到行为回归**
+- `agentq-server` 是 5,395 行无类型 shell，本仓 smoke **抓不到行为回归**
 - 这条路径是安全相关的（那两处 `created_at` 相等判断正是防止 id 复用误判的核心）
 - 所以顺序是：先为 `cancelled_task_replay` / `task_instance_created_at` 写一份
   针对性契约检查（**改之前就要能红**），再改，再复跑
