@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.2'
+agentq_version='0.1.3'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -2103,7 +2103,7 @@ def compact:
     lifecycle as $lifecycle
     | {
         id,
-        label,
+        label: .label,
         group,
         path,
         created_at,
@@ -3274,8 +3274,15 @@ request_payload() {
     local label=$2
     shift 2
 
-    jq -cn --arg workdir "$workdir" --arg label "$label" \
-        '{workdir: $workdir, label: $label, argv: $ARGS.positional}' \
+    # The variable must not be named `label`: jq 1.6 (el9/fedora/EPEL, and
+    # every jq before 1.6.3) lexes `label` as a reserved keyword, so `$label`
+    # here was a compile error and payload fell back to null -- which then
+    # failed request_record_filter, corrupting every submit on such a host.
+    # `task_label` is already used elsewhere for a non-reserved name (rule E).
+    # The KEY `label` may stay bare: `key: expr` is the `NAME ':' expr` form,
+    # which even reserved words lex as keys (verified jq-1.6).
+    jq -cn --arg workdir "$workdir" --arg task_label "$label" \
+        '{workdir: $workdir, label: $task_label, argv: $ARGS.positional}' \
         --args -- "$@"
 }
 

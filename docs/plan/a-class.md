@@ -2062,3 +2062,58 @@ fixture 在 CI 平台上的可移植性问题（本地 macOS 套件结构上看�
 `CONTRIBUTING.md` 的资源段落同步改写——措辞一律点明 `agentq=` 是**信息行、不参与协商**，
 B2「无协议版本协商字段」的结论不变。**范围检查**：两份客户端只透传 doctor 的 stderr、不解析
 任何 `=` 行，实测无需改动。
+
+### A31. jq 保留字被当作标识符 —— **已修（2026-10-10，零授权；C2 的 RHEL 格首次实跑时暴露）**
+
+**这是 C2 矩阵里 RHEL 那一格从未跑过所掩盖的真实缺陷。** jq 1.6（RHEL/Rocky/CentOS/Alma
+9、Debian 11、Ubuntu 20.04–22.04 的**系统 jq**）把一组词**词法为关键字**——`label`、`and`、
+`or`、`if`、`then`、`else`、`end`、`reduce`、`foreach`、`try`、`catch`、`as`、`def`、
+`import`、`include`、`module`、`null`、`true`、`false`、`break`、`__loc__` 等。在要求标识符
+的位置用其中一个就是**编译错误**；只有 jq **1.7** 才放开。实测（同一命令，两个版本）：
+
+```
+jq -n --arg label x '{label: $label}'   jq1.6 -> syntax error / 1 compile error；jq1.7.1 -> ok
+jq -n '{label, id}'                     jq1.6 -> syntax error；                       jq1.7.1 -> ok
+jq -n '{label: 1}'                      jq1.6 -> {"label":1}（key: expr 合法）；        jq1.7.1 -> ok
+```
+
+服务端恰好踩中前两种：`request_payload`（`agentq-server:3277` 附近）里
+`jq -cn --arg label "$label" '{…, label: $label, …}'`，以及 `status` 压缩过滤器
+`compact_filter`（`:2106` 附近）的对象简写 `label,`。**在 jq-1.6 主机上的后果实测**（Rocky 9
+容器、真实 systemd、普通用户、**装机即 jq 1.6**）：
+
+- `submit` **退 0 却把 `"payload":null` 落盘**——`request_payload` 编译失败、无守卫，空值照样
+  入盘。随后 `request_record_filter` 读到 `payload` 非法，**该主机上除 submit 外的读命令全部
+  以 `2`/`reason=protocol_error` 失败**（实测：`lookup`/`wait`/`cancel`/`remove`/`logs` 各退 2
+  `invalid AgentQ request record`，`doctor` 也退 2）。即**每一次 submit 都静默损坏**（报成功），
+  且事后所有针对它的操作都读不出来。
+- `status` 在**任何 submit 之前**就退 **3**——压缩过滤器的 `label,` 简写编译失败，jq 的错误码
+  直接漏给调用方（契约里 3 是 `lookup` 的 `not_found`，此处语义完全不同）。
+
+**为什么此前所有测试都看不见**：本项目每个测试环境的 jq 都是 1.7——macOS（`jq-1.7.1-apple`）、
+CI（Ubuntu 24.04）、Windows（chocolatey 1.7.1）、Fedora 容器（Fedora 44）、Ubuntu 容器
+（24.04）、arm64 容器。它们**结构上**跑不出这个形状。只有 RHEL 系/老 Ubuntu/Debian 的**系统
+jq 1.6** 会暴露，而 C2 的 RHEL 格此前从未跑过（索引行写「已执行容器可覆盖的部分」，是**超
+claim**）。
+
+**修法**（两处，canonical pair 同步、`cmp=0`）：`--arg label` → `--arg task_label`，过滤器里
+`$label` → `$task_label`（**键名 `label` 可保持裸写**：`key: expr` 是 `NAME ':' expr`，
+保留字作键也合法，1.6 实测）；对象简写 `label,` → `label: .label,`（显式键）。**为什么改的是
+变量名**：`$label` 变量名本身在 1.6 非法，改键名救不了（实测：`{…, "label": $label, …}` 仍编译
+失败；把变量改名为 `$task_label` 才通过，且 `task_label` 本就在别处用作非保留名，符合 rule E）。
+
+**回归锁 `smoke/29-jq-reserved-identifiers`（新增，29 项）**：本机/CI 的 jq 都是 1.7，
+**行为检查结构上看不见**，故沿用 `smoke/08` 的 argv 桩——捕获服务端**实际交给 jq 的程序文本**
+（驱动整个命令面，含 request-record 与 cancellation 扫描路径，自报 `jq_invocations=137
+programs=137`），再分类四种位置（`--arg` 名 / `$变量` / `as $变量` / 对象简写键）。**判形状而非
+跑 1.6**，与 `smoke/09` 建模 PowerShell 5.1 同类；分类器带**自校准自测**（10 行实测自 1.6/1.7
+行为的样本，改分类器则自测先红）。**变异 2/2 被抓**（去掉任一处修复 → 各报出对应站点）。
+**未覆盖**：真跑 jq 1.6（行为证据在 C2 的 RHEL 格）、客户端侧过滤器、驱动命令面到不了的
+Windows-only 分支。
+
+**顺带把 RHEL 格执行并记录**（见 `PLAN.md` C2 表）：`rockylinux/rockylinux:9` + 本地构建的
+systemd 镜像（Red Hat 官方 `ubi9-init` 在本网络不可达，故基于官方 Rocky 基底自建；**刻意不预装
+jq/perl**，让安装器真正走 `dnf install -y` 分支）。装机 `INSTALLER_EXIT=0`、二进制哈希与内置
+常量逐一相符、部署的服务端与仓库当前版本**逐字节相同**（`10710f70…`）、unit `active`+`enabled`、
+linger `yes`；协议 `submit→wait(Success)→logs→remove→wait(5)` 全通、失败任务 `wait=1/Failed:7`、
+`cancel` 已结束任务 `2/task_not_running`。
