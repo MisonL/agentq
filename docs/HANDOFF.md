@@ -134,7 +134,7 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
 - 运行规则与命令契约：`skill/SKILL.md`
 - 开发入口与流程：`CLAUDE.md`
 - 日常验证：`run-tests.sh`（`--quick` 只跑 `01`）
-- 冒烟检查：`smoke/` 下的 28 项，逐项的「覆盖什么 / 不覆盖什么」以
+- 冒烟检查：`smoke/` 下的 29 项，逐项的「覆盖什么 / 不覆盖什么」以
   `docs/verification-status.md`为准——本文件不再复制那份清单（复制过一次就漂移过一次）
 - `03`/`04`/`06`/`07` 需要 `AGENTQ_SMOKE_HOME` 指向含真实 `pueue` 的运行时，否则 SKIP；
   `03` 还要求它本身是可用运行时（`config/pueue.yml` + 已在运行的 `pueued`）。

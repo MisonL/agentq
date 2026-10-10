@@ -370,7 +370,7 @@ diff -rq /Volumes/Work/code/agentq/skill "$SKILL_DIR"   # 必须无输出
 正文逐字未变：
 
 - [`docs/verification-status.md`](docs/verification-status.md) —— 哪些结论已
-  实测、哪些没有，以及 **`smoke/` 二十八项检查各自证明什么 / 不证明什么** 的覆盖表、
+  实测、哪些没有，以及 **`smoke/` 二十九项检查各自证明什么 / 不证明什么** 的覆盖表、
   `run-tests.sh` 的防假绿机制与沙箱跑法。**改 `skill/assets/` 或声称任何覆盖前必读。**
 - [`docs/performance.md`](docs/performance.md) —— `status` 的子进程与耗时事实、历次实测，
   改热点路径前先读。

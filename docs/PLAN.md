@@ -71,7 +71,7 @@ CHANGELOG 里的过程记录）都是历史，不是任务。
 **节号**：本文件的 「一、二、三、四、五、六」 是它自己的节号；A/B 两类记录的标题
 不带节号——它们已归档到 `docs/plan/`，原先在 `PLAN.md` 里的 §三/§四 是拆分前的编号。
 
-**条目记录在哪**：A 类（A1–A30）的完整记录在 [`plan/a-class.md`](plan/a-class.md)，
+**条目记录在哪**：A 类（A1–A31）的完整记录在 [`plan/a-class.md`](plan/a-class.md)，
 B 类（B1–B5）在 [`plan/b-class.md`](plan/b-class.md)。本文件保留规划原则、C 类
 （需要你给范围，正文仍在本文件）、取消清单、警告清单与执行状态。引用 `PLAN.md A21`
 或 `PLAN.md B5` 即指对应记录文件中的那一条——**记录文件里没有待办，只有已归档条目
@@ -87,7 +87,7 @@ B 类（B1–B5）在 [`plan/b-class.md`](plan/b-class.md)。本文件保留规�
 | # | 事项 | 需要你给什么 |
 | --- | --- | --- |
 | C1 | P1-3 整体操作矩阵（**改为三台**、**真实网络中断**；2026-09-22 用户裁定） | **已执行（2026-09-22）**，结果与两个新缺陷见 `CHANGELOG.md`。**当时**三台里只有一台跑当前版本（此后已多轮追赶，2026-10-10 三台均升到 0.1.2）。**两项遗留均已消解（2026-09-24）**：① 主机 A 的客户端路径——重装后 `status`/`submit`/`wait`/`logs`/`remove` 五项 exit 0（见 B5-执行）；② 缺陷二已修并验证（见 A6，`smoke/03` 有用例、M3 证明其敏感）。**C1 无遗留** |
-| C2 | 平台/安装矩阵（WSL、arm64、RHEL、Fedora、Alpine、真实升级回滚） | **已执行容器可覆盖的部分（2026-09-24，用户全权授权）**，见下；**真实升级回滚 2026-10-07 已补验（Linux）**、**2026-10-10 已补验（Windows，专用测试机）**（见「C2 补格」）；**WSL2 2026-10-09 已在真机补验**（容器里仍不可伪造，真机可以） |
+| C2 | 平台/安装矩阵（WSL、arm64、RHEL、Fedora、Alpine、真实升级回滚） | **已执行容器可覆盖的部分（2026-09-24，用户全权授权）**，见下；**真实升级回滚 2026-10-07 已补验（Linux）**、**2026-10-10 已补验（Windows，专用测试机）**（见「C2 补格」）；**WSL2 2026-10-09 已在真机补验**（容器里仍不可伪造，真机可以）；**RHEL 系 2026-10-10 已补验（Rocky 9 容器）——它暴露并关闭了 A31（jq 1.6 保留字）** |
 | C3 | 原生 Windows 其余边界（NTFS reparse 点语义、registry/profile、跨用户安装/服务身份） | **已执行（2026-10-01 与 2026-10-06，专用测试机）**，三项全部关闭，见下。**用户已声明无生产权限**，故不在生产机上做 |
 | C4 | 真实服务/生产边界（远端服务生命周期、TLS/shared key、生产凭证、发布回滚） | **不是「不做」，是「用户无权授权」**：生产环境属上游，用户是 fork 贡献者，只在私有 CF 上部署测试。此项**不得**记为待办，也不得声称已验证 |
 | C5 | P2-18 外部审查 | **已执行（2026-09-24，用户指示「按正规工程审查做、使用 agents」）**，见下 |
@@ -104,6 +104,7 @@ B 类（B1–B5）在 [`plan/b-class.md`](plan/b-class.md)。本文件保留规�
 | **真实 arm64 安装 + 协议** | 自建 arm64 systemd 镜像（`--platform linux/arm64`，模拟层） | 平台判定选中 `pueue-aarch64-unknown-linux-musl`；安装出的二进制是 aarch64；`wait`=0/`Success`；零残留 |
 | **失败模式** | Alpine（musl/apk，无 systemd）、Fedora（dnf） | 两者都在**任何写入之前**干净拒绝、**零副作用**。Alpine 先在依赖闸门拒（缺 perl 且无 sudo），补齐依赖后精确停在 `required command is missing: systemctl` |
 | **真实 Fedora 安装 + 协议端到端（2026-09-30 补做）** | `jrei/systemd-fedora`（Fedora 44、systemd PID 1），以普通用户 `aqtest` 身份、`su -` 建真实 logind 会话、`AGENTQ_PUEUE_SOURCE_DIR=/stage` 预置真实二进制（仍走内置 SHA-256 校验） | **`INSTALLER_EXIT=0`**，`AgentQ 4.0.4 installed`；私有树 700/600；unit `enabled`+`active`（`Main PID pueued --config .../pueue.yml`）；linger `yes`；**零残留**；两个二进制哈希与内置常量**逐一相符**；**部署的服务端与仓库当前版本逐字节相同**（`sha256=a0b54bcbee455cee…`），所以这一格验的是**含 2026-09-30 优化的当前代码**，不是旧副本。协议面：`status`=0；`submit→wait`=`Success`、`logs` 回 `FED-OK` + `Linux`；**失败任务 `wait`=1 且 result 为 `Failed:7`（未被报成成功）**；`remove`→`wait`=**5**/`removed`；`lookup` 连查 3 次都是 **5**；`cancel` 已结束但仍在 Pueue 的任务=**2**+`reason=task_not_running`；`cancel` queued 返回 `cancel_requested`，**重放 `reused:true`**；`status` 能读到 `cancellation_requested_at`；`doctor`=0 且 stderr 报 `pueue=4.0.4`/`pueued=4.0.4`/`systemd_user_service=active` |
+| **真实 RHEL 系（Rocky 9）安装 + 协议端到端（2026-10-10 补做）** | `rockylinux/rockylinux:9` + 本地构建的 systemd 镜像（Red Hat 官方 `ubi9/init` 在本网络不可达，故在官方 Rocky 基底上自建 systemd；**刻意不预装 jq/perl**，让安装器真正走 `dnf install -y` 分支），systemd PID 1，普通用户 `aqtest` 经 `su -` 建真实 logind 会话、NOPASSWD sudo，`AGENTQ_PUEUE_SOURCE_DIR=/stage` 预置真实 Linux 二进制（仍走内置 SHA 校验） | **`INSTALLER_EXIT=0`、`AgentQ 0.1.3 installed`**；私有树与二进制 700；unit `active`+`enabled`；`linger yes`；两个二进制哈希与内置常量逐一相符；record/tombstone 零残留；**部署的服务端与仓库当前版本逐字节相同**（`c3628935…`，= 仓库 `skill/assets/unix/agentq-server` 当前字节）。协议面：`status`=0、`submit→wait(Success)`、`logs` 回 `RHEL-OK`+`Linux`、**失败任务 `wait=1` 且 `Failed:7`**、`remove`→`wait`=**5**、`lookup` 连查 3 次均 0、`cancel` 已结束任务=**2**+`reason=task_not_running`、`doctor`=0 且 `agentq=0.1.3`。 **这一格暴露了 A31**（jq 1.6 保留字）——见 `plan/a-class.md` A31 |
 
 **aarch64 与 x86_64 四个二进制哈希全部与安装器内置常量相符**（逐一实测）。
 
@@ -321,6 +322,12 @@ MIT、四子项全做。①②④ 已完成（版本 0.1.0 与 Pueue 4.0.4 拆�
 三次失败全是 fixture 的可移植性问题、无一是资产缺陷，逐条见 A29 ③），`release` 在 tag `v0.1.0` 上成功。
 **A30（`doctor` 报 AgentQ 版本）已完成**（服务端常量 + doctor 的 `agentq=` 行 + `smoke/03`
 逐字断言 + `smoke/01` 扩为四方 + 四份文档同步）。
+**A31（jq 保留字被当作标识符）已修（2026-10-10）**：C2 的 RHEL 格首次实跑时暴露的**真实
+缺陷**——jq 1.6（el9/RHEL/Rocky、Debian 11、Ubuntu 20.04–22.04 的系统 jq）把 `label` 等词
+词法为关键字，服务端 `request_payload` 的 `--arg label`/`$label` 与 `status` 压缩过滤器的
+`label,` 简写在 1.6 上**编译失败**：该主机上 `submit` 退 0 却写 `payload:null`，`status` 退 3，
+其余读命令全退 2。修两处 + 新增 `smoke/29`（argv 桩判形状，本机 jq 是 1.7 看不见）+ 版本
+`0.1.2 → 0.1.3`。详见 `plan/a-class.md` A31。
 **A8 已执行（2026-09-24）**：主机 A/B 只读核查后**无需清理**（无可 `remove` 对象），
 主机 C 后经用户提供凭据补盘（其队列已空，见 A8 续查）——详见 A8 那节。执行过程中撞出并修复了 A5a 引入的 P0 回归
 （POSIX 客户端连不上任何 Windows 主机）。
