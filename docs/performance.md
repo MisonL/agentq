@@ -191,6 +191,29 @@ jq 调用数（3 records）**28 → 19**，其中精度探测 **10 → 1**。**�
 但两处规则**不等价**——逐条版多接受 `state == "removed"`，聚合版会拒绝它。删任何一个都**改变行为**，
 而这是安全路径，**不要为提速顺手改**。
 
+**2026-10-11 折叠了逐文件重复的路径守卫（jq 已非热点之后剩下的最大头）。**
+折叠 A25/A26 之后，N=272 上的 **jq 调用已是 O(1)**（shim 实测 `status` 的子进程总数
+**恒为 45**、与记录数无关），但 `status` 的墙钟仍随记录数增长（本机中位 **1.3s@N=0 →
+6.7s@N=272**）。用 jq 时间戳桩测**调用之间的空隙**：9 次 jq 之间服务端**空转 7.5s**，
+三段 gap 各自对应一个**逐文件 bash 守卫循环**（`repair` 快路径 / `load_request_records` /
+`load_cancellation_markers`）。**根因**：`request_metadata_file_is_safe` 内部调
+`path_chain_is_safe`，后者**逐级 `[ -L ]` 遍历整条路径链**，而 `load_request_records`
+对**同一路径**在**相邻位置**调它 **4 次**（`request_record_path_guards_or_fail` 同样 4 次），
+两次之间无任何状态变化。**实测**：272 文件跑 4 次守卫 **1040ms**、1 次 **263ms**；
+生产者循环 **1696ms → 1083ms**；`status` 端到端 **6168ms → 4493ms**（交替 5 次中位），
+输出**逐字节相同**。修法是保留**探针前 1 + 后 1**（探针读文本、守卫读身份，这一对夹住
+TOCTOU 窗口），删掉中间多余的同调用。
+
+**别把这个和下面那条「34 行相邻重复、删掉无可测差异、不必动」混为一谈**：那条说的是
+`require_runtime_temporary_file`（纯 bash 内建、不遍历路径链）；**这一处的守卫每次走
+完整条路径链，成本结构不同**，故先例不适用。判据是**实测**，不是「都是相邻重复」。
+
+**改动前必须先补锁**：现有 `smoke/18` **抓不到**守卫被删——实测把 `load_request_records`
+里**全部**守卫删掉的变体仍跑出 `cases=27` 全绿，因为**没有任何用例种子化符号链接记录**。
+故先加 `symrecord` 用例（记录本身是指向目录外文件的符号链接 → 必须退 2
+`invalid AgentQ request record path`），并**先证明它能红**（删光三处记录路径守卫的变体报
+`symrecord: exit code differs (baseline 2, variant 0)`），再改代码。
+
 **探针超时 `AGENTQ_PLATFORM_PROBE_TIMEOUT`（默认 30s）在这类机器上偏紧**：同一次
 `status` 期间若主机被别的负载压住（实测我自己的孤儿把该机推到 **load=42**），
 探针会被拖过 30s 预算并报 `remote platform/protocol probe timed out`，看起来像
