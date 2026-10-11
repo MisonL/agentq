@@ -221,6 +221,32 @@ TOCTOU 窗口），删掉中间多余的同调用。
 `invalid AgentQ request record path`），并**先证明它能红**（删光三处记录路径守卫的变体报
 `symrecord: exit code differs (baseline 2, variant 0)`），再改代码。
 
+**2026-10-11 再折一处孪生：墓碑批量守卫 `request_tombstone_path_guards_or_fail`。**
+上面两轮只碰了**记录**侧的孪生（`request_record_path_guards_or_fail` 由 4 守卫折到 2），
+而**墓碑**侧的同名孪生（供 `wait` 的 reconcile 扫描逐墓碑调用）**仍是 4 守卫**——正是本仓
+反复纠正的「同一机制抄在两处、只修一处」形态。实测（58 个墓碑、8 层真实路径）：4 守卫
+**305ms** → 1 守卫 **94ms**，每次 `wait` 恢复扫描省 **约 211ms**。修法与记录侧逐字相同：
+保留**探针前 1 + 后 1**，删掉探针前多余的两份同调用。**逐字节对照**（pre-fold HEAD vs
+折叠后，四个场景：匹配墓碑 / 不匹配墓碑 / 畸形墓碑 / 符号链接墓碑）stdout+stderr+退出码
+**全部 IDENTICAL**。
+
+**这一处**有**独立的回归锁**，与记录侧不同：`smoke/26` 新增 `w2b`（墓碑本身是指向目录外
+文件的符号链接 → 必须退 2 + `invalid AgentQ request tombstone path` +
+`reason=protocol_error`）。**先证明能红再改**：把 `request_tombstone_path_guards_or_fail`
+里**全部**墓碑路径守卫删掉的变体报 `w2b: expected exit 2, got 5`（3 处失败）；而记录侧的
+`symrecord` **抓不到它**——它只种子化记录符号链接，墓碑扫描根本没跑到。折叠后 `w2b` 全绿。
+
+**同日评估后否掉的一处（`load_cancellation_markers` 的标记循环）——不是遗漏，是实测
+无可测差异。** 该循环里 `cancellation_marker_is_valid` 内部本身就跑 `守卫→探针→守卫`
+（第 4218–4222 行），所以循环体里那对**外部**守卫看似冗余。但两点使它**不该动**：
+① **不可观测**——实测把这对守卫**连同** `cancellation_marker_is_valid` 内的守卫**全部**
+删掉（`nogrdC` 变体），`status` 仍退 1、stderr 仍打 `invalid AgentQ cancellation marker
+path`，因为循环体自己那两行 `[ -f ] && [ ! -L ]` **独立**拦住了符号链接 marker；也就是
+说**没有任何 marker 形态能把「守卫在不在」区分出来**，写不出能红的用例。② **收益可忽略**——
+marker 实测 0–3 个（本机沙箱 0 个），即使折叠也只有毫秒级。故按本仓「无可测差异就不动」
+的先例（`require_runtime_temporary_file` 那条）**保持原样**，并如实记下否掉的理由，以免
+将来被当成漏折。
+
 **探针超时 `AGENTQ_PLATFORM_PROBE_TIMEOUT`（默认 30s）在这类机器上偏紧**：同一次
 `status` 期间若主机被别的负载压住（实测我自己的孤儿把该机推到 **load=42**），
 探针会被拖过 30s 预算并报 `remote platform/protocol probe timed out`，看起来像

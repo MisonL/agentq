@@ -256,6 +256,27 @@ assert_rc w2 5
 assert_json w2 '.state == "removed" and .task_id == 1001'
 assert_err_has w2 'was already removed before wait'
 
+# W2b. A tombstone reached through a SYMLINK must be refused.  This is the
+#      tombstone-scan lock: every other case seeds a plain tombstone file, so
+#      nothing exercised the scan's path guards.  The symlink points OUTSIDE
+#      the tombstone directory and every chain component above it is a real
+#      directory, so the refusal must come from `request_metadata_file_is_safe`'s
+#      chain walk (`path_chain_is_safe` rejects any symlink component).  The
+#      early `-L` file check inside wait_reconcile's fallback reader does NOT
+#      see this file first: the fast path's `request_tombstone_path_guards_or_fail`
+#      runs before any read.  A variant that drops that guard falls through to
+#      the fallback `read_request_tombstone`, whose jq follows the link and
+#      ACCEPTS the well-formed tombstone behind it: green with the guard, red
+#      without it.  Measured 2026-10-11 both ways.
+sym_tomb_target="$work/symlink-target-tomb.json"
+tombstone AQREAD-SYMTOMB-000001 1001 > "$sym_tomb_target"
+clear_runtime
+ln -s "$sym_tomb_target" "$work/data/agentq-requests/.tombstones/AQREAD-SYMTOMB-000001.json"
+run_case w2b wait 1001
+assert_rc w2b 2
+assert_err_has w2b 'invalid AgentQ request tombstone path'
+assert_reason w2b
+
 # W3. One matching accepted record whose task vanished: removed, exit 5, and the
 #     record is archived (this is wait's own writer, exercised through the scan).
 clear_runtime
