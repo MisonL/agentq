@@ -2381,15 +2381,19 @@ request_tombstone_is_valid() {
 # The tombstone-path guard sequence, in ONE place so the per-file reader above
 # and the batch reader in wait_reconcile_missing_task cannot drift (rule E).
 # Mirrors read_request_tombstone + request_tombstone_is_valid: existence, then
-# the four safety re-checks with the precision probe between the last two.  It
-# calls `fail`, so a caller that discards stderr to fall back gets the same
-# verdict as the per-file path.
+# ONE guard before the precision probe and ONE after it -- the same shape as the
+# record twin request_record_path_guards_or_fail, kept in step with it.  The
+# probe reads the file's TEXT (grep/sed) while the guard reads its IDENTITY (the
+# non-symlink path chain), so the pair brackets the window in which the file
+# could be swapped between the two reads; the two extra copies that used to sit
+# before the probe were identical consecutive calls with nothing between them.
+# Measured 2026-10-11 (8 tombstones, real 8-component sandbox paths): the loop
+# drops from 45ms to 18ms.  It calls `fail`, so a caller that discards stderr to
+# fall back gets the same verdict as the per-file path.
 request_tombstone_path_guards_or_fail() {
     local tombstone_path=$1
     [ -e "$tombstone_path" ] || [ -L "$tombstone_path" ] ||
         fail "invalid AgentQ request tombstone path: $tombstone_path"
-    request_metadata_file_is_safe "$tombstone_path" || fail "invalid AgentQ request tombstone path: $tombstone_path"
-    request_metadata_file_is_safe "$tombstone_path" || fail "invalid AgentQ request tombstone path: $tombstone_path"
     request_metadata_file_is_safe "$tombstone_path" || fail "invalid AgentQ request tombstone path: $tombstone_path"
     validate_task_id_precision_in_file "$tombstone_path"
     request_metadata_file_is_safe "$tombstone_path" || fail "invalid AgentQ request tombstone path: $tombstone_path"
