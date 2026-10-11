@@ -208,6 +208,13 @@ TOCTOU 窗口），删掉中间多余的同调用。
 `require_runtime_temporary_file`（纯 bash 内建、不遍历路径链）；**这一处的守卫每次走
 完整条路径链，成本结构不同**，故先例不适用。判据是**实测**，不是「都是相邻重复」。
 
+**同日又折叠了两处「独立但冗余」的路径链遍历**：`load_request_records` 与
+`load_cancellation_markers` 的循环各自先单独调一次 `path_chain_is_safe`，而紧随其后的
+`request_metadata_file_is_safe` 内部会**再走同一条链、同一个路径**（它的第一步就是
+`path_chain_is_safe "$metadata_path"`）。实测（272 条记录）保留 **724ms**、去掉 **510ms**；
+删的是独立那次、守卫仍在，故符号链接仍被拒（`symrecord` 场景实测 rc=2）。**这一处无需
+新用例**——上一段补的 `symrecord` 正是为「守卫被删」而写，已覆盖。
+
 **改动前必须先补锁**：现有 `smoke/18` **抓不到**守卫被删——实测把 `load_request_records`
 里**全部**守卫删掉的变体仍跑出 `cases=27` 全绿，因为**没有任何用例种子化符号链接记录**。
 故先加 `symrecord` 用例（记录本身是指向目录外文件的符号链接 → 必须退 2
