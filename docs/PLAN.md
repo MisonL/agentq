@@ -334,6 +334,24 @@ linux job 偶发报 `cleanup left an active request record for task(s): 5`——
 重试预算又按**次数**（40）而非秒计。修法是清理前先 `cancel`（`SKILL.md` 工作流的顺序），
 A/B 承重证明：预算缩到 3 轮时旧代码逐字复现该原话、新代码通过。**`skill/` 零改动**，
 详见 `plan/a-class.md` A32。
+**性能折叠（2026-10-11，零授权，`skill/assets/` 两处同步改）**：用户指示「优化好」。
+计划文件里那条「折叠 `repair_removed_request_records` 的逐条 jq」**2026-10-04 就已完成**
+（A25/A26），故先按本仓纪律实测**当前**热点：`status` 在 N=272 上仍随记录数增长
+（本机中位 1.3s@N=0 → 6.7s@N=272），而 shim 计数显示**子进程恒为 45**、与记录数无关——
+成本在 **bash 内部**。用 jq 时间戳桩测出 9 次 jq 之间服务端**空转 7.5s**，定位到三处
+**逐文件路径守卫循环**。**根因**：`request_metadata_file_is_safe` 内含
+`path_chain_is_safe`，后者**逐级 `[ -L ]` 遍历整条路径链**。**两处折叠**（`1cebf19`、
+`7d3e572`）：① `load_request_records`/`request_record_path_guards_or_fail` 对**同一路径**
+在**相邻位置**调它 **4 次**，改为保留探针前后各 1 次；② `load_request_records` 与
+`load_cancellation_markers` 各有一处**独立**的 `path_chain_is_safe`，紧随其后的守卫
+**内部会再走同一条链**，故删除。**合计**：生产者循环 1696ms→1083ms、4 次守卫
+1040ms→263ms、独立 chain walk 724ms→510ms、端到端 `status` 7875ms→6134ms（A/B 中位），
+输出**逐字节相同**。**先补锁再改**：现有覆盖**抓不到**守卫被删（实测删光全部记录路径守卫
+仍 `cases=27` 全绿，因为没有用例种子化符号链接记录），故 `smoke/18` 先加 `symrecord`
+用例并**证明它能红**（`exit code differs (baseline 2, variant 0)`）再改代码。**已量过但
+不改**：`read_request_record` 里 4 次守卫同样是冗余的，但它的调用点全是**单文件**路径
+（不在逐记录循环里），省 2 次约 **2.6ms/调用**，相对 N=0 的 1.3s 可忽略——记为「量过、
+不值得改」，不是遗漏。**未提版本号**（纯性能折叠，与 `0418da3`/`76b9cfe` 同类）。
 **A8 已执行（2026-09-24）**：主机 A/B 只读核查后**无需清理**（无可 `remove` 对象），
 主机 C 后经用户提供凭据补盘（其队列已空，见 A8 续查）——详见 A8 那节。执行过程中撞出并修复了 A5a 引入的 P0 回归
 （POSIX 客户端连不上任何 Windows 主机）。
