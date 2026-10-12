@@ -247,8 +247,12 @@ PART 是「本可跑却没跑」，NCOV 是「在此平台永远跑不了」。*
 每次 macOS/Linux 跑都报 `4 partial` + `NOT A FULL PASS`，唯一保住 CI 绿灯的办法是把
 `0 partial` 闸门放宽，而那会连**真实** partial 一起放掉。故 NCOV 单列**可见的一桶 + 计数**，
 并在总结行后打印一行 `NOT-covered: N check(s) declared platform-unverifiable sub-parts: <清单>`；
-CI 的 linux job 断言这个清单**恰好**是已知集合（多一个、少一个都红）——一个**新**的
-`NOT-covered`（某个检查悄悄不再覆盖某物）就落在这道闸门里。**此前这个词完全隐形**：
+CI 的 linux job 断言这个清单里的**每个名字**都在已知集合内（子集判定：某个已知检查在
+pwsh 恰好是 5.1 时不再报 NOT-covered 是覆盖变强、不是回归；出现**未知**名字则红）——
+一个**新**的 `NOT-covered`（某个检查悄悄不再覆盖某物）就落在这道闸门里。**注意 `22`/`23`
+的 token 是无条件的**（`windows-api=NOT-covered(needs-Windows)` 即使真在 Windows 上也打印，
+因为那两个检查本就不驱动 Windows 身份 API 路径），所以 Windows job **不能**断言「这 4 个
+检查不得报 NOT-covered」——最初加过、首跑即被 CI 证伪并撤回。**此前这个词完全隐形**：
 打印 `NOT-covered` 的检查被分类成 `ok`、总结行说 `0 partial`、没有任何闸门读到它——
 一个与 SKIP/PART 并存的「未验证」词汇藏在绿灯后面（2026-10-12 全维度审查发现并复现：
 一个打印 `NOT-covered` 的检查分类为 `ok`，含三条 `NOT-covered` 的日志同时通过 CI 的两道闸门）。
