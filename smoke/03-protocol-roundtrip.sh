@@ -468,22 +468,27 @@ jq -e '.reused == true' <<<"$replay_output" >/dev/null || {
 # this id must not make an unrelated task look like a replay.  Plant exactly
 # that: a marker whose recorded creation time disagrees with the creation time
 # AgentQ recorded for the id, and require the cancel to be refused.
-stale_marker_created=0
-stale_record_created=0
-if [ -d "$runtime_home/data/agentq-cancellations" ] \
-    && [ -d "$runtime_home/data/agentq-requests" ]; then
-    # Leftovers are rejected up top, before any protocol work.  That used to
-    # skip the whole assertion silently while the summary claimed the
-    # stale-marker rejection held; the summary is now only printed when it ran.
-    if true; then
-        printf '{"task_id":%s,"created_at":"2001-01-01T00:00:00Z","requested_at":"2001-01-01T00:00:01Z","reason":"user_requested","state":"requested"}\n' \
-            "$stale_task_id" > "$stale_marker"
-        printf '{"version":1,"request_id":"smoke-stale-instance-aaaa","payload":{"workdir":"%s","label":"stale","argv":["true"]},"task_label":"agentq:smoke-stale-instance-aaaa","state":"accepted","task_id":%s,"task_created_at":"2002-02-02T00:00:00Z","created_at":"2001-01-01T00:00:00Z"}\n' \
-            "$work" "$stale_task_id" > "$stale_record"
-        stale_marker_created=1
-        stale_record_created=1
-    fi
+# These two directories are created by the server during its own startup
+# (ensure_cancellation_directory / ensure_request_directory) BEFORE any
+# protocol work, so by the time this line runs -- after a full submit cycle --
+# they must exist.  A missing directory is an environment fault, not a reason
+# to skip: fail loudly.  (Previously this was `if [ -d ... ]` with a dead
+# `if true` inside, so a missing directory skipped the assertion silently while
+# the summary line still claimed `reuse-replay=reused` -- a false green the
+# summary's own comment said had been fixed.)
+if [ ! -d "$runtime_home/data/agentq-cancellations" ] || [ ! -d "$runtime_home/data/agentq-requests" ]; then
+    printf 'protocol-roundtrip: AgentQ data directories are missing after a submit cycle; the runtime is unusable: %s\n' \
+        "$runtime_home/data" >&2
+    exit 1
 fi
+{
+    printf '{"task_id":%s,"created_at":"2001-01-01T00:00:00Z","requested_at":"2001-01-01T00:00:01Z","reason":"user_requested","state":"requested"}\n' \
+        "$stale_task_id" > "$stale_marker"
+    printf '{"version":1,"request_id":"smoke-stale-instance-aaaa","payload":{"workdir":"%s","label":"stale","argv":["true"]},"task_label":"agentq:smoke-stale-instance-aaaa","state":"accepted","task_id":%s,"task_created_at":"2002-02-02T00:00:00Z","created_at":"2001-01-01T00:00:00Z"}\n' \
+        "$work" "$stale_task_id" > "$stale_record"
+    stale_marker_created=1
+    stale_record_created=1
+}
 if [ "$stale_marker_created" -eq 1 ] && [ "$stale_record_created" -eq 1 ]; then
     stale_status=0
     stale_output=$("$server" cancel "$stale_task_id" 2>"$work/stale.err") || stale_status=$?
@@ -510,19 +515,19 @@ fi
 # belonging to an older instance, and a marker naming the newer one.  The cancel
 # must still replay.
 reused_fixture_ready=0
-if [ -d "$runtime_home/data/agentq-cancellations" ] \
-    && [ -d "$runtime_home/data/agentq-requests" ]; then
-    # Leftovers are rejected up top, before any protocol work.
-    if true; then
-        printf '{"version":1,"request_id":"smoke-reuse-instance-aaaa","payload":{"workdir":"%s","label":"reuse-older","argv":["true"]},"task_label":"agentq:smoke-reuse-instance-aaaa","state":"accepted","task_id":%s,"task_created_at":"2003-03-03T00:00:00Z","created_at":"2003-03-03T00:00:00Z"}\n' \
-            "$work" "$reused_task_id" > "$reused_older_record"
-        printf '{"version":1,"request_id":"smoke-reuse-instance-bbbb","payload":{"workdir":"%s","label":"reuse-newer","argv":["true"]},"task_label":"agentq:smoke-reuse-instance-bbbb","state":"accepted","task_id":%s,"task_created_at":"2004-04-04T00:00:00Z","created_at":"2004-04-04T00:00:00Z"}\n' \
-            "$work" "$reused_task_id" > "$reused_newer_record"
-        printf '{"task_id":%s,"created_at":"2004-04-04T00:00:00Z","requested_at":"2004-04-04T00:00:01Z","reason":"user_requested","state":"requested"}\n' \
-            "$reused_task_id" > "$reused_marker"
-        reused_fixture_ready=1
-    fi
-fi
+# The directory guard for this block is the one above (a missing AgentQ data
+# directory already exited 1), so these writes run unconditionally rather than
+# hiding behind a second `[ -d ... ] &&` whose failure the summary would not
+# see.
+{
+    printf '{"version":1,"request_id":"smoke-reuse-instance-aaaa","payload":{"workdir":"%s","label":"reuse-older","argv":["true"]},"task_label":"agentq:smoke-reuse-instance-aaaa","state":"accepted","task_id":%s,"task_created_at":"2003-03-03T00:00:00Z","created_at":"2003-03-03T00:00:00Z"}\n' \
+        "$work" "$reused_task_id" > "$reused_older_record"
+    printf '{"version":1,"request_id":"smoke-reuse-instance-bbbb","payload":{"workdir":"%s","label":"reuse-newer","argv":["true"]},"task_label":"agentq:smoke-reuse-instance-bbbb","state":"accepted","task_id":%s,"task_created_at":"2004-04-04T00:00:00Z","created_at":"2004-04-04T00:00:00Z"}\n' \
+        "$work" "$reused_task_id" > "$reused_newer_record"
+    printf '{"task_id":%s,"created_at":"2004-04-04T00:00:00Z","requested_at":"2004-04-04T00:00:01Z","reason":"user_requested","state":"requested"}\n' \
+        "$reused_task_id" > "$reused_marker"
+    reused_fixture_ready=1
+}
 if [ "$reused_fixture_ready" -eq 1 ]; then
     reused_status=0
     reused_output=$("$server" cancel "$reused_task_id" 2>"$work/reused.err") || reused_status=$?

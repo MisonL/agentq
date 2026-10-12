@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.4'
+agentq_version='0.1.5'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -1758,7 +1758,19 @@ with_operation_lock() {
         :
     else
         release_status=$?
-        [ "$command_status" -ne 0 ] || command_status=$release_status
+        if [ "$command_status" -eq 0 ]; then
+            command_status=$release_status
+            # The command succeeded but the operation lock could not be
+            # released.  release_owned_lock already printed a human message for
+            # each shape, but the contract requires EVERY exit-2 path to carry a
+            # machine-readable reason line -- and this code (2 for an unsafe
+            # lock path, 1 for another cleanup failure) reaches the top level
+            # here.  Without this line a caller reading `reason=` saw an empty
+            # class and could misread the server's status.
+            if [ "$command_status" -eq 2 ]; then
+                printf '%s: reason=protocol_error\n' "$program" >&2
+            fi
+        fi
     fi
     return "$command_status"
 }
@@ -3793,7 +3805,20 @@ compact_status() {
     fi
     remove_runtime_temporary_file "$raw_status_file" || command_status=1
     release_request_metadata_files || command_status=1
-    return "$command_status"
+    # The jq filter above ends in `error("invalid visible Pueue task
+    # metadata")`, which exits jq with 5.  Returning that raw made `status` and
+    # `doctor` exit 5 -- the code the contract reserves for a REMOVED task, with
+    # no JSON body and no reason line, so a caller reading 5 as "removed" was
+    # misled (measured 2026-10-12: a Pueue task missing `created_at` produced
+    # `status exit=5 stdout=[] reason=0`).  Every other caller that compacts a
+    # task -- logs, wait, cancel, remove -- folds a non-zero status through
+    # report_compact_task_failure instead; fold here too.  A malformed status
+    # is "Pueue could not be inspected", which is a protocol failure (exit 2 +
+    # reason), not a task state.
+    if [ "$command_status" -ne 0 ]; then
+        fail 'cannot inspect Pueue while reading AgentQ status'
+    fi
+    return 0
 }
 
 raw_compact_task() {
@@ -4447,7 +4472,14 @@ wait_for_task() {
 
     if [ "$wait_status" -ne 0 ]; then
         printf '%s: pueue wait exited %s for task %s\n' "$program" "$wait_status" "$task_id" >&2
-        return "$wait_status"
+        # pueue's own exit code is NOT an AgentQ contract code.  Returning it
+        # raw let a pueue/clap failure (2=usage) surface as a server exit 2 with
+        # no reason line, and a theoretical 42-45/124 (the client-only range)
+        # leak out of a server that must never emit it.  The task did not reach
+        # a completed state and the operation failed -- the contract code for
+        # that is 1 (general failure).  Measured 2026-10-12: a stub `pueue wait`
+        # returning 124 produced `wait exit=124 reason=0`.
+        return 1
     fi
 
     task_succeeded <<<"$task"
@@ -4480,9 +4512,11 @@ compact_log() {
     if run_pueue "${log_args[@]}" > "$compact_log_raw_file"; then
         :
     else
-        command_status=$?
-        cleanup_compact_log_raw_file || command_status=1
-        return "$command_status"
+        # `pueue log` failing is a general failure, not a contract code; passing
+        # pueue's own exit code through could surface 42-45/124 from the server
+        # (see the submit/wait/remove sites).
+        cleanup_compact_log_raw_file || true
+        return 1
     fi
     require_runtime_temporary_file "$compact_log_raw_file"
     validate_pueue_task_id_precision_in_file "$compact_log_raw_file"
@@ -4520,7 +4554,14 @@ compact_log() {
         require_task_log_file "$log_path"
         [ -r "$log_path" ] || fail "Pueue reported a non-UTF-8 task log, but the raw log is unavailable: $log_path"
         command -v base64 >/dev/null 2>&1 || fail 'base64 is required to return a non-UTF-8 task log'
-        [ -n "$task" ] || task=$(compact_task "$task_id")
+        if [ -z "$task" ]; then
+            # A bare `[ -n "$task" ] || task=$(compact_task …)` would let
+            # compact_task's failure exit code (jq's 5 for malformed metadata)
+            # escape as this function's return under `set -e`, with no reason
+            # line -- the value 5 the contract reserves for a removed task.
+            task=$(compact_task "$task_id") ||
+                fail "cannot inspect Pueue while reading AgentQ task logs: $task_id"
+        fi
         require_task_log_file "$log_path"
 
         if {
@@ -4542,7 +4583,12 @@ compact_log() {
             command_status=$?
         fi
         cleanup_compact_log_raw_file || command_status=1
-        return "$command_status"
+        # See the note at this function's tail: a non-zero jq status must not
+        # escape as the contract's 5 (removed) with no reason line.
+        if [ "$command_status" -ne 0 ]; then
+            fail "cannot encode non-UTF-8 task log for AgentQ task: $task_id"
+        fi
+        return 0
     fi
 
     if ! prepare_request_metadata_files; then
@@ -4589,7 +4635,15 @@ compact_log() {
     fi
     release_request_metadata_files || command_status=1
     cleanup_compact_log_raw_file || command_status=1
-    return "$command_status"
+    # jq's `error("invalid visible Pueue task metadata")` exits 5 -- the code
+    # the contract reserves for a REMOVED task.  `logs` calls this bare, so
+    # returning it raw made a malformed status look like a removed task with no
+    # body and no reason line (the same defect fixed in compact_status).  A
+    # status we cannot parse is a protocol failure, not a task state.
+    if [ "$command_status" -ne 0 ]; then
+        fail 'cannot inspect Pueue while reading AgentQ task logs'
+    fi
+    return 0
 }
 
 submit() {
@@ -4803,7 +4857,14 @@ submit() {
             else
                 printf '%s: Pueue add exited %s and the request outcome is unresolved; use lookup before any manual retry: %s\n' \
                     "$program" "$pueue_add_status" "$request_id" >&2
-                return "$pueue_add_status"
+                # pueue's exit code is not an AgentQ contract code: returning it
+                # raw let a pueue/clap failure (2=usage) become a server exit 2
+                # with no reason line, and could leak 42-45/124 (the client-only
+                # range) from a server that must never emit it.  `pueue add`
+                # failing with the request unreconciled is a general failure.
+                # Measured 2026-10-12: a stub `pueue add` returning 43 produced
+                # `submit exit=43 reason=0`.
+                return 1
             fi
         fi
     fi
@@ -5319,7 +5380,11 @@ remove_task() {
     fi
 
     printf '%s: Pueue removal did not complete; the AgentQ request remains in removing state: %s\n' "$program" "$task_id" >&2
-    return "$removal_status"
+    # pueue's exit code is not an AgentQ contract code (see the submit and wait
+    # sites): a raw pass-through could surface 42-45/124 from the server.  The
+    # removal did not complete -- a general failure.  Measured 2026-10-12: a
+    # stub `pueue remove` returning 44 produced `remove exit=44 reason=0`.
+    return 1
 }
 
 main() {

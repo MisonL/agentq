@@ -328,7 +328,15 @@ cleanup_config_snapshot() {
     return "$cleanup_config_snapshot_status"
 }
 
-trap cleanup_config_snapshot EXIT HUP INT TERM
+# Early window: cleanup_client_runtime is not defined yet, so this binds the
+# config-snapshot cleanup as the EXIT handler.  The signal traps must EXIT too
+# -- a handler that only returns lets the shell RESUME past the interrupt, so
+# Ctrl-C during config validation would not stop the client (measured
+# 2026-10-12: three shells all printed the cleanup then continued and exited
+# 0).  This handler cleans the snapshot then exits 130, the same form the full
+# trap below uses; that trap supersedes HUP/INT/TERM once defined.
+trap cleanup_config_snapshot EXIT
+trap 'cleanup_config_snapshot; exit 130' HUP INT TERM
 
 if [ -L "$config_path" ]; then
     printf '%s: AGENTQ_CONFIG must be a regular file; symbolic links are not accepted\n' "$program" >&2
@@ -1259,7 +1267,14 @@ cleanup_client_runtime() {
 # only the config snapshot, so it is superseded here where the full runtime
 # cleanup is defined.
 trap cleanup_client_runtime EXIT
-trap 'cleanup_client_runtime; exit 130' HUP INT TERM
+# `cleanup_client_runtime` returns non-zero when any cleanup step fails, and
+# under `set -e` a non-zero return inside the trap body would trip errexit and
+# exit with THAT code before reaching `exit 130` -- so a failed cleanup would
+# both change the signal exit code and (via the EXIT trap) run cleanup a second
+# time. Measured 2026-10-12: `trap 'f; exit 130' TERM` with f returning 3 exits
+# 3, not 130.  `|| true` makes the 130 authoritative; cleanup is idempotent so
+# the EXIT trap's second run is harmless.
+trap 'cleanup_client_runtime || true; exit 130' HUP INT TERM
 
 windows_argument_identity_for_path() {
     windows_argument_lookup_path=$1

@@ -923,6 +923,25 @@ if [ "$failures" -ne 0 ]; then
     printf 'ps-client-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
+# Static lock: the probe-path exit-token reader must bound its digit run to
+# three, exactly like the operation-path reader.  An unbounded `\d+` let a
+# remote probe print `agentq-exit:<huge>` and make the following `[int]` cast
+# throw; the client has no top-level trap, so that exits 1 with a PowerShell
+# error instead of the fail-closed fallback to the SSH exit code (measured
+# 2026-10-12: `[int]"99999999999999999999"` throws RuntimeException).  The two
+# readers drifting apart is the "same mechanism, one copy fixed" shape this
+# repo keeps hitting, so both are pinned here.
+cases=$((cases + 1))
+# (the ps1 path is the existing $client)
+if ! grep -q "agentq-exit:(\\\\d{1,3})" "$client"; then
+    printf '%s\n' 'ps-client-contract: the probe-path exit-token reader does not bound its digit run to {1,3}' >&2
+    failures=$((failures + 1))
+fi
+if grep -q "agentq-exit:(\\\\d+)" "$client"; then
+    printf '%s\n' 'ps-client-contract: an unbounded \d+ exit-token reader is present; a huge token would crash the [int] cast' >&2
+    failures=$((failures + 1))
+fi
+
 # The ps51= token states whether THIS run exercised Windows PowerShell 5.1.
 # Under pwsh it must keep saying NOT-covered -- pwsh does not reproduce the two
 # PS 5.1 defects this project has been bitten by, so a green pwsh run says

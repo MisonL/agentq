@@ -377,6 +377,16 @@ resolve_ssh_binary
 is_nonnegative_integer "$reconnect_delay" || fail 'SSHP_RECONNECT_DELAY must be a non-negative integer'
 initialize_ssh_runtime
 trap cleanup_ssh_runtime EXIT
+# Bind the signal traps HERE, next to the EXIT trap, not just before the main
+# loop.  The probe / install / reconnect window (prepare_remote's unbounded
+# reconnect sleep, prompt_install's interactive read) runs between runtime
+# creation and the loop, and a fatal signal with no handler does NOT run the
+# EXIT trap on dash (measured 2026-10-12: `dash -c 'c(){ :;}; trap c EXIT;
+# kill -INT $$'` exits 130 with no cleanup; bash and ksh do clean up).  So on
+# Debian/Ubuntu, where /bin/sh is dash, Ctrl-C during that window leaked
+# $TMPDIR/sshp.XXXXXX with its -E ssh diagnostic log.  The handler cleans up
+# then exits 130, matching the client's own trap form.
+trap 'cleanup_ssh_runtime; exit 130' HUP INT TERM
 
 # shellcheck disable=SC2016
 remote_probe_command='
@@ -1165,8 +1175,6 @@ if [ "$check_only" = true ]; then
     esac
     exit 0
 fi
-
-trap 'exit 130' HUP INT TERM
 
 while :; do
     case "$remote_platform" in

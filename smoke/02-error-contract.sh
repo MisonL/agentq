@@ -24,6 +24,7 @@ done
 
 server="$work/agentq-server"
 failures=0
+cases=0
 
 # expect_rejected <label> <expected-message-fragment> <expected-reason> [args...]
 #
@@ -37,6 +38,7 @@ expect_rejected() {
     local label=$1 expected=$2 reason=$3
     shift 3
     local actual=0
+    cases=$((cases + 1))
     "$server" "$@" >"$work/$label.stdout" 2>"$work/$label.stderr" || actual=$?
     if [ "$actual" -ne 2 ]; then
         printf '%s: expected exit 2, got %s\n' "$label" "$actual" >&2
@@ -64,6 +66,53 @@ expect_rejected logs-no-task 'logs requires one task id' protocol_error logs
 expect_rejected cancel-no-task 'cancel requires one task id' protocol_error cancel
 expect_rejected remove-no-task 'remove requires one task id' protocol_error remove
 expect_rejected status-extra-arg 'status accepts no arguments' protocol_error status extra
+
+# A malformed Pueue status must NOT surface as exit 5.  The contract reserves 5
+# for a REMOVED task; but compact_status's jq filter ends in
+# error("invalid visible Pueue task metadata"), and jq exits 5 on error() -- so
+# before 2026-10-12 `status`/`doctor` exited 5 with no body and no reason line,
+# and a caller reading 5 as "removed" was misled.  This drives status against a
+# stub whose `status --json` returns a task MISSING `created_at` (a shape
+# validate_pueue_task_shape_in_file does not check -- it only validates id
+# precision), so the error() fires for real.  Every other compactor (logs, wait,
+# cancel, remove) folds this through report_compact_task_failure.
+bad_status_run() {
+    local op=$1
+    cases=$((cases + 1))
+    local status_rc=0
+    # The server resolves pueue as "$agentq_root/pueue" (its own directory),
+    # NOT via PATH -- so swap $work/pueue itself, then restore it.
+    cp "$work/pueue" "$work/pueue.real"
+    cat > "$work/pueue" <<'STUB'
+#!/bin/sh
+# `status --json` returns a group with one task that has an id but no
+# created_at; `group --json` reports the agentq group so verify_group passes.
+case "$*" in
+    *"group --json"*) printf '{"agentq":{"parallel_tasks":1}}\n' ;;
+    *"status --json"*)
+        printf '{"tasks":{"7":{"id":7,"group":"agentq"}},"groups":{"agentq":{"parallel_tasks":1}}}\n'
+        ;;
+    *) printf 'pueue 4.0.4\n' ;;
+esac
+STUB
+    chmod 700 "$work/pueue"
+    "$server" "$op" >"$work/bad.$op.out" 2>"$work/bad.$op.err" || status_rc=$?
+    mv "$work/pueue.real" "$work/pueue"
+    if [ "$status_rc" -ne 2 ]; then
+        printf 'a malformed Pueue status made `%s` exit %s; the contract reserves 5 for a removed task and requires 2 (protocol_error) for an unreadable status\n' \
+            "$op" "$status_rc" >&2
+        head -3 "$work/bad.$op.err" >&2 || true
+        failures=$((failures + 1))
+        return
+    fi
+    if ! grep -q 'reason=protocol_error' "$work/bad.$op.err"; then
+        printf 'a malformed Pueue status made `%s` exit 2 without reason=protocol_error\n' "$op" >&2
+        head -3 "$work/bad.$op.err" >&2 || true
+        failures=$((failures + 1))
+    fi
+}
+bad_status_run status
+bad_status_run doctor
 
 # `cancel` on a finished task (`reason=task_not_running`) is deliberately NOT
 # asserted here: it needs a real Pueue task that has actually completed, and
@@ -105,6 +154,19 @@ fi
 # Continuation lines are JOINED before the test.  Without that, a message split
 # as `printf '...' \\` / `"$program" >&2` never satisfies the `>&2` test and the
 # site is invisible -- the same shape the rule exists to catch, just wrapped.
+#
+# Why the rule matches literal `exit 2` and NOT `return 2`: the contract
+# promises a reason line on every path that reaches the top level as 2.  A
+# `return 2` inside a function is an internal value; whether it becomes the
+# process exit code depends on how each caller folds it.  A 2026-10-12 review
+# audited all 13 `return 2` sites (1188/1199/1507/1526/1540/1581/1588/1595/
+# 1790/1794/1800/1807/3601): every one is either folded by an `if`/`|| return 1`
+# at its call site or handled by fail() -- EXCEPT the lock-release family
+# (release_owned_lock's 1581/1588/1595), which reached the top level through
+# with_operation_lock.  That site now emits its own `reason=protocol_error`
+# (see with_operation_lock).  Matching `return 2` here instead would have
+# reported all 13 and buried the one real gap, so the rule stays on `exit 2`
+# and the return-2 audit lives in this comment plus the with_operation_lock fix.
 reason_gap_sites=$(
     awk '
         {
@@ -136,5 +198,6 @@ if [ "$failures" -ne 0 ]; then
     printf 'error-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'error-contract checks passed: cases=9 commands=%s runtime=synthetic reasons=asserted reason-gaps=0\n' \
+printf 'error-contract checks passed: cases=%s commands=%s runtime=synthetic reasons=asserted reason-gaps=0\n' \
+    "$cases" \
     "$(printf '%s\n' $documented_commands | wc -l | tr -d ' ')"

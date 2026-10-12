@@ -160,8 +160,30 @@ if [ "$control_status" -eq 130 ]; then
     failures=$((failures + 1))
 fi
 
+# Static lock on the two trap shapes the behavioural cases above cannot reach.
+# The signal cases exercise the ssh-call window; two other windows are real but
+# not schedulable here, so they are pinned structurally.
+cases=$((cases + 1))
+# (1) The EARLY window (config validation) must also exit on a signal.  A
+#     handler that merely cleans and returns lets the shell resume past the
+#     interrupt.  Before 2026-10-12 this was `trap cleanup_config_snapshot EXIT
+#     HUP INT TERM`; it must now be a `; exit 130` form.
+if ! grep -q "trap 'cleanup_config_snapshot; exit 130' HUP INT TERM" "$client"; then
+    printf '%s\n' 'client-interrupt: the early (config-window) signal trap does not exit; a handler that returns resumes the script after an interrupt' >&2
+    failures=$((failures + 1))
+fi
+# (2) The main signal trap must not let a failing cleanup swallow `exit 130`.
+#     `cleanup_client_runtime` returns non-zero when any step fails, and under
+#     `set -e` a bare `cleanup_client_runtime; exit 130` would exit with the
+#     cleanup code instead.  `|| true` keeps 130 authoritative.
+cases=$((cases + 1))
+if ! grep -q "trap 'cleanup_client_runtime || true; exit 130' HUP INT TERM" "$client"; then
+    printf '%s\n' 'client-interrupt: the main signal trap can be short-circuited by a failing cleanup before exit 130' >&2
+    failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'client-interrupt: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'client-interrupt checks passed: cases=%s signals=TERM/INT/HUP exit=130 residue=none control=not-130\n' "$cases"
+printf 'client-interrupt checks passed: cases=%s signals=TERM/INT/HUP exit=130 residue=none control=not-130 trap-shapes=pinned\n' "$cases"

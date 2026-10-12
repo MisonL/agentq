@@ -502,9 +502,13 @@ function Resolve-CredentialSource {
     }
 }
 
-# For AGENTQ_PASSWORD the secret would otherwise sit in the environment of every
-# ssh child, so it is moved into a private temporary script that reads it from
-# the environment.  The script carries no credential itself.
+# The askpass source is the ONLY credential source on this platform:
+# AGENTQ_PASSWORD is refused in Resolve-CredentialSource (AgentQ cannot write
+# the secret anywhere ssh reads it without the cleanup and metacharacter
+# problems noted there).  So no temporary wrapper is created here -- ssh reads
+# the secret from the user's own askpass program via SSH_ASKPASS_REQUIRE=force.
+# (The POSIX client does build such a wrapper; this comment used to describe
+# that mechanism, which does not exist in this file.)
 function Get-CredentialSshOptions {
     if ($script:CredentialSource -eq "") {
         return @("-o", "BatchMode=yes")
@@ -2032,7 +2036,16 @@ function Resolve-ProbeExitToken {
     # callers additionally require an exact Output value, which already rejects
     # most forgeries -- this keeps the two copies aligned rather than relying on
     # that as the only defense.
-    $exitTokenMatches = [regex]::Matches($Output, 'agentq-exit:(\d+)')
+    # At most three digits, exactly like the operation-path reader below
+    # (`(?m)^agentq-exit:(\d{1,3})\s*$`): the protocol codes are 0-255, so a
+    # longer run of digits cannot be one of ours.  An unbounded `\d+` here let a
+    # remote probe print `agentq-exit:<huge>` and make the subsequent `[int]`
+    # cast throw (measured 2026-10-12: `[int]"99999999999999999999"` throws
+    # RuntimeException); this file has no top-level trap, so an uncaught throw
+    # exits the client with 1 and a PowerShell error instead of a controlled
+    # diagnostic.  Leaving such a token unmatched falls back to the SSH exit
+    # code -- the fail-closed direction, same as the POSIX twin.
+    $exitTokenMatches = [regex]::Matches($Output, 'agentq-exit:(\d{1,3})')
     if ($exitTokenMatches.Count -gt 0) {
         $lastToken = $exitTokenMatches[$exitTokenMatches.Count - 1]
         $Output = $Output.Substring(0, $lastToken.Index).TrimEnd()

@@ -524,4 +524,20 @@ if [ "$failures" -ne 0 ]; then
     printf 'launcher-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'launcher-contract checks passed: cases=%s decoder=covered pathguards=covered roundtrip=covered windows-api=NOT-covered(needs-Windows)\n' "$cases"
+# Static lock: the argument-payload parse must be wrapped so a malformed payload
+# exits 2 (the contract's argument-error code), not 1.  Read-AgentQArguments
+# throws on empty / non-NUL-separated / over-limit / malformed payloads; with no
+# catch and $ErrorActionPreference="Stop" an uncaught throw exits a -File script
+# with 1 (measured 2026-10-12).  The client-side wrapper rejects oversize
+# payloads with the same ceiling before invoking the launcher, so this is
+# defense in depth, not a reachable path today -- but the code it reports must
+# still be the contract's 2.
+cases=$((cases + 1))
+if ! grep -q 'Read-AgentQArguments -Encoded \$encodedArguments' "$launcher"; then
+    printf '%s\n' 'launcher-contract: the launcher no longer calls Read-AgentQArguments (the static lock below would be vacuous)' >&2
+    failures=$((failures + 1))
+elif ! awk '/^try \{/ {in_try=1} in_try && /Read-AgentQArguments -Encoded \$encodedArguments/ {guarded=1} /catch/ {caught=1} END {exit !(guarded && caught)}' "$launcher"; then
+    printf '%s\n' 'launcher-contract: the argument parse is not wrapped in try/catch, so a malformed payload exits 1 instead of the contract 2' >&2
+    failures=$((failures + 1))
+fi
+printf 'launcher-contract checks passed: cases=%s decoder=covered pathguards=covered roundtrip=covered windows-api=NOT-covered(needs-Windows) malformed-payload=exit2\n' "$cases"
