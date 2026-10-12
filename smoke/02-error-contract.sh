@@ -193,11 +193,20 @@ if [ -n "$reason_gap_sites" ]; then
     printf 'exit-2 sites print a message but no reason line:\n%s\n' "$reason_gap_sites" >&2
     failures=$((failures + 1))
 fi
+# The gap count is derived from the same variable the guard above acts on, not a
+# hardcoded 0: a literal would keep reading "reason-gaps=0" if the guard were
+# ever separated from the summary.  It is 0 whenever this line is reached.
+if [ -n "$reason_gap_sites" ]; then
+    reason_gap_count=$(printf '%s\n' "$reason_gap_sites" | grep -c .)
+else
+    reason_gap_count=0
+fi
 
 if [ "$failures" -ne 0 ]; then
     printf 'error-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'error-contract checks passed: cases=%s commands=%s runtime=synthetic reasons=asserted reason-gaps=0\n' \
+printf 'error-contract checks passed: cases=%s commands=%s runtime=synthetic reasons=asserted reason-gaps=%s\n' \
     "$cases" \
-    "$(printf '%s\n' $documented_commands | wc -l | tr -d ' ')"
+    "$(printf '%s\n' $documented_commands | wc -l | tr -d ' ')" \
+    "$reason_gap_count"

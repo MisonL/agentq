@@ -2,7 +2,7 @@
 
 Remote task queue over SSH, backed by [Pueue](https://github.com/Nukesor/pueue) 4.0.4.
 
-**Version:** 0.1.5 — the deployment unit (`skill/assets/`, 23 files) ships as one
+**Version:** 0.1.6 — the deployment unit (`skill/assets/`, 23 files) ships as one
 version; releases are tagged in git and recorded in `CHANGELOG.md`.
 
 Submit a command to a remote host and keep tracking it after your terminal closes.
@@ -94,7 +94,11 @@ AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq ./run-tests.sh
 
 **A skip is not a pass.** `run-tests.sh` prints `NOT A FULL PASS` when anything
 skipped, and check `01` reports `ps1=skipped(...)` rather than a green light when
-`pwsh` is unavailable or unusable.
+`pwsh` is unavailable or unusable. Checks that admit a **platform-inherent** gap
+(a Windows-only code path on macOS/Linux) say so with `NOT-covered` and are
+reported on their own `NOT-covered:` line rather than folded into the pass — CI
+asserts that set is exactly the known one, so a new gap cannot hide as a green
+check.
 
 **After changing anything under `skill/`, sync the whole directory** — it is the
 install source, and nothing keeps the two in step automatically:

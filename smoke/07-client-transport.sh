@@ -36,8 +36,16 @@ if [ -z "$source_home" ] || [ ! -x "$source_home/pueue" ]; then
     printf '%s\n' 'client-transport: SKIPPED (needs AGENTQ_SMOKE_HOME with a real pueue)'
     exit 0
 fi
-if [ ! -x /usr/sbin/sshd ]; then
-    printf '%s\n' 'client-transport: SKIPPED (no /usr/sbin/sshd)'
+# sshd resolution: an override, then PATH, then the macOS/Linux default path.
+# Hardcoding /usr/sbin/sshd made "is a sandbox sshd available?" depend on the
+# machine layout rather than on the environment (Homebrew puts it in
+# /opt/homebrew/sbin, Nix elsewhere), which is a false-green class this suite
+# already catalogues.  The override also lets a mutated copy be driven by a
+# wrapper.
+sshd_binary=${AGENTQ_SMOKE_SSHD:-$(command -v sshd 2>/dev/null || true)}
+[ -n "$sshd_binary" ] || sshd_binary=/usr/sbin/sshd
+if [ ! -x "$sshd_binary" ]; then
+    printf '%s\n' 'client-transport: SKIPPED (no sshd; set AGENTQ_SMOKE_SSHD or install OpenSSH)'
     exit 0
 fi
 if [ ! -x "$client" ]; then
@@ -142,7 +150,7 @@ EOF
 port=''
 for _ in $(seq 1 25); do
     candidate=$(( 20000 + (RANDOM % 30000) ))
-    if /usr/sbin/sshd -f "$ssh_dir/sshd_config" -p "$candidate" 2>"$work/sshd.err"; then
+    if "$sshd_binary" -f "$ssh_dir/sshd_config" -p "$candidate" 2>"$work/sshd.err"; then
         port=$candidate
         break
     fi

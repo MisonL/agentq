@@ -222,9 +222,14 @@ if violations:
         print(f"    {arg}", file=sys.stderr)
     sys.exit(1)
 
+# The violation count is computed, not a literal: `path_arguments=0` as a fixed
+# string would keep claiming zero even if the guard above were ever separated
+# from it.  It is 0 whenever this line is reached (the `if violations: exit 1`
+# above guarantees it), but deriving it from len(violations) makes that a fact
+# of the code rather than a thing a reader has to trust.
 print(
     f"jq-path-arguments checks passed: jq_argv={len(args)} "
-    "path_arguments=0"
+    f"path_arguments={len(violations)}"
 )
 PY
 

@@ -260,14 +260,16 @@ assert_err_has w2 'was already removed before wait'
 #      tombstone-scan lock: every other case seeds a plain tombstone file, so
 #      nothing exercised the scan's path guards.  The symlink points OUTSIDE
 #      the tombstone directory and every chain component above it is a real
-#      directory, so the refusal must come from `request_metadata_file_is_safe`'s
-#      chain walk (`path_chain_is_safe` rejects any symlink component).  The
-#      early `-L` file check inside wait_reconcile's fallback reader does NOT
-#      see this file first: the fast path's `request_tombstone_path_guards_or_fail`
-#      runs before any read.  A variant that drops that guard falls through to
-#      the fallback `read_request_tombstone`, whose jq follows the link and
-#      ACCEPTS the well-formed tombstone behind it: green with the guard, red
-#      without it.  Measured 2026-10-11 both ways.
+#      directory, so the refusal comes from `request_metadata_file_is_safe`,
+#      which rejects a symlink at the leaf DIRECTLY (`[ ! -L "$metadata_path" ]`)
+#      and again via its chain walk (`path_chain_is_safe`).  Measured 2026-10-12:
+#      emptying ONLY the chain-walk check leaves this case green -- the leaf
+#      check catches it first -- so the guard this fixture actually pins is the
+#      pair, not the chain walk alone.  (A variant that drops the whole
+#      `request_tombstone_path_guards_or_fail` call falls through to the
+#      fallback `read_request_tombstone`, whose jq follows the link and ACCEPTS
+#      the well-formed tombstone behind it: green with the guard, red without
+#      it. Measured 2026-10-11 both ways.)
 sym_tomb_target="$work/symlink-target-tomb.json"
 tombstone AQREAD-SYMTOMB-000001 1001 > "$sym_tomb_target"
 clear_runtime

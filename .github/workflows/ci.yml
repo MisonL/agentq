@@ -73,6 +73,31 @@ jobs:
             exit 1
           fi
           grep -qE '^PASS checks: [0-9]+ ran, [01] skipped, 0 partial, 0 failed' smoke.log
+          # NOT-covered is platform-expected, so it is neither skipped nor
+          # partial and must not disturb the line above.  But the word has to
+          # be pinned somewhere: every check allowed to admit it must be in the
+          # known set (the Windows-only installers/launcher contract, plus 12's
+          # `ps51=NOT-covered`, which appears whenever pwsh is not PS 5.1 --
+          # exactly this job's situation).  A NEW `NOT-covered` -- a check that
+          # silently stopped covering something -- is the failure this gate is
+          # for; before the NCOV bucket existed the word classified as `ok` with
+          # no gate reading it at all.  The test is a SUBSET test, not equality:
+          # a known name DROPPING OUT (e.g. 12 when pwsh happens to be 5.1) means
+          # the platform covered more, which is good, not a red build.  An
+          # unknown name appearing is red in every direction.
+          known_ncov=" 12-ps-client-contract 13-ps-installer-contract 22-launcher-contract 23-durable-move-contract 25-ps-client-installer-contract "
+          unknown=''
+          for name in $(grep -E '^NOT-covered:' smoke.log | sed -E 's/^NOT-covered: [0-9]+ check\(s\) declared platform-unverifiable sub-parts: //'); do
+            case "$known_ncov" in
+              *" $name "*) : ;;
+              *) unknown="$unknown $name" ;;
+            esac
+          done
+          if [ -n "$unknown" ]; then
+            echo "NOT-covered reported by check(s) not in the known platform-expected set:$unknown" >&2
+            grep -E '^NOT-covered:' smoke.log >&2 || echo '(no NOT-covered line at all)' >&2
+            exit 1
+          fi
 
   macos:
     runs-on: macos-latest
@@ -143,6 +168,13 @@ jobs:
             if [ "$status" -ne 0 ]; then fail=1; fi
             if grep -q 'SKIPPED' "$log"; then
               echo "$check skipped -- it must run here" >&2
+              fail=1
+            fi
+            # These four must not report NOT-covered here: the Windows job is
+            # the one place those branches ARE verifiable.  A NOT-covered in
+            # one of these logs means the check gave up on this platform too.
+            if grep -q 'NOT-covered\|not-covered' "$log"; then
+              echo "$check reported NOT-covered on Windows, where those branches must be covered" >&2
               fail=1
             fi
           done

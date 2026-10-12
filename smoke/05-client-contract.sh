@@ -1110,6 +1110,37 @@ if [ "$leftovers" -ne 0 ]; then
     failures=$((failures + 1))
 fi
 
+# Static lock: run_ssh_logged must clear the forwarded reason BEFORE its early
+# returns.  The global `agentq_remote_failure_reason_value` is read by the
+# retry loop to classify a failure; several guards (log-file checks, the Windows
+# arg-identity check) return WITHOUT reaching ssh.  If the clear sits after them
+# a retry that failed a LOCAL guard reports the PREVIOUS attempt's
+# `remote failure reason: <class>` for a call that never contacted the server
+# (measured 2026-10-12).  Position is the whole point, so this asserts the clear
+# is the FIRST statement in the FUNCTION BODY -- searched only inside
+# run_ssh_logged, since the same literal also appears as the top-level global
+# initialiser (line ~50), which a whole-file grep would wrongly credit.
+cases=$((cases + 1))
+reason_fn_line=$(grep -n '^run_ssh_logged()' "$client" | head -1 | cut -d: -f1) || true
+if [ -z "$reason_fn_line" ]; then
+    printf '%s\n' 'client-contract: could not locate run_ssh_logged' >&2
+    failures=$((failures + 1))
+else
+    # Everything from the function opener to its closing brace at column 0.
+    fn_body=$(awk -v start="$reason_fn_line" 'NR>=start{print} NR>start && /^}[[:space:]]*$/{exit}' "$client")
+    # Line offset (1-based, relative to the opener) of the clear and of the
+    # first early return, both measured WITHIN the function body.
+    clear_rel=$(printf '%s\n' "$fn_body" | grep -n "agentq_remote_failure_reason_value=''" | head -1 | cut -d: -f1) || true
+    return_rel=$(printf '%s\n' "$fn_body" | grep -n 'return \$?' | head -1 | cut -d: -f1) || true
+    if [ -z "$clear_rel" ]; then
+        printf '%s\n' 'client-contract: run_ssh_logged no longer clears the forwarded reason at all' >&2
+        failures=$((failures + 1))
+    elif [ -n "$return_rel" ] && [ "$clear_rel" -ge "$return_rel" ]; then
+        printf '%s\n' 'client-contract: the forwarded-reason clear sits at/after run_ssh_logged'"'"'s first early return; a local-guard failure would report a stale reason from a prior attempt' >&2
+        failures=$((failures + 1))
+    fi
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'client-contract: %s failure(s)\n' "$failures" >&2
     exit 1
