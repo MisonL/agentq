@@ -336,7 +336,7 @@ cleanup_config_snapshot() {
 # 0).  This handler cleans the snapshot then exits 130, the same form the full
 # trap below uses; that trap supersedes HUP/INT/TERM once defined.
 trap cleanup_config_snapshot EXIT
-trap 'cleanup_config_snapshot; exit 130' HUP INT TERM
+trap 'cleanup_config_snapshot || true; exit 130' HUP INT TERM
 
 if [ -L "$config_path" ]; then
     printf '%s: AGENTQ_CONFIG must be a regular file; symbolic links are not accepted\n' "$program" >&2
@@ -2816,6 +2816,19 @@ run_ssh_logged() {
     ssh_log_file=$1
     ssh_remote_command=$2
     ssh_input_file=${3:-}
+
+    # Clear the reason FIRST, before any early return.  This global carries the
+    # controlled `reason=<class>` token the server sent on THIS ssh call, and
+    # callers read it to classify a failure (retryable lock contention vs an
+    # argument error).  The early returns below -- the log-file guards, the
+    # Windows arg-identity check -- bail out WITHOUT reaching ssh, so if the
+    # clear sat after them (its old position, mid-function) a retry that failed
+    # a LOCAL guard would still carry the PREVIOUS attempt's reason and report
+    # `remote failure reason: lock_contention` for a call that never contacted
+    # the server (measured 2026-10-12: a retry loop's second attempt that failed
+    # the local guard printed the first attempt's reason).  Clearing on entry
+    # makes the value describe only the attempt that set it.
+    agentq_remote_failure_reason_value=''
 
     agentq_ssh_log_require_file "$ssh_log_file" || return $?
     agentq_ssh_log_remove_file "$ssh_log_file" || return $?

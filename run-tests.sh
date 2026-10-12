@@ -15,6 +15,8 @@ failures=0
 ran=0
 skipped=0
 partial=0
+notcovered=0
+notcovered_list=''
 
 # The check list is held in a variable, NOT streamed into the loop on stdin.
 # A check may spawn a process that reads stdin -- 07-client-transport starts a
@@ -90,6 +92,26 @@ while IFS= read -r check <&3; do
         # check was not verified.
         printf 'PART  %-28s %s\n' "$name" "$(grep -i skipped "$output" | head -1)"
         partial=$((partial + 1))
+    elif grep -q 'NOT-covered\|not-covered' "$output"; then
+        # A THIRD bucket, distinct from PART.  A check whose summary says
+        # `staging=NOT-covered(needs-Windows)` has admitted a named sub-part it
+        # cannot verify HERE -- but that sub-part is a permanent property of the
+        # platform (needs-Windows), not a gap that a better run would close.  It
+        # is therefore NOT routed to PART: doing so would print `N partial` and
+        # `NOT A FULL PASS` on every macOS/Linux run, and the only way to keep
+        # CI green would be to relax the `0 partial` gate -- which would weaken
+        # it for REAL partials too.  Instead it gets a visible bucket, a count,
+        # and a named list on its own line; ci.yml asserts every name on that
+        # list is in the known set, so a NEW one -- a check that silently
+        # stopped covering something -- fails the gate.  Before this branch
+        # existed the word was invisible: a check printing NOT-covered
+        # classified `ok`, the summary said `0 partial`, and no gate ever
+        # learned of it (found and reproduced by the 2026-10-12 full-dimension
+        # review: a check printing NOT-covered classified `ok`, and a log with
+        # three such checks passed both CI gates).
+        printf 'NCOV  %-28s %s\n' "$name" "$(grep -E 'NOT-covered|not-covered' "$output" | head -1)"
+        notcovered=$((notcovered + 1))
+        notcovered_list="$notcovered_list$name "
     elif [ ! -s "$output" ]; then
         # A check that exits 0 without printing anything has not demonstrated
         # anything.  Treat silence as failure so a vacuous pass cannot hide
@@ -138,6 +160,13 @@ if [ "$skipped" -ne 0 ] || [ "$partial" -ne 0 ]; then
 else
     printf '\n%s checks: %s ran, %s skipped, %s partial, %s failed (%ss)\n' \
         "$verdict" "$ran" "$skipped" "$partial" "$failures" "$elapsed"
+fi
+# Platform-expected NOT-covered, reported on its own line so the `checks:` line
+# above keeps the exact shape every gate greps for.  This line is what CI pins:
+# every name on it must be in the known set (see the NCOV branch above for why
+# the bucket exists).
+if [ "$notcovered" -ne 0 ]; then
+    printf '%s\n' "NOT-covered: $notcovered check(s) declared platform-unverifiable sub-parts: $notcovered_list"
 fi
 
 [ "$failures" -eq 0 ] || exit 1

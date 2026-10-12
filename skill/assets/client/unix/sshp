@@ -375,18 +375,26 @@ esac
 
 resolve_ssh_binary
 is_nonnegative_integer "$reconnect_delay" || fail 'SSHP_RECONNECT_DELAY must be a non-negative integer'
-initialize_ssh_runtime
+# Bind BOTH traps BEFORE initialize_ssh_runtime creates the private runtime
+# directory.  If the signal traps are set only after runtime creation, a signal
+# landing in the microsecond window between the two leaves the just-made
+# directory (and its -E ssh diagnostic log) unreclaimed: on dash a fatal signal
+# with no handler does NOT run the EXIT trap (measured 2026-10-12:
+# `dash -c 'c(){ :;}; trap c EXIT; kill -INT $$'` exits 130 with no cleanup;
+# bash and ksh do clean up), so on Debian/Ubuntu, where /bin/sh is dash, the
+# directory would leak.  cleanup_ssh_runtime tolerates being called before
+# creation: ssh_runtime_directory and windows_input_pid are pre-set to '' at the
+# top of the file, and the function no-ops on empty values.
+#
+# The `|| true` on the signal trap mirrors the client's own hardened form.
+# `cleanup_ssh_runtime` is total today (every step is `|| true`-guarded), so a
+# bare `; exit 130` would not currently mis-fire -- but relying on that accident
+# means the next edit to the cleanup body could silently swallow the 130 under
+# `set -e`, turning an interrupted session into "failed".  Make 130 authoritative
+# here too rather than depend on the function staying total.
 trap cleanup_ssh_runtime EXIT
-# Bind the signal traps HERE, next to the EXIT trap, not just before the main
-# loop.  The probe / install / reconnect window (prepare_remote's unbounded
-# reconnect sleep, prompt_install's interactive read) runs between runtime
-# creation and the loop, and a fatal signal with no handler does NOT run the
-# EXIT trap on dash (measured 2026-10-12: `dash -c 'c(){ :;}; trap c EXIT;
-# kill -INT $$'` exits 130 with no cleanup; bash and ksh do clean up).  So on
-# Debian/Ubuntu, where /bin/sh is dash, Ctrl-C during that window leaked
-# $TMPDIR/sshp.XXXXXX with its -E ssh diagnostic log.  The handler cleans up
-# then exits 130, matching the client's own trap form.
-trap 'cleanup_ssh_runtime; exit 130' HUP INT TERM
+trap 'cleanup_ssh_runtime || true; exit 130' HUP INT TERM
+initialize_ssh_runtime
 
 # shellcheck disable=SC2016
 remote_probe_command='

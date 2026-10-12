@@ -37,6 +37,10 @@ set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 client="$root/skill/assets/client/unix/sshp"
+# The asset path is overridable so a mutated copy can drive this check (mirrors
+# smoke/05's AGENTQ_SMOKE_CLIENT); without it the trap-window locks below could
+# not be proven to go red.
+client=${AGENTQ_SMOKE_CLIENT:-$client}
 [ -f "$client" ] || { printf '%s\n' 'sshp-contract: missing client asset' >&2; exit 1; }
 
 # sshp walks every path component and rejects symlinks (runtime_path_is_safe),
@@ -404,19 +408,33 @@ fi
 # early, but before 2026-10-12 the HUP/INT/TERM trap was set ~790 lines later,
 # just before the main loop -- so a signal during the probe / reconnect /
 # install window ran NO cleanup on dash (a fatal signal with no handler does not
-# run the EXIT trap there; measured).  The signal trap must now sit right after
-# the runtime is created and clean up before exiting 130.  Both the shape and
-# its proximity to runtime creation are asserted: a trap moved back down would
-# pass a bare grep.
+# run the EXIT trap there; measured).  The first fix bound the trap right AFTER
+# runtime creation; the 2026-10-12 follow-up moved BOTH traps to sit BEFORE
+# initialize_ssh_runtime, closing the microsecond window between directory
+# creation and trap binding (a signal landing there still leaked the directory,
+# because no handler existed yet).  So the assertion is now: the signal trap
+# must bind STRICTLY ABOVE `initialize_ssh_runtime`, in the hardened `|| true`
+# form.  A trap moved back below runtime creation -- the shape the first fix
+# allowed and this one rejects -- must go red, which a bare grep of the trap
+# text (position-blind) would miss.
 cases=$((cases + 1))
-init_line=$(grep -n '^initialize_ssh_runtime$' "$client" | head -1 | cut -d: -f1)
-trap_line=$(grep -n "trap 'cleanup_ssh_runtime; exit 130' HUP INT TERM" "$client" | head -1 | cut -d: -f1)
+init_line=$(grep -n '^initialize_ssh_runtime$' "$client" | head -1 | cut -d: -f1) || true
+trap_line=$(grep -n "trap 'cleanup_ssh_runtime || true; exit 130' HUP INT TERM" "$client" | head -1 | cut -d: -f1) || true
 if [ -z "$trap_line" ]; then
-    printf '%s\n' 'sshp-contract: the signal trap does not clean up before exit 130' >&2
+    printf '%s\n' 'sshp-contract: the signal trap does not clean up authoritatively before exit 130 (expected the `|| true` form)' >&2
     failures=$((failures + 1))
-elif [ -z "$init_line" ] || [ $((trap_line - init_line)) -gt 30 ]; then
-    printf 'sshp-contract: the signal trap is %s lines below initialize_ssh_runtime (must bind within the early window, not before the main loop)\n' \
-        "$((trap_line - init_line))" >&2
+elif [ -z "$init_line" ] || [ "$trap_line" -ge "$init_line" ]; then
+    printf 'sshp-contract: the signal trap binds at line %s, not before initialize_ssh_runtime (%s); a signal between runtime creation and trap binding leaks the directory on dash\n' \
+        "${trap_line:-<absent>}" "${init_line:-<absent>}" >&2
+    failures=$((failures + 1))
+fi
+# The EXIT trap must ALSO precede runtime creation: on dash the EXIT trap only
+# runs if a handler exists for the fatal signal, so binding EXIT before the
+# directory exists is what makes the pre-trap window leak-free.
+cases=$((cases + 1))
+exit_trap_line=$(grep -n '^trap cleanup_ssh_runtime EXIT$' "$client" | head -1 | cut -d: -f1) || true
+if [ -z "$exit_trap_line" ] || { [ -n "$init_line" ] && [ "$exit_trap_line" -ge "$init_line" ]; }; then
+    printf '%s\n' 'sshp-contract: the EXIT trap binds at or after initialize_ssh_runtime; it must precede runtime creation so a signal in the early window still cleans up' >&2
     failures=$((failures + 1))
 fi
 

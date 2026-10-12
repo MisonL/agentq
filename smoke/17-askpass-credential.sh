@@ -30,8 +30,12 @@ if [ -z "$source_home" ] || [ ! -x "$source_home/pueue" ]; then
     printf '%s\n' 'askpass-credential: SKIPPED (needs AGENTQ_SMOKE_HOME with a real pueue)'
     exit 0
 fi
-if [ ! -x /usr/sbin/sshd ]; then
-    printf '%s\n' 'askpass-credential: SKIPPED (no /usr/sbin/sshd)'
+# sshd resolution: an override, then PATH, then the macOS/Linux default path
+# (see smoke/07 for why hardcoding made availability depend on machine layout).
+sshd_binary=${AGENTQ_SMOKE_SSHD:-$(command -v sshd 2>/dev/null || true)}
+[ -n "$sshd_binary" ] || sshd_binary=/usr/sbin/sshd
+if [ ! -x "$sshd_binary" ]; then
+    printf '%s\n' 'askpass-credential: SKIPPED (no sshd; set AGENTQ_SMOKE_SSHD or install OpenSSH)'
     exit 0
 fi
 for command_name in jq ssh-keygen ssh; do
@@ -130,7 +134,7 @@ EOF
 port=''
 for _ in $(seq 1 25); do
     candidate=$(( 20000 + (RANDOM % 30000) ))
-    if /usr/sbin/sshd -f "$ssh_dir/sshd_config" -p "$candidate" 2>"$work/sshd.err"; then
+    if "$sshd_binary" -f "$ssh_dir/sshd_config" -p "$candidate" 2>"$work/sshd.err"; then
         port=$candidate
         break
     fi

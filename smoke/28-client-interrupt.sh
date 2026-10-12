@@ -167,9 +167,16 @@ cases=$((cases + 1))
 # (1) The EARLY window (config validation) must also exit on a signal.  A
 #     handler that merely cleans and returns lets the shell resume past the
 #     interrupt.  Before 2026-10-12 this was `trap cleanup_config_snapshot EXIT
-#     HUP INT TERM`; it must now be a `; exit 130` form.
-if ! grep -q "trap 'cleanup_config_snapshot; exit 130' HUP INT TERM" "$client"; then
-    printf '%s\n' 'client-interrupt: the early (config-window) signal trap does not exit; a handler that returns resumes the script after an interrupt' >&2
+#     HUP INT TERM`; it must now be a `; exit 130` form.  The `|| true` is the
+#     same requirement as (2): `cleanup_config_snapshot` returns non-zero when
+#     any rm/rmdir fails or a snapshot file remains, and under `set -e` a bare
+#     `cleanup_config_snapshot; exit 130` would exit with the CLEANUP code
+#     instead of 130 -- turning "interrupted" into "failed".  Measured
+#     2026-10-12: with the function returning 3, `dash`/`/bin/sh` exit 3, not
+#     130.  The 0.1.5 fix corrected the bound function but left this window
+#     without `|| true`; this lock now pins the hardened form in BOTH traps.
+if ! grep -q "trap 'cleanup_config_snapshot || true; exit 130' HUP INT TERM" "$client"; then
+    printf '%s\n' 'client-interrupt: the early (config-window) signal trap does not exit 130 authoritatively; a handler that returns resumes the script, and a failing cleanup swallows the 130' >&2
     failures=$((failures + 1))
 fi
 # (2) The main signal trap must not let a failing cleanup swallow `exit 130`.
