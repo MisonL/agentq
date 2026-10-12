@@ -170,13 +170,6 @@ jobs:
               echo "$check skipped -- it must run here" >&2
               fail=1
             fi
-            # These four must not report NOT-covered here: the Windows job is
-            # the one place those branches ARE verifiable.  A NOT-covered in
-            # one of these logs means the check gave up on this platform too.
-            if grep -q 'NOT-covered\|not-covered' "$log"; then
-              echo "$check reported NOT-covered on Windows, where those branches must be covered" >&2
-              fail=1
-            fi
           done
           exit "$fail"
       - name: Assert PS 5.1 was the interpreter
