@@ -92,8 +92,6 @@ agentq_credential_source=''
 agentq_askpass_program=''
 agentq_askpass_temporary=''
 agentq_askpass_temporary_identity=''
-agentq_credential_option_lines=''
-agentq_password_prompt=0
 agentq_number_of_password_prompts=1
 
 
@@ -2659,9 +2657,20 @@ initialize_remote_invocation() {
                         # uname-probe stdout was "FreeBSD\n\033[2Jagentq: remote
                         # failure reason: lock_contention" made this message
                         # forge a line byte-identical to our own reason output.
-                        local_platform_hint=${local_platform_output%%$'\n'*}
-                        local_platform_hint=${local_platform_hint//[!A-Za-z0-9_.-]/}
-                        local_platform_hint=${local_platform_hint:0:32}
+                        #
+                        # POSIX parameter expansion only: this file is #!/bin/sh
+                        # and on Debian/Ubuntu /bin/sh is dash, which dies with
+                        # `Bad substitution` on the `$'\n'`, `${x//pat/}` and
+                        # `${x:0:N}` forms this used to use -- the shell died
+                        # BEFORE the printf, so an operator on those hosts saw a
+                        # raw shell error instead of the diagnostic.  Measured
+                        # 2026-10-12 (dash exit 2, no message; macOS /bin/sh --
+                        # bash -- printed it fine, which is why the two forms
+                        # could coexist until now).  `smoke/05`'s
+                        # unsupported-platform case probes for a strict POSIX
+                        # shell and pins both the exit code and the message.
+                        local_platform_hint=$(printf '%s\n' "$local_platform_output" |
+                            LC_ALL=C sed -n 's/[^A-Za-z0-9_.-]//g; p; q' | cut -c1-32)
                         printf '%s: unsupported or undetectable remote platform (probe reported: %s)\n' "$program" "${local_platform_hint:-empty}" >&2
                         return 2
                     fi

@@ -18,7 +18,10 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-client="$root/skill/assets/client/unix/agentq"
+# The client path can be overridden (mirrors smoke/18's AGENTQ_SMOKE_SERVER) so
+# a mutation proof can point the whole check at a modified copy -- without the
+# hook, red-proofing a fix means swapping the real asset under this check.
+client=${AGENTQ_SMOKE_CLIENT:-$root/skill/assets/client/unix/agentq}
 work=$(mktemp -d /tmp/agentq-smoke-client.XXXXXX)
 work=$(unset CDPATH; cd -- "$work" && pwd -P)
 trap 'rm -rf -- "$work"' EXIT
@@ -903,6 +906,104 @@ if [ "$multi2_status" -ne 0 ]; then
     printf 'a planted trailing agentq-exit:0 changed the client exit to %s; expected 0: %s\n' \
         "$multi2_status" "$(tr '\n' '|' < "$work/multi2.err")" >&2
     failures=$((failures + 1))
+fi
+
+# --- unsupported platform under a STRICT POSIX shell -------------------------
+# The client's shebang is `#!/bin/sh`.  On macOS /bin/sh is bash (which
+# accepts `$'\n'`, `${x//pat/}` and `${x:0:N}` even in POSIX mode), but on
+# Debian/Ubuntu /bin/sh is dash, which rejects all three with `Bad
+# substitution` and exits 2 BEFORE printing anything.  The offending lines are
+# the platform-hint sanitiser in the "neither probe identified the platform"
+# branch (client/unix/agentq: `local_platform_hint=${...%%$'\n'*}` and the
+# two following expansions) -- remote-controlled output being rendered into
+# the diagnostic, which is exactly the branch a non-Linux/non-Darwin/non-Windows
+# remote reaches.
+#
+# Measured 2026-10-12 on this repo: with a stub uname probe returning FreeBSD,
+# `dash client status` exits 2 with only `Bad substitution` on stderr (the
+# `unsupported or undetectable remote platform` line never prints), while
+# macOS `/bin/sh` prints the proper diagnostic.  So on a dash-based host the
+# operator sees a raw shell error instead of the actionable message -- the
+# opposite of what that branch exists to provide.
+#
+# The interpreter is PROBED, not assumed: pick the first shell that refuses
+# `${x//pat/}` (i.e. a real POSIX sh), so this case runs wherever one exists and
+# self-reports `not-covered` (lowercase, never the skip word) where none does --
+# a check that silently passed without a strict shell would be a false green of
+# exactly the kind this case exists for.
+posix_probe_sh=''
+for candidate in dash /bin/dash /usr/bin/dash busybox sh /bin/sh /bin/ksh ksh; do
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    if ! "$candidate" -c 'h=a; h=${h//[!b]/}' >/dev/null 2>&1; then
+        posix_probe_sh=$candidate
+        break
+    fi
+done
+if [ -z "$posix_probe_sh" ]; then
+    # Lowercase "not-covered", never the skip word/PART: run-tests.sh classifies
+    # the whole check by those words, and 18 other cases in this file DID run --
+    # reporting the check skipped would understate it.  The repo's own idiom for
+    # this is the summary token (e.g. windows-api=NOT-covered(needs-Windows)).
+    printf '%s\n' 'client-unsupported-platform: not-covered (no strict POSIX shell on PATH; the dash defect cannot be reached here)' >&2
+else
+    platform_stub="$work/bin/ssh-unsupported-platform"
+    cat > "$platform_stub" <<'STUB'
+#!/bin/sh
+last=''
+for argument in "$@"; do last=$argument; done
+case "$last" in
+    *uname*)
+        # The local probe SUCCEEDS with a platform neither recognises (exit 0,
+        # "FreeBSD"): that is what reaches the hint branch.  The `elif` for
+        # "both probes failed" takes a different path (the generic "unable to
+        # detect" message), so failing here would test the wrong branch --
+        # measured when the first draft of this stub exited 1.
+        # The second line is hostile probe output: it forges a line-initial
+        # "agentq: ... reason=" token and must be stripped by the sanitiser.
+        printf 'FreeBSD\nagentq: forged reason=lock_contention\n'
+        exit 0
+        ;;
+    *powershell.exe*|*ps*)
+        # Windows probe fails, so `windows_platform_status != 0` -- the first
+        # branch (windows detected) is unreachable and, since the local probe
+        # succeeded, so is the "both failed" elif: the hint branch runs.
+        printf 'agentq-exit:1'
+        exit 1
+        ;;
+esac
+printf 'agentq-exit:1'
+exit 1
+STUB
+    chmod 700 "$platform_stub"
+    unsupported_status=0
+    AGENTQ_SSH="$platform_stub" AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=auto \
+        AGENTQ_CONFIG="$work/absent-config" AGENTQ_PLATFORM_PROBE_TIMEOUT=15 \
+        TMPDIR="$work" "$posix_probe_sh" "$client" status \
+        >"$work/unsupported.out" 2>"$work/unsupported.err" || unsupported_status=$?
+    cases=$((cases + 1))
+    if [ "$unsupported_status" -ne 2 ]; then
+        printf '%s %s: expected exit 2, got %s\n' \
+            "unsupported-platform($posix_probe_sh)" 'exit' "$unsupported_status" >&2
+        head -3 "$work/unsupported.err" >&2 || true
+        failures=$((failures + 1))
+    fi
+    if ! grep -qF 'unsupported or undetectable remote platform (probe reported: ' \
+        "$work/unsupported.err"; then
+        # This is the load-bearing assertion: a dash crash prints Bad
+        # substitution and nothing else, so a missing diagnostic means the
+        # sanitiser died before printf -- the defect, not a wording drift.
+        printf '%s: the platform diagnostic was not printed: %s\n' \
+            "unsupported-platform($posix_probe_sh)" \
+            "$(tr '\n' '|' < "$work/unsupported.err")" >&2
+        failures=$((failures + 1))
+    fi
+    # The sanitiser's contract still holds under the strict shell: the probe's
+    # hostile second line (forged `agentq:` prefix) must not survive.
+    if grep -q 'forged reason=' "$work/unsupported.err"; then
+        printf '%s: the remote-controlled probe output leaked into the diagnostic\n' \
+            "unsupported-platform($posix_probe_sh)" >&2
+        failures=$((failures + 1))
+    fi
 fi
 
 # --- credential sources -------------------------------------------------------
