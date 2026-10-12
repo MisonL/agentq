@@ -51,6 +51,7 @@ min_plausible=32
 prefix='powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand '
 
 failures=0
+sites=0
 
 # command_line_length <script-text>
 # Encodes exactly as the clients do: UTF-16LE, then base64, then the prefix.
@@ -82,6 +83,7 @@ PY
 check_site() {
     local label=$1 length=$2
     local verdict
+    sites=$((sites + 1))
     # A zero length is not a short command line -- it is an extraction that
     # matched nothing, and reporting it as "ok" is the false-green this file has
     # already been bitten by twice (the site-2 marker that matched a variable
@@ -159,6 +161,7 @@ if [ "${#probe_cmdline}" -gt "$budget" ]; then
 else
     probe_cmdline_verdict='ok'
 fi
+sites=$((sites + 1))
 printf '%-46s %6s chars  (budget %s)  %s\n' \
     'POSIX client: Windows platform probe' "${#probe_cmdline}" "$budget" "$probe_cmdline_verdict"
 
@@ -270,5 +273,6 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 
-printf '\nremote-command-length checks passed: sites=7 budget=%s smallest-limit=%s\n' \
+printf '\nremote-command-length checks passed: sites=%s budget=%s smallest-limit=%s\n' \
+    "$sites" \
     "$budget" "$smallest_measured_limit"

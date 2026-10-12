@@ -400,8 +400,28 @@ if [ "$leftovers" -ne 0 ]; then
     failures=$((failures + 1))
 fi
 
+# Static lock on the signal-trap window.  sshp creates its runtime directory
+# early, but before 2026-10-12 the HUP/INT/TERM trap was set ~790 lines later,
+# just before the main loop -- so a signal during the probe / reconnect /
+# install window ran NO cleanup on dash (a fatal signal with no handler does not
+# run the EXIT trap there; measured).  The signal trap must now sit right after
+# the runtime is created and clean up before exiting 130.  Both the shape and
+# its proximity to runtime creation are asserted: a trap moved back down would
+# pass a bare grep.
+cases=$((cases + 1))
+init_line=$(grep -n '^initialize_ssh_runtime$' "$client" | head -1 | cut -d: -f1)
+trap_line=$(grep -n "trap 'cleanup_ssh_runtime; exit 130' HUP INT TERM" "$client" | head -1 | cut -d: -f1)
+if [ -z "$trap_line" ]; then
+    printf '%s\n' 'sshp-contract: the signal trap does not clean up before exit 130' >&2
+    failures=$((failures + 1))
+elif [ -z "$init_line" ] || [ $((trap_line - init_line)) -gt 30 ]; then
+    printf 'sshp-contract: the signal trap is %s lines below initialize_ssh_runtime (must bind within the early window, not before the main loop)\n' \
+        "$((trap_line - init_line))" >&2
+    failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'sshp-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'sshp-contract checks passed: cases=%s stub-ssh=yes reconnect=covered argv=checked residue=none\n' "$cases"
+printf 'sshp-contract checks passed: cases=%s stub-ssh=yes reconnect=covered argv=checked residue=none trap-window=pinned\n' "$cases"

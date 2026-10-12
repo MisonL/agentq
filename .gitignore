@@ -47,5 +47,12 @@ config/agentq/
 *.swo
 *~
 
+# Python bytecode.  smoke/ has a .py (10-launcher-parity.py); running it as a
+# script creates nothing, but importing it -- as a mutation harness or a future
+# test helper might -- drops __pycache__/ next to it, which must never be
+# committed.
+__pycache__/
+*.pyc
+
 # Sandbox leftovers, in case sandbox.sh is ever pointed at the repo.
 /aqsb/

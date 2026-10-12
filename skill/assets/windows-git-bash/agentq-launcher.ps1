@@ -361,7 +361,19 @@ Assert-AgentQLauncherRequiredFile -Path $serverPath -Description "AgentQ server"
 Assert-AgentQLauncherRequiredFile -Path $gitBashPath -Description "Git Bash launcher"
 
 $encodedArguments = $ArgumentsBase64.Trim()
-[string[]]$arguments = @(Read-AgentQArguments -Encoded $encodedArguments)
+# Read-AgentQArguments throws on an empty / non-NUL-separated / over-limit /
+# malformed payload.  Those are PROTOCOL argument errors, which the contract
+# maps to exit 2 -- but with no catch here the throw reached the top level and
+# exited 1 (measured 2026-10-12: an uncaught throw in a -File script exits 1).
+# The client-side wrapper already rejects oversize payloads with the same
+# 1048576 ceiling before invoking the launcher, so this is defense in depth,
+# not a reachable path today; still, it must report the contract code.
+try {
+    [string[]]$arguments = @(Read-AgentQArguments -Encoded $encodedArguments)
+} catch {
+    [Console]::Error.WriteLine("agentq: $($_.Exception.Message)")
+    exit 2
+}
 $currentUserEnvironment = Get-CurrentWindowsUserEnvironment
 Set-AgentQUserEnvironment -UserEnvironment $currentUserEnvironment
 $environmentVariable = "AGENTQ_SERVER_PATH"

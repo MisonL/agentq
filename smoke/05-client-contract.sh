@@ -179,9 +179,11 @@ fi
 credential_cases=0
 # The count of cases.  It was a literal `16` in the summary line until
 # 2026-10-05, which meant a new case could be added without the reported number
-# moving -- a small false green of its own.  It starts at the 16 pre-existing
-# cases and the cases added since increment it; the summary prints this value.
-cases=16
+# moving -- a small false green of its own.  That first fix left the 16 as a
+# hardcoded base with only the LATER cases incrementing (2026-10-12 review);
+# now every case increments it: expect_rejected bumps it, and the explicit
+# cases=$((cases+1)) sites do too.  So the number tracks the assertions.
+cases=0
 
 # expect_rejected <expected-message-fragment> [args...]
 expect_rejected() {
@@ -189,6 +191,7 @@ expect_rejected() {
     shift
     local label=$*
     local status=0
+    cases=$((cases + 1))
     AGENTQ_SSH="$work/bin/ssh" AGENTQ_HOST=smoke-host \
         "$client" "$@" >"$work/out" 2>"$work/err" || status=$?
     if [ "$status" -ne 2 ]; then

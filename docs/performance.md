@@ -237,8 +237,7 @@ TOCTOU 窗口），删掉中间多余的同调用。
 `symrecord` **抓不到它**——它只种子化记录符号链接，墓碑扫描根本没跑到。折叠后 `w2b` 全绿。
 
 **同日评估后否掉的一处（`load_cancellation_markers` 的标记循环）——不是遗漏，是实测
-无可测差异。** 该循环里 `cancellation_marker_is_valid` 内部本身就跑 `守卫→探针→守卫`
-（第 4218–4222 行），所以循环体里那对**外部**守卫看似冗余。但两点使它**不该动**：
+无可测差异。** 该循环里 `cancellation_marker_is_valid` 内部本身就跑 `守卫→探针→守卫`（见该函数体内联的两处 `request_metadata_file_is_safe`），所以循环体里那对**外部**守卫看似冗余。但两点使它**不该动**：
 ① **不可观测**——实测把这对守卫**连同** `cancellation_marker_is_valid` 内的守卫**全部**
 删掉（`nogrdC` 变体），`status` 仍退 1、stderr 仍打 `invalid AgentQ cancellation marker
 path`，因为循环体自己那两行 `[ -f ] && [ ! -L ]` **独立**拦住了符号链接 marker；也就是
