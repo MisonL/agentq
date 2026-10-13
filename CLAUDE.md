@@ -116,7 +116,7 @@ doctor
 | `3` | `lookup` 的 `not_found` / `not_started`——**都不是完成结果**，只可用相同参数与相同 request ID 重试 |
 | `4` | `ambiguous` 或 `removing` / `cancellation_pending`——服务端无法安全判断，**必须停止**，不得自动重试 |
 | `5` | 已移除（`wait`/`lookup` 的 `state: "removed"`；tombstone 保留期内可重复读到，不是一次性） |
-| `6` | `wait` 无法确认最终状态（`state: "unavailable"`） |
+| `6` | `wait`/`logs` 无法确认最终状态（`state: "unavailable"`；`logs` 在任务身份歧义时同样退 `6`，实测 `agentq-server` 的 `logs()`） |
 | `42-45` | Windows launcher（`agentq.ps1` / `sshp` 客户端） |
 | `124` | 平台探测超时（客户端） |
 

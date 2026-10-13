@@ -1,4 +1,4 @@
-# AgentQ 规划 · A 类记录（A1–A32）
+# AgentQ 规划 · A 类记录（A1–A33）
 
 **这是 `docs/PLAN.md` 的一部分，不是清单本身。** 全部 A 类条目均已关闭，正文
 在此归档；待办、C 类（需要你给范围）、取消清单、警告清单与执行状态见
@@ -2171,3 +2171,75 @@ blocker 是 `sleep 60`、清理时**仍在 Running**，而 **Pueue 拒绝删除�
 的 probe，但它们的运行时是**各自独立的临时目录**并在 EXIT trap 里连 pueued 一起杀掉，
 不共享状态，不受本条影响；本仓其余检查没有同形的「清理循环只调 remove」模式（已 grep 确认）。
 
+
+## A33：第三轮全维度审查（2026-10-13，6 个并行只读 agent，每条发现本人复现/证伪）
+
+第三轮沿用 C5/A28 先例：6 个互不知情的只读审查者（服务端 / POSIX 客户端 / Windows 资产 /
+安装器与服务单元 / 测试与 CI / 契约与文档）各包一个维度，**每条高影响结论都由本人对代码或
+实测复核后才动手**。本轮修 12 处，另留 1 处已复现但**刻意不修**（见末段）。
+
+**已修（每条都先证明能红）**：
+
+1. **裸 EXIT trap 吞协议退出码（3 资产，P1）**——`set -e` 下 EXIT trap 里的 cleanup 返回非零
+   会让 shell 以 **cleanup 的码**退出，主体的协议码丢失。实测（bash 3.2/bash/dash 三者一致）：
+   `set -e; f(){ return 3; }; trap f EXIT; exit 5` → 退 3；`exit 0` → 退 1（**成功被翻成失败**）。
+   受影响：`agentq-server:1666`（**agent 用真服务端复现**：锁目录 chmod 555 时 `wait 1001`
+   stdout 正确而 exit=1）、`client/unix/agentq` 两处（早期 config 窗口 + 主 trap）、
+   `client/unix/sshp`（今日 total，潜伏）。修法与 0.1.5/0.1.6 的信号 trap 逐字同形：
+   `trap '... || true' EXIT`。锁：`smoke/02` 新增服务端 EXIT-trap 形态锁、`smoke/28` 新增客户端
+   两个 EXIT-trap 锁、`smoke/19` 的 EXIT-trap 锁从旧形态改为 `|| true` 形态。
+2. **`submit` 的裸 `$( )` 赋值毒化整个 request 目录（P0）**——`with_operation_lock` 用 `if "$@"`
+   调命令体（errexit 关闭），`$( )` 内 `fail` 的 `exit 2` 只终止子 shell，空串落盘后
+   `load_request_records`（**每个命令都过的共享闸门**）让该主机全部 8 个命令永久退 2。
+   修了 8 处同族站点（`request_payload` / `create_request_record` / 六处 `set_request_state`
+   的 prepared→adding→accepted→removing→removed 转换），全部补 `|| return $?` 或 `|| fail`。
+   `reconcile_accepted_request` 那处经核实**被子 shell 继承的 errexit 保护**（实测），但为统一
+   形态也加了守卫。`smoke/27` 的 S6 类锁扩展到全部同形站点。
+3. **六处「消息 + `return 2`」绕过 reason 契约（P1）**——`recover_stale_maintenance_lock` 的
+   三处经 `ensure_not_in_maintenance` **裸调用**直达顶层 → exit 2 无 `reason=` 行（实测：活性
+   holder 身份不符时 stderr 无 reason）。smoke/02 的旧静态规则只匹配字面 `exit 2`，其注释里
+   「13 个 `return 2` 站点已人工审过」**恰好漏了这三处**。修：三处补 reason 行；`smoke/02`
+   新增**第二条结构规则**——「消息后跟 `return 2`，且所在函数在文件里被**裸调用**过」即违规
+   （按函数名跟踪，改名/加调用点/删 reason 都会红）。
+4. **`smoke/08` 的 `--args/--jsonargs` 建模从未存在（测试+文档）**——CHANGELOG 2026-10-06 条与
+   覆盖表都称已加，但 `git show 33fb339 --stat` 根本没有 smoke/08、`git log -S '--args'` 为空。
+   真实 `request_payload` 是 `jq -cn … --args -- "$@"`，`submit -- ls /tmp` 的 `/tmp` 会被旧
+   walker 判违规（实测 violations=[(11,'/tmp')]）。修：照 smoke/29 补 `--args` 分支；fixture 从
+   `-- true` 改为带绝对路径实参（旧 walker 下必红）。
+5. **windows CI job 名义跑 PS 5.1 而 `smoke/23` 用 PATH 上的 pwsh（测试）**——23（及 13/25）
+   不读 `AGENTQ_SMOKE_PWSH`。修：三者补该挂钩 + 「override 不可执行则 SKIP」守卫。
+6. **`smoke/16` 记忆目录硬编码本机 slug（测试）**——克隆到别的路径则记忆半边静默 SKIP 且被 CI
+   具名放行。修：从 `$root` 推导 slug（保留前导 `-`，实测形态）+ `AGENTQ_SMOKE_MEMORY_DIR` 覆盖。
+7. **`agentq-launcher.ps1` 的 `$script:Program` 从未赋值（安装器 agent 的 F1，P1）**——三处清理
+   诊断引用它，而资产设了 `Set-StrictMode -Version Latest`，于是清理失败时**抛出**而非打印诊断：
+   在 finally 里替换在途异常、中止环境变量还原、退 1 而非契约的 2。实测（真实资产函数 + StrictMode
+   + 目录参数）复现抛出。修：资产顶部赋值；`smoke/22` 的驱动脚本补 `Set-StrictMode` 并从**资产里
+   提取**该赋值（缺失即红——驱动自造一个会让资产丢赋值时仍绿，正是 F1 藏身之处）。
+8. **`agentq.ps1` 配置错误退 1（Windows agent 的 #3，P1）**——`Get-ConfiguredHost` 的 throw
+   （超长/坏编码）在顶层逃逸成未处理异常：退 1 + 栈转储。实测两种配置均退 1。修：调用点 try/catch
+   → `Stop-AgentQ`（退 2 + 受控消息）；实测两种配置现退 2。
+9. **`sshp.ps1` 的 `--check` 无界重连（Windows agent 的 #2，P1）**——POSIX twin 2026-10-07 已把
+   `--check` 限 3 次，Windows 版仍 `while :`。实测（桩 ssh 恒 255+传输行）：20s 内 17+ 次调用仍继续。
+   修：`Prepare-Remote` 增 `-CheckReconnectAttempts`（交互路径传 0 保持无界），`--check` 传 3；
+   实测 3 次后 exit 255 并报 `--check does not retry forever`。
+10. **Windows 客户端两处 P2**：成功时仍打「SSH diagnostic omitted」（Windows wrapper 恒写
+    `agentq-exit:` 到 stderr → Diagnostics 恒非空）——三个操作调用点改为「验证成功则不打印」，
+    与 POSIX twin 的 `[ -s log ]` 门控对齐；认证提示不再建议 `AGENTQ_PASSWORD`（该平台明确拒绝它，
+    实测退 2）。
+11. **文档 8 处**：CONTRIBUTING 的「不得设执行位」（与实际 8 个 755 资产及 `install-client.sh`
+    的 `[ -x ]` 要求矛盾）、CONTRIBUTING/README/ci.yml 的 NCOV 子集措辞（子集测试抓的是**新名字**，
+    不是「停止覆盖」）、CLAUDE.md/SKILL.md 把退出码 `6` 说成 wait 专属（`logs` 亦退 6）、
+    SKILL.md 关于退 2 `unknown AgentQ task id` 的过窄排他断言、verification-status 的 02/05 行
+    计数、performance.md 的 smoke/18「27 例」（实测 29）、PLAN 的 C2–C5 行（挂已关闭项）。
+
+**已复现、刻意不修（记此以免下轮重查）**：
+
+- **`sshp.ps1` 的三条 Windows 命令经 `-EncodedCommand`，命令行 ~22–23K 字符，超三种
+  DefaultShell 实测上限（8,125/8,155/8,176）**（Windows agent 的 #1，P0 级）。实测
+  probe=23,214 / install≈23,882 / session≈22,274 字符；`agentq.ps1` 早已迁到 `-Command -`
+  （stdin），**POSIX sshp 也早已如此**（`client/unix/sshp:744`），只有 `sshp.ps1` 未迁。
+  **为什么不在这轮修**：正确修法要把探针/安装/会话三条命令都改成 stdin 喂送，其中会话路径
+  （`-tt` 交互）还需移植 POSIX 侧的 FIFO/TTY 喂送逻辑；而 `sshp.ps1` 在整套检查里**没有任何
+  行为级检查**，本机又无原生 Windows——盲改交互 TTY 管道正是本仓反复纠正的「桩没照抄真实
+  行为、检查全绿却真机失败」形态。**留着比半修安全**。需要一台真 Windows + 一条 `smoke/14`
+  式命令行长度断言才能关闭。**这不是「没证据」的边界，是已复现的开放缺陷。**

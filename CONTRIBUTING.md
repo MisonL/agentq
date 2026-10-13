@@ -36,8 +36,9 @@ A **platform-inherent** gap (a Windows-only code path on macOS/Linux) is
 different: checks report it as `NOT-covered`, counted on their own
 `NOT-covered:` line instead of triggering `NOT A FULL PASS` — it is a property
 of the platform, not a run someone could have made better. CI still pins it:
-every name on that line must be in a known set (subset test), so a check that
-silently stops covering something goes red. Details:
+every name on that line must be in a known set (a subset test -- a NEW name, a
+check claiming a gap nobody has seen before, is red; a known name dropping out
+means the platform covered more, which is fine). Details:
 [`docs/verification-status.md`](docs/verification-status.md).
 
 ## Rules that are not style preferences
@@ -56,8 +57,15 @@ every check still passes.
 - **Never convert line endings under `skill/assets/`.** That is why
   `.gitattributes` uses `* -text`: the assets are deployed as they are stored,
   and one conversion breaks the byte-parity above.
-- **Do not set the execute bit on files under `skill/assets/`.** The installers
-  are invoked as `sh ./install-agentq.sh`; the mode is deliberate.
+- **Do not change the committed file modes under `skill/assets/`.** The modes
+  are deliberate per file (verified against `git ls-files -s`, 2026-10-13):
+  `install-agentq.sh` is 644 (invoked as `sh ./install-agentq.sh`, no execute
+  bit needed), as are the PowerShell/CMD assets, the service units and the
+  `.yml` files; the POSIX clients (`agentq`, `sshp`, `install-client.sh`), the
+  two `.bash` bridges, the unix wrapper, and the three server copies
+  (`agentq-server` / two `agentq`) are 755 — `install-client.sh` REFUSES to run
+  when its source assets are not executable.  Clearing an executable bit breaks
+  the installer; adding one where there was none changes the deployment unit.
 - **After changing anything under `skill/`, sync the whole directory.** It is
   the install source, and nothing keeps the two copies in step automatically:
 

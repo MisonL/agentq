@@ -430,11 +430,18 @@ elif [ -z "$init_line" ] || [ "$trap_line" -ge "$init_line" ]; then
 fi
 # The EXIT trap must ALSO precede runtime creation: on dash the EXIT trap only
 # runs if a handler exists for the fatal signal, so binding EXIT before the
-# directory exists is what makes the pre-trap window leak-free.
+# directory exists is what makes the pre-trap window leak-free.  And it carries
+# `|| true` (2026-10-13): a non-zero cleanup return under `set -e` would replace
+# the session's exit code with the cleanup's -- the same clobber the signal trap
+# was hardened against, on the slot that was still bare.
 cases=$((cases + 1))
-exit_trap_line=$(grep -n '^trap cleanup_ssh_runtime EXIT$' "$client" | head -1 | cut -d: -f1) || true
-if [ -z "$exit_trap_line" ] || { [ -n "$init_line" ] && [ "$exit_trap_line" -ge "$init_line" ]; }; then
-    printf '%s\n' 'sshp-contract: the EXIT trap binds at or after initialize_ssh_runtime; it must precede runtime creation so a signal in the early window still cleans up' >&2
+exit_trap_line=$(grep -n "^trap 'cleanup_ssh_runtime || true' EXIT$" "$client" | head -1 | cut -d: -f1) || true
+if [ -z "$exit_trap_line" ]; then
+    printf '%s\n' 'sshp-contract: the EXIT trap is not in the hardened `cleanup_ssh_runtime || true` form; a failing cleanup would replace the session exit code' >&2
+    failures=$((failures + 1))
+elif [ -n "$init_line" ] && [ "$exit_trap_line" -ge "$init_line" ]; then
+    printf 'sshp-contract: the EXIT trap binds at line %s, not before initialize_ssh_runtime (%s); a signal in the early window would still clean up\n' \
+        "$exit_trap_line" "$init_line" >&2
     failures=$((failures + 1))
 fi
 

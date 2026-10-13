@@ -28,9 +28,16 @@ root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 installer="$root/skill/assets/client/windows/install-client.ps1"
 [ -f "$installer" ] || { printf '%s\n' 'ps-client-installer: missing asset' >&2; exit 1; }
 
-pwsh_binary=$(command -v pwsh || true)
+# AGENTQ_SMOKE_PWSH selects the interpreter, as in the other PS checks (measured
+# 2026-10-13: 23 was the lone PS check without the hook).
+pwsh_binary=${AGENTQ_SMOKE_PWSH:-$(command -v pwsh || true)}
 if [ -z "$pwsh_binary" ]; then
     printf '%s\n' 'SKIPPED: pwsh is not available; the client installer was not executed'
+    exit 0
+fi
+# A bogus override is an environment fault, not an asset one: skip, do not fail.
+if ! command -v "$pwsh_binary" >/dev/null 2>&1; then
+    printf 'SKIPPED: pwsh is not available (AGENTQ_SMOKE_PWSH=%s is not an executable on PATH)\n' "$pwsh_binary"
     exit 0
 fi
 

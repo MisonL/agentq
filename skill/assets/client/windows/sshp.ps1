@@ -937,15 +937,25 @@ function Set-PreparationResult {
 }
 
 function Prepare-Remote {
-    param([bool]$AllowInstall)
+    param([bool]$AllowInstall, [int]$CheckReconnectAttempts = 0)
 
     $installationAttempted = $false
+    $reconnectAttempt = 0
     while ($true) {
         $unixProbe = Invoke-SshLogged -Interactive $false -RemoteCommand (Get-UnixProbeCommand)
         $outcome = Get-ProbeOutcome -Result $unixProbe
         $windowsShellDetected = Test-WindowsShellMarker -Result $unixProbe
         if (($null -eq $outcome) -or $windowsShellDetected) {
             if (($unixProbe.ExitCode -eq 255) -and (Test-SshTransportError -Diagnostics $unixProbe.TransportDiagnostics)) {
+                if ($CheckReconnectAttempts -gt 0) {
+                    $reconnectAttempt += 1
+                    if ($reconnectAttempt -gt $CheckReconnectAttempts) {
+                        Write-Diagnostics -Diagnostics $unixProbe.Diagnostics
+                        [Console]::Error.WriteLine("$($script:Program): SSH transport stayed down after $CheckReconnectAttempts reconnect attempts; giving up (--check does not retry forever).")
+                        Set-PreparationResult -ExitCode 255 -Platform ""
+                        return
+                    }
+                }
                 Write-Diagnostics -Diagnostics $unixProbe.Diagnostics
                 [Console]::Error.WriteLine("$($script:Program): initial SSH transport lost; reconnecting in $($script:ReconnectDelay)s...")
                 Start-Sleep -Seconds $script:ReconnectDelay
@@ -958,6 +968,15 @@ function Prepare-Remote {
             $outcome = Get-WindowsProbeOutcome -Result $windowsProbe
             if ($null -eq $outcome) {
                 if (($windowsProbe.ExitCode -eq 255) -and (Test-SshTransportError -Diagnostics $windowsProbe.TransportDiagnostics)) {
+                    if ($CheckReconnectAttempts -gt 0) {
+                        $reconnectAttempt += 1
+                        if ($reconnectAttempt -gt $CheckReconnectAttempts) {
+                            Write-Diagnostics -Diagnostics $windowsProbe.Diagnostics
+                            [Console]::Error.WriteLine("$($script:Program): SSH transport stayed down after $CheckReconnectAttempts reconnect attempts; giving up (--check does not retry forever).")
+                            Set-PreparationResult -ExitCode 255 -Platform ""
+                            return
+                        }
+                    }
                     Write-Diagnostics -Diagnostics $windowsProbe.Diagnostics
                     [Console]::Error.WriteLine("$($script:Program): initial SSH transport lost; reconnecting in $($script:ReconnectDelay)s...")
                     Start-Sleep -Seconds $script:ReconnectDelay
@@ -1116,7 +1135,14 @@ if ($script:SessionName.StartsWith("-", [System.StringComparison]::Ordinal)) {
 
 $script:SshPath = Resolve-SshPath
 $script:PreparationResult = $null
-Prepare-Remote -AllowInstall (!$checkOnly)
+if ($checkOnly) {
+    Prepare-Remote -AllowInstall:$false -CheckReconnectAttempts 3
+} else {
+    # -AllowInstall is a [bool] parameter, not a switch: a bare `-AllowInstall`
+    # binds no value and the binder rejects the call (measured 2026-10-13 —
+    # this broke every non---check session). The named-colon form is required.
+    Prepare-Remote -AllowInstall:$true
+}
 $preparation = $script:PreparationResult
 if ($null -eq $preparation) {
     Stop-Sshp "internal error: remote preparation returned no result"

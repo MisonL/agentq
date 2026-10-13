@@ -137,8 +137,14 @@ run_all() {
     "$server" cancel 1 >/dev/null 2>&1 || true
     "$server" wait 1 >/dev/null 2>&1 || true
     "$server" remove 0 >/dev/null 2>&1 || true
+    # The command's own argv carries an ABSOLUTE PATH (`$work/workdir`), which
+    # reaches jq as a `--args` positional STRING -- legitimate, and the reason
+    # the walker needs its `--args` branch.  Without that branch this submit is
+    # reported as a violation (measured 2026-10-13); the fixture previously used
+    # `-- true`, whose argv has no absolute path, so the missing branch stayed
+    # invisible.  This line is the regression lock for the branch.
     "$server" submit --workdir "$work/workdir" --label smoke \
-        --request-id "jq-path-submit-0001" -- true >/dev/null 2>&1 || true
+        --request-id "jq-path-submit-0001" -- true "$work/workdir" >/dev/null 2>&1 || true
 }
 run_all
 
@@ -190,6 +196,7 @@ for i, arg in enumerate(args):
     # be an --arg value rather than the option, which silently swallowed real
     # violations when this check was mutation-tested.
     consumed_until = -1
+    args_mode_at = None
     role = None  # "value" for --arg/--argjson, "filename" for file options
     k = 0
     while k < i:
@@ -207,7 +214,23 @@ for i, arg in enumerate(args):
             elif tok in ("--indent", "--tab", "--seq"):
                 consumed_until = k + 1
                 role = "value"
+            elif tok in ("--args", "--jsonargs"):
+                # Everything AFTER --args/--jsonargs is a POSITIONAL STRING, not
+                # a file: jq collects them into $ARGS.positional.  The server's
+                # request_payload is exactly this shape (`jq -cn ... --args --
+                # "$@"` carrying the user's command argv), so a submit of
+                # `ls /tmp` puts /tmp there legitimately.  Smoke/29 models this
+                # branch; this walker had never had it -- the 2026-10-06 CHANGELOG
+                # claimed it was added, but the claim was never true (git log -S
+                # '--args' on this file is empty), and the fixture's `-- true`
+                # (no absolute-path argument) was the only reason the gap stayed
+                # invisible.  Everything from the first --args onward is exempt.
+                args_mode_at = k
+                role = "positional-string"
+                break
         k += 1
+    if args_mode_at is not None and i > args_mode_at:
+        continue
     if consumed_until >= i and role in ("value", "filename"):
         continue
     violations.append((i, arg))

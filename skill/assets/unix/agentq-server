@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.6'
+agentq_version='0.1.7'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -1504,6 +1504,7 @@ recover_stale_maintenance_lock() {
 
     if ! path_chain_is_safe "$maintenance_lock_directory"; then
         printf '%s: refusing to recover an unsafe AgentQ maintenance lock: %s\n' "$program" "$maintenance_lock_directory" >&2
+        printf '%s: reason=protocol_error\n' "$program" >&2
         return 2
     fi
     if maintenance_lock_is_stale; then
@@ -1523,6 +1524,7 @@ recover_stale_maintenance_lock() {
                         fail "cannot re-read the stale AgentQ maintenance lock metadata: $maintenance_lock_directory"
                     if ! process_is_confirmed_dead "$lock_pid" "$lock_identity"; then
                         printf '%s: the AgentQ maintenance lock holder could not be re-confirmed dead; refusing to remove it: %s\n' "$program" "$maintenance_lock_directory" >&2
+                        printf '%s: reason=protocol_error\n' "$program" >&2
                         return 2
                     fi
                 fi
@@ -1537,6 +1539,7 @@ recover_stale_maintenance_lock() {
                         fail "cannot re-read the stale AgentQ maintenance lock metadata: $maintenance_lock_directory"
                     if ! process_is_confirmed_dead "$lock_pid" "$lock_identity"; then
                         printf '%s: the AgentQ maintenance lock holder could not be re-confirmed dead; refusing to remove it: %s\n' "$program" "$maintenance_lock_directory" >&2
+                        printf '%s: reason=protocol_error\n' "$program" >&2
                         return 2
                     fi
                 fi
@@ -1663,7 +1666,14 @@ cleanup() {
     return "$cleanup_status"
 }
 
-trap cleanup EXIT
+# `|| true` for the same measured reason the POSIX clients' EXIT traps carry it
+# (measured 2026-10-13 on bash and dash): under `set -e` a non-zero return from
+# the trap body trips errexit and the shell exits with the CLEANUP's status,
+# discarding the protocol code the body produced -- a successful `exit 0` reads
+# as 1, and a `wait`'s 5/6 or a `fail`'s 2 (reason line already printed) read as
+# an undifferentiated 1.  The cleanup steps fold their own failures into
+# `cleanup_status` and print messages; the exit code must stay the body's.
+trap 'cleanup || true' EXIT
 
 acquire_operation_lock() {
     local candidate="$operation_lock_directory"
@@ -3536,7 +3546,11 @@ reconcile_accepted_request() {
         return 0
     fi
 
-    record=$(set_request_state "$record" removed "$expected_task_id" "$(jq -Rn --arg value "$expected_task_created_at" '$value')")
+    # Errexit is OFF here (this function runs as an `if` condition), so a bare
+    # `$( )` failure would continue with an empty record and archive it.
+    record=$(set_request_state "$record" removed "$expected_task_id" "$(jq -Rn --arg value "$expected_task_created_at" '$value')") || {
+        fail "cannot update the AgentQ request record during removing-recovery: $request_id"
+    }
     if ! record=$(archive_removed_request "$request_id" "$record"); then
         printf '%s: failed to archive removed AgentQ request during recovery: %s\n' "$program" "$request_id" >&2
         return 1
@@ -3595,7 +3609,9 @@ reconcile_removing_request() {
         return 1
     fi
 
-    record=$(set_request_state "$record" removed "$expected_task_id" "$(jq -Rn --arg value "$expected_task_created_at" '$value')")
+    record=$(set_request_state "$record" removed "$expected_task_id" "$(jq -Rn --arg value "$expected_task_created_at" '$value')") || {
+        fail "cannot update the AgentQ request record during removal: $request_id"
+    }
     if ! record=$(archive_removed_request "$request_id" "$record"); then
         printf '%s: failed to archive removed AgentQ request during recovery: %s\n' "$program" "$request_id" >&2
         return 2
@@ -3715,7 +3731,11 @@ mark_request_removing() {
     if [ "$(jq -r '.state' <<<"$record")" = accepted ]; then
         task_id=$(jq -r '.id' <<<"$task")
         task_created_at=$(jq -r '.created_at' <<<"$task")
-        record=$(set_request_state "$record" removing "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')")
+        # Errexit is OFF (this function runs as an `if` condition); a bare `$( )`
+        # failure would write an empty record over the valid `accepted` one.
+        record=$(set_request_state "$record" removing "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')") || {
+            fail "cannot update the AgentQ request record to removing: $request_id"
+        }
         if ! write_request_record "$request_id" "$record"; then
             fail "cannot persist removing AgentQ request: $request_id"
         fi
@@ -3745,7 +3765,11 @@ mark_request_removed() {
     [ "$(jq -r '.state' <<<"$record")" = removing ] || fail "AgentQ request removal was not prepared: $request_id"
     task_id=$(jq -r '.id' <<<"$task")
     task_created_at=$(jq -r '.created_at' <<<"$task")
-    record=$(set_request_state "$record" removed "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')")
+    # Same errexit-off guard as mark_request_removing: an empty record must not
+    # reach archive_removed_request.
+    record=$(set_request_state "$record" removed "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')") || {
+        fail "cannot update the AgentQ request record to removed: $request_id"
+    }
     if ! archive_removed_request "$request_id" "$record" >/dev/null; then
         fail "cannot archive removed AgentQ request while removing task: $request_id"
     fi
@@ -4161,7 +4185,14 @@ wait_reconcile_missing_task() {
 
     if [ -n "$matched_record" ]; then
         task_created_at=$(jq -r '.task_created_at' <<<"$matched_record")
-        record=$(set_request_state "$matched_record" removed "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')")
+        # Errexit is OFF (this function runs as an `if` condition); a bare `$( )`
+        # failure would archive an empty record and the wait would then report
+        # `removed` for a task whose record was destroyed.
+        record=$(set_request_state "$matched_record" removed "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')") || {
+            jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+            printf '%s: final state for task %s is unavailable because the request record could not be updated\n' "$program" "$task_id" >&2
+            return 6
+        }
         if ! archive_removed_request "$matched_request_id" "$record" >/dev/null; then
             jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
             printf '%s: final state for task %s is unavailable because request archival failed\n' "$program" "$task_id" >&2
@@ -4701,7 +4732,14 @@ submit() {
     # handed to `pueue add --working-directory`.  Measured on 2026-10-06: an
     # invalid --workdir printed the rejection and still enqueued with "".
     normalized_workdir=$(normalize_workdir "$workdir") || return $?
-    payload=$(request_payload "$normalized_workdir" "$label" "$@")
+    # Same trap as `normalize_workdir` above: this runs inside `with_operation_lock`'s
+    # `if "$@"` body, where errexit is disabled, and a bare `$( )` assignment that
+    # fails leaves the variable EMPTY (the inner failure only ends the subshell).
+    # `request_payload` calls jq; a transient jq failure would then persist
+    # `"payload":null` and -- worse -- the request still reaches `pueue add`, so
+    # the user's command runs while submit reports an ambiguous failure.
+    # Measured 2026-10-13 by making the jq call fail once.
+    payload=$(request_payload "$normalized_workdir" "$label" "$@") || return $?
     task_label=$(request_task_label "$request_id")
 
     acquire_request_lock "$request_id"
@@ -4754,7 +4792,16 @@ submit() {
     elif read_request_tombstone "$request_id" >/dev/null; then
         fail "request id was already consumed by a task that has been removed: $request_id"
     else
-        record=$(create_request_record "$request_id" "$payload" "$task_label")
+        # Same `$( )`-in-errexit-off trap as `request_payload` above: the inner
+        # jq failure only ends the assignment's subshell, an empty `record`
+        # reaches `write_request_record`, and the resulting one-newline file
+        # fails `request_record_filter` in `load_request_records` -- the shared
+        # gate EVERY command runs, so one transient jq failure would poison
+        # status/lookup/wait/cancel/remove/logs/doctor on this host until the
+        # file is removed by hand.  Measured 2026-10-13.
+        record=$(create_request_record "$request_id" "$payload" "$task_label") || {
+            fail "cannot build the prepared AgentQ request record: $request_id"
+        }
         if ! write_request_record "$request_id" "$record"; then
             fail "cannot persist prepared AgentQ request: $request_id"
         fi
@@ -4790,7 +4837,13 @@ submit() {
         fi
 
         [ "$record_state" = prepared ] || fail "invalid AgentQ request state: $record_state"
-        record=$(set_request_state "$record" adding)
+        # Same `$( )` trap: a jq failure here leaves `record` empty and the
+        # empty write REPLACES a valid `prepared` record -- the prepared state
+        # (safe to retry) is destroyed in favour of an unreadable file.  Measured
+        # 2026-10-13.
+        record=$(set_request_state "$record" adding) || {
+            fail "cannot update the AgentQ request record to adding: $request_id"
+        }
         if ! write_request_record "$request_id" "$record"; then
             fail "cannot persist adding AgentQ request: $request_id"
         fi
@@ -4872,7 +4925,12 @@ submit() {
     is_task_id "$task_id" || fail "Pueue returned an invalid task id: $task_id"
     validate_task_id_precision "$task_id"
     [ -n "$task_created_at" ] || fail "Pueue returned a task without a creation time: $task_id"
-    record=$(set_request_state "$record" accepted "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')")
+    # Same errexit-off `$( )` trap as the prepared/adding transitions in this
+    # function: an empty record here would overwrite the `adding` record after
+    # the task was already enqueued.
+    record=$(set_request_state "$record" accepted "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')") || {
+        fail "cannot update the AgentQ request record to accepted: $request_id"
+    }
     if ! write_request_record "$request_id" "$record"; then
         fail "cannot persist accepted AgentQ request: $request_id"
     fi
@@ -5005,7 +5063,10 @@ lookup() {
             task_id=$(jq -r '.id' <<<"$task")
             task_created_at=$(jq -r '.created_at' <<<"$task")
             validate_task_id_precision "$task_id"
-            record=$(set_request_state "$record" accepted "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')")
+            # Same errexit-off `$( )` trap as the submit-side accepted transition.
+            record=$(set_request_state "$record" accepted "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')") || {
+                fail "cannot update the AgentQ request record to accepted while looking up: $request_id"
+            }
             if ! write_request_record "$request_id" "$record"; then
                 fail "cannot persist accepted AgentQ request while looking up: $request_id"
             fi

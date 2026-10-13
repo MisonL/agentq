@@ -34,7 +34,15 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-memory_dir="$HOME/.claude/projects/-Volumes-Work-code-agentq/memory"
+# The memory directory's name is derived from the repo's ABSOLUTE PATH (a
+# Claude-projects slug), so hardcoding this checkout's slug made the scan
+# silently skip on every other clone path -- repo half green, memory half
+# unverified, invisible in CI because of the named allowance below.  Derive the
+# slug from the actual checkout path: Claude replaces each run of non-alphanumeric
+# characters with a single '-', keeping the LEADING one (measured: /Volumes/Work/
+# code/agentq -> -Volumes-Work-code-agentq).  AGENTQ_SMOKE_MEMORY_DIR overrides.
+memory_slug=$(printf '%s' "$root" | LC_ALL=C sed -E 's/[^A-Za-z0-9]+/-/g')
+memory_dir=${AGENTQ_SMOKE_MEMORY_DIR:-$HOME/.claude/projects/$memory_slug/memory}
 
 # The rules.  One definition, used by both the scan and the self-test, so the
 # two can never disagree about what a rule means.

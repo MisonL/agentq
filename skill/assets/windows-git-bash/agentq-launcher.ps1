@@ -8,6 +8,17 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+# The cleanup diagnostics in Remove-AgentQLauncherRuntimeFile read this name.
+# Under StrictMode an unset variable THROWS instead of expanding to empty, so a
+# missing assignment turned every cleanup-failure branch into an unrelated
+# "variable cannot be retrieved" error: the throw replaced the in-flight
+# exception inside the launcher's finally (masking the real failure), aborted
+# the rest of the finally (skipping the environment-variable restore), and left
+# the process at exit 1 instead of the contract's 2.  Measured 2026-10-13 with
+# the real asset function under StrictMode.  Every sibling asset initializes
+# its own $script:Program (agentq.ps1, sshp.ps1, both installers); this one was
+# the only miss.
+$script:Program = "agentq-launcher"
 
 function Read-AgentQBoundedText {
     param(
