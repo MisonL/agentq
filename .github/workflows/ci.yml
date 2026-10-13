@@ -191,6 +191,7 @@ jobs:
           # AGENTQ_SMOKE_PWSH (as 23 measurably did on 2026-10-13) runs pwsh 7
           # while this job counts it as 5.1 evidence.
           grep -q 'ps51=covered' smoke-12-ps-client-contract.log
+          fail=0
           for log in smoke-20-ps-native-argv-roundtrip.log smoke-22-launcher-contract.log smoke-23-durable-move-contract.log; do
             if ! grep -qE 'pwsh=5\.' "$log"; then
               echo "$log did not report PowerShell 5.1 as its interpreter" >&2
