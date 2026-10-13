@@ -97,8 +97,9 @@ skipped, and check `01` reports `ps1=skipped(...)` rather than a green light whe
 `pwsh` is unavailable or unusable. Checks that admit a **platform-inherent** gap
 (a Windows-only code path on macOS/Linux) say so with `NOT-covered` and are
 reported on their own `NOT-covered:` line rather than folded into the pass — CI
-asserts that set is exactly the known one, so a new gap cannot hide as a green
-check.
+asserts every name on that line is in a known set (a subset test: a known name
+dropping out is better coverage, an unknown name is red), so a new gap cannot
+hide as a green check.
 
 **After changing anything under `skill/`, sync the whole directory** — it is the
 install source, and nothing keeps the two in step automatically:
