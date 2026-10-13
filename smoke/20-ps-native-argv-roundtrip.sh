@@ -442,4 +442,5 @@ if [ "$failures" -ne 0 ]; then
     printf 'ps-native-argv: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'ps-native-argv checks passed: cases=%s model=calibrated(%s rows)\n' "$cases" "$selftest_rows"
+printf 'ps-native-argv checks passed: cases=%s model=calibrated(%s rows) pwsh=%s\n' "$cases" "$selftest_rows" \
+    "$("$pwsh_binary" -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()' 2>/dev/null || printf 'unknown')"

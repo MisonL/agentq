@@ -1226,7 +1226,14 @@ function Invoke-SshLogged {
                 # measured fail-open on a 20-digit token, 2026-10-06).
                 $exitTokenMatches = [regex]::Matches($standardError, '(?m)^agentq-exit:(\d{1,3})\s*$')
                 if ($exitTokenMatches.Count -gt 0) {
-                    $exitCode = [int]$exitTokenMatches[$exitTokenMatches.Count - 1].Groups[1].Value
+                    $tokenCode = [int]$exitTokenMatches[$exitTokenMatches.Count - 1].Groups[1].Value
+                    # 256-999 pass the length filter but are NOT protocol codes;
+                    # a code above 255 is not ours -- ignore it and fall back to
+                    # the SSH exit code (same 2026-10-13 tightening as the POSIX
+                    # twin, where return 256 folds to 0).
+                    if ($tokenCode -le 255) {
+                        $exitCode = $tokenCode
+                    }
                 }
             }
             $diagnostics = $transportDiagnostics
@@ -1717,7 +1724,7 @@ function Test-SshTransportError {
     }
 
     $normalized = $Diagnostics -replace "`r", ""
-    $pattern = '^(ssh: connect to host [^\s]+ port [0-9]+: (Connection (refused|timed out|reset by peer|aborted)|Operation timed out|No route to host|Network is unreachable|Host is down)|Connection reset by [^\s]+ port [0-9]+\.?|Connection timed out during banner exchange|banner exchange: Connection to [^\s]+ port [0-9]+: (Connection (timed out|reset by peer)|No route to host|Network is unreachable|Host is down)|kex_exchange_identification: (read: )?(Connection (reset by peer|timed out|refused)|No route to host|Network is unreachable|Host is down)|client_loop: .* (Broken pipe|Connection reset by peer)|packet_write_wait: Connection to [^:]+: Broken pipe|Write failed: Broken pipe|Read from remote host [^:]+: Connection reset by peer|Timeout, server [^\s]+ not responding\.)$'
+    $pattern = '^(ssh: connect to host [^\s]+ port [0-9]+: (Connection (refused|timed out|reset by peer|aborted)|Operation timed out|No route to host|Network is unreachable|Host is down)|Connection reset by [^\s]+ port [0-9]+\.?|Connection to [^\s]+ closed by remote host\.?|Connection timed out during banner exchange|banner exchange: Connection to [^\s]+ port [0-9]+: (Connection (timed out|reset by peer)|No route to host|Network is unreachable|Host is down)|kex_exchange_identification: (read: )?(Connection (reset by peer|timed out|refused)|No route to host|Network is unreachable|Host is down)|client_loop: .* (Broken pipe|Connection reset by peer)|packet_write_wait: Connection to [^:]+: Broken pipe|Write failed: Broken pipe|Read from remote host [^:]+: Connection reset by peer|Timeout, server [^\s]+ not responding\.)$'
     return [regex]::IsMatch($normalized, $pattern, [System.Text.RegularExpressions.RegexOptions]::Multiline)
 }
 

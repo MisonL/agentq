@@ -348,9 +348,18 @@ scanned=$((scanned - 1))
 # --- the tree --------------------------------------------------------------
 # Binary files are skipped: they are not text a reader copies an address out of,
 # and grepping them produces noise.  `grep -Iq .` is the test for "is text".
+# A file judged binary by NUL bytes alone is REPORTED, not silently skipped:
+# a text leak can hide behind one stray NUL (e.g. a UTF-16 or damaged file),
+# and a silent continue made that file invisible to all seven rules while the
+# files= counter still grew (measured 2026-10-13, review round 4).
 tree_scanned=0
 while IFS= read -r file; do
-    grep -Iq . "$file" 2>/dev/null || continue
+    if ! grep -Iq . "$file" 2>/dev/null; then
+        if [ -s "$file" ] && LC_ALL=C grep -q "$(printf '\x00')" "$file" 2>/dev/null; then
+            printf 'no-host-identifiers: skipped a file that looks binary by NUL bytes (it could hide a text leak): %s\n' "$file" >&2
+        fi
+        continue
+    fi
     tree_scanned=$((tree_scanned + 1))
     scan_file "$file"
 done <<EOF

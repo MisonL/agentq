@@ -46,6 +46,15 @@ work=$(unset CDPATH; cd -- "$work" && pwd -P)
 trap 'rm -rf -- "$work"' EXIT
 
 failures=0
+
+# Normalized stderr matching, exactly as smoke/23 documents: Windows PowerShell
+# 5.1 wraps error messages across lines at the console width (measured on CI,
+# 2026-10-13) and pwsh 7 colourises them; the fragment assertions are on the
+# message text.  Same mechanism, one definition per file by design (12/13/23
+# each define it; 12 and 13 gained it after 23's CI red proved the gap).
+strip_ansi() { sed -E $'s/\x1b\\[[0-9;]*m//g' "$1"; }
+flatten_err() { strip_ansi "$1" | tr -d '\r' | tr '\n' ' ' | sed -E 's/ +/ /g'; }
+
 cases=0
 
 # expect_rejected <expected-stderr-fragment> [args...]
@@ -66,7 +75,7 @@ expect_rejected() {
         failures=$((failures + 1))
         return
     fi
-    if ! grep -qF -- "$expected" "$work/err"; then
+    if ! flatten_err "$work/err" | grep -qF -- "$expected"; then
         printf 'ps-installer %s: stderr does not contain %s\n' "${label:-<no args>}" "$expected" >&2
         head -2 "$work/err" >&2 || true
         failures=$((failures + 1))

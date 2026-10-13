@@ -557,8 +557,36 @@ cases=$((cases + 1))
 if ! grep -q 'Read-AgentQArguments -Encoded \$encodedArguments' "$launcher"; then
     printf '%s\n' 'launcher-contract: the launcher no longer calls Read-AgentQArguments (the static lock below would be vacuous)' >&2
     failures=$((failures + 1))
-elif ! awk '/^try \{/ {in_try=1} in_try && /Read-AgentQArguments -Encoded \$encodedArguments/ {guarded=1} /catch/ {caught=1} END {exit !(guarded && caught)}' "$launcher"; then
+elif ! awk '
+    # Anchored END-state machine (2026-10-13: the previous rolling-window rule
+    # was mutation-verified vacuous -- "caught" was satisfied by ANY catch in
+    # the file, including an unrelated function and a comment, and the rule
+    # passed implicitly when no window matched).  Require a verbatim window:
+    # `try {` immediately followed by the call, then `} catch {`, then exit 2
+    # within three lines.
+    { lines[NR] = $0 }
+    END {
+        found = 0
+        for (i = 2; i <= NR - 1; i++) {
+            if (lines[i] == "try {" && lines[i + 1] ~ /Read-AgentQArguments -Encoded \$encodedArguments/) {
+                found = 1
+                if (lines[i + 2] !~ /^\} catch \{/) exit 1
+                ok = 0
+                for (j = i + 3; j <= i + 5 && j <= NR; j++) {
+                    if (lines[j] ~ /exit 2/) ok = 1
+                }
+                if (!ok) exit 1
+            }
+        }
+        exit found ? 0 : 1
+    }
+' "$launcher"; then
     printf '%s\n' 'launcher-contract: the argument parse is not wrapped in try/catch, so a malformed payload exits 1 instead of the contract 2' >&2
     failures=$((failures + 1))
 fi
-printf 'launcher-contract checks passed: cases=%s decoder=covered pathguards=covered roundtrip=covered windows-api=NOT-covered(needs-Windows) malformed-payload=exit2\n' "$cases"
+if [ "$failures" -ne 0 ]; then
+    printf 'launcher-contract: %s failure(s)\n' "$failures" >&2
+    exit 1
+fi
+printf 'launcher-contract checks passed: cases=%s pwsh=%s decoder=covered pathguards=covered roundtrip=covered windows-api=NOT-covered(needs-Windows) malformed-payload=exit2\n' "$cases" \
+    "$("$pwsh_binary" -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()' 2>/dev/null || printf 'unknown')"

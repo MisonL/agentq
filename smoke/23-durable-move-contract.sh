@@ -134,4 +134,5 @@ if [ "$failures" -ne 0 ]; then
     printf 'durable-move-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'durable-move-contract checks passed: cases=%s contract=covered access-mask=pinned behaviour=NOT-covered(needs-Windows)\n' "$cases"
+printf 'durable-move-contract checks passed: cases=%s pwsh=%s contract=covered access-mask=pinned behaviour=NOT-covered(needs-Windows)\n' "$cases" \
+    "$("$pwsh_binary" -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()' 2>/dev/null || printf 'unknown')"

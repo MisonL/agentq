@@ -89,7 +89,10 @@ jobs:
           # a known name DROPPING OUT (e.g. 12 when pwsh happens to be 5.1) means
           # the platform covered more, which is good, not a red build.  An
           # unknown name appearing is red in every direction.
-          known_ncov=" 12-ps-client-contract 13-ps-installer-contract 22-launcher-contract 23-durable-move-contract 25-ps-client-installer-contract "
+          # 05 self-reports a lowercase not-covered when no strict-POSIX shell
+          # (dash/busybox/ksh refusing ${x//pat/}) is on PATH -- a runner
+          # property, so it is a legitimate platform-gap declaration here too.
+          known_ncov=" 05-client-contract 12-ps-client-contract 13-ps-installer-contract 22-launcher-contract 23-durable-move-contract 25-ps-client-installer-contract "
           unknown=''
           for name in $(grep -E '^NOT-covered:' smoke.log | sed -E 's/^NOT-covered: [0-9]+ check\(s\) declared platform-unverifiable sub-parts: //'); do
             case "$known_ncov" in
@@ -182,6 +185,16 @@ jobs:
         run: |
           # The ps51 token is what makes this job meaningful: without it the
           # same run under pwsh 7 would look identical and prove nothing about
-          # 5.1.  smoke/12 prints it; the other three have no pwsh-7 blind spot
-          # of this shape.
+          # 5.1.  smoke/12 prints `ps51=covered`; 20/22/23 each print a
+          # `pwsh=<version>` token whose major version must be 5 -- without
+          # per-check tokens a check that silently detaches from
+          # AGENTQ_SMOKE_PWSH (as 23 measurably did on 2026-10-13) runs pwsh 7
+          # while this job counts it as 5.1 evidence.
           grep -q 'ps51=covered' smoke-12-ps-client-contract.log
+          for log in smoke-20-ps-native-argv-roundtrip.log smoke-22-launcher-contract.log smoke-23-durable-move-contract.log; do
+            if ! grep -qE 'pwsh=5\.' "$log"; then
+              echo "$log did not report PowerShell 5.1 as its interpreter" >&2
+              fail=1
+            fi
+          done
+          exit "$fail"

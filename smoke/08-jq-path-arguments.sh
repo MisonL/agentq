@@ -169,14 +169,31 @@ import re
 import sys
 
 raw = open(sys.argv[1], "rb").read()
-args = [a.decode("utf-8", "surrogateescape") for a in raw.split(b"\0") if a]
+# Split per INVOCATION on the shim's double-NUL separator.  Walking the stream
+# flat let a mid-list `--args` blanket every LATER invocation too (the
+# exemption `i > args_mode_at` never reset) -- safe today only because the
+# submit case that carries `--args` is the last call in run_all.  Measured
+# 2026-10-13, review round 4.
+invocations = [chunk for chunk in raw.split(b"\0\0") if chunk]
+args = [a.decode("utf-8", "surrogateescape") for chunk in invocations for a in chunk.split(b"\0") if a]
 
 # Options whose next argument is legitimately a filename.  `--slurpfile NAME
 # FILE` consumes two arguments; the filename is the one after the NAME.
 FILENAME_OPTS = {"-f", "--from-file", "--rawfile", "--argfile"}
 
+# Offsets where a new jq invocation begins; the --args exemption must not
+# survive past its own invocation.
+boundaries = set()
+offset = 0
+for chunk in invocations:
+    offset += len([a for a in chunk.split(b"\0") if a])
+    boundaries.add(offset)
+
 violations = []
+args_mode_at = None
 for i, arg in enumerate(args):
+    if i in boundaries:
+        args_mode_at = None
     if not arg.startswith("/"):
         continue
     # Every absolute-path positional argument is a violation.  Two narrower
@@ -196,7 +213,6 @@ for i, arg in enumerate(args):
     # be an --arg value rather than the option, which silently swallowed real
     # violations when this check was mutation-tested.
     consumed_until = -1
-    args_mode_at = None
     role = None  # "value" for --arg/--argjson, "filename" for file options
     k = 0
     while k < i:

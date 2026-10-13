@@ -53,6 +53,10 @@ cases=0
 # on the message text, which is wrapped in escape sequences on a tty-capable
 # stderr.  Same handling smoke/13 relies on being absent -- this check normalises.
 strip_ansi() { sed -E $'s/\x1b\\[[0-9;]*m//g' "$1"; }
+# Same join discipline as smoke/23 (2026-10-13): PS 5.1 wraps binder messages
+# across lines, so the CR/join half belongs here too even though pwsh 7 alone
+# never needs it.
+flatten_err() { strip_ansi "$1" | tr -d '\r' | tr '\n' ' ' | sed -E 's/ +/ /g'; }
 
 # run_installer [args...] -- runs the installer in the sandbox HOME, capturing
 # status/stdout/stderr; prints the status.  HOME is redirected so a run that got
@@ -81,7 +85,7 @@ expect_rejected() {
         failures=$((failures + 1))
         return
     fi
-    if ! strip_ansi "$work/err" | grep -qF -- "$expected"; then
+    if ! flatten_err "$work/err" | grep -qF -- "$expected"; then
         printf 'ps-client-installer %s: stderr does not contain %s\n' "$label" "$expected" >&2
         strip_ansi "$work/err" | head -2 >&2 || true
         failures=$((failures + 1))

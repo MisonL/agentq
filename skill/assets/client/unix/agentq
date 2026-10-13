@@ -557,6 +557,12 @@ resolve_credential_source() {
 # "$AGENTQ_PASSWORD", not its value.
 prepare_credential_delivery() {
     [ "$agentq_credential_source" = password ] || return 0
+    # AGENTQ_PASSWORD lives in this process's environment and is inherited by
+    # every child (ssh and its askpass wrapper must read it there).  A core
+    # dump of any of them would write the credential to disk, so disable
+    # coredumps for the password path.  Best-effort: some shells reject the
+    # call; that must not break the credential setup itself (2026-10-13).
+    ulimit -c 0 2>/dev/null || :
     resolve_agentq_temp_directory || return $?
 
     agentq_askpass_temporary=''
@@ -571,6 +577,11 @@ prepare_credential_delivery() {
         :
     else
         printf '%s: cannot record askpass temporary identity: %s\n' "$program" "$agentq_askpass_temporary" >&2
+        # Drop tracking on an unattributable file, exactly as run_ssh_logged
+        # does for its stderr capture: cleanup refuses to delete a temporary
+        # whose identity was never recorded, so keeping the global would leak
+        # an empty 0600 askpass file (measured 2026-10-13, review round 4).
+        agentq_askpass_temporary=''
         return 1
     fi
     # Written by redirection, never as an argv: the value must not appear in a
@@ -1324,7 +1335,10 @@ write_response_metadata() {
     response_file=$1
     response_metadata_require_file "$response_file" || return $?
     response_metadata_require_file "$response_file" || return $?
-    response_bytes=$(wc -c < "$response_file" | tr -d '[:space:]')
+    response_bytes=$(wc -c < "$response_file") && response_bytes=$(printf '%s' "$response_bytes" | tr -d '[:space:]') || return 1
+    case "$response_bytes" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
     printf '%s: raw response omitted for safety (%s bytes)\n' "$program" "$response_bytes" >&2
 }
 
@@ -1360,6 +1374,17 @@ agentq_remote_exit_token() {
     ssh_exit_token_value=$(LC_ALL=C tr -d '\r' < "$ssh_exit_token_log" |
         LC_ALL=C sed -n 's/^agentq-exit:\([0-9]\{1,3\}\)$/\1/p' | tail -n 1)
     [ -n "$ssh_exit_token_value" ] || return 1
+    # Three digits includes 256-999, which are NOT protocol codes -- and the
+    # shell folds them: measured 2026-10-13, `return 256` reads 0 under both
+    # bash and dash (mod 256), so a forged `agentq-exit:256` was read as
+    # SUCCESS -- the exact fail-open the 2026-10-06 bounded-length fix claimed
+    # to have closed.  Codes above 255 are not ours; ignore them like a
+    # missing token (fail-closed, back to the SSH exit code).
+    case "$ssh_exit_token_value" in
+        2[5-9][0-9]|[3-9][0-9][0-9])
+            return 1
+            ;;
+    esac
     printf '%s\n' "$ssh_exit_token_value"
 }
 
@@ -1367,7 +1392,10 @@ write_ssh_diagnostic_metadata() {
     ssh_metadata_file=$1
     agentq_ssh_log_require_existing_file "$ssh_metadata_file" || return $?
     agentq_ssh_log_require_existing_file "$ssh_metadata_file" || return $?
-    ssh_metadata_bytes=$(wc -c < "$ssh_metadata_file" | tr -d '[:space:]')
+    ssh_metadata_bytes=$(wc -c < "$ssh_metadata_file") && ssh_metadata_bytes=$(printf '%s' "$ssh_metadata_bytes" | tr -d '[:space:]') || return 1
+    case "$ssh_metadata_bytes" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
     if ssh_transport_error "$ssh_metadata_file"; then
         ssh_metadata_class=transport
     else
@@ -1603,7 +1631,7 @@ ssh_transport_error() {
     [ -s "$ssh_log_file" ] || return 1
     agentq_ssh_log_require_existing_file "$ssh_log_file" || return $?
     LC_ALL=C tr -d '\r' < "$ssh_log_file" | LC_ALL=C grep -E -q \
-        '^(ssh: connect to host [^[:space:]]+ port [0-9]+: (Connection (refused|timed out|reset by peer|aborted)|Operation timed out|No route to host|Network is unreachable|Host is down)|Connection reset by [^[:space:]]+ port [0-9]+\.?|Connection timed out during banner exchange|banner exchange: Connection to [^[:space:]]+ port [0-9]+: (Connection (timed out|reset by peer)|No route to host|Network is unreachable|Host is down)|kex_exchange_identification: (read: )?(Connection (reset by peer|timed out|refused)|No route to host|Network is unreachable|Host is down)|client_loop: .* (Broken pipe|Connection reset by peer)|packet_write_wait: Connection to [^:]+: Broken pipe|Write failed: Broken pipe|Read from remote host [^:]+: Connection reset by peer|Timeout, server [^[:space:]]+ not responding\.)$'
+        '^(ssh: connect to host [^[:space:]]+ port [0-9]+: (Connection (refused|timed out|reset by peer|aborted)|Operation timed out|No route to host|Network is unreachable|Host is down)|Connection reset by [^[:space:]]+ port [0-9]+\.?|Connection to [^[:space:]]+ closed by remote host\.?|Connection timed out during banner exchange|banner exchange: Connection to [^[:space:]]+ port [0-9]+: (Connection (timed out|reset by peer)|No route to host|Network is unreachable|Host is down)|kex_exchange_identification: (read: )?(Connection (reset by peer|timed out|refused)|No route to host|Network is unreachable|Host is down)|client_loop: .* (Broken pipe|Connection reset by peer)|packet_write_wait: Connection to [^:]+: Broken pipe|Write failed: Broken pipe|Read from remote host [^:]+: Connection reset by peer|Timeout, server [^[:space:]]+ not responding\.)$'
 }
 
 platform_probe_file_is_safe() {
@@ -1836,6 +1864,7 @@ run_platform_probe() {
     platform_probe_output_file=$(mktemp "$agentq_temp_directory/agentq-platform-output.XXXXXX") || return 2
     platform_probe_output_identity=$(platform_probe_file_identity "$platform_probe_output_file") || {
         printf '%s: cannot record platform probe output temporary identity\n' "$program" >&2
+        platform_probe_output_file=''
         platform_probe_status=2
         if platform_probe_remove_file "$platform_probe_output_file" ''; then
             platform_probe_output_cleanup_status=0
@@ -1875,6 +1904,7 @@ run_platform_probe() {
     }
     platform_probe_log_identity=$(platform_probe_file_identity "$platform_probe_log_file") || {
         printf '%s: cannot record platform probe log temporary identity\n' "$program" >&2
+        platform_probe_log_file=''
         platform_probe_status=2
         if platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity"; then
             platform_probe_output_cleanup_status=0
@@ -2112,7 +2142,11 @@ run_platform_probe() {
         fi
         return "$platform_probe_status"
     fi
-    platform_probe_output_bytes=$(wc -c < "$platform_probe_output_file" | tr -d '[:space:]') || {
+    # wc's status is what the guard must see: in a pipeline the status is tr's,
+    # and tr on empty input succeeds -- measured 2026-10-13, the old single
+    # pipeline never fired its guard and the 64KB truncation fell open to an
+    # unbounded cat when wc failed.  Measure in two steps, then validate.
+    platform_probe_output_bytes=$(wc -c < "$platform_probe_output_file") || {
         printf '%s: cannot measure platform probe output size\n' "$program" >&2
         platform_probe_output_cleanup_status=1
         platform_probe_log_cleanup_status=0
@@ -2120,6 +2154,13 @@ run_platform_probe() {
         platform_probe_remove_file "$platform_probe_log_file" "$platform_probe_log_identity" || platform_probe_log_cleanup_status=$?
         return 2
     }
+    platform_probe_output_bytes=$(printf '%s' "$platform_probe_output_bytes" | tr -d '[:space:]')
+    case "$platform_probe_output_bytes" in
+        ''|*[!0-9]*)
+            printf '%s: cannot measure platform probe output size\n' "$program" >&2
+            return 2
+            ;;
+    esac
     platform_probe_output_max=${platform_probe_output_limit:-65536}
     if platform_probe_require_existing_file "$platform_probe_output_file"; then
         :
@@ -2213,6 +2254,8 @@ encode_windows_powershell() {
     windows_encoding_input=$(mktemp "$agentq_temp_directory/agentq-windows-powershell.XXXXXX") || return 1
     windows_encoding_input_identity=$(windows_encoding_file_identity "$windows_encoding_input") || {
         printf '%s: cannot record Windows PowerShell encoding input identity: %s\n' "$program" "$windows_encoding_input" >&2
+        # drop tracking: cleanup refuses an unattributable temporary (see run_ssh_logged)
+        windows_encoding_input=''
         windows_encoding_status=1
         if windows_encoding_remove_file "$windows_encoding_input" ''; then
             windows_encoding_input_cleanup_status=0
@@ -2252,6 +2295,7 @@ encode_windows_powershell() {
     }
     windows_encoding_output_identity=$(windows_encoding_file_identity "$windows_encoding_output") || {
         printf '%s: cannot record Windows PowerShell encoding output identity: %s\n' "$program" "$windows_encoding_output" >&2
+        windows_encoding_output=''
         windows_encoding_status=1
         if windows_encoding_remove_file "$windows_encoding_input" "$windows_encoding_input_identity"; then
             windows_encoding_input_cleanup_status=0
@@ -2560,9 +2604,17 @@ windows_probe_apply_exit_token() {
             windows_probe_token_code=${windows_probe_token_code%%[!0-9]*}
             # At most three digits (protocol codes are 0-255); a longer token
             # cannot be one of ours and is ignored exactly like a missing one.
+            # 256-999 are also not protocol codes and fold on return/exit
+            # (256 reads 0 under bash and dash, measured 2026-10-13) -- same
+            # rejection as the operation-path parser above.
             if [ "${#windows_probe_token_code}" -gt 3 ]; then
                 windows_probe_token_code=''
             fi
+            case "$windows_probe_token_code" in
+                2[5-9][0-9]|[3-9][0-9][0-9])
+                    windows_probe_token_code=''
+                    ;;
+            esac
             if [ -n "$windows_probe_token_code" ]; then
                 windows_probe_token_status=$windows_probe_token_code
                 windows_probe_token_output=${windows_probe_token_raw%agentq-exit:*}
@@ -2761,6 +2813,8 @@ build_windows_remote_command() {
     remote_input_file=$(mktemp "$agentq_temp_directory/agentq-windows-arguments.XXXXXX") || fail 'cannot create a temporary Windows argument payload'
     remote_input_file_identity=$(windows_argument_file_identity "$remote_input_file") || {
         printf '%s: cannot record Windows argument payload identity: %s\n' "$program" "$remote_input_file" >&2
+        # drop tracking: cleanup refuses an unattributable temporary (see run_ssh_logged)
+        remote_input_file=''
         windows_argument_status=1
         if windows_argument_remove_file "$remote_input_file" "$remote_input_file_identity"; then
             windows_argument_cleanup_status=0
@@ -2929,8 +2983,10 @@ run_ssh_logged() {
         # Identity-checked removal, like every other temporary in this file --
         # NOT `rm -f ... || true`.  That form was the one place a removal failure
         # was swallowed and never folded into the exit status.  cleanup_client_runtime
-        # also removes this path, so a failure here is not fatal: it is reported
-        # and the EXIT trap retries.
+        # also removes this path, so a failure here is not fatal: it is reported,
+        # folded into the exit status, and the variable is then cleared -- the
+        # EXIT trap does NOT retry (comment used to claim it did; measured
+        # 2026-10-13: 2943-2944 unconditionally clear the variable).
         if windows_argument_remove_file "$ssh_stderr_capture" "$ssh_stderr_capture_identity"; then
             :
         else
@@ -2949,6 +3005,20 @@ run_ssh_logged() {
         write_ssh_diagnostic_metadata "$ssh_log_file"
     fi
     return "$ssh_status"
+}
+
+# Forward the controlled server reason class for a failed submit attempt,
+# exactly as the read/mutation operation paths do (grep the two consumers of
+# agentq_remote_failure_reason_value).  SKILL.md promises that BOTH clients
+# forward this line; before this helper the submit recovery loop never read
+# the global, so a caller could not distinguish a retryable lock rejection
+# (reason=lock_contention) from an argument error on the command that hits
+# lock contention most often.  Measured 2026-10-13: same stub fixture,
+# cancel printed the reason, submit printed nothing.
+agentq_submit_forward_reason() {
+    if [ "$agentq_recovery_status" -ne 0 ] && [ -n "$agentq_remote_failure_reason_value" ]; then
+        printf '%s: remote failure reason: %s\n' "$program" "$agentq_remote_failure_reason_value" >&2
+    fi
 }
 
 run_submit_with_recovery() {
@@ -2976,6 +3046,7 @@ run_submit_with_recovery() {
             fi
         fi
         printf '%s: cannot create a temporary SSH log for submit recovery\n' "$program" >&2
+        agentq_submit_forward_reason
         return "$agentq_recovery_status"
     }
 
@@ -3002,6 +3073,7 @@ run_submit_with_recovery() {
                         agentq_recovery_status=$agentq_recovery_log_cleanup_status
                     fi
                 fi
+                agentq_submit_forward_reason
                 return "$agentq_recovery_status"
             fi
             recovery_output_require_existing_file "$agentq_recovery_output_file" || return $?
@@ -3049,6 +3121,7 @@ run_submit_with_recovery() {
                     agentq_recovery_status=$agentq_recovery_log_cleanup_status
                 fi
             fi
+            agentq_submit_forward_reason
             return "$agentq_recovery_status"
         fi
 
@@ -3072,6 +3145,7 @@ run_submit_with_recovery() {
             fi
             printf '%s: SSH transport remained unavailable while submitting request %s; recover later with: %s --host %s lookup %s\n' \
                 "$program" "$agentq_recovery_request_id" "$program" "$host" "$agentq_recovery_request_id" >&2
+            agentq_submit_forward_reason
             return "$agentq_recovery_status"
         fi
 
@@ -3102,6 +3176,7 @@ run_submit_with_recovery() {
                         agentq_recovery_status=$agentq_recovery_log_cleanup_status
                     fi
                 fi
+                agentq_submit_forward_reason
                 return "$agentq_recovery_status"
             fi
             recovery_output_require_existing_file "$agentq_recovery_output_file" || return $?
@@ -3148,6 +3223,7 @@ run_submit_with_recovery() {
                         agentq_recovery_status=$agentq_recovery_log_cleanup_status
                     fi
                 fi
+                agentq_submit_forward_reason
                 return "$agentq_recovery_status"
             fi
         fi
@@ -3193,6 +3269,7 @@ run_submit_with_recovery() {
                     agentq_recovery_status=$agentq_recovery_log_cleanup_status
                 fi
             fi
+            agentq_submit_forward_reason
             return "$agentq_recovery_status"
         fi
         if [ "$agentq_recovery_status" -eq 5 ]; then
@@ -3217,6 +3294,7 @@ run_submit_with_recovery() {
                     agentq_recovery_status=$agentq_recovery_log_cleanup_status
                 fi
             fi
+            agentq_submit_forward_reason
             return "$agentq_recovery_status"
         fi
         if [ "$agentq_recovery_status" -eq 255 ] && ssh_transport_error "$agentq_recovery_log_file"; then
@@ -3260,6 +3338,7 @@ run_submit_with_recovery() {
                 agentq_recovery_status=$agentq_recovery_log_cleanup_status
             fi
         fi
+        agentq_submit_forward_reason
         return "$agentq_recovery_status"
     done
 }

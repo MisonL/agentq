@@ -151,9 +151,9 @@ sshd_pid=$(cat "$ssh_dir/sshd.pid" 2>/dev/null || printf '')
 mkdir -p "$work/bin"
 cat > "$work/bin/ssh" <<EOF
 #!/bin/sh
-exec /usr/bin/ssh -p $port -i "$ssh_dir/id" \\
+exec /usr/bin/ssh -F none -p $port -i "$ssh_dir/id" \\
     -o UserKnownHostsFile="$ssh_dir/known_hosts" \\
-    -o StrictHostKeyChecking=no "\$@"
+    -o StrictHostKeyChecking=no -o IdentitiesOnly=yes "\$@"
 EOF
 chmod 700 "$work/bin/ssh"
 
