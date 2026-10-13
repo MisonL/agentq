@@ -232,7 +232,7 @@ for chunk in invocations:
         records.append(args)
 
 # Options whose next argument(s) are values, not jq programs.
-VALUE_OPTS_1 = {"--arg", "--argjson", "--slurpfile", "--indent", "--tab", "--seq"}
+VALUE_OPTS_1 = {"--arg", "--argjson", "--slurpfile"}
 FILE_OPTS_1 = {"-f", "--from-file", "--rawfile", "--argfile"}
 
 violations = []
@@ -242,9 +242,9 @@ for args in records:
     n = len(args)
     while i < n:
         tok = args[i]
-        if tok in VALUE_OPTS_1:
-            # --arg NAME VALUE / --argjson NAME VALUE / --slurpfile NAME FILE
-            if tok in ("--arg", "--argjson") and i + 1 < n:
+        if tok in ("--arg", "--argjson"):
+            # NAME VALUE (two consumed values, three positions)
+            if i + 1 < n:
                 name = args[i + 1]
                 if classify_argv_value(name):
                     violations.append(
@@ -258,8 +258,15 @@ for args in records:
         if tok in FILE_OPTS_1:
             i += 2
             continue
-        if tok in ("--indent", "--tab", "--seq"):
+        if tok == "--indent":
+            # consumes ONE value; the token AFTER that value is the jq PROGRAM.
+            # Treating it as a two-value option skipped the program entirely
+            # (measured 2026-10-13: walk(["--indent","2","prog"]) -> []).
             i += 2
+            continue
+        if tok in ("--tab", "--seq"):
+            # jq flags, no value; the NEXT token is the program.
+            i += 1
             continue
         if tok == "--args" or tok == "--jsonargs":
             i += 1
@@ -275,6 +282,14 @@ for args in records:
         for name, matched, line in classify_program(tok):
             violations.append((name, matched, line))
         i += 1
+
+if programs_seen < 1:
+    print(
+        "jq-reserved-identifiers: no jq program was classified; the walker or "
+        "the command surface has drifted and this check would prove nothing",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 if violations:
     # Dedupe: the same program text can be handed to jq many times (every

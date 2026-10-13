@@ -1,4 +1,4 @@
-# AgentQ 规划 · A 类记录（A1–A33）
+# AgentQ 规划 · A 类记录（A1–A34）
 
 **这是 `docs/PLAN.md` 的一部分，不是清单本身。** 全部 A 类条目均已关闭，正文
 在此归档；待办、C 类（需要你给范围）、取消清单、警告清单与执行状态见
@@ -2176,7 +2176,7 @@ blocker 是 `sleep 60`、清理时**仍在 Running**，而 **Pueue 拒绝删除�
 
 第三轮沿用 C5/A28 先例：6 个互不知情的只读审查者（服务端 / POSIX 客户端 / Windows 资产 /
 安装器与服务单元 / 测试与 CI / 契约与文档）各包一个维度，**每条高影响结论都由本人对代码或
-实测复核后才动手**。本轮修 12 处，另留 1 处已复现但**刻意不修**（见末段）。
+实测复核后才动手**。本轮修 12 处（按**修复点**计；CHANGELOG 按**条**计作 11——第 10 条含两处客户端 P2），另留 1 处已复现但**刻意不修**（见末段）。
 
 **已修（每条都先证明能红）**：
 
@@ -2243,3 +2243,82 @@ blocker 是 `sleep 60`、清理时**仍在 Running**，而 **Pueue 拒绝删除�
   行为级检查**，本机又无原生 Windows——盲改交互 TTY 管道正是本仓反复纠正的「桩没照抄真实
   行为、检查全绿却真机失败」形态。**留着比半修安全**。需要一台真 Windows + 一条 `smoke/14`
   式命令行长度断言才能关闭。**这不是「没证据」的边界，是已复现的开放缺陷。**
+
+## A34：第四轮全维度审查（2026-10-13，6 个并行只读 agent，每条发现本人复现/证伪；0.1.8）
+
+产出 2 条 P1（均已复现并修复）、17 条 P2、约 12 条 P3。**已修复**：
+
+1. **P1 POSIX submit 丢 reason**（POSIX 客户端维度）：`run_submit_with_recovery` 的
+   9 个失败 return 全部不读 `agentq_remote_failure_reason_value`——同 fixture 实测
+   cancel 打 `remote failure reason: lock_contention`、submit 不打；SKILL.md「两个客户端
+   都转发」不成立，且锁竞争最常发生在 submit。修：新增 `agentq_submit_forward_reason`
+   helper，9 个 return 点前各调一次（与安全操作路径的三行打印同形）。
+2. **P1 `agentq:` 前缀用户 label 砖化 remove**（服务端维度）：`decorate` 用 payload label
+   覆写 `.label`，`request_id_from_task` 读到 `agentq:foo` 时与前缀冲突 → 该任务 remove
+   永久退 2 `conflicting request identities`（实测 submit exit 0 → remove exit 2）。
+   修：decorate 后权威身份是 `.agentq.request_id`，label 分歧时改信 metadata（附
+   fail-closed 的空 request_id 守卫）；`smoke/03` 现有语义不放松。
+3. **服务端 3 处裸 `$(date -u)`**：空 `created_at`/`removed_at`/`requested_at` 会砖化
+   整个存储（filter 全拒）——各补 `|| return 1`（同族已知 $() 模式的残例）。
+4. **wait/reconcile 竞争**：`load_request_records`/marker 扫描/墓碑回退循环对
+   glob-then-read 之间消失的文件改为 **skip**（竞争是常态、路径守卫失败仍是致命），
+   消除毫秒级瞬态 2/1 错码。
+5. **exit-token 256–999**（安全 + POSIX 两维度独立发现）：3 位数字过滤放行 256–999，
+   实测 bash `return 256`→0（mod 256）、dash 终态折 0——`agentq-exit:256` 把失败读成
+   成功，正是 2026-10-06 修复声称关死的 fail-open。修：POSIX 两处解析器 + PS 客户端
+   一处统一加 `>255` 拒绝（回落 SSH 码）。
+6. **传输分类正则分叉**：`Connection to X closed by remote host.` 只有 sshp 认——
+   agentq 对这一类真实传输丢失不重试、submit 不做对账。修：共享备选并入 agentq 与
+   `agentq.ps1`/`sshp.ps1` 三处（sshp 专有的两行除外）。
+7. **凭据/临时文件族**（安全 + POSIX）：password 路径入口 `ulimit -c 0`（coredump 不落
+   盘密码）；5 处「身份记录失败不清全局」改 drop 模式（照 run_ssh_logged 先例），
+   EXIT trap 不再被无身份文件卡住；4 处 `wc -c | tr` 管道守卫死代码改为两步测量 +
+   数字校验（64KB 截断保护不再 fail-open）。
+8. **CRLF shim 顺序**（Windows）：`install_jq_line_ending_shim` 提到
+   `resolve_windows_user_environment` 之前——14 个 jq 抽取的环境值此前带尾随 `\r`
+   进入 `env -i`（只有 2 处有手工剥 `\r`）；shim 幂等，后续 ensure 再装一次是 no-op。
+9. **Windows 资产三处死代码/失守**：`sshp.ps1` 127+INSTALL_UNAVAILABLE 分支不可达
+   （Get-WindowsProbeOutcome 已接）——删；`install-agentq.ps1` 的 `$state.tasks` 守卫在
+   StrictMode 下意图分支不可达——显式探测属性；`install-client.ps1` 的 Git Bash 候选
+   遇 reparse 点 throw → `--check` 未捕获退 1——改 skip 候选（无候选时由调用方报缺）。
+10. **测试套件**：`smoke/29` 行走器把 `--indent/--tab/--seq` 当两值选项**吞掉 jq 程序**
+    （实测 walk 返回空），改正确计数 + `programs_seen<1` 即红；`smoke/08` 行走器按
+    双 NUL 分 invocation（`--args` 豁免不再跨调用扩散）；`smoke/22` 的 try/catch 静态锁
+    被**变异证明空洞**（任何 catch 都满足、窗口漂移也绿）——改 END 状态机逐行锚定
+    `try {`+调用+`} catch {`+`exit 2`，顺带发现并修掉该检查 exit 闸门在静态锁**之前**
+    的排序缺陷（变异红而 exit 0）；`smoke/12`/`13` 补 23 同款归一化、`smoke/25` 补
+    CR/join 半边（「三份拷贝只修一份」家族）；`smoke/20/22/23` 摘要加 `pwsh=<version>`
+    token，CI windows job 断言四检查全部 `pwsh=5.*`（20/22/23 此前可静默脱离
+    `AGENTQ_SMOKE_PWSH`——23 自己 2026-10-13 实测踩过）；`smoke/05` 的 lowercase
+    `not-covered` 加入 CI known_ncov（无 dash 的 runner 假红）；`smoke/16` 对 NUL
+    判二的文件改为**报告**而非静默跳过；`smoke/02` 规则 1 补单行 printf+exit2 的
+    cannot-conclude 诊断。
+11. **文档**：分母/行数计数全部重算（27,415→27,723 等，2026-10-13 复核）；CHANGELOG
+    头条两处张冠李戴修正（EXIT trap 3 个文件非 4；23,214 属探针非会话）；A33 口径限定
+    （12 处按修复点计 / 11 条按条计）。
+12. **安全杂项**：`.gitignore` 补 `shared_secret`/`*.cert`/`*.crt`/`*.p12`/`*.pfx`/
+    `id_dsa*`/`ssh_host_*_key*`/`certs/`（Windows 部署自生成的凭据文件名族）；
+    `smoke/07`/`17` 沙箱 ssh 补 `-F none` + `IdentitiesOnly=yes`——此前 pass-through
+    ssh 读操作者真实 `~/.ssh/config`，配了 ProxyJump 的机器跑测试会经真实跳板机发连接
+    （主机授权边界）。
+13. **注释失实**：`agentq` 2981「EXIT trap 会重试删除」与实现相反——改为描述实情。
+
+**记录未修（全部需真 Windows / Pueue 源验证，与 A33 的 sshp 载荷同性质）**：
+- **launcher `$LASTEXITCODE` 三分支**（agentq.ps1 wrapper 读 launcher 退出码）：pwsh 7.5
+  实测 `& 脚本` 的 `exit` 会更新 `$LASTEXITCODE`，5.1 文档条款疑回填——若 5.1 不更新，
+  finally 强制 exit 2 的路径会报 `agentq-exit:0`（fail-open）、早退 exit 2 报 1。
+  三行真机脚本即可判定；判定前不盲修。
+- **ACL 硬化在升级路径被丢**（install-client.ps1）：`File.Replace` → Win32 `ReplaceFile`
+  按 MSDN 保留旧目的地 DACL——新 ACL 只在首次安装生效。修法方向：Replace 后对目的地
+  复核/重设 ACL，或 MoveFileEx REPLACE_EXISTING。
+- **PS 5.1 代码页重编码**（agentq.ps1 操作路径 + install-agentq.ps1 两处残余）：`& exe 1> file`
+  在非 UTF-8 代码页损坏非 ASCII（2026-09-21 缺陷四已实测、安装器 status 一处已修）。
+  修法照 `Invoke-AgentQInstallerPueueStatus` 的 ProcessStartInfo 模式，但操作路径承载
+  stdin 管道与全部 argv，盲改风险高——需真 Windows 验证后动。
+- **`pueue kill` 落在刚好完成的目标上**：cancel 确认取自 `pueue kill` 退出码而非观测
+  任务终态，若 Pueue 对 Done 任务 kill 返回成功则可伪造 `requested` marker（重放退 0
+  而非 2）。前提（Pueue 对 Done kill 的行为）未验证。
+- **`smoke/02` 规则 2 只追踪无参裸调用**：带参独立调用同hazards，当前 13 处 return-2
+  全部折叠（复审确认），未来加带参调用点时开启。
+- **`run-tests.sh` 桶分类靠大小写子串 grep**：小写 `skipped(...)` 会在 windows job 逃过
+  SKIPPED 检测——结构化标记行是修法，改动面大、单独立项。

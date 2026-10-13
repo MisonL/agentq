@@ -221,7 +221,10 @@ write_ssh_diagnostic_metadata() {
     ssh_metadata_file=$1
     require_existing_runtime_file "$ssh_metadata_file" || return $?
     require_existing_runtime_file "$ssh_metadata_file" || return $?
-    ssh_metadata_bytes=$(wc -c < "$ssh_metadata_file" | tr -d '[:space:]')
+    ssh_metadata_bytes=$(wc -c < "$ssh_metadata_file") && ssh_metadata_bytes=$(printf '%s' "$ssh_metadata_bytes" | tr -d '[:space:]') || return 1
+    case "$ssh_metadata_bytes" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
     if ssh_transport_error "$ssh_metadata_file"; then
         ssh_metadata_class=transport
     else
@@ -292,7 +295,11 @@ run_ssh_logged() {
 write_bounded_noninteractive_output() {
     sshp_bounded_output_file=$1
     require_existing_runtime_file "$sshp_bounded_output_file" || return $?
-    sshp_bounded_output_bytes=$(wc -c < "$sshp_bounded_output_file" | tr -d '[:space:]') || return 2
+    sshp_bounded_output_bytes=$(wc -c < "$sshp_bounded_output_file") || return 2
+    sshp_bounded_output_bytes=$(printf '%s' "$sshp_bounded_output_bytes" | tr -d '[:space:]')
+    case "$sshp_bounded_output_bytes" in
+        ''|*[!0-9]*) return 2 ;;
+    esac
     require_existing_runtime_file "$sshp_bounded_output_file" || return $?
     sshp_bounded_output_max=${sshp_noninteractive_output_limit:-65536}
     case "$sshp_bounded_output_max" in

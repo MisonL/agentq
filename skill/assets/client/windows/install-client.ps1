@@ -405,11 +405,17 @@ function Resolve-GitBashPath {
             $runtimePath = Join-Path $candidateRoot "usr\bin\bash.exe"
             $launcherItem = Get-Item -LiteralPath $launcherPath -Force -ErrorAction SilentlyContinue
             $runtimeItem = Get-Item -LiteralPath $runtimePath -Force -ErrorAction SilentlyContinue
+            # An UNSAFE CANDIDATE is skipped, not fatal: the loop searches
+            # several roots, and one reparse-point candidate (a linked Program
+            # Files entry, say) must not abort the search -- least of all in
+            # -Check mode, where the caller expects a controlled 0/1/2 and an
+            # uncaught throw exited 1 (review round 4, 2026-10-13).  If NO
+            # candidate survives, the caller reports the missing Git Bash.
             if (!(Test-NonReparsePathChain -Path $launcherPath)) {
-                throw "Git Bash with bin\\bash.exe and usr\\bin\\bash.exe is required; unsafe launcher candidate: $launcherPath"
+                continue
             }
             if (!(Test-NonReparsePathChain -Path $runtimePath)) {
-                throw "Git Bash with bin\\bash.exe and usr\\bin\\bash.exe is required; unsafe runtime candidate: $runtimePath"
+                continue
             }
             if (($null -ne $launcherItem) -and ($null -ne $runtimeItem) -and
                 !$launcherItem.PSIsContainer -and !$runtimeItem.PSIsContainer) {

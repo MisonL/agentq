@@ -18,7 +18,7 @@ $expectedClientHash = "28b0756d54ec16ce13d78b251d086aa62e0057089cb27f793cd649f97
 $expectedDaemonHash = "aafa05e2f26cda9aff3eeb9be261e8f9f67752d1e9bb7fbcb47318e35c52ab1d"
 $releaseVersion = "4.0.4"
 $releaseBaseUrl = "https://github.com/Nukesor/pueue/releases/download/v$releaseVersion"
-$agentqVersion = "0.1.7"
+$agentqVersion = "0.1.8"
 $clientAssetName = "pueue-x86_64-pc-windows-msvc.exe"
 $daemonAssetName = "pueued-x86_64-pc-windows-msvc.exe"
 $gitBashPath = $null
@@ -633,7 +633,11 @@ function Assert-NoActivePueueTasks {
     # default.  Still finite: 64 MiB is far above any real queue and far below
     # anything that would exhaust memory.
     $state = Get-PueueStatus -ClientPath $ClientPath -ConfigPath $ConfigPath -MaximumBytes 67108864
-    if ($null -eq $state.tasks) {
+    # StrictMode Latest makes a MISSING `tasks` property throw here, so the
+    # intended "omitted the tasks object" message was unreachable (measured
+    # 2026-10-13, review round 4); probe the property explicitly.
+    $hasTasks = ($null -ne $state) -and ($state.PSObject.Properties.Name -contains "tasks") -and ($null -ne $state.tasks)
+    if (!$hasTasks) {
         throw "$Description Pueue status omitted the tasks object"
     }
     $activeTasks = @($state.tasks.PSObject.Properties | Where-Object {

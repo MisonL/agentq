@@ -24,10 +24,22 @@ agentq-askpass.*
 id_rsa*
 id_ed25519*
 id_ecdsa*
+id_dsa*
+ssh_host_*_key*
 .git-credentials
 .netrc
 authorized_keys
 known_hosts
+
+# The Windows server deployment generates and length-verifies these itself
+# (install-agentq.ps1: a 512-byte TLS shared_secret plus certs/daemon.*);
+# they are credentials as surely as a .key is.
+shared_secret
+*.cert
+*.crt
+*.p12
+*.pfx
+certs/
 
 # Local agentq state: hosts, request records, tombstones, locks.
 .agentq/

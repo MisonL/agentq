@@ -358,7 +358,7 @@ function Test-SshTransportError {
     }
 
     $normalized = $Diagnostics -replace "`r", ""
-    $pattern = '^(ssh: connect to host [^\s]+ port [0-9]+: (Connection (refused|timed out|reset by peer|aborted)|Operation timed out|No route to host|Network is unreachable|Host is down)|Connection reset by [^\s]+ port [0-9]+\.?|Connection timed out during banner exchange|banner exchange: Connection to [^\s]+ port [0-9]+: (Connection (timed out|reset by peer)|No route to host|Network is unreachable|Host is down)|kex_exchange_identification: (read: )?(Connection (reset by peer|timed out|refused)|No route to host|Network is unreachable|Host is down)|client_loop: .* (Broken pipe|Connection reset by peer)|packet_write_wait: Connection to [^:]+: Broken pipe|Write failed: Broken pipe|Read from remote host [^:]+: Connection reset by peer|Timeout, server [^\s]+ not responding\.)$'
+    $pattern = '^(ssh: connect to host [^\s]+ port [0-9]+: (Connection (refused|timed out|reset by peer|aborted)|Operation timed out|No route to host|Network is unreachable|Host is down)|Connection reset by [^\s]+ port [0-9]+\.?|Connection to [^\s]+ closed by remote host\.?|Connection timed out during banner exchange|banner exchange: Connection to [^\s]+ port [0-9]+: (Connection (timed out|reset by peer)|No route to host|Network is unreachable|Host is down)|kex_exchange_identification: (read: )?(Connection (reset by peer|timed out|refused)|No route to host|Network is unreachable|Host is down)|client_loop: .* (Broken pipe|Connection reset by peer)|packet_write_wait: Connection to [^:]+: Broken pipe|Write failed: Broken pipe|Read from remote host [^:]+: Connection reset by peer|Timeout, server [^\s]+ not responding\.)$'
     return [regex]::IsMatch($normalized, $pattern, [System.Text.RegularExpressions.RegexOptions]::Multiline)
 }
 
@@ -982,12 +982,11 @@ function Prepare-Remote {
                     Start-Sleep -Seconds $script:ReconnectDelay
                     continue
                 }
-                if (($windowsProbe.ExitCode -eq 127) -and ($windowsProbe.Output.Trim() -match '(?m)^__SSHP_INSTALL_UNAVAILABLE__:Windows$')) {
-                    Write-Diagnostics -Diagnostics $windowsProbe.Diagnostics
-                    [Console]::Error.WriteLine("$($script:Program): persistent remote session unavailable: native Zellij is required on Windows and no supported installer was found.")
-                    Set-PreparationResult -ExitCode 127 -Platform "windows"
-                    return
-                }
+                # (The 127 + INSTALL_UNAVAILABLE case was handled here with a
+                # duplicate of the InstallUnavailable branch below, but
+                # Get-WindowsProbeOutcome returns non-null for that combination,
+                # so this branch was unreachable -- removed 2026-10-13; the
+                # consumer at the outcome stage owns it.)
                 Write-Diagnostics -Diagnostics $unixProbe.Diagnostics
                 Write-Diagnostics -Diagnostics $windowsProbe.Diagnostics
                 $failureDescription = if ($windowsShellDetected) { "the Windows shell" } else { "both Unix and Windows shells" }

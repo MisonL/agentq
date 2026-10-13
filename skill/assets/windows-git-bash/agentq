@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.7'
+agentq_version='0.1.8'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -209,6 +209,15 @@ case "$platform" in
         pueue_config_path=$(cygpath -aw "$config_path")
         startup_script_path=$(cygpath -aw "$startup_script")
         pueued_path_windows=$(cygpath -aw "$pueued_bin")
+        # Install the CRLF jq shim BEFORE resolving the Windows user
+        # environment: on a text-mode jq host the 14 jq-extracted environment
+        # values below would otherwise each carry a trailing \r (only
+        # metadata/agentq_home had manual strips), and PATH's last entry with a
+        # trailing \r reaches every child via env -i.  The shim is idempotent
+        # (it defines jq() only when the probe sees interior \r) and
+        # ensure_runtime_dependencies later calls it again -- a no-op the
+        # second time (2026-10-13, review round 4 finding 5).
+        install_jq_line_ending_shim
         resolve_windows_user_environment
         agentq_tmp=$agentq_temp
         # Preserve user arguments such as cmd /c when invoking Windows tools.
@@ -1034,7 +1043,8 @@ durable_sync_file() {
     [ "$platform_kind" = unix ] || return 0
     [ -n "$path" ] || return 1
     temporary_file_is_safe "$path" || return 1
-    temporary_file_is_safe "$path" || return 1
+    # (2026-10-13: a second consecutive identical call stood here -- no
+    # operation between them means no TOCTOU bracket; removed as drift bait.)
     AGENTQ_DURABLE_PATH=$path perl -MIO::Handle -MFcntl=:DEFAULT -e '
         my $path = $ENV{AGENTQ_DURABLE_PATH};
         my $ok = eval {
@@ -1062,7 +1072,7 @@ durable_sync_directory() {
     [ "$platform_kind" = unix ] || return 0
     [ -n "$path" ] || return 1
     durable_sync_directory_path_is_safe "$path" || return 1
-    durable_sync_directory_path_is_safe "$path" || return 1
+    # (2026-10-13: second consecutive identical call removed, same reasoning.)
     AGENTQ_DURABLE_PATH=$path perl -MIO::Handle -MFcntl=:DEFAULT -e '
         my $path = $ENV{AGENTQ_DURABLE_PATH};
         my $ok = eval {
@@ -1314,16 +1324,9 @@ read_lock_metadata() {
         [ -f "$lock_path" ] || return 1
         [ -r "$lock_path" ] || return 1
     fi
-    if declare -F lock_metadata_file_is_safe >/dev/null 2>&1; then
-        lock_metadata_file_is_safe "$lock_path" || return 1
-    else
-        path_chain_is_safe "$lock_path" || return 1
-        [ ! -L "$lock_parent_directory" ] || return 1
-        [ ! -L "$lock_directory" ] || return 1
-        [ ! -L "$lock_path" ] || return 1
-        [ -f "$lock_path" ] || return 1
-        [ -r "$lock_path" ] || return 1
-    fi
+    # (2026-10-13: the second identical guard block that stood between this
+    # comment and the read below was removed -- consecutive no-op copies buy
+    # nothing and are the rule-E drift bait this repo keeps pruning.)
     if lock_sample=$(
         head -c "$((lock_metadata_limit + 1))" -- "$lock_path" 2>/dev/null
         lock_read_status=$?
@@ -2190,6 +2193,9 @@ load_cancellation_markers() {
                 fail "non-canonical AgentQ cancellation marker filename: $marker_path"
             marker_parent=${marker_path%/*}
             [ -n "$marker_parent" ] || marker_parent=.
+            # vanish-between-glob-and-read is a race, not a guard violation
+            # (same 2026-10-13 reasoning as load_request_records)
+            [ -e "$marker_path" ] || continue
             [ -d "$marker_parent" ] && [ ! -L "$marker_parent" ] ||
                 fail "invalid AgentQ cancellation marker path: $marker_path"
             [ -f "$marker_path" ] && [ ! -L "$marker_path" ] ||
@@ -2521,6 +2527,14 @@ load_request_records() {
         # are bash builtins and stay.
         record_parent=${record_path%/*}
         [ -n "$record_parent" ] || record_parent=.
+        # A concurrent archiver (remove recovery, wait reconcile) may delete a
+        # record between the glob above and this read.  Vanishing is a RACE,
+        # not a path-guard violation: skipping keeps the scanner rescan-friendly
+        # (the next invocation sees the tombstone) instead of failing every
+        # lock-holding command with a transient protocol_error (measured
+        # 2026-10-13, review round 4).  A file that EXISTS but fails the guard
+        # below is still fatal.
+        [ -e "$record_path" ] || continue
         [ -d "$record_parent" ] && [ ! -L "$record_parent" ] ||
             fail "invalid AgentQ request record path: $record_path"
         [ -f "$record_path" ] && [ ! -L "$record_path" ] ||
@@ -3012,7 +3026,10 @@ create_request_record() {
     local payload_jq_file
     local command_status
 
-    created_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    created_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || return 1
+    # An empty created_at is rejected by request_record_filter and would brick
+    # load_request_records for every command until the file is hand-deleted --
+    # the same $() family guarded everywhere else; remaining site (2026-10-13).
     payload_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-payload') || return 1
     if ! require_runtime_temporary_file "$payload_file" ||
         ! require_runtime_temporary_file "$payload_file" ||
@@ -3079,8 +3096,8 @@ make_request_tombstone() {
     local removed_at=${2:-}
 
     if [ -z "$removed_at" ]; then
-        removed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-    fi
+        removed_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || return 1
+    fi  # empty removed_at would fail request_tombstone_filter and brick lookup/wait
 
     jq -ce --arg removed_at "$removed_at" '
         if .state == "removed" then {
@@ -3669,13 +3686,26 @@ request_id_from_task() {
         agentq:*)
             request_id=${task_label#agentq:}
             if [ -n "$metadata_request_id" ] && [ "$metadata_request_id" != "$request_id" ]; then
-                fail 'AgentQ task metadata contains conflicting request identities'
+                # The decorated label is the USER payload label, not Pueue's raw
+                # `agentq:<request-id>`: decorate overwrites .label with
+                # payload.label, so a user label that itself starts with
+                # `agentq:` collides with the prefix here.  The authoritative
+                # identity is the metadata request id attached by the same
+                # decorate pass (or the raw compact label when the task is not
+                # decorated); only distrust the label when BOTH disagree.
+                # Measured 2026-10-13 (review round 4): a payload label
+                # `agentq:foo` made every `remove` of that task exit 2
+                # "conflicting request identities" forever.
+                request_id=$metadata_request_id
             fi
             ;;
         *)
             request_id=$metadata_request_id
             ;;
     esac
+    if [ -z "$request_id" ]; then
+        fail 'AgentQ task metadata does not identify its request'
+    fi
 
     printf '%s\n' "$request_id"
 }
@@ -4100,6 +4130,11 @@ wait_reconcile_missing_task() {
                     request_id=${path##*/}
                     request_id=${request_id%.json}
                     is_request_id "$request_id" || fail "invalid AgentQ request tombstone filename: $path"
+                    # vanish-between-glob-and-read is the concurrent-archiver
+                    # race (2026-10-13): skip, the scanner converges on the
+                    # next invocation instead of exiting 2 with a misleading
+                    # "missing tombstone" on a file that never belonged to us.
+                    [ -e "$request_tombstone_directory/$request_id.json" ] || continue
                     tombstone=$(read_request_tombstone "$request_id") || fail "missing AgentQ request tombstone during wait recovery: $path"
                     validate_task_id_precision "$(jq -r '.task_id' <<<"$tombstone")"
                     if [ "$(canonical_task_id "$(jq -r '.task_id' <<<"$tombstone")")" = "$(canonical_task_id "$task_id")" ]; then
@@ -5374,7 +5409,8 @@ cancel_task() {
     fi
 
     if [ "$marker_state" != pending ]; then
-        requested_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+        requested_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || return 1
+        # an empty requested_at fails valid_marker and bricks load_cancellation_markers
         write_cancellation_marker "$task_id" "$created_at" "$requested_at" pending
     fi
 

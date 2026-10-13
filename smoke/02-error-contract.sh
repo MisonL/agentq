@@ -189,6 +189,13 @@ reason_gap_sites=$(
                 j = i + 1
                 while (j <= n && (joined[j] ~ /^[[:space:]]*$/ || joined[j] ~ /^[[:space:]]*#/)) j++
                 if (j <= n && joined[j] ~ /^[[:space:]]*exit 2[[:space:]]*$/) printf "%d:%s\n", i, joined[i]
+                # Same one-liner shape on a single physical line
+                # (`printf ... >&2; exit 2`): none exist today (checked
+                # 2026-10-13) but the shape escapes the join above -- a
+                # semicolon-joined printf+exit-2 is reported as
+                # cannot-conclude rather than silently invisible.
+                if (j == i + 1 && joined[i] ~ /printf.*>&2;[[:space:]]*exit 2[[:space:]]*$/ && joined[i] !~ /reason=/)
+                    printf "%d:CANNOT-CONCLUDE(one-liner printf+exit2):%s\n", i, joined[i]
             }
         }' "$server"
 )
