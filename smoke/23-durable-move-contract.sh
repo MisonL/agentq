@@ -51,6 +51,18 @@ failures=0
 cases=0
 
 # expect_rejected <label> <expected-stderr-fragment> [args...]
+# Windows PowerShell 5.1 wraps error messages across lines (measured on CI,
+# 2026-10-13: "...of one\nmore missing mandatory parameters..."), and pwsh 7
+# colourises them; the fragment assertions are on the message text, so the
+# stderr is ANSI-stripped and newline-joined before matching.  Under pwsh 7
+# alone this normalization is invisible -- which is exactly why the pre-hook
+# version of this check stayed green while never actually running under 5.1.
+strip_ansi() { sed -E $'s/\x1b\\[[0-9;]*m//g' "$1"; }
+# flatten_err: strip ANSI, drop CR, join lines, collapse whitespace runs.  The
+# CR drop matters: a 5.1 CRLF wrap keeps the trailing space of the wrapped line
+# ("...of one \r\nmore..."), and the fragment spells it "one or more" -- without
+# collapsing whitespace runs the 5.1 text does not match (measured 2026-10-13).
+flatten_err() { strip_ansi "$1" | tr -d '\r' | tr '\n' ' ' | sed -E 's/ +/ /g'; }
 expect_rejected() {
     local label=$1 expected=$2
     shift 2
@@ -65,9 +77,9 @@ expect_rejected() {
         failures=$((failures + 1))
         return
     fi
-    if ! grep -qF -- "$expected" "$work/err"; then
+    if ! flatten_err "$work/err" | grep -qF -- "$expected"; then
         printf 'durable-move %s: stderr does not contain %s\n' "$label" "$expected" >&2
-        head -2 "$work/err" >&2 || true
+        strip_ansi "$work/err" | head -2 >&2 || true
         failures=$((failures + 1))
     fi
 }
