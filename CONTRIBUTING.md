@@ -32,6 +32,14 @@ skipped or was only partially verified, and check `01` reports
 `ps1=skipped(...)` instead of a green light when `pwsh` is unavailable or
 unusable. Read the summary line before claiming a run succeeded.
 
+A **platform-inherent** gap (a Windows-only code path on macOS/Linux) is
+different: checks report it as `NOT-covered`, counted on their own
+`NOT-covered:` line instead of triggering `NOT A FULL PASS` — it is a property
+of the platform, not a run someone could have made better. CI still pins it:
+every name on that line must be in a known set (subset test), so a check that
+silently stops covering something goes red. Details:
+[`docs/verification-status.md`](docs/verification-status.md).
+
 ## Rules that are not style preferences
 
 These are load-bearing. A change that breaks one of them is a defect even if
