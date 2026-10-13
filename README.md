@@ -2,7 +2,7 @@
 
 Remote task queue over SSH, backed by [Pueue](https://github.com/Nukesor/pueue) 4.0.4.
 
-**Version:** 0.1.6 — the deployment unit (`skill/assets/`, 23 files) ships as one
+**Version:** 0.1.7 — the deployment unit (`skill/assets/`, 23 files) ships as one
 version; releases are tagged in git and recorded in `CHANGELOG.md`.
 
 Submit a command to a remote host and keep tracking it after your terminal closes.
@@ -98,8 +98,10 @@ skipped, and check `01` reports `ps1=skipped(...)` rather than a green light whe
 (a Windows-only code path on macOS/Linux) say so with `NOT-covered` and are
 reported on their own `NOT-covered:` line rather than folded into the pass — CI
 asserts every name on that line is in a known set (a subset test: a known name
-dropping out is better coverage, an unknown name is red), so a new gap cannot
-hide as a green check.
+dropping out is better coverage, an unknown name — a check newly claiming a gap
+nobody has seen before — is red), so a new gap cannot hide as a green check.
+The gate is by check name: a known check adding a further token is not
+distinguished.
 
 **After changing anything under `skill/`, sync the whole directory** — it is the
 install source, and nothing keeps the two in step automatically:

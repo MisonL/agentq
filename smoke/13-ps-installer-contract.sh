@@ -26,10 +26,18 @@ root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 # same convention as smoke/05 and smoke/07 (their AGENTQ_SMOKE_CLIENT).
 installer="${AGENTQ_SMOKE_INSTALLER:-$root/skill/assets/windows-git-bash/install-agentq.ps1}"
 stage_source="$root/skill/assets/windows-git-bash"
-pwsh_binary=$(command -v pwsh || true)
+# AGENTQ_SMOKE_PWSH selects the interpreter, exactly as smoke/12/20/22/23 do.
+# Leaving the hook out made 23 the lone PS check pinned to whatever `pwsh` is on
+# PATH while the windows job counted it as 5.1 evidence -- measured 2026-10-13.
+pwsh_binary=${AGENTQ_SMOKE_PWSH:-$(command -v pwsh || true)}
 
 if [ -z "$pwsh_binary" ]; then
     printf '%s\n' 'SKIPPED: pwsh is not available; the Windows installer was not executed'
+    exit 0
+fi
+# A bogus override is an environment fault, not an asset one: skip, do not fail.
+if ! command -v "$pwsh_binary" >/dev/null 2>&1; then
+    printf 'SKIPPED: pwsh is not available (AGENTQ_SMOKE_PWSH=%s is not an executable on PATH)\n' "$pwsh_binary"
     exit 0
 fi
 

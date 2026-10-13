@@ -392,7 +392,12 @@ is_nonnegative_integer "$reconnect_delay" || fail 'SSHP_RECONNECT_DELAY must be 
 # means the next edit to the cleanup body could silently swallow the 130 under
 # `set -e`, turning an interrupted session into "failed".  Make 130 authoritative
 # here too rather than depend on the function staying total.
-trap cleanup_ssh_runtime EXIT
+#
+# The EXIT slot is hardened the same way (measured 2026-10-13 on bash and dash):
+# if the cleanup ever stops being total, a bare trap body under `set -e` would
+# replace the session's exit code with the cleanup's -- the same accident the
+# signal slot refuses to depend on.
+trap 'cleanup_ssh_runtime || true' EXIT
 trap 'cleanup_ssh_runtime || true; exit 130' HUP INT TERM
 initialize_ssh_runtime
 

@@ -27,9 +27,19 @@ root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 asset="$root/skill/assets/windows-git-bash/agentq-durable-move.ps1"
 [ -f "$asset" ] || { printf '%s\n' 'durable-move-contract: missing asset' >&2; exit 1; }
 
-pwsh_binary=$(command -v pwsh || true)
+# AGENTQ_SMOKE_PWSH selects the interpreter, exactly as smoke/12/20/22 do.  The
+# CI windows job sets it to powershell.exe to run under real PowerShell 5.1 --
+# without this, 23 silently used whatever `pwsh` was on PATH (7.x on the runner)
+# while the job's comment counted it as 5.1 evidence.  Measured 2026-10-13.
+pwsh_binary=${AGENTQ_SMOKE_PWSH:-$(command -v pwsh || true)}
 if [ -z "$pwsh_binary" ]; then
     printf '%s\n' 'SKIPPED: pwsh is not available; the parameter contract was not executed'
+    exit 0
+fi
+# A bogus override (typo'd path) must not read as contract failures -- the same
+# shape 12's guard pins: pwsh-unusable is an environment fault, not an asset one.
+if ! command -v "$pwsh_binary" >/dev/null 2>&1; then
+    printf 'SKIPPED: pwsh is not available (AGENTQ_SMOKE_PWSH=%s is not an executable on PATH)\n' "$pwsh_binary"
     exit 0
 fi
 

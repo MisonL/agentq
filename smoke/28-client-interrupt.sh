@@ -188,6 +188,25 @@ if ! grep -q "trap 'cleanup_client_runtime || true; exit 130' HUP INT TERM" "$cl
     printf '%s\n' 'client-interrupt: the main signal trap can be short-circuited by a failing cleanup before exit 130' >&2
     failures=$((failures + 1))
 fi
+# (3) The two EXIT traps must carry `|| true` too.  2026-10-13 found this family
+#     still bare on the EXIT slot in THREE assets (this client's early and main
+#     traps, and the server's), and the server case was reproduced on a real
+#     server: with a lock directory made unremovable, every protocol code
+#     (`wait`'s 5, `fail`'s 2 with its reason line, even a success 0) came out
+#     as 1.  The signal slots were hardened in 0.1.5/0.1.6 and this one was
+#     missed -- the same mechanism, one slot over.  Measured on bash and dash:
+#     `set -e; f(){ return 3; }; trap f EXIT; exit 5` exits 3, and with
+#     `|| true` exits 5.
+cases=$((cases + 1))
+if ! grep -q "^trap 'cleanup_config_snapshot || true' EXIT$" "$client"; then
+    printf '%s\n' 'client-interrupt: the early EXIT trap is not `|| true`-guarded; a failing snapshot cleanup replaces the client exit code (measured 2026-10-13)' >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if ! grep -q "^trap 'cleanup_client_runtime || true' EXIT$" "$client"; then
+    printf '%s\n' 'client-interrupt: the main EXIT trap is not `|| true`-guarded; a failing runtime cleanup replaces the client exit code (measured 2026-10-13)' >&2
+    failures=$((failures + 1))
+fi
 
 if [ "$failures" -ne 0 ]; then
     printf 'client-interrupt: %s failure(s)\n' "$failures" >&2

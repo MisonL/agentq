@@ -335,7 +335,12 @@ cleanup_config_snapshot() {
 # 2026-10-12: three shells all printed the cleanup then continued and exited
 # 0).  This handler cleans the snapshot then exits 130, the same form the full
 # trap below uses; that trap supersedes HUP/INT/TERM once defined.
-trap cleanup_config_snapshot EXIT
+# `|| true` on the EXIT slot for the same measured reason as the signal traps
+# (measured 2026-10-13 on bash and dash): `cleanup_config_snapshot` returns
+# non-zero when a removal fails, and under `set -e` a non-zero return from the
+# trap body makes the shell exit with THAT code, discarding the body's -- a
+# rejected argument's `exit 2` would read as 1, and a success as 1 too.
+trap 'cleanup_config_snapshot || true' EXIT
 trap 'cleanup_config_snapshot || true; exit 130' HUP INT TERM
 
 if [ -L "$config_path" ]; then
@@ -1266,7 +1271,7 @@ cleanup_client_runtime() {
 # EXIT HUP INT TERM` at the top rebinds HUP/INT/TERM to a function that trims
 # only the config snapshot, so it is superseded here where the full runtime
 # cleanup is defined.
-trap cleanup_client_runtime EXIT
+trap 'cleanup_client_runtime || true' EXIT
 # `cleanup_client_runtime` returns non-zero when any cleanup step fails, and
 # under `set -e` a non-zero return inside the trap body would trip errexit and
 # exit with THAT code before reaching `exit 130` -- so a failed cleanup would
@@ -1274,6 +1279,12 @@ trap cleanup_client_runtime EXIT
 # time. Measured 2026-10-12: `trap 'f; exit 130' TERM` with f returning 3 exits
 # 3, not 130.  `|| true` makes the 130 authoritative; cleanup is idempotent so
 # the EXIT trap's second run is harmless.
+#
+# The EXIT slot carries `|| true` for the SAME reason, measured 2026-10-13: the
+# body's own exit code (a `wait`'s 5/6, a `lookup`'s 3, a rejected argument's 2,
+# or a plain success 0) is what the caller's exit-code contract depends on, and
+# a failing cleanup step would otherwise replace it with 1 -- the same clobber
+# the signal traps were hardened against, on the one slot that was missed.
 trap 'cleanup_client_runtime || true; exit 130' HUP INT TERM
 
 windows_argument_identity_for_path() {

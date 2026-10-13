@@ -36,7 +36,7 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-launcher="$root/skill/assets/windows-git-bash/agentq-launcher.ps1"
+launcher=${AGENTQ_SMOKE_LAUNCHER:-$root/skill/assets/windows-git-bash/agentq-launcher.ps1}
 start_daemon="$root/skill/assets/windows-git-bash/agentq-start-daemon.ps1"
 [ -f "$launcher" ] || { printf '%s\n' 'launcher-contract: missing launcher asset' >&2; exit 1; }
 [ -f "$start_daemon" ] || { printf '%s\n' 'launcher-contract: missing start-daemon asset' >&2; exit 1; }
@@ -78,6 +78,14 @@ printf '\xEF\xBB\xBF' > "$driver"
 cat >> "$driver" <<'PS1'
 param([string]$LauncherPath, [string]$StartDaemonPath, [string]$WorkDirectory)
 $ErrorActionPreference = "Stop"
+# Mirror the asset's own strictness.  The launcher sets Set-StrictMode -Version
+# Latest at its top; a driver that omits it expands an unset $script: variable
+# to the empty string instead of throwing, so a cleanup branch that references
+# an undefined name (the 2026-10-13 $script:Program defect) printed its message
+# and returned as if healthy -- the driver tested a weakened environment and
+# stayed green while the real asset threw.  Same class as the "the stub must
+# copy the real tool" rule this suite records elsewhere.
+Set-StrictMode -Version Latest
 
 function Get-Fn([string]$src, [string]$name) {
     $pattern = '(?s)function ' + [regex]::Escape($name) + ' \{.*?\n\}\n'
@@ -99,6 +107,19 @@ $names = @(
     'Assert-AgentQLauncherRequiredFile'
 )
 foreach ($n in $names) { Invoke-Expression (Get-Fn $src $n) }
+
+# The extracted functions read $script:Program in their diagnostics.  The asset
+# defines it at its top; the extraction above lifts only the function bodies, so
+# the driver must reproduce that top-level assignment -- and it must take it FROM
+# the asset, not invent one, or the driver would stay green even if the asset
+# dropped the assignment (the 2026-10-13 defect: without it, StrictMode throws in
+# every cleanup-failure branch).  Extract the assignment; a missing one is a
+# loud failure here.
+$programAssignment = [regex]::Match($src, '(?m)^\s*\$script:Program\s*=.*$')
+if (-not $programAssignment.Success) {
+    throw "launcher: the asset no longer assigns `$script:Program, which its cleanup diagnostics read under StrictMode"
+}
+Invoke-Expression $programAssignment.Value
 
 # start-daemon's two guards, extracted from the REAL asset.  Their names differ
 # (Test-NonReparseWindows*) so they load alongside the launcher's without clashing.

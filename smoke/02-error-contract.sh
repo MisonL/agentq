@@ -160,13 +160,16 @@ fi
 # `return 2` inside a function is an internal value; whether it becomes the
 # process exit code depends on how each caller folds it.  A 2026-10-12 review
 # audited all 13 `return 2` sites (1188/1199/1507/1526/1540/1581/1588/1595/
-# 1790/1794/1800/1807/3601): every one is either folded by an `if`/`|| return 1`
-# at its call site or handled by fail() -- EXCEPT the lock-release family
-# (release_owned_lock's 1581/1588/1595), which reached the top level through
-# with_operation_lock.  That site now emits its own `reason=protocol_error`
-# (see with_operation_lock).  Matching `return 2` here instead would have
-# reported all 13 and buried the one real gap, so the rule stays on `exit 2`
-# and the return-2 audit lives in this comment plus the with_operation_lock fix.
+# 1790/1794/1800/1807/3601) and concluded every one is folded -- but that audit
+# MISSED the maintenance-lock family (recover_stale_maintenance_lock's three
+# refusal sites, 1507/1526/1540 back then): it is called BARE from
+# ensure_not_in_maintenance, which itself is called bare from main(), so its
+# `return 2` reached the top level as exit 2 with NO reason line (reproduced
+# 2026-10-13: a live-holder identity mismatch printed the refusal and exited 2
+# with `grep -c reason=` = 0).  Fixed 2026-10-13: all three sites now emit
+# `reason=protocol_error` before returning.  Matching `return 2` here instead
+# would have reported all 13 and buried the one real gap, so the rule stays on
+# `exit 2` and the return-2 audit lives in this comment plus the fix above.
 reason_gap_sites=$(
     awk '
         {
@@ -200,6 +203,70 @@ if [ -n "$reason_gap_sites" ]; then
     reason_gap_count=$(printf '%s\n' "$reason_gap_sites" | grep -c .)
 else
     reason_gap_count=0
+fi
+
+# Second structural rule, closing the hole the first one cannot see: a message
+# followed by `return 2` inside a function that is invoked BARE (not as an `if`
+# condition and not under `||`/`&&`) somewhere in the file.  A bare call under
+# `set -e` turns that return value into the process exit code, so the contract
+# applies to it exactly as to a literal `exit 2` -- this is precisely the shape
+# the 2026-10-12 manual audit missed (recover_stale_maintenance_lock, see the
+# comment above).  The rule is structural, not a name list: renaming the
+# function, adding a call site, or dropping the reason line all go red.
+# Functions are tracked by scanning for `name() {` definitions; a site is
+# "bare" when some line consists of (optional leading whitespace +) the name
+# alone.  Calls guarded by if/||/&&/&& or inside $( ) are fine -- their return
+# value is folded by the caller, which must then carry the reason itself.
+return2_gap_sites=$(
+    awk '
+        {
+            line = $0
+            if (pending != "") { line = pending " " line; pending = "" }
+            if (line ~ /\\[[:space:]]*$/) {
+                sub(/\\[[:space:]]*$/, "", line)
+                pending = line
+                next
+            }
+            joined[++n] = line
+        }
+        END {
+            if (pending != "") joined[++n] = pending
+            for (i = 1; i <= n; i++) {
+                if (joined[i] ~ /^[[:space:]]*[a-z_]+[[:space:]]*$/) {
+                    f = joined[i]; sub(/^[[:space:]]*/, "", f); sub(/[[:space:]]*$/, "", f)
+                    bare[f] = 1
+                }
+            }
+            cur = ""
+            for (i = 1; i < n; i++) {
+                if (joined[i] ~ /^[[:space:]]*[a-z_]+\(\) \{[[:space:]]*$/) {
+                    cur = joined[i]; sub(/^[[:space:]]*/, "", cur); sub(/\(\) \{[[:space:]]*$/, "", cur)
+                }
+                if (joined[i] !~ /printf/ || joined[i] ~ /reason=/ || joined[i] !~ />&2/) continue
+                j = i + 1
+                while (j <= n && (joined[j] ~ /^[[:space:]]*$/ || joined[j] ~ /^[[:space:]]*#/)) j++
+                if (j <= n && joined[j] ~ /^[[:space:]]*return 2[[:space:]]*$/ && cur != "" && bare[cur]) printf "%d [%s]: %s\n", i, cur, joined[i]
+            }
+        }' "$server"
+)
+if [ -n "$return2_gap_sites" ]; then
+    printf 'return-2 sites in bare-invoked functions print a message but no reason line:\n%s\n' "$return2_gap_sites" >&2
+    failures=$((failures + 1))
+fi
+
+# Third structural rule: the server's EXIT trap must be `|| true`-guarded.
+# Measured 2026-10-13 on bash and dash: under `set -e`, a non-zero return from
+# the trap body trips errexit and the process exits with the CLEANUP's code --
+# a successful `exit 0` reads as 1, and a `wait`'s 5/6 or a `fail`'s 2 (reason
+# already printed) read as an undifferentiated 1.  Reproduced on a real server
+# with a lock directory made unremovable: stdout was the correct removed JSON
+# and the exit code was 1.  The POSIX clients' signal traps were hardened in
+# 0.1.5/0.1.6 and the server's EXIT slot was the one missed; this rule pins the
+# hardened form so the next trap edit cannot regress it.
+cases=$((cases + 1))
+if ! grep -q "^trap 'cleanup || true' EXIT$" "$server"; then
+    printf '%s\n' 'error-contract: the server EXIT trap is not `|| true`-guarded; a failing lock/teardown cleanup replaces the server protocol exit code (measured 2026-10-13)' >&2
+    failures=$((failures + 1))
 fi
 
 if [ "$failures" -ne 0 ]; then

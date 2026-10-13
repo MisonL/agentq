@@ -79,9 +79,13 @@ jobs:
           # known set (the Windows-only installers/launcher contract, plus 12's
           # `ps51=NOT-covered`, which appears whenever pwsh is not PS 5.1 --
           # exactly this job's situation).  A NEW `NOT-covered` -- a check that
-          # silently stopped covering something -- is the failure this gate is
-          # for; before the NCOV bucket existed the word classified as `ok` with
-          # no gate reading it at all.  The test is a SUBSET test, not equality:
+          # has never claimed a platform gap before joining this line -- is the
+          # failure this gate is for.  (The gate is by CHECK NAME: a known check
+          # adding a further NOT-covered token is not distinguished.  Wording
+          # corrected 2026-10-13 -- the earlier phrasing "silently stopped
+          # covering" overclaimed what a name-level gate can see.); before the
+          # NCOV bucket existed the word classified as `ok` with no gate reading
+          # it at all.  The test is a SUBSET test, not equality:
           # a known name DROPPING OUT (e.g. 12 when pwsh happens to be 5.1) means
           # the platform covered more, which is good, not a red build.  An
           # unknown name appearing is red in every direction.

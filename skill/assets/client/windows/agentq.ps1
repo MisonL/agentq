@@ -1382,7 +1382,12 @@ function Write-Diagnostics {
     if ($diagnosticClass -eq "authentication") {
         if ($script:CredentialSource -eq "") {
             [Console]::Error.WriteLine("$($script:Program): ssh could not authenticate to $($script:TargetHost); AgentQ runs ssh with BatchMode=yes, so it cannot answer a password prompt. Install a key for this host, or use an ssh-agent.")
-            [Console]::Error.WriteLine("$($script:Program): to authenticate with a password instead, set AGENTQ_ASKPASS to a program that prints it (for example a system credential helper), or set AGENTQ_PASSWORD.")
+            # AGENTQ_PASSWORD is deliberately NOT offered: this platform refuses
+            # it (Resolve-CredentialSource, asserted by smoke/12) -- the hint was
+            # copied verbatim from the POSIX twin, whose auth hint mentions
+            # AGENTQ_PASSWORD because there it IS supported.  Measured 2026-10-13:
+            # the suggested variable here led to an immediate exit 2.
+            [Console]::Error.WriteLine("$($script:Program): to authenticate with a password instead, set AGENTQ_ASKPASS to a program that prints it (for example a system credential helper).")
         } else {
             [Console]::Error.WriteLine("$($script:Program): ssh could not authenticate to $($script:TargetHost) even though a credential source ($($script:CredentialSource)) is configured. Either the password was rejected, or the host does not accept password authentication; keys are tried first, so a key is not the problem.")
         }
@@ -2180,14 +2185,15 @@ function Invoke-SubmitWithRecovery {
     $attempt = 0
     while ($true) {
         $result = Invoke-SshLogged -RemoteCommand $SubmitInvocation.Command -InputPayload $SubmitInvocation.Input
-        Write-Diagnostics -Diagnostics $result.Diagnostics
         if ($result.ExitCode -eq 0) {
             if (!(Test-AgentQJsonResponse -Operation "submit" -Output $result.Output -ExpectedRequestId $RequestId)) {
+                Write-Diagnostics -Diagnostics $result.Diagnostics
                 return 2
             }
             Write-OperationOutput -Output $result.Output
             return 0
         }
+        Write-Diagnostics -Diagnostics $result.Diagnostics
         if (($result.ExitCode -ne 255) -or !(Test-SshTransportError -Diagnostics $result.TransportDiagnostics)) {
             Write-OperationOutput -Output $result.Output
             return $result.ExitCode
@@ -2237,9 +2243,9 @@ function Invoke-SafeOperationWithRecovery {
     $attempt = 0
     while ($true) {
         $result = Invoke-SshLogged -RemoteCommand $Invocation.Command -InputPayload $Invocation.Input
-        Write-Diagnostics -Diagnostics $result.Diagnostics
         if ($result.ExitCode -eq 0) {
             if (!(Test-AgentQJsonResponse -Operation $OperationName -Output $result.Output -ExpectedRequestId $ExpectedRequestId -ExpectedTaskId $ExpectedTaskId)) {
+                Write-Diagnostics -Diagnostics $result.Diagnostics
                 return 2
             }
             if (($OperationName -eq "wait") -and !(Test-AgentQWaitContract -Output $result.Output -ExitCode 0 -ExpectedTaskId $ExpectedTaskId)) {
@@ -2249,6 +2255,7 @@ function Invoke-SafeOperationWithRecovery {
             Write-OperationOutput -Output $result.Output
             return 0
         }
+        Write-Diagnostics -Diagnostics $result.Diagnostics
         if (($OperationName -eq "wait") -and ($result.ExitCode -in @(1, 5, 6)) -and
             !(Test-AgentQWaitContract -Output $result.Output -ExitCode $result.ExitCode -ExpectedTaskId $ExpectedTaskId)) {
             [Console]::Error.WriteLine("$($script:Program): remote wait response failed the AgentQ exit/result contract for exit $($result.ExitCode)")
@@ -2306,7 +2313,18 @@ $script:PlatformProbeTimeout = Convert-ToPositiveInt32 -Value $script:PlatformPr
 Resolve-CredentialSource
 $script:CredentialOptionLines = Get-CredentialSshOptions
 
-$configuredHost = Get-ConfiguredHost
+# A config-read failure here (oversized file, undecodable encoding, reparse
+# path) must exit 2 with the controlled "agentq: ..." message, like the POSIX
+# twin.  Thrown raw it escapes as an unhandled PowerShell exception: exit 1
+# (protocol "general failure" -- indistinguishable from an operation failure)
+# and a stack-trace dump on stderr.  Measured 2026-10-13 with an oversized and
+# an invalidly-encoded AGENTQ_CONFIG.  Get-ConfiguredHost returns "" when the
+# config is ABSENT, which is normal and must not be caught.
+try {
+    $configuredHost = Get-ConfiguredHost
+} catch {
+    Stop-AgentQ ("invalid AgentQ config: " + $_.Exception.Message)
+}
 $script:TargetHost = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_HOST)) { $env:AGENTQ_HOST } else { $configuredHost }
 $arguments = @($args)
 $position = 0
