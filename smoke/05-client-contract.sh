@@ -1141,6 +1141,29 @@ else
     fi
 fi
 
+# Both Windows launcher-wrapper copies must read the argument payload with the
+# per-byte .NET stream read, never the 4096-char [Console]::In.Read(char[])
+# block loop.  Measured 2026-10-14 on the Windows test host: the block read
+# hangs intermittently once the payload passes ~4.5K characters (near-certainly
+# past ~8.6K) -- a PS 5.1 Console.In block-read stall on the OpenSSH pipe;
+# per-byte reads completed 12/12 with no hang (payloads to 53K).  The two
+# copies (POSIX client's single-quoted one-liner, Windows client's here-string)
+# cannot be compared by rule E -- assert the property in each file instead:
+# the stream read must be present, and the block-read buffer must be gone.
+cases=$((cases + 1))
+windows_wrapper_asset="$root/skill/assets/client/windows/agentq.ps1"
+for wrapper_file in "$client" "$windows_wrapper_asset"; do
+    if ! grep -q 'OpenStandardInput' "$wrapper_file" || \
+       ! grep -q 'ReadByte' "$wrapper_file"; then
+        printf 'client-contract: %s no longer reads the Windows argument payload per byte (the block read hangs on real Windows ssh)\n' "$wrapper_file" >&2
+        failures=$((failures + 1))
+    fi
+    if grep -q '\[char\[\]::new(4096)' "$wrapper_file"; then
+        printf 'client-contract: %s still carries the 4096-char block-read buffer that hangs on real Windows ssh\n' "$wrapper_file" >&2
+        failures=$((failures + 1))
+    fi
+done
+
 if [ "$failures" -ne 0 ]; then
     printf 'client-contract: %s failure(s)\n' "$failures" >&2
     exit 1

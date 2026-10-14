@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
@@ -427,10 +427,23 @@ try {
     [Environment]::SetEnvironmentVariable("MSYS_NO_PATHCONV", "1", "Process")
     [Environment]::SetEnvironmentVariable($environmentVariable, $serverPath, "Process")
     [Environment]::SetEnvironmentVariable($argumentCountEnvironmentVariable, [string]$arguments.Count, "Process")
-    for ($index = 0; $index -lt $arguments.Count; $index += 1) {
-        $argumentEnvironmentVariable = "$argumentEnvironmentPrefix$index"
-        $previousArguments[$argumentEnvironmentVariable] = [Environment]::GetEnvironmentVariable($argumentEnvironmentVariable, "Process")
-        [Environment]::SetEnvironmentVariable($argumentEnvironmentVariable, $arguments[$index], "Process")
+    # A single argument past ~32.5K characters overflows the per-process
+    # environment block: measured 2026-10-14 on the Windows test host, a 33000-char
+    # argument makes SetEnvironmentVariable throw ArgumentException ("value too
+    # large") while 32500 succeeds -- the CreateProcess 32767 block, name included.
+    # Without this catch the throw was uncaught: the wrapper died with exit 1 and
+    # a CLIXML stack trace, no contract error.  Report the contract code instead.
+    try {
+        for ($index = 0; $index -lt $arguments.Count; $index += 1) {
+            $argumentEnvironmentVariable = "$argumentEnvironmentPrefix$index"
+            $previousArguments[$argumentEnvironmentVariable] = [Environment]::GetEnvironmentVariable($argumentEnvironmentVariable, "Process")
+            [Environment]::SetEnvironmentVariable($argumentEnvironmentVariable, $arguments[$index], "Process")
+        }
+    } catch {
+        [Console]::Error.WriteLine("agentq: an argument is too large for the Windows environment handoff (measured limit: a single argument over ~32.5K characters)")
+        [Console]::Error.WriteLine("agentq: reason=protocol_error")
+        [Console]::Error.WriteLine("agentq-exit:2")
+        exit 2
     }
     Assert-AgentQLauncherRuntimeFilePath -Path $runtimeScriptPath
     [System.IO.File]::WriteAllText($runtimeScriptPath, $runtimeScriptContent, [System.Text.UTF8Encoding]::new($false))
