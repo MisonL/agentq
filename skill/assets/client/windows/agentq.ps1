@@ -1786,19 +1786,25 @@ function New-WindowsRemoteInvocation {
     $launcherWrapper = @'
 $ProgressPreference = "SilentlyContinue"
 $maximumArgumentPayloadCharacters = 1048576
-$payloadBuffer = [char[]]::new(4096)
+# Read stdin one BYTE at a time via the .NET stream.  Measured 2026-10-14 on the
+# Windows test host: the 4096-char [Console]::In.Read(char[]) block loop hangs
+# intermittently once the payload passes ~4.5K characters (near-certainly past
+# ~8.6K) -- a PS 5.1 Console.In block-read stall on the OpenSSH pipe; per-byte
+# reads completed 12/12 (payloads up to 53K) with no hang.  The payload is
+# base64 ASCII, so byte-wise accumulation is loss-free.
+$payloadStream = [Console]::OpenStandardInput()
 $payloadBuilder = [System.Text.StringBuilder]::new()
 while ($true) {
-    $payloadReadCount = [Console]::In.Read($payloadBuffer, 0, $payloadBuffer.Length)
-    if ($payloadReadCount -le 0) {
+    $payloadReadByte = $payloadStream.ReadByte()
+    if ($payloadReadByte -lt 0) {
         break
     }
-    if (($payloadBuilder.Length + $payloadReadCount) -gt $maximumArgumentPayloadCharacters) {
+    if (($payloadBuilder.Length + 1) -gt $maximumArgumentPayloadCharacters) {
         [Console]::Error.WriteLine("agentq: Windows argument payload exceeds $maximumArgumentPayloadCharacters characters")
         [Console]::Error.WriteLine("agentq-exit:2")
         exit 2
     }
-    [void]$payloadBuilder.Append($payloadBuffer, 0, $payloadReadCount)
+    [void]$payloadBuilder.Append([char]$payloadReadByte)
 }
 $payload = $payloadBuilder.ToString()
 & "C:\ProgramData\AgentQ\agentq-launcher.ps1" -ArgumentsBase64 $payload

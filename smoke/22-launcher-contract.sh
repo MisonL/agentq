@@ -584,6 +584,47 @@ elif ! awk '
     printf '%s\n' 'launcher-contract: the argument parse is not wrapped in try/catch, so a malformed payload exits 1 instead of the contract 2' >&2
     failures=$((failures + 1))
 fi
+
+# The per-argument environment write must be wrapped in try/catch: a single
+# argument past ~32.5K characters overflows the per-process environment block
+# (CreateProcess 32767, measured 2026-10-14 on the Windows test host) and
+# SetEnvironmentVariable throws ArgumentException.  Without the catch the throw
+# was uncaught -- the wrapper died with exit 1 and a CLIXML stack trace, no
+# contract error.  Same structural rule as the parse lock above: `try {`
+# immediately before the SetEnvironmentVariable loop, `} catch {` right after,
+# an `exit 2` within five lines of the catch, and the emitted reason class.
+if ! awk '
+    { lines[NR] = $0 }
+    END {
+        found = 0
+        for (i = 2; i <= NR - 8 && i <= NR; i++) {
+            if (lines[i] == "    try {" && lines[i + 1] ~ /for \(\$index = 0; \$index -lt \$arguments\.Count/) {
+                found = 1
+                # The loop body (SetEnvironmentVariable on the argument variable)
+                # must be inside, the catch within the next few lines, and the
+                # contract code + reason class must both follow the catch.
+                body = 0
+                catch_line = -1
+                for (j = i + 1; j <= i + 6 && j <= NR; j++) {
+                    if (lines[j] ~ /SetEnvironmentVariable\(\$argumentEnvironmentVariable/) body = 1
+                    if (lines[j] ~ /^[[:space:]]*\} catch \{/) { catch_line = j; break }
+                }
+                if (!body || catch_line < 0) exit 1
+                ok = 0
+                reason = 0
+                for (j = catch_line; j <= catch_line + 5 && j <= NR; j++) {
+                    if (lines[j] ~ /exit 2/) ok = 1
+                    if (lines[j] ~ /reason=protocol_error/) reason = 1
+                }
+                if (!ok || !reason) exit 1
+            }
+        }
+        exit found ? 0 : 1
+    }
+' "$launcher"; then
+    printf '%s\n' 'launcher-contract: the argument environment write is not wrapped in try/catch with reason=protocol_error, so an environment-block overflow exits 1 instead of the contract 2' >&2
+    failures=$((failures + 1))
+fi
 if [ "$failures" -ne 0 ]; then
     printf 'launcher-contract: %s failure(s)\n' "$failures" >&2
     exit 1
