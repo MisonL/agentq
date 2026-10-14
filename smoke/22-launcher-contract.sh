@@ -585,6 +585,7 @@ elif ! awk '
     failures=$((failures + 1))
 fi
 
+cases=$((cases + 1))
 # The per-argument environment write must be wrapped in try/catch: a single
 # argument past ~32.5K characters overflows the per-process environment block
 # (CreateProcess 32767, measured 2026-10-14 on the Windows test host) and
