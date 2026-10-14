@@ -2339,12 +2339,15 @@ task_id 0）→ 双记录判歧义，**正是契约设计的 fail-closed**；人
 通。**遗留观察**：10-02 的 remove 为什么没归档该记录（当时部署是 0.1.2，可能属
 已修的旧缺陷或流程未走完）——新 remove 的归档已验证正常（tombstone 就位）。
 
-**机器状态备注（非产品缺陷）**：该 VM 的 `powershell.exe -EncodedCommand` 对
-**任意长度载荷**（含 48 字符）静默失败（rc 0/-1、无输出），govc 与 ssh 两通道、
-重启后均同——sshp.ps1 的 Windows 探针路径在该机**不可用**，A33 的 23K 长度问题
-在该机上无从实测（机制在长度之前就断了）。重灾区是机器本身（模板/策略未知），
-非 AgentQ 资产；guest.run 反复挂起的 powershell 进程会让 Tools 进入
-"operation not allowed in current state"，重启 VM 恢复。
+**机器状态备注（非产品缺陷；2026-10-14 晚间修正）**：该 VM 的 `powershell.exe -EncodedCommand`
+行为**随会话状态漂移**——本日早些时候测得「对任意长度载荷（含 48 字符）静默失败（rc 0/-1、
+无输出），govc 与 ssh 两通道、重启后均同」，但同日晚间经 Git Bash 直接调、`Write-Output` 短载荷
+实测**可达**（编码 52 字符 → 输出正常）。当日 0.1.9 的整条 Windows submit 链路（wrapper 本身就是
+`-EncodedCommand`）在真机跑通，也证明该断言过强。**教训**：该机的 `-EncodedCommand` 不能当稳定
+探针用；判别缺陷与环境抖动要固定变量做交叉实验。A33 的 23K 长度问题在该机仍无从实测。
+另实测：一个会话内连续生成大量 powershell 后整机操作延迟从秒级劣化到 17–40s/次
+（疑 Defender），`taskkill /F /IM powershell.exe` 清掉孤儿后恢复；guest.run 反复挂起的
+powershell 进程会让 Tools 进入 "operation not allowed in current state"，重启 VM 恢复。
 
 **记录未修（全部需真 Windows / Pueue 源验证，与 A33 的 sshp 载荷同性质）**：
 - **launcher `$LASTEXITCODE` 三分支**（agentq.ps1 wrapper 读 launcher 退出码）：pwsh 7.5
