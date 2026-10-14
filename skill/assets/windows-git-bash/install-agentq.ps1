@@ -18,7 +18,7 @@ $expectedClientHash = "28b0756d54ec16ce13d78b251d086aa62e0057089cb27f793cd649f97
 $expectedDaemonHash = "aafa05e2f26cda9aff3eeb9be261e8f9f67752d1e9bb7fbcb47318e35c52ab1d"
 $releaseVersion = "4.0.4"
 $releaseBaseUrl = "https://github.com/Nukesor/pueue/releases/download/v$releaseVersion"
-$agentqVersion = "0.1.8"
+$agentqVersion = "0.1.9"
 $clientAssetName = "pueue-x86_64-pc-windows-msvc.exe"
 $daemonAssetName = "pueued-x86_64-pc-windows-msvc.exe"
 $gitBashPath = $null
@@ -1641,8 +1641,24 @@ function Assert-PueueSmokeLogContainsToken {
         $temporaryPath = New-AgentQInstallerTemporaryFile -Directory $TemporaryDirectory -Prefix "smoke-log"
         Assert-NonReparseFilePath -Path $temporaryPath -Description "Pueue shell smoke log temporary file"
         try {
-            & $ClientPath --config $ConfigPath log --full $TaskId 1> $temporaryPath
-            $exitCode = $LASTEXITCODE
+            # pueue log --full writes its table to STDERR in a session without
+            # a console (measured 2026-10-14 on the test VM: out-len=24,
+            # err-len=1466).  Under $ErrorActionPreference = "Stop" PS 5.1
+            # turns the first native stderr line into a terminating
+            # NativeCommandError EVEN when stderr is redirected (measured:
+            # EAP=Stop + 2> file still throws) -- so the smoke's log read
+            # failed and ROLLED BACK the whole install ("Pueue shell smoke log
+            # could not be read").  Local EAP=Continue for this one call:
+            # the child's exit code is the contract, and stderr is routed to
+            # its own file where the redirect still captures the bytes.
+            $previousSmokeEAP = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            try {
+                & $ClientPath --config $ConfigPath log --full $TaskId 1> $temporaryPath 2> $smokeLogErrorPath
+                $exitCode = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $previousSmokeEAP
+            }
         } catch {
             $exitCode = 1
         }
@@ -1670,6 +1686,9 @@ function Assert-PueueSmokeLogContainsToken {
         } catch {
             $cleanupError = "Pueue shell smoke log cleanup failed: $temporaryPath"
         }
+        if ($null -ne $smokeLogErrorPath) {
+            Remove-Item -LiteralPath $smokeLogErrorPath -Force -ErrorAction SilentlyContinue
+        }
     }
     if ($null -ne $operationError) {
         if ($null -ne $cleanupError) {
@@ -1696,6 +1715,7 @@ function Invoke-PueueShellCommandSmoke {
     $taskRemoved = $false
     $smokeFailure = $null
     $cleanupFailure = $null
+    $smokeLogErrorPath = $null
 
     try {
         $addArguments = @(

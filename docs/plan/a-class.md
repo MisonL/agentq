@@ -2303,6 +2303,49 @@ blocker 是 `sleep 60`、清理时**仍在 Running**，而 **Pueue 拒绝删除�
     （主机授权边界）。
 13. **注释失实**：`agentq` 2981「EXIT trap 会重试删除」与实现相反——改为描述实情。
 
+
+### A34 补记（2026-10-14，专用 Windows 测试机真机）
+
+**「记录未修」第一条实测裁决（真机 PS 5.1 19041.3996）**：`& script` 调用点的
+`$LASTEXITCODE` 在三条分歧路径上**全部正确更新**——原生命令后 `exit 2`→2、纯
+`exit 2`→2、**finally 强制 `exit 2`（前面原生命令退 0）→2**；未捕获 throw 时保持
+null（进 wrapper 的 null 分支，与设计一致）。**A34 原 fail-open 假设不成立，该项
+关闭为「实测无缺陷」**，wrapper 现行实现（读 `$LASTEXITCODE`）在 5.1 上正确。
+
+**真机暴露并已修的两个真实缺陷（0.1.9）**：
+1. **`install_jq_line_ending_shim` 先调用后定义**（A34 修复 8 引入的回归，被安装器
+   launcher smoke 退 127 抓住）：本日把 shim 安装提前到平台 dispatch（~220 行）时，
+   其函数定义仍在 382 行——bash 顶层「先调用后定义」退 **127**，`--EncodedCommand`
+   的整条 doctor/操作路径失效。实测（真机）：launcher smoke err 含
+   `install_jq_line_ending_shim: command not found`。修：函数定义移到平台 dispatch
+   之前（200 行）；`smoke/02` 新增静态锁（定义行号必须早于全部调用点；先证能红：
+   变异副本报两处红，干净副本 13 例绿）。
+2. **安装器 smoke 的 `pueue log --full 1> file` 在 EAP=Stop 下被 stderr 错误记录
+   打断**（A34 发现 3/4 同族的新残余站点，实测：真机无控制台会话中 `pueue log
+   --full` 把整张表写 **stderr**——out-len=24/err-len=1466；PS 5.1 在
+   `$ErrorActionPreference="Stop"` 下**即使 `2> file` 重定向**仍把第一条原生 stderr
+   行转成 terminating `NativeCommandError`（EAP=Stop×2>file 组合实测复现），
+   smoke 判 `log could not be read` → **整个安装回滚**。修：该调用局部
+   `$ErrorActionPreference="Continue"`（finally 恢复）+ stderr 落独立临时文件、
+   finally 清理。
+
+**专用测试机升级 0.1.2→0.1.8 并端到端**（用户「继续」授权）：`AgentQ 0.1.8
+installed`、`updated_atomically:true`、两 pueue 哈希与内置常量逐一相符、
+`doctor` 报 `agentq=0.1.8`/`scheduled_task State=3`；经保护 launcher 跑通
+`submit→wait(0/Success)→logs(E2E018-OK)→remove→wait(5/removed)→lookup(5 可重复)`。
+**端到端期间的一个 fail-closed 实证**：wait 退 `6/unavailable`（ambiguous）——
+Pueue 复用数字 id 0，而 2026-10-02 旧测试遗留的 `winwin` 记录仍 `accepted`（同
+task_id 0）→ 双记录判歧义，**正是契约设计的 fail-closed**；人工清掉陈旧记录后全
+通。**遗留观察**：10-02 的 remove 为什么没归档该记录（当时部署是 0.1.2，可能属
+已修的旧缺陷或流程未走完）——新 remove 的归档已验证正常（tombstone 就位）。
+
+**机器状态备注（非产品缺陷）**：该 VM 的 `powershell.exe -EncodedCommand` 对
+**任意长度载荷**（含 48 字符）静默失败（rc 0/-1、无输出），govc 与 ssh 两通道、
+重启后均同——sshp.ps1 的 Windows 探针路径在该机**不可用**，A33 的 23K 长度问题
+在该机上无从实测（机制在长度之前就断了）。重灾区是机器本身（模板/策略未知），
+非 AgentQ 资产；guest.run 反复挂起的 powershell 进程会让 Tools 进入
+"operation not allowed in current state"，重启 VM 恢复。
+
 **记录未修（全部需真 Windows / Pueue 源验证，与 A33 的 sshp 载荷同性质）**：
 - **launcher `$LASTEXITCODE` 三分支**（agentq.ps1 wrapper 读 launcher 退出码）：pwsh 7.5
   实测 `& 脚本` 的 `exit` 会更新 `$LASTEXITCODE`，5.1 文档条款疑回填——若 5.1 不更新，

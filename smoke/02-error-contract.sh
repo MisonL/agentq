@@ -15,7 +15,9 @@ trap 'rm -rf -- "$work"' EXIT
 mkdir -p "$work/config" "$work/data/task_logs" "$work/data/agentq-cancellations" \
     "$work/data/agentq-requests/.locks" "$work/data/agentq-requests/.tombstones" \
     "$work/runtime"
-cp "$root/skill/assets/unix/agentq-server" "$work/agentq-server"
+# AGENTQ_SMOKE_SERVER selects the server under test (same hook as smoke/18) so
+# the static rules below can be mutation-proven against a modified copy.
+cp "${AGENTQ_SMOKE_SERVER:-$root/skill/assets/unix/agentq-server}" "$work/agentq-server"
 cp "$root/skill/assets/unix/pueue.yml" "$work/config/pueue.yml"
 for stub in pueue pueued; do
     printf '#!/bin/sh\nprintf "%%s 4.0.4\\n" "%s"\n' "$stub" > "$work/$stub"
@@ -274,6 +276,28 @@ cases=$((cases + 1))
 if ! grep -q "^trap 'cleanup || true' EXIT$" "$server"; then
     printf '%s\n' 'error-contract: the server EXIT trap is not `|| true`-guarded; a failing lock/teardown cleanup replaces the server protocol exit code (measured 2026-10-13)' >&2
     failures=$((failures + 1))
+fi
+
+# A bash function called at top level BEFORE its definition dies with
+# "command not found" (exit 127) -- on the Windows target that surfaced as the
+# installer's launcher smoke reading 127 instead of the contract's 2
+# (measured on the test VM 2026-10-14: install_jq_line_ending_shim was called
+# at line 220 from the platform dispatch while its definition sat at 382; the
+# whole doctor path returned 127).  Lock the measured case structurally: the
+# shim installer's definition must precede its every call site.
+cases=$((cases + 1))
+shim_def_line=$(grep -n '^install_jq_line_ending_shim() {' "$server" | head -1 | cut -d: -f1)
+shim_call_lines=$(grep -n '^[[:space:]]*install_jq_line_ending_shim$' "$server" | cut -d: -f1)
+if [ -z "$shim_def_line" ] || [ -z "$shim_call_lines" ]; then
+    printf '%s\n' 'error-contract: install_jq_line_ending_shim definition or call sites vanished (the static ordering lock below would be vacuous)' >&2
+    failures=$((failures + 1))
+else
+    for line in $shim_call_lines; do
+        if [ "$line" -lt "$shim_def_line" ]; then
+            printf 'error-contract: install_jq_line_ending_shim is called at line %s before its definition at line %s; the Windows dispatch exits 127 there (measured on the test VM, 2026-10-14)\n' "$line" "$shim_def_line" >&2
+            failures=$((failures + 1))
+        fi
+    done
 fi
 
 if [ "$failures" -ne 0 ]; then
