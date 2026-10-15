@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.11'
+agentq_version='0.1.12'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -1687,6 +1687,7 @@ trap 'cleanup || true' EXIT
 # live holder's own release path owns that lock.
 recover_stale_operation_lock_for_read() {
     local candidate="$operation_lock_directory"
+    local stale_read_recovery_status
 
     [ -e "$candidate" ] || [ -L "$candidate" ] || return 0
     path_chain_is_safe "$candidate" || fail "invalid AgentQ operation lock path: $candidate"
@@ -1694,13 +1695,34 @@ recover_stale_operation_lock_for_read() {
     [ -d "$candidate" ] || fail "invalid AgentQ operation lock path: $candidate"
     if read_lock_metadata "$candidate/pid"; then
         if process_is_confirmed_dead "$lock_pid" "$lock_identity"; then
-            if ! remove_stale_lock "$candidate" operation "$lock_pid" "$lock_identity"; then
-                fail "cannot recover stale AgentQ operation lock: $candidate"
+            # A READ does not need this lock at all (that is the whole point of
+            # the lock-free read paths), so clearing a stale one is best-effort:
+            # if the lock is no longer the one we inspected -- a concurrent run
+            # removed it, or a writer just created a live one -- the right
+            # answer is to carry on, not to fail.  Failing here made two
+            # concurrent reads race: the loser exited 2 with
+            # reason=protocol_error while the winner succeeded (measured
+            # 2026-10-16 by reading remove_stale_lock's return values: 2 means
+            # "unsafe or changed", 1 means a real removal failure).  Only the
+            # real failure is fatal.  remove_stale_lock still prints its
+            # one-line diagnostic for the changed case, so a rare race is
+            # visible on stderr without turning a successful read into an
+            # error.
+            if remove_stale_lock "$candidate" operation "$lock_pid" "$lock_identity"; then
+                :
+            else
+                stale_read_recovery_status=$?
+                [ "$stale_read_recovery_status" -eq 2 ] ||
+                    fail "cannot recover stale AgentQ operation lock: $candidate"
             fi
         fi
     elif lock_directory_is_stale_empty "$candidate"; then
-        if ! remove_stale_lock "$candidate" operation '' '' true; then
-            fail "cannot recover empty AgentQ operation lock: $candidate"
+        if remove_stale_lock "$candidate" operation '' '' true; then
+            :
+        else
+            stale_read_recovery_status=$?
+            [ "$stale_read_recovery_status" -eq 2 ] ||
+                fail "cannot recover empty AgentQ operation lock: $candidate"
         fi
     fi
     return 0
@@ -3914,7 +3936,14 @@ compact_status_summary() {
                            and (.value.id >= 0)
                            and ((.value.created_at | type) == "string")
                            and ((.value.created_at | length) > 0)
-                           and ((.value.label | type) == "string")
+                           # label may be null: the Pueue task label is optional,
+                           # so a task added to the group directly (`pueue add -g
+                           # agentq`) has none.  The full-status guard does not
+                           # require a label either; requiring one here made the
+                           # DEFAULT doctor view fail (exit 2) on a queue that
+                           # `doctor --full` and `status --task` read fine
+                           # (measured 2026-10-16).
+                           and (((.value.label | type) == "string") or (.value.label == null))
                            and ((.value.status | type) == "object") then
                             {
                                 key: (.value.id | tostring),
@@ -5822,6 +5851,14 @@ main() {
                 status_mode=summary
             elif [ "$#" -eq 2 ]; then
                 [ "$1" = '--task' ] || fail 'status accepts --summary or --task <id>'
+                # Validate the id HERE, not only inside status(): status() reads
+                # an empty mode as "the full queue" and the literal `summary` as
+                # the summary mode, so `status --task ""` (a shell variable that
+                # never got set) returned the whole queue with exit 0 and
+                # `status --task summary` returned the summary -- both a success
+                # response of the wrong shape, which a caller parsing {"task":...}
+                # cannot tell from the right one (measured 2026-10-16).
+                is_task_id "$2" || fail 'task id must be a non-negative integer'
                 status_mode=$2
             elif [ "$#" -ne 0 ]; then
                 fail 'status accepts --summary or --task <id>'

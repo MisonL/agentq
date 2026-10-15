@@ -29,17 +29,25 @@ function Read-AgentQBoundedText {
     if ($MaximumCharacters -le 0) {
         throw "AgentQ argument payload limit must be positive"
     }
-    $buffer = [char[]]::new(4096)
+    # Read ONE character at a time, never a block.  A 4096-character block read
+    # on [Console]::In intermittently BLOCKS FOREVER when the input arrives over
+    # an OpenSSH pipe -- measured 2026-10-14 on the real Windows host: the same
+    # payload and the same stdin read fast 2 of 4 times and hung the other 2 at
+    # ~4.5K characters, and was near-certain to hang by ~8.6K.  Per-character
+    # reads completed 6/6 in the same experiment.  Both client wrappers were
+    # changed for this reason in 0.1.10; this stdin entry is the third copy of
+    # the same reader and was missed (no caller passes `-` today, so the defect
+    # is latent -- but the documented entry is reachable).
     $builder = [System.Text.StringBuilder]::new()
     while ($true) {
-        $readCount = $Reader.Read($buffer, 0, $buffer.Length)
-        if ($readCount -le 0) {
+        $codePoint = $Reader.Read()
+        if ($codePoint -lt 0) {
             break
         }
-        if (($builder.Length + $readCount) -gt $MaximumCharacters) {
+        if (($builder.Length + 1) -gt $MaximumCharacters) {
             throw "AgentQ argument payload exceeds $MaximumCharacters characters"
         }
-        [void]$builder.Append($buffer, 0, $readCount)
+        [void]$builder.Append([char]$codePoint)
     }
     return $builder.ToString()
 }

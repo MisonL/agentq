@@ -152,13 +152,18 @@ $script:PlatformProbeTimeout = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLA
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.11"
-# --stdin-script's payload must fit in ONE argv element on the target; a Windows
-# target re-encodes argv onto a CreateProcess command line capped at 32767
-# characters and the payload shares that line with the rest of the server
-# invocation (the POSIX twin carries the unix-side MAX_ARG_STRLEN bound too).
-# The bound leaves ~12K of headroom on that command line.
-$script:StdinScriptLimit = 20000
+$script:ClientVersion = "0.1.12"
+# --stdin-script's payload must fit in ONE argv element on the TARGET, so the
+# cap follows the target's argv limit, not this machine's platform: a unix
+# target takes up to 100000 base64 characters (the POSIX twin's MAX_ARG_STRLEN
+# headroom), a Windows target 20000 -- Windows re-encodes argv onto a
+# CreateProcess command line capped at 32767 characters and the payload shares
+# that line with the rest of the server invocation.  Resolved per submission
+# against the probed remote platform; see the submit arm.  Fixed 2026-10-16:
+# a single constant applied the Windows cap to every target, refusing a 60K
+# script to a unix host with a message that blamed the wrong limit.
+$script:StdinScriptLimitUnix = 100000
+$script:StdinScriptLimitWindows = 20000
 $script:RemotePlatform = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_REMOTE_PLATFORM)) {
     $env:AGENTQ_REMOTE_PLATFORM
 } else {
@@ -214,6 +219,9 @@ Environment:
   AGENTQ_PLATFORM_PROBE_TIMEOUT    Read-only platform/launcher probe limit in seconds.
   AGENTQ_PLATFORM_PROBE_CACHE      on (default) caches the resolved platform per
                                    host for 7 days; off probes every run.
+  AGENTQ_PLATFORM_PROBE_CACHE_TTL  Cache lifetime in seconds; default 604800.
+  AGENTQ_PLATFORM_CACHE_DIR        Directory holding the platform cache;
+                                   defaults to %USERPROFILE%\.config\agentq.
   AGENTQ_WAIT_TIMEOUT              Default wait --timeout in seconds; the wait
                                    flag overrides it.
   AGENTQ_SSH                       OpenSSH client path; defaults to ssh.exe found on PATH.
@@ -1312,8 +1320,17 @@ function Invoke-SshLogged {
 }
 
 function Invoke-WaitSshWithTimeout {
-    # wait with a client-side deadline, modeled on Invoke-SshLogged but
-    # running ssh as a Process so it can be killed when the budget elapses.
+    # wait with a client-side deadline, modeled on Invoke-SshLoggedWithTimeout:
+    # ssh runs as a Process so it can be killed when the budget elapses, and its
+    # stdout/stderr are DRAINED ASYNCHRONOUSLY while the deadline loop runs.
+    #
+    # The drain is not optional.  New-SshProcessStartInfo redirects stdout and
+    # stderr to PIPES, so a response larger than the pipe buffer would block ssh
+    # on write and never exit -- the deadline loop would then report a false
+    # timeout (measured 2026-10-15: the first version of this function never
+    # read the pipes at all, so even a small completed response came back empty
+    # and every `wait --timeout` failed validation with "response was empty").
+    #
     # Killing the LOCAL ssh does not stop the remote wait (the Windows test
     # host has no coreutils timeout; the bound is local-only here), which is
     # the measured 2026-10-15 orphan-lock shape -- the caller surfaces exit 6
@@ -1326,8 +1343,6 @@ function Invoke-WaitSshWithTimeout {
     )
 
     $sshLogPath = $null
-    $outputPath = $null
-    $errorPath = $null
     $process = $null
     $started = $false
     $timedOut = $false
@@ -1336,11 +1351,7 @@ function Invoke-WaitSshWithTimeout {
     $cleanupFailurePaths = @()
     try {
         $sshLogPath = New-TemporaryPath -Prefix "agentq-wait-log"
-        $outputPath = New-TemporaryPath -Prefix "agentq-wait-output"
-        $errorPath = New-TemporaryPath -Prefix "agentq-wait-error"
         Assert-NonReparseTemporaryFilePath -Path $sshLogPath
-        Assert-NonReparseTemporaryFilePath -Path $outputPath
-        Assert-NonReparseTemporaryFilePath -Path $errorPath
         $sshArguments = @(
             "-E", $sshLogPath,
             "-o", "LogLevel=ERROR") + $script:CredentialOptionLines + @(
@@ -1375,8 +1386,44 @@ function Invoke-WaitSshWithTimeout {
                 $process.StandardInput.Close()
             }
 
+            $maximumStreamCharacters = 65536
+            $streamBufferCharacters = 4096
+            $stdoutState = [pscustomobject]@{
+                Name = "stdout"
+                Reader = $process.StandardOutput
+                Buffer = [char[]]::new($streamBufferCharacters)
+                Task = $null
+                Builder = [System.Text.StringBuilder]::new()
+                Characters = 0
+                Truncated = $false
+                Failure = ""
+                Complete = $false
+            }
+            $stderrState = [pscustomobject]@{
+                Name = "stderr"
+                Reader = $process.StandardError
+                Buffer = [char[]]::new($streamBufferCharacters)
+                Task = $null
+                Builder = [System.Text.StringBuilder]::new()
+                Characters = 0
+                Truncated = $false
+                Failure = ""
+                Complete = $false
+            }
+            $stdoutState.Task = $stdoutState.Reader.ReadAsync($stdoutState.Buffer, 0, $stdoutState.Buffer.Length)
+            $stderrState.Task = $stderrState.Reader.ReadAsync($stderrState.Buffer, 0, $stderrState.Buffer.Length)
+
             $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
             while ($true) {
+                $progressed = $false
+                if (!$stdoutState.Complete -and $stdoutState.Task.IsCompleted) {
+                    [void](Read-BoundedProcessStreamChunk -State $stdoutState -MaximumCharacters $maximumStreamCharacters)
+                    $progressed = $true
+                }
+                if (!$stderrState.Complete -and $stderrState.Task.IsCompleted) {
+                    [void](Read-BoundedProcessStreamChunk -State $stderrState -MaximumCharacters $maximumStreamCharacters)
+                    $progressed = $true
+                }
                 if ($process.HasExited) {
                     break
                 }
@@ -1384,7 +1431,9 @@ function Invoke-WaitSshWithTimeout {
                     $timedOut = $true
                     break
                 }
-                [void]$process.WaitForExit(200)
+                if (!$progressed) {
+                    [void]$process.WaitForExit(50)
+                }
             }
 
             if ($timedOut) {
@@ -1400,9 +1449,38 @@ function Invoke-WaitSshWithTimeout {
                     Diagnostics = ""
                 }
             } else {
+                # Drain whatever is still buffered before reading the result:
+                # the exit can be observed while the last chunk is in flight.
+                $drainDeadline = [DateTime]::UtcNow.AddMilliseconds(5000)
+                while (!$stdoutState.Complete -or !$stderrState.Complete) {
+                    $progressed = $false
+                    if (!$stdoutState.Complete -and $stdoutState.Task.IsCompleted) {
+                        [void](Read-BoundedProcessStreamChunk -State $stdoutState -MaximumCharacters $maximumStreamCharacters)
+                        $progressed = $true
+                    }
+                    if (!$stderrState.Complete -and $stderrState.Task.IsCompleted) {
+                        [void](Read-BoundedProcessStreamChunk -State $stderrState -MaximumCharacters $maximumStreamCharacters)
+                        $progressed = $true
+                    }
+                    if (!$progressed) {
+                        if ([DateTime]::UtcNow -ge $drainDeadline) {
+                            if (!$stdoutState.Complete) {
+                                $stdoutState.Complete = $true
+                                $stdoutState.Failure = "stream drain timed out after 5 seconds"
+                            }
+                            if (!$stderrState.Complete) {
+                                $stderrState.Complete = $true
+                                $stderrState.Failure = "stream drain timed out after 5 seconds"
+                            }
+                            break
+                        }
+                        [void]$process.WaitForExit(50)
+                    }
+                }
+
                 $exitCode = $process.ExitCode
                 $transportDiagnostics = Get-FileTextOrEmpty -Path $sshLogPath -Bounded
-                $standardError = Get-FileTextOrEmpty -Path $errorPath -Bounded
+                $standardError = $stderrState.Builder.ToString()
                 if ($script:RemotePlatform -eq "windows") {
                     $exitTokenMatches = [regex]::Matches($standardError, '(?m)^agentq-exit:(\d{1,3})\s*$')
                     if ($exitTokenMatches.Count -gt 0) {
@@ -1412,11 +1490,18 @@ function Invoke-WaitSshWithTimeout {
                         }
                     }
                 }
+                $diagnostics = $transportDiagnostics
+                if (![string]::IsNullOrWhiteSpace($standardError)) {
+                    if (![string]::IsNullOrEmpty($diagnostics) -and !$diagnostics.EndsWith("`n")) {
+                        $diagnostics += [Environment]::NewLine
+                    }
+                    $diagnostics += $standardError
+                }
                 $result = [pscustomobject]@{
                     ExitCode = $exitCode
-                    Output = (Get-FileTextOrEmpty -Path $outputPath)
+                    Output = $stdoutState.Builder.ToString()
                     TransportDiagnostics = $transportDiagnostics
-                    Diagnostics = $transportDiagnostics
+                    Diagnostics = $diagnostics
                 }
             }
         } finally {
@@ -1442,7 +1527,7 @@ function Invoke-WaitSshWithTimeout {
         if ($null -ne $process) {
             $process.Dispose()
         }
-        foreach ($path in @($sshLogPath, $outputPath, $errorPath)) {
+        foreach ($path in @($sshLogPath)) {
             if (!(Remove-SafeTemporaryFile -Path $path)) {
                 $cleanupFailurePaths += $path
             }
@@ -1467,12 +1552,14 @@ function Invoke-WaitSshWithTimeout {
 }
 
 function Get-PlatformProbeCachePath {
-    # Host names are user input; keep only characters that cannot escape the
-    # cache directory, hash the rest so distinct hosts never collide.
-    $safe = ($script:TargetHost -replace '[^A-Za-z0-9._-]', '-')
+    # The file is named by a hash of the WHOLE host string.  Hashing a
+    # sanitized form instead (the first version did) collapses distinct hosts
+    # onto one file -- `a-b`, `a:b`, `a@b`, `a b` and `a,b` all sanitize to
+    # `a-b` -- so two hosts could share a verdict, and the host is user input.
+    # Only the hash reaches the path, so no character can escape the directory.
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($safe)
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($script:TargetHost)
         $hash = ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join ''
     } finally {
         $sha.Dispose()
@@ -1492,6 +1579,11 @@ function Read-PlatformProbeCache {
     if (!(Test-Path -LiteralPath $path -PathType Leaf)) {
         return $false
     }
+    # A reparse point is refused, like the POSIX twin's `[ ! -L ]`: another
+    # local process could otherwise redirect the read to a file of its choosing.
+    if (!(Test-NonReparseWindowsFilePath -Path $path)) {
+        return $false
+    }
     try {
         $entry = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
     } catch {
@@ -1509,6 +1601,12 @@ function Read-PlatformProbeCache {
         [void][int64]::TryParse($env:AGENTQ_PLATFORM_PROBE_CACHE_TTL, [ref]$ttl)
     }
     $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $probedAt
+    # A timestamp from the future (clock skew, or an entry written while the
+    # clock was ahead) must not make the entry immortal: with only the `-gt`
+    # test a negative age always passes.
+    if ($age -lt 0) {
+        return $false
+    }
     if ($age -gt $ttl) {
         return $false
     }
@@ -1526,12 +1624,27 @@ function Write-PlatformProbeCache {
         if (!(Test-Path -LiteralPath $dir)) {
             [void](New-Item -ItemType Directory -Path $dir -Force)
         }
+        # Refuse to write through a reparse point (the read side refuses to read
+        # one, and a pre-planted link would otherwise make this truncate a file
+        # of someone else's choosing).  Write to a temporary in the same
+        # directory and move it into place so a concurrent reader never sees a
+        # partial line.
+        if (Test-Path -LiteralPath $path) {
+            if (!(Test-NonReparseWindowsFilePath -Path $path)) {
+                return
+            }
+        }
         $entry = @{ platform = $script:RemotePlatform; probed_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); probe_ms = 0 }
         $json = $entry | ConvertTo-Json -Compress
-        [System.IO.File]::WriteAllText($path, $json + [Environment]::NewLine)
+        $temporary = "$path.$PID.tmp"
+        [System.IO.File]::WriteAllText($temporary, $json + [Environment]::NewLine)
+        [System.IO.File]::Move($temporary, $path, $true)
     } catch {
         # A cache we cannot write simply means every run probes again, which
         # is the pre-cache behaviour -- never fatal.
+        if ($null -ne $temporary -and (Test-Path -LiteralPath $temporary)) {
+            try { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue } catch { }
+        }
     }
 }
 
@@ -2840,9 +2953,16 @@ switch ($operation) {
                 Stop-AgentQ "submit --stdin-script received no script on standard input"
             }
             $scriptBase64 = [Convert]::ToBase64String($scriptBytes)
-            if ($scriptBase64.Length -gt $script:StdinScriptLimit) {
+            # The cap belongs to the TARGET's argv, not this machine: the same
+            # client can drive a Linux host (MAX_ARG_STRLEN headroom -> 100000
+            # b64 chars) or a Windows host (CreateProcess 32767 -> 20000).
+            # Fixed 2026-10-16: it used to apply the Windows cap to every
+            # target, so a 60K-character script to a unix host was refused
+            # with a message that blamed the wrong limit.
+            $stdinScriptLimit = if ($script:RemotePlatform -eq "windows") { $script:StdinScriptLimitWindows } else { $script:StdinScriptLimitUnix }
+            if ($scriptBase64.Length -gt $stdinScriptLimit) {
                 Stop-AgentQ ("the script is too large for --stdin-script (base64 length " + $scriptBase64.Length +
-                    " exceeds $script:StdinScriptLimit on this target); stage it as a file and submit a command that reads it")
+                    " exceeds $stdinScriptLimit on this target); stage it as a file and submit a command that reads it")
             }
             $commandArguments = @("sh", "-c", "printf %s $scriptBase64 | base64 -d | sh")
         } else {
@@ -2888,6 +3008,14 @@ switch ($operation) {
         }
         Initialize-ClientTransport
         $invocation = New-RemoteInvocation -Arguments $remoteStatusArgs
+        # The expected task id travels with the status_task profile: without it
+        # Test-TaskIdMatch treats an empty Expected as "no constraint" and a
+        # response naming a DIFFERENT task passes validation (the same gap the
+        # POSIX client closes by passing $status_expected_task_id).  Only the
+        # --task mode has an id to pin.
+        if ($statusProfile -eq "status_task") {
+            exit (Invoke-SafeOperationWithRecovery -OperationName "status" -Invocation $invocation -ResponseProfile $statusProfile -ExpectedTaskId $arguments[$position + 1])
+        }
         exit (Invoke-SafeOperationWithRecovery -OperationName "status" -Invocation $invocation -ResponseProfile $statusProfile)
     }
     "doctor" {
@@ -2958,13 +3086,21 @@ switch ($operation) {
             if (!($arguments[$position + 2] -match '^[1-9][0-9]*$')) {
                 Stop-AgentQ "--timeout must be a positive integer"
             }
-            $waitTimeoutSeconds = [int]$arguments[$position + 2]
-            $remoteWaitArgs = @("wait", $arguments[$position], "--timeout", $arguments[$position + 2])
+            $waitTimeoutSeconds = Convert-ToPositiveInt32 -Value $arguments[$position + 2] -Name "--timeout"
+            # The budget is client-side only: the server's `wait` takes exactly
+            # one task id, so --timeout must NOT travel on the remote command
+            # (forwarding it makes the server answer `wait requires one task id`
+            # with exit 2).  $remoteWaitArgs stays as plain `wait <id>`.
         } elseif (![string]::IsNullOrWhiteSpace($env:AGENTQ_WAIT_TIMEOUT)) {
             if ($env:AGENTQ_WAIT_TIMEOUT -notmatch '^[1-9][0-9]*$') {
                 Stop-AgentQ "AGENTQ_WAIT_TIMEOUT must be a positive integer"
             }
-            $waitTimeoutSeconds = [int]$env:AGENTQ_WAIT_TIMEOUT
+            # Convert-ToPositiveInt32, not a bare [int] cast: 99999999999
+            # passes the regex but throws on the cast, and an unhandled throw
+            # exits 1 with a stack trace instead of the contract's exit 2
+            # (measured 2026-10-15).  Same guard as every other numeric env
+            # var in this file.
+            $waitTimeoutSeconds = Convert-ToPositiveInt32 -Value $env:AGENTQ_WAIT_TIMEOUT -Name "AGENTQ_WAIT_TIMEOUT"
         }
         Initialize-ClientTransport
         $invocation = New-RemoteInvocation -Arguments $remoteWaitArgs

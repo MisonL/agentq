@@ -388,6 +388,116 @@ SSH 走 **2222** 端口
 
 ## 六、执行状态
 
+**第五轮全维度审查（2026-10-16，用户「使用agents进行全维度全场景审查」）——
+7 个并行只读 agent 覆盖服务端 / POSIX 客户端 / Windows 客户端 / smoke 质量 /
+协议一致性 / 安全面 / 安装器与 launcher；1 个 agent 中途 API 超时，其半成品
+线索本人复核后确认为真 P0。每条发现均先复现或证伪再动手。**
+
+**P0：`wait --timeout` 在两个客户端上完全不可用（0.1.11 首发即坏，且无任何用例
+覆盖成功路径）。** 三处独立成因，全部实测：
+1. **两端都把 `--timeout` 转发给服务端**，而服务端 `wait)` 是 `[ "$#" -eq 2 ]`：
+   实测 `agentq-server wait 5 --timeout 60` → `wait requires one task id` +
+   `reason=protocol_error` + exit 2。用桩 ssh 捕获到两端实际发出的远端命令：
+   POSIX `…agentq_run 'wait' '5' '--timeout' '60'`、Windows 解码后的 base64 相同。
+2. **POSIX 的远端 `timeout <N>s` 前缀是语法错误**：unix 远端命令以函数定义开头
+   （`agentq_run() { … }; agentq_run 'wait' '5'`），而 shell 只允许函数定义出现在命令
+   位置——实测 `/bin/dash -c 'timeout 5s f() { echo hi; }; f'` → `Syntax error: "("
+   unexpected`，bash 同样报错。远端**什么都没执行**，wait 以空响应退 2。修法：预算改为
+   前置赋值语句 `AGENTQ_WAIT_BUDGET=<N>s; <命令>`（赋值语句可在任何位置），由
+   `agentq_run` 读取并用 `timeout` 包裹；`command -v timeout` 缺失时退化为纯本地预算
+   （macOS 默认没有 coreutils `timeout`）。
+3. **Windows 客户端 `Invoke-WaitSshWithTimeout` 从不读 ssh 的管道**：
+   `New-SshProcessStartInfo` 把 stdout/stderr 重定向到**管道**，而该函数从**从未被
+   写入的空临时文件**读 Output。实测（桩 ssh 打印合法 Success JSON）：客户端报
+   `response was empty`、退 2——**带 `--timeout` 的 wait 在该客户端永远不可能成功**。
+   同源第二面：不读管道时，响应超过管道缓冲（Windows 匿名管道约 4KB）会让 ssh 阻塞在
+   写、永不退出，被截止循环误判为超时。修法：照搬同文件探针路径
+   （`Invoke-SshLoggedWithTimeout`）已验证的异步 `Read-BoundedProcessStreamChunk` 排水。
+**回归锁（均先证能红）**：`smoke/05` 新增桩 ssh 的 `agentq_run wait` 分支（**镜像服务端
+的参数契约**——收到 `--timeout` 就退 2，否则这条用例在坏客户端上也会绿）、
+`wait 3 --timeout 60` 必须退 0 + 远端命令不得含 `--timeout` + 远端命令必须过 `sh -n`
++ 远端包装必须真用 `timeout` 包住服务端；变异证明三个方向各自能红（重新转发 → 2 处红；
+恢复 `timeout` 前缀 → `sh -n` 红；删掉包装里的 exec → 红）。
+> 一处自身的弱锁教训：远端包装那半最初写成 `grep -q AGENTQ_WAIT_BUDGET`，而变量名在
+> 赋值与注释里也出现，**删掉处理逻辑仍绿**——实测后改为断言确切的 exec 形式才承重。
+`smoke/12` 新增行为用例：桩 ssh 回合法响应，直接驱动 `Invoke-WaitSshWithTimeout`，
+断言 ExitCode 0 + Output 非空 + 过 wait 校验器；变异（把 `Output` 改回空串）实测红。
+
+**其余已修（全部先复现）**：
+- **Windows `status --task` 不传 expected task id**：`Test-TaskIdMatch` 因 Expected 为空
+  直接放行，远端返回**另一个**任务 id 也会被接受；POSIX 侧对照着传了
+  `$status_expected_task_id`——典型的「同一机制两份拷贝只修一份」。已补传。
+- **Windows `--timeout`/`AGENTQ_WAIT_TIMEOUT` 的 `[int]` 强转无上界**：实测
+  `wait 5 --timeout 99999999999` → 未捕获 `InvalidArgument`、退 **1** + 堆栈，而非契约
+  的 2。改用文件内既有的 `Convert-ToPositiveInt32`。
+- **POSIX 同类**：`AGENTQ_WAIT_TIMEOUT=99999999999999999999` 过 `is_positive_integer`
+  后在 dash 下 `[ … -ge … ]` 报 `Illegal number`、判定恒假 → **本地预算永不触发 = 无限
+  等待**（实测 rc=2、读作 false）。新增 `is_bounded_positive_integer`（≤9 位），用于
+  `--timeout`、`AGENTQ_WAIT_TIMEOUT` 与新增校验的 `AGENTQ_PLATFORM_PROBE_CACHE_TTL`
+  （后者此前完全未校验，`abc` 会让 TTL 比较在 stderr 报错并静默失效）。
+- **服务端 `status --task` 解析期不校验**：`--task ""` → `status_mode=''` → `[ -n "" ]`
+  假 → **打印全量队列并以 0 退出**；`--task summary` → 静默返回摘要。调用方按
+  `{"task":…}` 解析拿到的是另一种形状的「成功」。dispatch 处补 `is_task_id`。
+- **服务端摘要的 label 守卫比全量严格**：全量 `compact_status` 不查 label，摘要却要求
+  `type == "string"`，于是队列里出现一个**无 label 的任务**（`pueue add -g agentq` 直接
+  加）会让 `doctor`/`status --summary` 退 2，而 `doctor --full`/`status --task` 正常——
+  默认视图严格弱于 `--full`。已放宽为允许 null。
+- **POSIX 平台缓存的多处缺陷**（P5 的核心实现）：① **`shasum` 缺失 → 所有主机共用
+  一个缓存文件**：管道状态取 `cut` 的 0，哈希为空 → 路径塌缩为
+  `<dir>/platform-cache/.json`（实测空哈希 + rc=0），且 `shasum: not found` 未经脱敏
+  直接打到 stderr。改为 shasum → sha256sum → openssl 回退，都没有就**放弃缓存**。
+  ② **先 sanitize 再哈希 → 不同主机碰撞**：实测 `a-b`/`a@b`/`a:b`/`a b` 的 sanitized
+  哈希**完全相同**（`d44362d6…`），而原注释宣称「distinct hosts never collide」。改为
+  哈希**原始**主机串（实测四者各不相同）。③ **未来时间戳永不失效**：`now - probed_at`
+  为负 → `-le ttl` 恒真。补 `probed_at <= now`。④ 写入改为 `umask 077` + 临时文件 +
+  `mv`（原为默认 umask 直接 `>`，会跟随预置符号链接），Windows 侧同样补 reparse 点
+  拒绝与原子写。⑤ `AGENTQ_PLATFORM_PROBE_CACHE=off` 改为大小写不敏感。
+- **SKILL.md 与代码注释宣称缓存「失配会自动回落到重新探测」——代码里没有任何失效
+  路径**。诚实修正为「命中即信任到 TTL 过期；换平台需显式处理」，并在 usage 里补上
+  此前完全没列出的 `AGENTQ_PLATFORM_PROBE_CACHE_TTL` 与 `AGENTQ_PLATFORM_CACHE_DIR`
+  （两个客户端都补）。
+- **POSIX `wait` 的 stderr 捕获未登记进运行时清理**：`Ctrl-C`/SIGTERM 只走
+  `cleanup_client_runtime`，漏登记会在 `$TMPDIR` 留下 `agentq-wait-stderr.*`。已登记并
+  在两处删除点清空。
+- **服务端读路径的陈旧锁恢复会把「输掉清理竞争」当致命**：两个并发读同时清理同一把
+  陈旧锁时，后到者拿到 `remove_stale_lock` 的 2（「changed during recovery」，本身已
+  打印一行 stderr）→ `fail` → **读命令退 2**，而读根本不需要这把锁。改为对 2 继续执行
+  （1 = 真实删除失败，仍致命）。
+- **launcher 的第三个 4096 块读**：`Read-AgentQBoundedText`（`-ArgumentsBase64 -` 的
+  stdin 入口）仍用 `[char[]]::new(4096)` 块读——0.1.10 已从两份 wrapper 修掉这一形态，
+  launcher 这份漏了（当前无调用方传 `-`，属潜伏）。改为逐字符 `Read()`，并把 `smoke/05`
+  的既存静态锁从两份拷贝扩到**三份**（变异实测能红）。
+- **Windows 客户端 `--stdin-script` 对所有目标都用 Windows 上限 20000**：同一个客户端
+  可驱动 Linux 主机（上限 100000），却按本机平台拒绝并指出错误的理由。改为按**目标**
+  平台选择（新增 `StdinScriptLimitUnix`/`Windows`）。
+- **POSIX `--stdin-script` 的读取无上界**：先把整个 stdin 读进 shell 变量再检查长度。
+  改为 `head -c <上限×3/4+1>` 截断读取（多留 1 字节使超限仍可检出），实测 120000 字节
+  输入被正确拒绝（b64 100004 > 100000）。
+- **SKILL.md 的 Windows 边界自相矛盾**：①「单参数 >约 8.1K 会被 cmd 截断」与
+  ②「`--stdin-script` Windows 上限 20000」并存——DefaultShell 为 cmd 的目标上，8.1K
+  以上的脚本仍会被任务执行层截断。已把 ③ 作为显式边界写入（不改上限：真机未测，不
+  猜测），并把脚本要求由「UTF-8 文本」更正为「**POSIX sh** 文本」（远端是 `sh`）。
+
+**审查发现但未修（如实记录）**：
+- smoke 质量 agent 的 S2/S4/S5/S6/S7/S8/S11/S12/S13：多为**断言过弱**而非假绿（如
+  `expect_mode_ok 'agentq_run status'` 是子串匹配，裸 `status` 若错误地加发 `--summary`
+  不会被发现；`smoke/12` 的 authhint 探针在无 host 时断言恒真；`smoke/03` 新批量块失败
+  路径不清理真实 runtime；`smoke/12` 的 `\d{1,3}` 静态锁是「至少一处存在」语义，删掉
+  probe 路径那一处不会被发现）。**S1 经本人 A/B 复核后降级**：`smoke/06` 第 3 节复用的
+  `add.entered` 是第 1 节留下的陈旧标记，使就绪检查失去意义（死守卫）——已修（第 1 节
+  末尾删除标记）；但用「读仍取锁」的变异服务器做 A/B 时**两侧都红**，即**未能造出可
+  观测的假绿**，故这是夹具健壮性缺陷而非已证的假绿。
+- **服务端记录消失竞态**：`load_request_records` 的 `[ -e ]` 与随后的 `$(<"$path")`
+  之间记录被并发归档 → 读命令退 2 并报 `invalid AgentQ request record`（像数据损坏）。
+  锁免读把该窗口从「仅 logs/wait 中途放锁时」扩大到「每次读」。真实但窗口极窄。
+- **`--stdin-script` 的远端解码失败会退 0**（fail-open）：管道末段是 `sh`，远端缺
+  `base64` 时 `sh` 读到空输入退 0 → 任务 Done/**Success** 而脚本从未执行；客户端的
+  `command -v base64` 检查的是**本地**。需 sentinel 输出校验才能关闭，属设计变更。
+- `doctor_with_operation_lock` 未转发 `"$@"`（当前无调用点）；`result_lines` 的 jq 赋值
+  缺 `|| fail`（当前不可达）；锁龄可能为负——均为 nits。
+- 安装器残留指引里的 `<the .backup directory>` 占位符不可直接粘贴（shell 里 `<` 是
+  重定向）；`smoke/10` 的 `mv <` 整行排除因此仍需要。
+
 **Agent-UX 优化 P1–P7（2026-10-15 完成，用户对计划文件 `greedy-forging-moore` 的
 「全部优化好」授权）**：基于全量历史会话挖掘确认的七项真实摩擦，一次性落地为
 **0.1.11**（偏离原计划的 0.1.11–0.1.14 分四版：七项改动交错在同一批文件里、
