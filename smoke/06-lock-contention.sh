@@ -227,6 +227,14 @@ rm -f "$control/add.block"
 holder_wait_status=0
 wait "$holder_shell_pid" 2>/dev/null || holder_wait_status=$?
 
+# The readiness marker below must reflect THIS section's holder, not the one
+# from section 1: the wrapper writes add.entered every time it blocks, and a
+# stale file would let the section-3 readiness loop pass before the second
+# holder ever reached `add` -- i.e. before the lock was actually held -- which
+# is exactly the state where a lock-TAKING read implementation also passes
+# (measured 2026-10-16 by re-reading the flow: the marker is never cleared).
+rm -f "$control/add.entered"
+
 if [ "$holder_wait_status" -ne 0 ]; then
     printf 'the lock holder failed (%s): %s\n' "$holder_wait_status" \
         "$(head -1 "$work/holder.err")" >&2

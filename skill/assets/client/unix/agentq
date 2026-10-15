@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.11'
+agentq_client_version='0.1.12'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072); a Windows target re-encodes
 # argv onto a CreateProcess command line capped at 32767 characters, and the
@@ -72,6 +72,14 @@ agentq_remote_failure_reason_value=''
 # other temporary here follows.
 ssh_stderr_capture=''
 ssh_stderr_capture_identity=''
+# The wait path captures the remote stderr into a temporary of its own (it
+# needs the server's reason token before it decides whether the run timed out).
+# It is registered here as well as removed on the operation's own paths: a
+# SIGTERM/INT/HUP during the wait reaches only the runtime cleanup, so an
+# unregistered capture would be left behind in $TMPDIR (the same gap the
+# ssh_stderr_capture entry above documents for the non-wait path).
+wait_ssh_stderr_capture=''
+wait_ssh_stderr_capture_identity=''
 mutation_output_file=''
 agentq_recovery_log_file=''
 agentq_recovery_output_file=''
@@ -665,6 +673,9 @@ Environment:
   AGENTQ_PLATFORM_PROBE_TIMEOUT    Maximum seconds for a read-only platform/protocol probe.
   AGENTQ_PLATFORM_PROBE_CACHE      on (default) caches the resolved platform per
                                    host for 7 days; off probes every run.
+  AGENTQ_PLATFORM_PROBE_CACHE_TTL  Cache lifetime in seconds; default 604800.
+  AGENTQ_PLATFORM_CACHE_DIR        Directory holding the platform cache;
+                                   defaults to $HOME/.config/agentq.
   AGENTQ_WAIT_TIMEOUT              Default wait --timeout in seconds; the wait
                                    flag overrides it.
   AGENTQ_SSH                       OpenSSH client path; defaults to ssh found on PATH.
@@ -1098,7 +1109,22 @@ run_wait_ssh_with_timeout() {
 
     wait_remote_command=$wait_ssh_command
     if [ "$remote_platform" != windows ]; then
-        wait_remote_command="timeout ${wait_timeout_seconds}s $wait_ssh_command"
+        # Bound the REMOTE wait with coreutils `timeout` so a task that never
+        # ends cannot leave the server holding its operation lock after the
+        # local ssh is killed -- measured 2026-10-15: those remote orphans were
+        # the largest reliability pain in real agent usage.
+        #
+        # The bound is NOT a `timeout <N>s <command>` prefix.  The unix remote
+        # command BEGINS with a function definition
+        # (`agentq_run() { ... }; agentq_run 'wait' '5'`), and shell grammar
+        # allows a function definition only in command position, so a prefix
+        # makes the whole line a syntax error -- measured 2026-10-16: dash says
+        # `Syntax error: "(" unexpected` and bash says `syntax error near
+        # unexpected token '('`, the remote executes NOTHING, and every
+        # `wait --timeout` died with an empty response.  Instead the budget
+        # travels as a leading assignment statement (valid anywhere) that
+        # `agentq_run` honours; see remote_base_command.
+        wait_remote_command="AGENTQ_WAIT_BUDGET=${wait_timeout_seconds}s; $wait_ssh_command"
     fi
 
     wait_ssh_stderr_capture=$(umask 077; make_client_temporary_file "$agentq_temp_directory" 'agentq-wait-stderr') || {
@@ -1168,7 +1194,8 @@ run_wait_ssh_with_timeout() {
             return $?
         fi
         if windows_argument_remove_file "$wait_ssh_stderr_capture" "$wait_ssh_stderr_capture_identity"; then
-            :
+            wait_ssh_stderr_capture=''
+            wait_ssh_stderr_capture_identity=''
         else
             return $?
         fi
@@ -1198,7 +1225,8 @@ run_wait_ssh_with_timeout() {
         fi
     fi
     if windows_argument_remove_file "$wait_ssh_stderr_capture" "$wait_ssh_stderr_capture_identity"; then
-        :
+        wait_ssh_stderr_capture=''
+        wait_ssh_stderr_capture_identity=''
     else
         printf '%s: failed to remove the wait stderr capture: %s\n' "$program" "$wait_ssh_stderr_capture" >&2
         if [ "$wait_ssh_status" -eq 0 ]; then
@@ -1398,6 +1426,16 @@ cleanup_client_runtime() {
             cleanup_client_runtime_ssh_stderr_capture_status=$?
             if [ "$cleanup_client_runtime_status" -eq 0 ]; then
                 cleanup_client_runtime_status=$cleanup_client_runtime_ssh_stderr_capture_status
+            fi
+        fi
+    fi
+    if [ -n "$wait_ssh_stderr_capture" ]; then
+        if windows_argument_remove_file "$wait_ssh_stderr_capture" "$wait_ssh_stderr_capture_identity"; then
+            :
+        else
+            cleanup_client_runtime_wait_stderr_capture_status=$?
+            if [ "$cleanup_client_runtime_status" -eq 0 ]; then
+                cleanup_client_runtime_status=$cleanup_client_runtime_wait_stderr_capture_status
             fi
         fi
     fi
@@ -1776,6 +1814,21 @@ is_positive_integer_or_all() {
         ''|*[!0-9]*|0) return 1 ;;
         *) return 0 ;;
     esac
+}
+
+# A positive integer that also fits the range every consumer here can do
+# arithmetic on.  `[ "$a" -ge "$b" ]` with a value past the shell's integer
+# range does not fail the test -- dash prints "Illegal number" and the
+# comparison reads as FALSE (measured 2026-10-16: `[ 5 -ge 99999999999999999999 ]`
+# → rc=2, and every deadline check that uses this shape then never fires, so a
+# `wait --timeout` with such a value would wait forever).  Anything that feeds
+# a comparison or an arithmetic expansion must pass through here.
+is_bounded_positive_integer() {
+    case "$1" in
+        ''|*[!0-9]*|0) return 1 ;;
+    esac
+    [ "${#1}" -le 9 ] || return 1
+    return 0
 }
 
 is_positive_integer() {
@@ -2893,15 +2946,38 @@ probe_windows_agentq_protocol() {
 # cannot be read is indistinguishable from an empty one).
 platform_probe_cache_ttl=${AGENTQ_PLATFORM_PROBE_CACHE_TTL:-604800}
 platform_cache_enabled() {
-    [ "${AGENTQ_PLATFORM_PROBE_CACHE:-on}" != off ]
+    case "${AGENTQ_PLATFORM_PROBE_CACHE:-on}" in
+        off|OFF|Off|oFF|OFf|oFf|ofF) return 1 ;;
+        *) return 0 ;;
+    esac
 }
 
 platform_cache_path_for_host() {
-    # Host names are user input; keep only the characters that cannot escape
-    # the cache directory, and hash the rest so distinct hosts never collide.
-    platform_cache_safe=$(printf '%s' "$host" | LC_ALL=C tr -c 'A-Za-z0-9._-' '-')
-    printf '%s/platform-cache/%s.json' "$cache_state_directory" \
-        "$(printf '%s' "$platform_cache_safe" | shasum -a 256 | cut -c1-16)"
+    # The cache file is named by a hash of the WHOLE host string.  Hashing the
+    # sanitized form instead (the first version did) collapses distinct hosts
+    # onto one file -- `a-b`, `a:b`, `a@b`, `a b` and `a,b` all sanitize to
+    # `a-b` -- so two hosts could share a verdict, and `AGENTQ_HOST` is user
+    # input.  Only the hash reaches the path, so no character can escape the
+    # directory.  The digest also needs a fallback: `shasum` is a Perl script
+    # that minimal Linux images ship without, and a failed pipeline here used
+    # to yield an empty hash (the pipeline's status is `cut`'s, which succeeds),
+    # collapsing EVERY host onto `<dir>/platform-cache/.json`.
+    platform_cache_digest=''
+    if command -v shasum >/dev/null 2>&1; then
+        platform_cache_digest=$(printf '%s' "$host" | LC_ALL=C shasum -a 256 2>/dev/null | cut -c1-16)
+    elif command -v sha256sum >/dev/null 2>&1; then
+        platform_cache_digest=$(printf '%s' "$host" | LC_ALL=C sha256sum 2>/dev/null | cut -c1-16)
+    elif command -v openssl >/dev/null 2>&1; then
+        platform_cache_digest=$(printf '%s' "$host" | LC_ALL=C openssl dgst -sha256 2>/dev/null | sed 's/.*[ =]//' | cut -c1-16)
+    fi
+    case "$platform_cache_digest" in
+        [0-9a-f][0-9a-f]*) ;;
+        # No usable digest tool: skip the cache entirely rather than let every
+        # host share one file.  Returning a failure here is a cache MISS by
+        # contract (the caller falls through to probing), never a command error.
+        *) return 1 ;;
+    esac
+    printf '%s/platform-cache/%s.json' "$cache_state_directory" "$platform_cache_digest"
 }
 
 platform_cache_read() {
@@ -2922,6 +2998,13 @@ platform_cache_read() {
         ''|*[!0-9]*) return 1 ;;
     esac
     platform_cache_now=$(date +%s) || return 1
+    case "$platform_cache_now" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    # A timestamp from the future (clock skew, or an entry written by a machine
+    # whose clock was ahead) must not make the entry immortal: with only the
+    # `-le ttl` test, now - probed_at is negative and always passes.
+    [ "$platform_cache_age" -le "$platform_cache_now" ] || return 1
     [ $((platform_cache_now - platform_cache_age)) -le "$platform_probe_cache_ttl" ] || return 1
     remote_platform=$platform_cache_platform
     return 0
@@ -2933,10 +3016,27 @@ platform_cache_write() {
     # which is the pre-cache behaviour.
     platform_cache_enabled || return 0
     platform_cache_file=$(platform_cache_path_for_host) || return 0
-    if mkdir -p -- "${platform_cache_file%/*}" 2>/dev/null; then
+    # 0700/0600 like every other client-made file: the default umask (usually
+    # 022) would leave the directory world-readable and the entry world-writable
+    # path if the dir is shared, and a plain `>` would follow a pre-planted
+    # symlink at the entry path (the read side already refuses symlinks).  The
+    # write is atomic (temp + mv) so a concurrent reader never sees a partial
+    # line; a failure at any step just means "no cache".
+    if (umask 077; mkdir -p -- "${platform_cache_file%/*}") 2>/dev/null; then
         platform_cache_now=$(date +%s) || platform_cache_now=0
-        printf '{"platform":"%s","probed_at":%s,"probe_ms":0}\n' \
-            "$remote_platform" "$platform_cache_now" > "$platform_cache_file" 2>/dev/null || true
+        platform_cache_temporary=$(umask 077; mktemp "${platform_cache_file}.XXXXXX" 2>/dev/null) || return 0
+        if [ -L "$platform_cache_temporary" ]; then
+            rm -f -- "$platform_cache_temporary" 2>/dev/null || true
+            return 0
+        fi
+        if printf '{"platform":"%s","probed_at":%s,"probe_ms":0}\n' \
+            "$remote_platform" "$platform_cache_now" > "$platform_cache_temporary" 2>/dev/null &&
+            [ ! -L "$platform_cache_file" ] &&
+            mv -f -- "$platform_cache_temporary" "$platform_cache_file" 2>/dev/null; then
+            :
+        else
+            rm -f -- "$platform_cache_temporary" 2>/dev/null || true
+        fi
     fi
     return 0
 }
@@ -3026,9 +3126,17 @@ initialize_remote_invocation() {
             # cache records the FINAL platform verdict (unix, or windows plus
             # a passing launcher-protocol verdict), so a hit skips BOTH
             # probes.  AGENTQ_REMOTE_PLATFORM (explicit) and
-            # AGENTQ_PLATFORM_PROBE_CACHE=off bypass it; an all-probes-failed
-            # run through a cache hit falls back to probing (the target may
-            # have been redeployed), which also invalidates the entry.
+            # AGENTQ_PLATFORM_PROBE_CACHE=off bypass it.
+            #
+            # There is NO invalidation path: a hit is trusted until the TTL
+            # expires.  A target redeployed onto the other platform therefore
+            # fails until then (the windows branch below still runs its
+            # launcher probe and fails closed; a stale `unix` verdict fails on
+            # the response), which is why the recovery is documented as an
+            # explicit action -- set AGENTQ_REMOTE_PLATFORM, or turn the cache
+            # off, or delete the entry -- rather than an automatic fallback.
+            # An earlier comment here claimed a failed run "also invalidates
+            # the entry"; no code did that (measured 2026-10-16).
             if platform_cache_read; then
                 :
             else
@@ -3049,7 +3157,16 @@ initialize_remote_invocation() {
     case "$remote_platform" in
         unix)
             # shellcheck disable=SC2016
-            remote_base_command='agentq_run() { agentq_server="$HOME/.local/bin/agentq"; exec "$agentq_server" "$@"; }; agentq_run'
+            # `agentq_run` honours AGENTQ_WAIT_BUDGET when the caller set it:
+            # the wait path prepends `AGENTQ_WAIT_BUDGET=<N>s; ` to the command
+            # (see run_wait_ssh_with_timeout) so the REMOTE wait is bounded by
+            # coreutils `timeout` and cannot outlive the local ssh holding the
+            # server's operation lock.  `command -v` degrades to a local-only
+            # bound -- the shape Windows targets already have -- when the
+            # target ships no timeout (macOS has none by default, and a
+            # non-interactive ssh PATH may miss a Homebrew one).  Every other
+            # operation leaves the variable unset, so this is inert for them.
+            remote_base_command='agentq_run() { agentq_server="$HOME/.local/bin/agentq"; if [ -n "$AGENTQ_WAIT_BUDGET" ] && command -v timeout >/dev/null 2>&1; then exec timeout "$AGENTQ_WAIT_BUDGET" "$agentq_server" "$@"; fi; exec "$agentq_server" "$@"; }; agentq_run'
             remote_command=$remote_base_command
             ;;
         windows)
@@ -3900,6 +4017,11 @@ is_positive_integer "$submit_retry_delay" || fail 'AGENTQ_SUBMIT_RETRY_DELAY mus
 is_positive_integer "$operation_retry_attempts" || fail 'AGENTQ_OPERATION_RETRY_ATTEMPTS must be a positive integer'
 is_positive_integer "$operation_retry_delay" || fail 'AGENTQ_OPERATION_RETRY_DELAY must be a positive integer'
 is_positive_integer "$platform_probe_timeout" || fail 'AGENTQ_PLATFORM_PROBE_TIMEOUT must be a positive integer'
+# The cache TTL feeds `[ $((now - probed_at)) -le "$ttl" ]`; an unvalidated
+# value ("abc", or one past the shell's integer range) makes that test fail
+# LOUDLY on stderr under dash and read as false, i.e. the cache silently
+# vanishes.  Validated here like every other numeric environment variable.
+is_bounded_positive_integer "$platform_probe_cache_ttl" || fail 'AGENTQ_PLATFORM_PROBE_CACHE_TTL must be a positive integer of at most nine digits'
 
 # Resolve and validate the credential source before anything reaches ssh --
 # including the platform probe, which is itself an ssh call that runs before
@@ -4038,17 +4160,26 @@ case "$operation" in
                 fail 'submit --stdin-script needs the script on standard input (pipe or redirect it)'
             fi
             command -v base64 >/dev/null 2>&1 || fail 'submit --stdin-script requires base64 on PATH'
-            if stdin_script_b64=$(base64 | tr -d '\n'); then
-                :
-            else
-                fail 'cannot base64-encode the script from standard input'
-            fi
-            [ -n "$stdin_script_b64" ] || fail 'submit --stdin-script received no script on standard input'
+            # Cap the read as well as the result.  The size check below runs on
+            # the encoded length, so without a bound a multi-gigabyte stdin is
+            # buffered into a shell variable first and only then rejected --
+            # `head -c` stops reading at the cap, and the extra byte it is
+            # allowed to pass through is what makes an over-cap payload
+            # detectable (base64 of limit+1 bytes is longer than the limit).
+            # The read is by BYTES and the check is on base64 CHARACTERS; the
+            # 4/3 expansion means the byte cap must be the character cap scaled
+            # down, which is why this is generous rather than exact.
             if [ "$remote_platform" = windows ]; then
                 stdin_script_limit=$stdin_script_windows_limit
             else
                 stdin_script_limit=$stdin_script_unix_limit
             fi
+            if stdin_script_b64=$(head -c "$((stdin_script_limit * 3 / 4 + 1))" | base64 | tr -d '\n'); then
+                :
+            else
+                fail 'cannot base64-encode the script from standard input'
+            fi
+            [ -n "$stdin_script_b64" ] || fail 'submit --stdin-script received no script on standard input'
             if [ "${#stdin_script_b64}" -gt "$stdin_script_limit" ]; then
                 fail "the script is too large for --stdin-script (base64 length ${#stdin_script_b64} exceeds $stdin_script_limit on this target); stage it as a file and submit a command that reads it"
             fi
@@ -4174,14 +4305,18 @@ case "$operation" in
         append_arg "$1"
         if [ "$#" -eq 3 ]; then
             [ "$2" = '--timeout' ] || fail 'wait accepts only --timeout <seconds>'
-            is_positive_integer "$3" || fail '--timeout must be a positive integer'
+            is_bounded_positive_integer "$3" || fail '--timeout must be a positive integer of at most nine digits'
             wait_timeout_seconds=$3
-            append_arg --timeout
-            append_arg "$3"
         elif [ -n "$wait_timeout" ]; then
-            is_positive_integer "$wait_timeout" || fail 'AGENTQ_WAIT_TIMEOUT must be a positive integer'
+            is_bounded_positive_integer "$wait_timeout" || fail 'AGENTQ_WAIT_TIMEOUT must be a positive integer of at most nine digits'
             wait_timeout_seconds=$wait_timeout
         fi
+        # The budget is CLIENT-side: run_wait_ssh_with_timeout kills the local
+        # ssh at the deadline and bounds the remote wait with `timeout <N>s`.
+        # The server's `wait` arm takes exactly one task id, so forwarding
+        # --timeout there would be a protocol_error (measured: the server
+        # answers `wait requires one task id`, exit 2).  Nothing goes on the
+        # remote command.
         ;;
     *)
         fail "unknown command: $operation"

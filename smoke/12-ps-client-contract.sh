@@ -706,6 +706,71 @@ if [ "$status" -ne 0 ] || ! grep -qF 'exit token last-wins ok' "$work/out"; then
     failures=$((failures + 1))
 fi
 
+# --- wait --timeout must actually RETURN the response ------------------------
+# Invoke-WaitSshWithTimeout runs ssh through New-SshProcessStartInfo, which
+# redirects stdout and stderr to PIPES.  The first version never read those
+# pipes and took Output from an empty temporary file instead, so a wait that
+# completed inside its budget came back as "response was empty" and exited 2 --
+# every `wait --timeout` was broken on this client (measured 2026-10-16 with a
+# stub ssh that prints a valid Success response and exits 0).  The second half
+# of the same defect is that an unread pipe deadlocks ssh once the response
+# exceeds the pipe buffer, which the deadline loop then reports as a timeout.
+#
+# This drives the real function against a stub ssh, so it pins the reading, not
+# the shape of the code that does it.
+wait_timeout_dir="$work/wait-timeout-ssh"
+mkdir -p "$wait_timeout_dir"
+if [ "$client_arg" != "$client" ]; then
+    wait_timeout_stub="$wait_timeout_dir/ssh.cmd"
+    printf '%s\r\n' \
+        '@echo off' \
+        'echo {"task":{"id":5,"group":"agentq","created_at":"2026-01-01T00:00:00Z","status":{"Done":{"result":"Success"}}}}' \
+        'exit /b 0' > "$wait_timeout_stub"
+    wait_timeout_ssh=$(cygpath -w "$wait_timeout_stub")
+else
+    wait_timeout_stub="$wait_timeout_dir/ssh"
+    cat > "$wait_timeout_stub" <<'STUB'
+#!/bin/sh
+cat > /dev/null 2>&1 || true
+printf '%s\n' '{"task":{"id":5,"group":"agentq","created_at":"2026-01-01T00:00:00Z","status":{"Done":{"result":"Success"}}}}'
+exit 0
+STUB
+    chmod 700 "$wait_timeout_stub"
+    wait_timeout_ssh="$wait_timeout_stub"
+fi
+wait_timeout_probe='
+. "'"$client_arg"'" 2>$null
+$env:AGENTQ_SSH = "'"$wait_timeout_ssh"'"
+$script:SshPath = Resolve-SshPath
+$script:RemotePlatform = "unix"
+$script:TargetHost = "smoke-host"
+$script:CredentialSource = ""
+$script:CredentialOptionLines = Get-CredentialSshOptions
+$r = Invoke-WaitSshWithTimeout -RemoteCommand "ignored" -InputPayload $null -TimeoutSeconds 30
+if ($r.ExitCode -ne 0) {
+    [Console]::Error.WriteLine("wait timeout: expected exit 0 from the completed wait, got $($r.ExitCode)")
+    exit 1
+}
+if ($r.Output -notmatch ''"task"'') {
+    [Console]::Error.WriteLine("wait timeout: the response body was not read back (Output was $($r.Output.Length) chars)")
+    exit 1
+}
+if (!(Test-AgentQJsonResponse -Operation "wait" -Output $r.Output -ExpectedTaskId "5")) {
+    [Console]::Error.WriteLine("wait timeout: the response did not pass the wait validator")
+    exit 1
+}
+"wait timeout response ok"
+'
+cases=$((cases + 1))
+status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command "$wait_timeout_probe" \
+    >"$work/out" 2>"$work/err" || status=$?
+if [ "$status" -ne 0 ] || ! grep -qF 'wait timeout response ok' "$work/out"; then
+    printf '%s\n' 'ps-client: wait --timeout does not return the remote response' >&2
+    grep -i 'wait timeout' "$work/err" >&2 || head -3 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+
 # --- the PROBE token reader must take the last token too ---------------------
 # The same divergence existed on the PROBE path, over stdout instead of stderr:
 # the POSIX client's windows_probe_apply_exit_token strips up to the FINAL

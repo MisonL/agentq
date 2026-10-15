@@ -104,6 +104,19 @@ case "$command" in
         printf '{"task_id":7,"request_id":"%s","reused":false}\n' "$request_id"
         ;;
     *"agentq_run remove"*) printf '[]\n' ;;
+    *"agentq_run wait"*)
+        # Mirror the server's wait contract: `wait` takes exactly one task id.
+        # A client that forwards --timeout makes the real server answer
+        # `wait requires one task id` with exit 2, so the stub does the same --
+        # otherwise the case below would pass on a client that leaks the flag.
+        case "$command" in
+            *'--timeout'*)
+                printf 'agentq-server: wait requires one task id\nagentq-server: reason=protocol_error\n' >&2
+                exit 2
+                ;;
+        esac
+        printf '{"task":{"id":3,"group":"agentq","created_at":"2026-01-01T00:00:00Z","status":{"Done":{"result":"Success"}}}}\n'
+        ;;
     *'--summary'*) printf '{"tasks":{"3":{"id":3,"state":"Done","result":"Success","label":"agentq:x"}},"group":null,"summary":true}\n' ;;
     *'--task'*) printf '{"task":{"id":3,"group":"agentq","created_at":"2026-01-01T00:00:00Z","status":{"Done":{"result":"Success"}}}}\n' ;;
     *'--full'*) printf '{"tasks":{},"group":null}\n' ;;
@@ -318,6 +331,65 @@ expect_mode_ok 'agentq_run status --task 3' status-task status --task 3
 expect_mode_ok 'agentq_run doctor' doctor doctor
 expect_mode_ok 'agentq_run doctor --full' doctor-full doctor --full
 expect_mode_ok 'agentq_run remove --label smoke --confirm' remove-label remove --label smoke --confirm
+expect_mode_ok 'agentq_run wait' wait-plain wait 3
+
+# wait --timeout: the budget is CLIENT-side, and two things must hold at once.
+# Neither was checked before 2026-10-16, which is how both halves of this
+# feature shipped broken:
+#   1. the flag must NOT travel on the remote command -- the server's wait arm
+#      takes exactly one task id, so a forwarded flag makes it answer
+#      `wait requires one task id` with exit 2 (measured against the real
+#      server: `agentq-server wait 5 --timeout 60` -> exit 2,
+#      reason=protocol_error).  The stub mirrors that contract.
+#   2. the remote command must still be VALID SHELL.  The unix remote command
+#      BEGINS with a function definition, and a `timeout <N>s` prefix turns
+#      that into a syntax error -- `timeout 5s f() {...}` gives "syntax error
+#      near unexpected token `('" on dash and bash -- so the remote executed
+#      nothing and every timed wait died with an empty response.  `sh -n` on
+#      the exact command string is the check: it accepts the `sh -c` form and
+#      rejects the bare prefix form.
+cases=$((cases + 1))
+: > "$work/modes.argv"
+: > "$work/modes.argv.cmd"
+wait_status=0
+AGENTQ_ARGV_CAPTURE="$work/modes.argv" AGENTQ_SSH="$work/bin/ssh-modes" \
+    AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+    "$client" wait 3 --timeout 60 >"$work/modes.out" 2>"$work/modes.err" || wait_status=$?
+if [ "$wait_status" -ne 0 ]; then
+    printf 'client wait --timeout: expected exit 0, got %s: %s\n' \
+        "$wait_status" "$(head -1 "$work/modes.err")" >&2
+    failures=$((failures + 1))
+fi
+if grep -qF -- '--timeout' "$work/modes.argv.cmd"; then
+    printf 'client wait --timeout: the budget leaked onto the remote command (the server takes one task id); command was: %s\n' \
+        "$(tr '\n' '|' < "$work/modes.argv.cmd")" >&2
+    failures=$((failures + 1))
+fi
+# The last argument ssh receives IS the remote command.
+wait_remote_command=$(tail -n 1 "$work/modes.argv")
+if ! printf '%s\n' "$wait_remote_command" | sh -n 2>"$work/modes.parse.err"; then
+    printf 'client wait --timeout: the remote command is not valid shell: %s\n' \
+        "$(head -1 "$work/modes.parse.err")" >&2
+    failures=$((failures + 1))
+fi
+# The budget must be PRESENT on the remote command (as the leading assignment),
+# and the remote wrapper must actually consume it.  Behaviour beyond this point
+# -- that the remote wait is really bounded -- is only observable on a real unix
+# target and is NOT claimed here; this pins the two things the client owns.
+#
+# The wrapper check is the exact exec form, not a `grep -q AGENTQ_WAIT_BUDGET`:
+# the variable name also appears in the assignment above and in the surrounding
+# comments, so a name-only grep stays green when the handling is deleted
+# (measured 2026-10-16 -- the mutation that removed the exec line passed).
+if ! grep -qF 'AGENTQ_WAIT_BUDGET=60s;' "$work/modes.argv.cmd"; then
+    printf 'client wait --timeout: the remote command does not carry the budget assignment; command was: %s\n' \
+        "$(tr '\n' '|' < "$work/modes.argv.cmd")" >&2
+    failures=$((failures + 1))
+fi
+if ! grep -qF 'exec timeout "$AGENTQ_WAIT_BUDGET" "$agentq_server" "$@"' "$client"; then
+    printf '%s\n' 'client wait --timeout: the remote wrapper does not exec the server under timeout with the budget, so the remote wait is unbounded' >&2
+    failures=$((failures + 1))
+fi
 
 # submit --stdin-script: the script arrives as ONE base64 argument that decodes
 # back to the script itself.  Asserting the decode (not just the exit code) is
@@ -1309,11 +1381,19 @@ fi
 # copies (POSIX client's single-quoted one-liner, Windows client's here-string)
 # cannot be compared by rule E -- assert the property in each file instead:
 # the stream read must be present, and the block-read buffer must be gone.
+#
+# The launcher is the THIRD copy of this reader: its `-ArgumentsBase64 -` stdin
+# entry reads the same payload through Read-AgentQBoundedText, which kept the
+# 4096 block loop after the two wrappers were fixed (measured 2026-10-16).  No
+# caller passes `-` today, so it is latent -- but SKILL.md documents that entry
+# as one of the accepted delivery paths, so a future caller would hit the hang
+# this lock exists to prevent.
 cases=$((cases + 1))
 windows_wrapper_asset="$root/skill/assets/client/windows/agentq.ps1"
-for wrapper_file in "$client" "$windows_wrapper_asset"; do
-    if ! grep -q 'OpenStandardInput' "$wrapper_file" || \
-       ! grep -q 'ReadByte' "$wrapper_file"; then
+launcher_asset="$root/skill/assets/windows-git-bash/agentq-launcher.ps1"
+for wrapper_file in "$client" "$windows_wrapper_asset" "$launcher_asset"; do
+    if ! grep -q 'OpenStandardInput\|\.Read()' "$wrapper_file" || \
+       ! grep -q 'ReadByte\|\.Read()' "$wrapper_file"; then
         printf 'client-contract: %s no longer reads the Windows argument payload per byte (the block read hangs on real Windows ssh)\n' "$wrapper_file" >&2
         failures=$((failures + 1))
     fi
