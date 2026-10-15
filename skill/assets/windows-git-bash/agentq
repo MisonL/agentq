@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.10'
+agentq_version='0.1.11'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -302,12 +302,12 @@ usage() {
 Usage:
   $program submit --workdir <directory> [--label <label>] --request-id <id> -- <command> [arguments...]
   $program lookup <request-id>
-  $program status
+  $program status [--summary | --task <task-id>]
   $program logs <task-id> [--tail <lines>]
   $program cancel <task-id>
   $program wait <task-id>
-  $program remove <task-id>
-  $program doctor
+  $program remove <task-id> | --label <label> --confirm
+  $program doctor [--full]
 EOF
 }
 
@@ -1678,6 +1678,34 @@ cleanup() {
 # `cleanup_status` and print messages; the exit code must stay the body's.
 trap 'cleanup || true' EXIT
 
+# One NON-BLOCKING pass of the stale-lock recovery that acquire_operation_lock
+# performs in its retry loop.  Lock-free reads skip the lock, but the stale-lock
+# recovery contract (smoke/03) is pinned through `status`: an empty backdated
+# lock, or one whose recorded holder is confirmed dead, must still be cleaned by
+# the next command that touches the runtime.  A LIVE lock is left alone and the
+# read proceeds anyway -- that is the whole point of the lock-free read; the
+# live holder's own release path owns that lock.
+recover_stale_operation_lock_for_read() {
+    local candidate="$operation_lock_directory"
+
+    [ -e "$candidate" ] || [ -L "$candidate" ] || return 0
+    path_chain_is_safe "$candidate" || fail "invalid AgentQ operation lock path: $candidate"
+    [ ! -L "$candidate" ] || fail "invalid AgentQ operation lock path: $candidate"
+    [ -d "$candidate" ] || fail "invalid AgentQ operation lock path: $candidate"
+    if read_lock_metadata "$candidate/pid"; then
+        if process_is_confirmed_dead "$lock_pid" "$lock_identity"; then
+            if ! remove_stale_lock "$candidate" operation "$lock_pid" "$lock_identity"; then
+                fail "cannot recover stale AgentQ operation lock: $candidate"
+            fi
+        fi
+    elif lock_directory_is_stale_empty "$candidate"; then
+        if ! remove_stale_lock "$candidate" operation '' '' true; then
+            fail "cannot recover empty AgentQ operation lock: $candidate"
+        fi
+    fi
+    return 0
+}
+
 acquire_operation_lock() {
     local candidate="$operation_lock_directory"
     local candidate_parent
@@ -1745,7 +1773,34 @@ acquire_operation_lock() {
         sleep "$lock_retry_delay_seconds"
     done
 
-    fail "AgentQ operation is already in progress: $candidate" lock_contention
+    # The retry loop's last read_lock_metadata left lock_pid/lock_identity
+    # populated (when the lock carries a pid file), so surface the holder:
+    # the session-log mining run of 2026-10-15 found the most expensive real
+    # usage shape was a caller unable to tell a live operation from a stale
+    # lock -- including a stale Windows lock that survived 17 days, where no
+    # agent dared clean it precisely because nothing said who held it.
+    operation_lock_holder=''
+    if [ -n "$lock_pid" ]; then
+        operation_lock_holder="held by pid $lock_pid (started: $lock_identity)"
+    fi
+    lock_holder_age=''
+    lock_mtime=$(stat_mtime "$candidate") || lock_mtime=''
+    if [ -n "$lock_mtime" ]; then
+        current_epoch=$(date +%s) || current_epoch=''
+        case "$lock_mtime$current_epoch" in
+            *[!0-9]*) ;;
+            *) lock_holder_age=$((current_epoch - lock_mtime)) ;;
+        esac
+    fi
+    operation_lock_message="AgentQ operation is already in progress: $candidate"
+    if [ -n "$operation_lock_holder" ]; then
+        operation_lock_message="$operation_lock_message ($operation_lock_holder"
+        if [ -n "$lock_holder_age" ]; then
+            operation_lock_message="$operation_lock_message, lock age ${lock_holder_age}s"
+        fi
+        operation_lock_message="$operation_lock_message)"
+    fi
+    fail "$operation_lock_message" lock_contention
 }
 
 operation_lock_is_held() {
@@ -3422,7 +3477,15 @@ acquire_request_lock() {
         sleep "$lock_retry_delay_seconds"
     done
 
-    fail "AgentQ request is already being submitted: $request_id" lock_contention
+    request_lock_holder=''
+    if [ -n "$lock_pid" ]; then
+        request_lock_holder="held by pid $lock_pid (started: $lock_identity)"
+    fi
+    request_lock_message="AgentQ request is already being submitted: $request_id"
+    if [ -n "$request_lock_holder" ]; then
+        request_lock_message="$request_lock_message ($request_lock_holder)"
+    fi
+    fail "$request_lock_message" lock_contention
 }
 
 find_request_task() {
@@ -3803,6 +3866,89 @@ mark_request_removed() {
     if ! archive_removed_request "$request_id" "$record" >/dev/null; then
         fail "cannot archive removed AgentQ request while removing task: $request_id"
     fi
+}
+
+compact_status_summary() {
+    # A compact view of the agentq group: for each task, its id, queue state,
+    # label and -- for finished tasks -- the Done result.  Same raw-status
+    # snapshot discipline as compact_status (single `pueue status --json`,
+    # precision + shape guards) but NO request-record join and a much smaller
+    # per-task payload, so an agent can answer "what is in the queue" without
+    # pulling a full decorated dump: measured 2026-10-15 (session-log mining) a
+    # 258-task doctor emitted 124291 bytes and callers truncated it ~2600 times.
+    #
+    # The output is JSON, not lines, because every AgentQ success response is
+    # JSON and the clients validate it structurally before reporting success:
+    #   {"tasks": {"<id>": {"id":N,"state":"Done","result":"Success","label":...}},
+    #    "group": {...} | null, "summary": true}
+    # `state` is "Done" for finished tasks and the joined Pueue status key(s)
+    # otherwise; `result` is present only for Done.  The `summary` marker lets a
+    # consumer tell this shape from the full one.  A task whose shape cannot be
+    # summarised fails the whole summary (jq error -> caller's fold -> exit 2),
+    # never a silent gap: the created_at check that the full compactor makes is
+    # repeated here so `doctor`'s malformed-status contract holds in this mode
+    # too (smoke/02).
+    local command_status
+    local raw_status_file
+
+    raw_status_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-status' '.json') || return 1
+
+    if require_runtime_temporary_file "$raw_status_file" &&
+        run_pueue status --json > "$raw_status_file" &&
+        require_runtime_temporary_file "$raw_status_file"; then
+        validate_pueue_task_id_precision_in_file "$raw_status_file"
+        require_runtime_temporary_file "$raw_status_file"
+        validate_pueue_task_shape_in_file "$raw_status_file"
+        require_runtime_temporary_file "$raw_status_file"
+        if jq -c --arg group "$group_name" '
+            . as $status
+            | {
+                tasks: (
+                    $status.tasks
+                    | to_entries
+                    | map(select(.value.group == $group))
+                    | sort_by(.value.id)
+                    | map(
+                        if ((.value.id | type) == "number")
+                           and ((.value.id | floor) == .value.id)
+                           and (.value.id >= 0)
+                           and ((.value.created_at | type) == "string")
+                           and ((.value.created_at | length) > 0)
+                           and ((.value.label | type) == "string")
+                           and ((.value.status | type) == "object") then
+                            {
+                                key: (.value.id | tostring),
+                                value: (
+                                    if ((.value.status.Done | type) == "object")
+                                       and (.value.status.Done | has("result")) then
+                                        {id: .value.id, state: "Done", result: .value.status.Done.result, label: .value.label}
+                                    else
+                                        {id: .value.id, state: ([.value.status | keys[]] | join(",")), label: .value.label}
+                                    end
+                                )
+                            }
+                        else
+                            error("invalid task in AgentQ status summary")
+                        end
+                    )
+                    | from_entries
+                ),
+                group: ($status.groups[$group] // null),
+                summary: true
+            }
+        ' < "$raw_status_file"; then
+            command_status=0
+        else
+            command_status=$?
+        fi
+    else
+        command_status=$?
+    fi
+    remove_runtime_temporary_file "$raw_status_file" || command_status=1
+    if [ "$command_status" -ne 0 ]; then
+        fail 'cannot summarise Pueue status for AgentQ'
+    fi
+    return 0
 }
 
 compact_status() {
@@ -5161,21 +5307,89 @@ logs() {
     compact_log "$task_id" "$tail_lines" "$task" "$task_created_at"
 }
 
+logs_with_read_lock() {
+    # Read WITHOUT the operation lock.  The lock exists to serialise writers
+    # over the request-record layout; a read still runs the layout check
+    # (repair/migrate) because that is where a MALFORMED record fails loudly
+    # -- without it, a corrupt record surfaced as a bare exit 1 with jq noise
+    # instead of exit 2 + reason=protocol_error (measured against the locked
+    # baseline, 2026-10-15).  The concurrent-writer hazard this creates is
+    # bounded: repair's archive path is idempotent under races (tombstone
+    # write is temp+install atomic, an existing tombstone must MATCH, and the
+    # record removal is rm -f, which is a no-op on an already-archived
+    # record), so two concurrent repairs converge instead of corrupting.
+    # The maintenance check stays: maintenance mode must still stop reads.
+    ensure_not_in_maintenance
+    recover_stale_operation_lock_for_read
+    migrate_removed_request_records
+    logs "$@"
+}
+
 logs_with_operation_lock() {
     with_operation_lock logs "$@"
 }
 
 status() {
+    # $1 (optional): "summary" or a task id.  An empty value keeps the
+    # historical full-queue output.  --summary emits the compact JSON summary
+    # (see compact_status_summary).  --task <id> reuses compact_task and wraps
+    # the decorated task the same way `logs` and `wait` do -- {"task": {...}} --
+    # so a caller reads the same field whichever single-task view it uses, and
+    # the inner shape is exactly one entry of the full output.  A task that
+    # cannot be read is folded through report_compact_task_failure, so an
+    # unknown id is `unknown AgentQ task id`/exit 2 rather than a raw jq 4.
+    local status_mode=$1
+    local status_task_id
+    local status_task_status=0
+    local status_task
+
     ensure_daemon
     verify_group
-    compact_status
+    if [ -n "$status_mode" ]; then
+        case "$status_mode" in
+            summary)
+                compact_status_summary
+                ;;
+            *)
+                is_task_id "$status_mode" || fail 'status accepts --summary or --task <id>'
+                validate_task_id_precision "$status_mode"
+                status_task_id=$(canonical_task_id "$status_mode")
+                if status_task=$(compact_task "$status_task_id"); then
+                    :
+                else
+                    status_task_status=$?
+                fi
+                report_compact_task_failure "$status_task_status" "$status_task_id"
+                printf '{"task":%s}\n' "$status_task"
+                ;;
+        esac
+    else
+        compact_status
+    fi
+}
+
+status_with_read_lock() {
+    # Read WITHOUT the operation lock -- same reasoning as logs_with_read_lock,
+    # including stale-lock recovery and the migrate call for loud
+    # malformed-record failures.  "$@" forwards the optional summary/task mode.
+    ensure_not_in_maintenance
+    recover_stale_operation_lock_for_read
+    migrate_removed_request_records
+    status "$@"
 }
 
 status_with_operation_lock() {
-    with_operation_lock status
+    with_operation_lock status "$@"
 }
 
 doctor() {
+    # $1 (optional): "full".  The default queue section is the compact summary
+    # (see compact_status_summary) -- doctor is the documented first call on a
+    # new host, and its full decorated dump was the 124KB output that callers
+    # truncated ~2600 times across the mined sessions.  `doctor --full` keeps
+    # the historical full queue JSON for callers that inspect per-task agentq
+    # metadata.  The version diagnostic lines on stderr are unchanged.
+    local doctor_mode=${1:-}
     printf 'agentq=' >&2
     printf '%s\n' "$agentq_version" >&2
     printf 'pueue=' >&2
@@ -5212,7 +5426,22 @@ doctor() {
 
     ensure_daemon
     verify_group
-    compact_status
+    if [ "$doctor_mode" = full ]; then
+        compact_status
+    else
+        compact_status_summary
+    fi
+}
+
+doctor_with_read_lock() {
+    # The diagnostic lines above compact_status are read-only; ensure_daemon
+    # inside status/doctor CAN start the service, but that side effect is the
+    # documented doctor behaviour and independent of the operation lock.  The
+    # lock itself is dropped: same reasoning as status_with_read_lock.
+    ensure_not_in_maintenance
+    recover_stale_operation_lock_for_read
+    migrate_removed_request_records
+    doctor "$@"
 }
 
 doctor_with_operation_lock() {
@@ -5436,6 +5665,79 @@ cancel_task() {
     jq -cn --argjson task_id "$task_id" --arg requested_at "$requested_at" '{task_id: $task_id, action: "cancel_requested", cancellation_requested_at: $requested_at}'
 }
 
+# Batch removal by user label: `remove --label <label> --confirm`.
+#
+# Removes every live task whose DECORATED label equals <label> -- the label the
+# submitting caller chose and the one `status` shows, not Pueue's raw
+# `agentq:<request-id>` (which no caller sets).  The candidate ids come from one
+# compact_status snapshot; each id is then removed through remove_task, the same
+# code path a single `remove <id>` takes, so per-task semantics (removing-state
+# reconciliation, tombstone handling, id-reuse identity checks) cannot drift
+# between the two forms.
+#
+# Each removal runs inside a command-substitution subshell so its `fail` (exit
+# 2) cannot abort the batch: an item that vanished, is ambiguous, or otherwise
+# cannot be removed is recorded as {"task_id":N,"removed":false,"state":"failed"}
+# and the loop continues -- one bad id must not silently skip the rest.  The
+# per-item stderr is suppressed on purpose: those are the inner fail()'s reason
+# lines, and this command's own exit is 0 or 1, not 2, so printing reason= here
+# would break the "every exit-2 path carries a reason line" contract.  The whole
+# batch runs under one operation lock (the caller takes it), so no concurrent
+# queue mutation can interleave with it.
+remove_tasks_by_label() {
+    local match_label=$1
+    local snapshot
+    local label_ids
+    local item_id
+    local item_output
+    local item_status
+    local result_lines=''
+    local removed_count=0
+    local failed_count=0
+
+    [ -n "$match_label" ] || fail 'remove --label requires a non-empty label'
+
+    ensure_daemon
+    # `|| return $?` is load-bearing: inside with_operation_lock's `if "$@"` body
+    # `set -e` is off, so a bare `$( )` assignment that fails would fall through
+    # with an empty snapshot and remove nothing while reporting success -- the
+    # fail-open this repository has measured twice (2026-10-06).
+    snapshot=$(compact_status) || return $?
+
+    label_ids=$(jq -r --arg task_label "$match_label" '
+        [ .tasks | to_entries[] | select(.value.label == $task_label) | (.key | tostring) ]
+        | sort_by(tonumber)
+        | .[]
+    ' <<<"$snapshot") || fail 'cannot select AgentQ tasks by label'
+
+    while IFS= read -r item_id; do
+        [ -n "$item_id" ] || continue
+        item_status=0
+        item_output=''
+        if item_output=$(remove_task "$item_id" 2>/dev/null); then
+            :
+        else
+            item_status=$?
+        fi
+        if [ "$item_status" -eq 0 ] && [ -n "$item_output" ]; then
+            result_lines="$result_lines$item_output"$'\n'
+            removed_count=$((removed_count + 1))
+        else
+            result_lines="$result_lines$(jq -cn --argjson task_id "$item_id" '{task_id: $task_id, removed: false, state: "failed"}')"$'\n'
+            failed_count=$((failed_count + 1))
+        fi
+    done <<<"$label_ids"
+
+    jq -cs '.' <<<"$result_lines" || fail 'cannot render AgentQ batch removal results'
+
+    if [ "$failed_count" -gt 0 ]; then
+        printf '%s: %s of %s tasks with label %s were not removed\n' \
+            "$program" "$failed_count" "$((removed_count + failed_count))" "$match_label" >&2
+        return 1
+    fi
+    return 0
+}
+
 remove_task() {
     local task_id=$1
     local removable_task
@@ -5513,8 +5815,18 @@ main() {
             lookup_with_operation_lock "$@"
             ;;
         status)
-            [ "$#" -eq 1 ] || fail 'status accepts no arguments'
-            status_with_operation_lock
+            shift
+            status_mode=''
+            if [ "$#" -eq 1 ]; then
+                [ "$1" = '--summary' ] || fail 'status accepts --summary or --task <id>'
+                status_mode=summary
+            elif [ "$#" -eq 2 ]; then
+                [ "$1" = '--task' ] || fail 'status accepts --summary or --task <id>'
+                status_mode=$2
+            elif [ "$#" -ne 0 ]; then
+                fail 'status accepts --summary or --task <id>'
+            fi
+            status_with_read_lock "$status_mode"
             ;;
         logs)
             shift
@@ -5522,7 +5834,7 @@ main() {
             is_task_id "$1" || fail 'task id must be a non-negative integer'
             validate_task_id_precision "$1"
             task_id=$(canonical_task_id "$1")
-            logs_with_operation_lock "$task_id" "${@:2}"
+            logs_with_read_lock "$task_id" "${@:2}"
             ;;
         cancel)
             [ "$#" -eq 2 ] || fail 'cancel requires one task id'
@@ -5539,15 +5851,29 @@ main() {
             with_operation_lock wait_for_task "$task_id"
             ;;
         remove)
-            [ "$#" -eq 2 ] || fail 'remove requires one task id'
-            is_task_id "$2" || fail 'task id must be a non-negative integer'
-            validate_task_id_precision "$2"
-            task_id=$(canonical_task_id "$2")
-            with_operation_lock remove_task "$task_id"
+            if [ "$#" -ge 2 ] && [ "$2" = '--label' ]; then
+                [ "$#" -eq 4 ] || fail 'remove --label requires exactly a label and --confirm'
+                [ "$4" = '--confirm' ] || fail 'remove --label requires --confirm: a batch removal must be explicitly acknowledged'
+                [ -n "$3" ] || fail 'remove --label requires a non-empty label'
+                with_operation_lock remove_tasks_by_label "$3"
+            else
+                [ "$#" -eq 2 ] || fail 'remove requires one task id, or --label <label> --confirm'
+                is_task_id "$2" || fail 'task id must be a non-negative integer'
+                validate_task_id_precision "$2"
+                task_id=$(canonical_task_id "$2")
+                with_operation_lock remove_task "$task_id"
+            fi
             ;;
         doctor)
-            [ "$#" -eq 1 ] || fail 'doctor accepts no arguments'
-            doctor_with_operation_lock
+            shift
+            doctor_mode=''
+            if [ "$#" -eq 1 ]; then
+                [ "$1" = '--full' ] || fail 'doctor accepts --full or no arguments'
+                doctor_mode=full
+            elif [ "$#" -ne 0 ]; then
+                fail 'doctor accepts --full or no arguments'
+            fi
+            doctor_with_read_lock "$doctor_mode"
             ;;
         -h|--help|help)
             usage

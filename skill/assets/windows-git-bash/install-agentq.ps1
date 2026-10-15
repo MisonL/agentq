@@ -18,7 +18,7 @@ $expectedClientHash = "28b0756d54ec16ce13d78b251d086aa62e0057089cb27f793cd649f97
 $expectedDaemonHash = "aafa05e2f26cda9aff3eeb9be261e8f9f67752d1e9bb7fbcb47318e35c52ab1d"
 $releaseVersion = "4.0.4"
 $releaseBaseUrl = "https://github.com/Nukesor/pueue/releases/download/v$releaseVersion"
-$agentqVersion = "0.1.10"
+$agentqVersion = "0.1.11"
 $clientAssetName = "pueue-x86_64-pc-windows-msvc.exe"
 $daemonAssetName = "pueued-x86_64-pc-windows-msvc.exe"
 $gitBashPath = $null
@@ -2382,9 +2382,9 @@ function Assert-NoCrashLeftoverTransactions {
     }
     $rootItem = Get-Item -LiteralPath $RootDirectory -Force -ErrorAction SilentlyContinue
     if ($null -eq $rootItem) {
-        throw "refusing to install: AgentQ root $RootDirectory is missing but a previous run's transaction residue exists ($leftoverPaths). A run crashed between moving the old root aside and installing the new one; the previous deployment (queue data, shared secret, certificates) is still in the .backup directory above. Move it back to $RootDirectory and restart the AgentQ daemon (the crashed run stopped it) before re-running, or remove it to confirm a fresh install. Nothing was modified."
+        throw "refusing to install: AgentQ root $RootDirectory is missing but a previous run's transaction residue exists ($leftoverPaths). A run crashed between moving the old root aside and installing the new one; the previous deployment (queue data, shared secret, certificates) is still in the .backup directory above. Restore it with: Move-Item <the .AgentQ.backup directory> $RootDirectory -- then restart the AgentQ daemon (the crashed run stopped it) and re-run; or remove it to confirm a fresh install. Inspect first with: Get-ChildItem -Force $ParentDirectory. Nothing was modified."
     }
-    throw "refusing to install: a previous run's transaction residue exists beside the AgentQ root ($leftoverPaths). Either an install crashed after the swap or another install is in progress; inspect these directories and restore or remove the backup as intended, then re-run. Nothing was modified."
+    throw "refusing to install: a previous run's transaction residue exists beside the AgentQ root ($leftoverPaths). Either an install crashed after the swap or another install is in progress; inspect these directories with: Get-ChildItem -Force $ParentDirectory -- then restore the .AgentQ.backup to $RootDirectory or remove it as intended, and re-run. Nothing was modified."
 }
 
 function Get-ProcessIdentityState {

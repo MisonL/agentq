@@ -388,6 +388,44 @@ SSH 走 **2222** 端口
 
 ## 六、执行状态
 
+**Agent-UX 优化 P1–P7（2026-10-15 完成，用户对计划文件 `greedy-forging-moore` 的
+「全部优化好」授权）**：基于全量历史会话挖掘确认的七项真实摩擦，一次性落地为
+**0.1.11**（偏离原计划的 0.1.11–0.1.14 分四版：七项改动交错在同一批文件里、
+无法拆成各自可验证的中间提交，故合并为一版）。
+
+- **P1 `wait --timeout <s>`**（客户端两份）：后台 pid + 截止轮询；到预算 kill 本地
+  ssh、stderr 一行 `wait budget of Ns elapsed, task <id> still running`、退 `6`
+  （复用「无法确认终态」语义，不新增退出码）；响应已到达则照常按 0/1/5/6 契约。
+  `AGENTQ_WAIT_TIMEOUT` 提供默认值。
+- **P2 读免锁 + 锁报错增强**（服务端）：`status`/`logs`/`doctor` 改走
+  `*_with_read_lock`（免操作锁，保留维护锁检查与陈旧锁恢复）；争用报错带
+  `held by pid <pid> (started <ts>), lock age <N>s`。`lookup` 保持持锁。
+  **smoke/06 新增第 3 节钉读免锁**——先证能红：把三个读改回互斥锁的变异服务器上
+  `status --summary` 在锁持有下退 2 `lock_contention`，真实服务器全绿。
+- **P3 `status --summary` / `status --task <id>` + doctor 双形态**（服务端 +
+  客户端两份的转发与按 profile 校验）：summary 为单次 jq 聚合
+  `{"tasks":{…},"summary":true}`；`--task` 复用 `compact_task`（`{"task":…}`）；
+  doctor 默认 summary、`--full` 保留全量。`smoke/03` 真运行时钉形状，
+  `smoke/05`/`12` 钉客户端转发与校验器。
+- **P4 本地防呆**（客户端两份）：`--version`（第四处版本常量，`smoke/01` 同步钉）；
+  usage 加 `doctor` 副作用警示；`status <id>` 等本地拦截提示 `logs <id>`。
+- **P5 探针缓存**（客户端两份）：`~/.config/agentq/platform-cache/`、TTL 7d、
+  `AGENTQ_PLATFORM_PROBE_CACHE=off` / `AGENTQ_PLATFORM_CACHE_DIR`；五个 smoke 套件
+  加隔离导出（曾实测污染真实 HOME，已清）。
+- **P6 `submit --stdin-script`**（客户端两份）：stdin → base64 → 单 argv 元素；
+  unix 上限 100000（MAX_ARG_STRLEN 余量）、Windows 20000（CreateProcess 32767）；
+  `smoke/05` 行为钉（payload 解码逐字节回环）。
+- **P7 `remove --label <l> --confirm` + 安装器残留指引**：服务端从一次
+  `compact_status` 快照按装饰后 label 收集 id、单锁内逐个走既有 `remove_task`
+  （`$( )` 隔离使单项失败不中断批次），输出 JSON 数组、exit 0/1；安装器残留
+  拒绝消息补具体人工命令（语义不变）。`smoke/02` 钉三个参数拒绝、`smoke/03`
+  真运行时钉批次结果。
+- **本轮测试侧自身修的两个假绿**：① `smoke/12` 的 failures 闸门原先位于文件中部，
+  其后追加的检查（0.1.11 校验器块、静态锁）失败仍打印「checks passed」并 exit 0
+  ——闸门移至末尾、注入失败实测退 1；② 同套件暴露 ps1 `Test-JsonBatchRemoveResult`
+  对空数组拒真（`@($null)` 是单元素数组、元素为 null，pwsh 7.5.4 实测），加
+  `if ($null -eq $Response) { return $true }` 修复，十个直接调用用例全过。
+
 已完成（本会话）：A1、A2、A3、A4（零授权项），A5、A6（零授权、只改 `assets/`），
 A7（零授权、只改 `smoke/`），B2、B3、B4（用户已授权），**C1（三台，用户已裁定范围）**。
 

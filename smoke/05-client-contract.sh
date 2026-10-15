@@ -24,6 +24,16 @@ root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 client=${AGENTQ_SMOKE_CLIENT:-$root/skill/assets/client/unix/agentq}
 work=$(mktemp -d /tmp/agentq-smoke-client.XXXXXX)
 work=$(unset CDPATH; cd -- "$work" && pwd -P)
+# Keep the client's platform-probe cache inside this run's temp dir (0.1.11).
+# A cache under the real ~/.config/agentq would (a) write into the developer's
+# own config and (b) leak the resolved platform of this check's test hosts into
+# other cases or other suites, which then SKIP the probe they mean to exercise.
+export AGENTQ_PLATFORM_CACHE_DIR="$work/platform-cache"
+# and default the cache OFF: these cases exercise probing itself, and a
+# warm entry (written by an earlier case for the same test host) would skip
+# the probe under test. The dedicated cache case below re-enables it with
+# its own fresh directory.
+export AGENTQ_PLATFORM_PROBE_CACHE=off
 trap 'rm -rf -- "$work"' EXIT
 
 # A stub ssh.  The client probes the remote platform before it validates its own
@@ -61,6 +71,48 @@ printf '%s\n' '{"group":"agentq","tasks":{}}'
 exit 0
 STUB
 chmod 700 "$work/bin/ssh-argv"
+
+# A stub that answers each mode the way the real server documents it, so the
+# client's forwarding AND its response validation are both exercised: a client
+# that stopped passing `--summary` would fail the argv assertion, and one that
+# validated the summary against the full-status shape would fail the exit code
+# (its own validation error).  The response shapes mirror `agentq-server`'s:
+# status --summary -> {"tasks":{...},"group":...,"summary":true}, status --task
+# -> {"task":{...}}, doctor default -> the summary, doctor --full -> the
+# decorated map, remove --label -> an array of per-task results.  The request id
+# is echoed back because the submit validator compares it to the one it sent.
+cat > "$work/bin/ssh-modes" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$@" >> "${AGENTQ_ARGV_CAPTURE:?}"
+command=''
+for argument in "$@"; do
+    command=$argument
+done
+# The client quotes every argv element into one remote command string
+# (`agentq_run 'status' '--summary'`), so strip the single quotes before
+# matching -- otherwise every pattern below silently falls through to the
+# default response and the cases above test the wrong shape.  The de-quoted
+# command is what the assertions grep.
+command=$(printf '%s' "$command" | tr -d "'")
+printf '%s\n' "$command" >> "${AGENTQ_ARGV_CAPTURE}.cmd"
+case "$command" in
+    *'uname '*) printf 'Linux\n'; exit 0 ;;
+esac
+case "$command" in
+    *"agentq_run submit"*)
+        request_id=$(printf '%s' "$command" | sed -n 's/.*--request-id \([A-Za-z0-9._-]*\).*/\1/p')
+        printf '{"task_id":7,"request_id":"%s","reused":false}\n' "$request_id"
+        ;;
+    *"agentq_run remove"*) printf '[]\n' ;;
+    *'--summary'*) printf '{"tasks":{"3":{"id":3,"state":"Done","result":"Success","label":"agentq:x"}},"group":null,"summary":true}\n' ;;
+    *'--task'*) printf '{"task":{"id":3,"group":"agentq","created_at":"2026-01-01T00:00:00Z","status":{"Done":{"result":"Success"}}}}\n' ;;
+    *'--full'*) printf '{"tasks":{},"group":null}\n' ;;
+    *"agentq_run doctor"*) printf '{"tasks":{},"group":null,"summary":true}\n' ;;
+    *) printf '{"group":"agentq","tasks":{}}\n' ;;
+esac
+exit 0
+STUB
+chmod 700 "$work/bin/ssh-modes"
 
 # assert_credentials <yes|no> <label> [env assignments...]
 #
@@ -208,11 +260,116 @@ expect_rejected() {
 }
 
 expect_rejected 'Usage:'                 # no arguments
+expect_rejected 'status accepts --summary or --task' status extra
+# `status --summary` is no longer a local error: the client forwards it and
+# validates the summary shape (asserted below against ssh-modes).
+# --version and --help are local: they must answer before any SSH round trip.
+version_status=0
+AGENTQ_SSH="$work/bin/ssh" AGENTQ_HOST=smoke-host "$client" --version >"$work/ver.out" 2>"$work/ver.err" || version_status=$?
+cases=$((cases + 1))
+if [ "$version_status" -ne 0 ] || ! grep -qE '^agentq 0\.1\.[0-9]+$' "$work/ver.out"; then
+    printf 'client --version: expected "agentq 0.1.x" on stdout with exit 0, got exit %s: %s\n' \
+        "$version_status" "$(head -1 "$work/ver.out" "$work/ver.err" 2>/dev/null)" >&2
+    failures=$((failures + 1))
+fi
+# Static locks: the version constant, the doctor side-effect warning, and the
+# wait --timeout flag must exist in BOTH clients (the three copies of the
+# payload protocol already have their own parity rule; these pin the CLI face).
+static_failures=0
+for client_file in "$root/skill/assets/client/unix/agentq" "$root/skill/assets/client/windows/agentq.ps1"; do
+    grep -q "0\.1\.[0-9][0-9]*" "$client_file" || { printf 'client asset missing the version constant: %s\n' "$client_file" >&2; static_failures=$((static_failures + 1)); }
+    grep -q 'NOT read-only' "$client_file" || { printf 'client usage missing the doctor warning: %s\n' "$client_file" >&2; static_failures=$((static_failures + 1)); }
+    grep -q -- '--timeout' "$client_file" || { printf 'client missing wait --timeout: %s\n' "$client_file" >&2; static_failures=$((static_failures + 1)); }
+done
+failures=$((failures + static_failures))
+
+# --- mode forwarding and response validation ---------------------------------
+# Each case runs against ssh-modes and asserts BOTH that the run succeeds (the
+# response passed the client's validation for that mode) and that the mode
+# actually travelled on the remote command.  The pair is what makes these
+# non-vacuous: an empty response would fail the exit code, and a client that
+# dropped the flag would fail the fragment check.
+expect_mode_ok() {
+    local fragment=$1
+    local label=$2
+    shift 2
+    cases=$((cases + 1))
+    : > "$work/modes.argv"
+    : > "$work/modes.argv.cmd"
+    local status=0
+    AGENTQ_ARGV_CAPTURE="$work/modes.argv" AGENTQ_SSH="$work/bin/ssh-modes" \
+        AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+        "$client" "$@" >"$work/modes.out" 2>"$work/modes.err" || status=$?
+    if [ "$status" -ne 0 ]; then
+        printf 'client %s: expected exit 0, got %s: %s\n' \
+            "$label" "$status" "$(head -1 "$work/modes.err")" >&2
+        failures=$((failures + 1))
+        return
+    fi
+    if ! grep -qF -- "$fragment" "$work/modes.argv.cmd"; then
+        printf 'client %s: the remote command did not carry %s; command was: %s\n' \
+            "$label" "$fragment" "$(tr '\n' '|' < "$work/modes.argv.cmd")" >&2
+        failures=$((failures + 1))
+    fi
+}
+expect_mode_ok 'agentq_run status' status status
+expect_mode_ok 'agentq_run status --summary' status-summary status --summary
+expect_mode_ok 'agentq_run status --task 3' status-task status --task 3
+expect_mode_ok 'agentq_run doctor' doctor doctor
+expect_mode_ok 'agentq_run doctor --full' doctor-full doctor --full
+expect_mode_ok 'agentq_run remove --label smoke --confirm' remove-label remove --label smoke --confirm
+
+# submit --stdin-script: the script arrives as ONE base64 argument that decodes
+# back to the script itself.  Asserting the decode (not just the exit code) is
+# what proves the payload is the script and not, say, an empty or re-encoded
+# copy -- the same class of blindness smoke/14 cannot see through.
+cases=$((cases + 1))
+: > "$work/modes.argv"
+: > "$work/modes.argv.cmd"
+stdin_script_text='printf hello-from-stdin'
+submit_status=0
+printf '%s\n' "$stdin_script_text" |
+    AGENTQ_ARGV_CAPTURE="$work/modes.argv" AGENTQ_SSH="$work/bin/ssh-modes" \
+    AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+    "$client" submit --workdir /tmp --stdin-script >"$work/submit.out" 2>"$work/submit.err" || submit_status=$?
+if [ "$submit_status" -ne 0 ]; then
+    printf 'client stdin-script: expected exit 0, got %s: %s\n' \
+        "$submit_status" "$(head -1 "$work/submit.err")" >&2
+    failures=$((failures + 1))
+else
+    submit_b64=$(sed -n 's/.*printf %s \([A-Za-z0-9+/=]*\) | base64 -d | sh.*/\1/p' "$work/modes.argv.cmd" | head -1)
+    submit_decoded=$(printf '%s' "$submit_b64" | base64 -d 2>/dev/null)
+    if [ -z "$submit_b64" ]; then
+        printf 'client stdin-script: the remote command carried no base64 payload; command was: %s\n' \
+            "$(tr '\n' '|' < "$work/modes.argv.cmd")" >&2
+        failures=$((failures + 1))
+    elif [ "$submit_decoded" != "$stdin_script_text" ]; then
+        printf 'client stdin-script: the payload decodes to %s, not the script\n' \
+            "$submit_decoded" >&2
+        failures=$((failures + 1))
+    fi
+fi
+# The local guards: a terminal on stdin cannot supply a script, and an empty
+# pipe is a mistake worth catching before the round trip.
+expect_rejected 'submit --stdin-script takes the script from standard input; drop the command after --' \
+    submit --workdir /tmp --stdin-script -- true
+cases=$((cases + 1))
+empty_script_status=0
+AGENTQ_SSH="$work/bin/ssh" AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+    "$client" submit --workdir /tmp --stdin-script </dev/null >"$work/empty.out" 2>"$work/empty.err" || empty_script_status=$?
+if [ "$empty_script_status" -ne 2 ] || ! grep -qF 'received no script on standard input' "$work/empty.err"; then
+    printf 'client stdin-script: an empty stdin exited %s, expected 2 with the empty-script message\n' \
+        "$empty_script_status" >&2
+    failures=$((failures + 1))
+fi
+
 expect_rejected 'unknown command: bogus' bogus
 expect_rejected 'lookup requires one request id' lookup
 expect_rejected 'request id must be'     lookup abc
-expect_rejected 'wait requires one task id' wait
+expect_rejected 'wait requires a task id and optional --timeout <seconds>' wait
 expect_rejected 'task id must be a non-negative integer' wait abc
+expect_rejected 'wait accepts only --timeout <seconds>' wait 1 --nope 3
+expect_rejected '--timeout must be a positive integer' wait 1 --timeout abc
 expect_rejected 'logs requires a task id' logs
 expect_rejected 'task id must be a non-negative integer' logs abc
 expect_rejected '--tail must be a positive integer or all' logs 1 --tail x
@@ -220,8 +377,10 @@ expect_rejected 'cancel requires one task id' cancel
 expect_rejected 'task id must be a non-negative integer' cancel abc
 expect_rejected 'remove requires one task id' remove
 expect_rejected 'task id must be a non-negative integer' remove abc
-expect_rejected 'doctor accepts no arguments' doctor extra
-expect_rejected 'status accepts no arguments' status extra
+expect_rejected 'doctor accepts --full or no arguments' doctor extra
+expect_rejected 'status accepts --summary or --task' status extra
+expect_rejected 'remove --label requires --confirm' remove --label smoke
+expect_rejected 'remove --label requires --confirm' remove --label smoke --nope
 expect_rejected '--workdir is required' submit
 
 # --help is the one invocation that must succeed without a remote.

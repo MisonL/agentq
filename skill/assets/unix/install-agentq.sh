@@ -4,7 +4,7 @@ set -eu
 
 program=${0##*/}
 release_version='4.0.4'
-agentq_version='0.1.10'
+agentq_version='0.1.11'
 asset_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 agentq_home=${AGENTQ_HOME:-"$HOME/.agentq"}
 artifact_source_directory=${AGENTQ_PUEUE_SOURCE_DIR:-}
@@ -470,9 +470,9 @@ $crash_matches"
     [ -n "$crash_leftovers" ] || return 0
     crash_leftover_list=$(printf '%s\n' "$crash_leftovers" | tr '\n' ' ')
     if [ ! -e "$agentq_home" ] && [ ! -L "$agentq_home" ]; then
-        fail "refusing to install: AgentQ root $agentq_home is missing but a previous run's transaction residue exists ($crash_leftover_list). A run crashed between moving the old root aside and installing the new one; the previous deployment (queue data and credentials) is still in the .backup directory above. Move it back to $agentq_home and restart the AgentQ daemon (the crashed run stopped it) before re-running, or remove it to confirm a fresh install. Nothing was modified."
+        fail "refusing to install: AgentQ root $agentq_home is missing but a previous run's transaction residue exists ($crash_leftover_list). A run crashed between moving the old root aside and installing the new one; the previous deployment (queue data and credentials) is still in the .backup directory above. Restore it with: mv <the .backup directory> $agentq_home -- then restart the AgentQ daemon (the crashed run stopped it) and re-run; or remove it to confirm a fresh install. Inspect first with: ls -la $agentq_parent. Nothing was modified."
     fi
-    fail "refusing to install: a previous run's transaction residue exists beside the AgentQ root ($crash_leftover_list). Either an install crashed after the swap or another install is in progress; inspect these directories and restore or remove the backup as intended, then re-run. Nothing was modified."
+    fail "refusing to install: a previous run's transaction residue exists beside the AgentQ root ($crash_leftover_list). Either an install crashed after the swap or another install is in progress; inspect these directories with: ls -la $agentq_parent -- then restore the .backup to $agentq_home or remove it as intended, and re-run. Nothing was modified."
 }
 
 move_installer_file() {

@@ -377,6 +377,14 @@ for posix_installer in $posix_installers; do
         [ -n "$mv_line" ] || continue
         # A bare `mv` mentioned inside a required-command list is not a move.
         case "$mv_text" in *required_command*) continue ;; esac
+        # A `mv` inside a double-quoted *message string* is guidance text for a
+        # human (measured 2026-10-15: the residue-refusal message tells the user
+        # `Restore it with: mv <the .backup directory> $agentq_home`), not an
+        # executed move.  Real moves in this file all take real arguments --
+        # quoted variable expansions or `--` -- never a `<` placeholder.
+        case "$mv_text" in
+            *'mv <'*|*'mv -f <'*) continue ;;
+        esac
         # `end` must be the FIRST `^}` after the move -- the enclosing
         # function's closing brace.  My first version kept overwriting `end`
         # with every later `^}`, so the scan ran to the end of the FILE and
