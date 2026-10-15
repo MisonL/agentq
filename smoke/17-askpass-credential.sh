@@ -47,6 +47,14 @@ done
 
 work=$(mktemp -d /tmp/agentq-smoke-askpass.XXXXXX)
 work=$(unset CDPATH; cd -- "$work" && pwd -P)
+# Keep the client's platform-probe cache inside this run (0.1.11); see 05 for
+# the reasoning.
+export AGENTQ_PLATFORM_CACHE_DIR="$work/platform-cache"
+# and default the cache OFF: these cases exercise probing itself, and a
+# warm entry (written by an earlier case for the same test host) would skip
+# the probe under test. The dedicated cache case below re-enables it with
+# its own fresh directory.
+export AGENTQ_PLATFORM_PROBE_CACHE=off
 case "$work" in
     /private/var/folders/*)
         printf '%s\n' 'refusing to run: the work directory is too long for a unix socket' >&2

@@ -760,8 +760,102 @@ if record_still_active "$ambiguous_task_id"; then
     exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# The compact views (0.1.11): status --summary, status --task <id>, and
+# doctor's default summary queue section.  Each is asserted against real Pueue
+# output, so a shape that the client validators would reject fails here first.
+batch_label="batchroundtrip-$$-aaaa"
+batch_a_id=''
+batch_b_id=''
+for suffix in a b; do
+    rid="batchroundtrip-$$-${suffix}aaaa"
+    submit_json=$("$server" submit --workdir "$work" --label "$batch_label" \
+        --request-id "$rid" -- sh -c 'printf batch-ok') || {
+        printf '%s\n' "batch-roundtrip submit ($suffix) failed" >&2
+        exit 1
+    }
+    tid=$(jq -er '.task_id' <<<"$submit_json") || {
+        printf 'batch-roundtrip submit returned no task_id: %s\n' "$submit_json" >&2
+        exit 1
+    }
+    "$server" wait "$tid" >/dev/null || {
+        printf 'batch-roundtrip wait for task %s failed\n' "$tid" >&2
+        exit 1
+    }
+    if [ "$suffix" = a ]; then batch_a_id=$tid; else batch_b_id=$tid; fi
+done
+
+# --summary answers one compact entry per task with the marker set.
+summary_out=$("$server" status --summary) || {
+    printf '%s\n' 'status --summary failed' >&2
+    exit 1
+}
+jq -e --argjson a "$batch_a_id" --argjson b "$batch_b_id" '
+    .summary == true
+    and (.tasks | type == "object")
+    and (.tasks[($a|tostring)].id == $a)
+    and (.tasks[($a|tostring)].state == "Done")
+    and (.tasks[($a|tostring)].result == "Success")
+    and (.tasks[($b|tostring)].label | startswith("agentq:"))
+' <<<"$summary_out" >/dev/null || {
+    printf 'status --summary does not carry the batch tasks in the documented shape: %s\n' \
+        "$(head -c 200 <<<"$summary_out")" >&2
+    exit 1
+}
+
+# --task wraps the decorated task exactly like logs and wait do.
+task_out=$("$server" status --task "$batch_a_id") || {
+    printf '%s\n' 'status --task failed' >&2
+    exit 1
+}
+jq -e --argjson id "$batch_a_id" '.task.id == $id and (.task.status.Done.result == "Success")' \
+    <<<"$task_out" >/dev/null || {
+    printf 'status --task does not wrap the task in the documented shape: %s\n' \
+        "$(head -c 200 <<<"$task_out")" >&2
+    exit 1
+}
+
+# doctor's default queue section is the same summary; --full keeps the map.
+"$server" doctor 2>/dev/null | jq -e '.summary == true and (.tasks | type == "object")' >/dev/null || {
+    printf '%s\n' 'doctor default did not answer with the summary shape' >&2
+    exit 1
+}
+"$server" doctor --full 2>/dev/null | jq -e '(.summary == null or .summary == false) and (.tasks | type == "object")' >/dev/null 2>&1 || {
+    printf '%s\n' 'doctor --full did not answer with the full map' >&2
+    exit 1
+}
+
+# Batch removal by label removes BOTH tasks and nothing else, and reports each
+# result; an empty match is a successful no-op.
+batch_out=$("$server" remove --label "$batch_label" --confirm) || {
+    printf 'remove --label exited %s: %s\n' "$?" "$(head -c 200 <<<"${batch_out:-}")" >&2
+    exit 1
+}
+jq -e --argjson a "$batch_a_id" --argjson b "$batch_b_id" '
+    type == "array" and length == 2
+    and ([.[] | select(.task_id == $a and .removed == true)] | length == 1)
+    and ([.[] | select(.task_id == $b and .removed == true)] | length == 1)
+' <<<"$batch_out" >/dev/null || {
+    printf 'remove --label did not report both removals: %s\n' "$(head -c 200 <<<"$batch_out")" >&2
+    exit 1
+}
+for id in "$batch_a_id" "$batch_b_id"; do
+    "$server" status --task "$id" >/dev/null 2>&1 && {
+        printf 'batch removal left task %s visible\n' "$id" >&2
+        exit 1
+    }
+done
+empty_out=$("$server" remove --label "no-such-label-$$" --confirm) || {
+    printf 'remove --label with no matches exited %s\n' "$?" >&2
+    exit 1
+}
+jq -e 'type == "array" and length == 0' <<<"$empty_out" >/dev/null || {
+    printf 'a no-match batch removal did not answer an empty array: %s\n' "$(head -c 100 <<<"$empty_out")" >&2
+    exit 1
+}
+
 # Every token below is printed only after its assertion actually ran -- the
 # three that used to be conditionally skipped now exit 1 instead, so a green
 # summary cannot coexist with an unexercised contract.
-printf 'protocol-roundtrip checks passed: home=%s task=%s fail-task=%s lookup=not_found stale-lock=recovered cancel-running=ok cancel-queued=queued_removed/5 cancel-replay=reused reuse-replay=reused finished-cancel=task_not_running binary-log=base64 doctor=ok ambiguous-id=unavailable/6\n' \
+printf 'protocol-roundtrip checks passed: home=%s task=%s fail-task=%s lookup=not_found stale-lock=recovered cancel-running=ok cancel-queued=queued_removed/5 cancel-replay=reused reuse-replay=reused finished-cancel=task_not_running binary-log=base64 doctor=ok ambiguous-id=unavailable/6 summary=ok batch-remove=2/2+empty\n' \
     "$runtime_home" "$task_id" "$failure_task_id"

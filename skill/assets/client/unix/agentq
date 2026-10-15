@@ -15,6 +15,7 @@ if [ -z "${HOME:-}" ]; then
     exit 2
 fi
 config_path=${AGENTQ_CONFIG:-"$HOME/.config/agentq/config"}
+cache_state_directory=$(printf '%s' "${AGENTQ_PLATFORM_CACHE_DIR:-$HOME/.config/agentq}" | sed 's:/*$::')
 configured_host=''
 config_max_bytes=4096
 config_marker='__AGENTQ_CONFIG_READ_BOUNDARY_9f3c7b2a__'
@@ -30,6 +31,19 @@ submit_retry_delay=${AGENTQ_SUBMIT_RETRY_DELAY:-2}
 operation_retry_attempts=${AGENTQ_OPERATION_RETRY_ATTEMPTS:-6}
 operation_retry_delay=${AGENTQ_OPERATION_RETRY_DELAY:-2}
 platform_probe_timeout=${AGENTQ_PLATFORM_PROBE_TIMEOUT:-30}
+wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
+# Kept in step with the four version constants smoke/01 pins (POSIX installer,
+# Windows installer, server asset, README); the client carries its own copy
+# because --version must answer without an SSH round trip.
+agentq_client_version='0.1.11'
+# --stdin-script's payload must fit in ONE argv element on the target.  Linux
+# caps a single argument at MAX_ARG_STRLEN (131072); a Windows target re-encodes
+# argv onto a CreateProcess command line capped at 32767 characters, and the
+# payload shares that line with the rest of the server invocation.  The unix
+# bound keeps a safety margin under the Linux cap; the Windows bound leaves
+# ~12K of headroom on the command line.
+stdin_script_unix_limit=100000
+stdin_script_windows_limit=20000
 platform_probe_output_limit=65536
 ssh_binary=${AGENTQ_SSH:-}
 json_parser=${AGENTQ_JQ:-}
@@ -63,6 +77,14 @@ agentq_recovery_log_file=''
 agentq_recovery_output_file=''
 agentq_operation_log_file=''
 agentq_operation_output_file=''
+agentq_operation_ssh_pid=''
+wait_timeout_seconds=''
+# The response shape the safe-operation loop validates against.  Defaults to
+# the operation name; status --summary/--task and doctor --full set a specific
+# profile because the server answers each mode with its own JSON shape.
+agentq_operation_profile=''
+remove_batch=0
+status_expected_task_id=''
 platform_probe_output_file=''
 platform_probe_log_file=''
 platform_probe_output_identity=''
@@ -622,13 +644,16 @@ usage() {
     cat <<EOF
 Usage:
   $program [--host <ssh-host>] submit --workdir <remote-directory> [--label <label>] [--request-id <id>] -- <command> [arguments...]
+  $program [--host <ssh-host>] submit --workdir <remote-directory> [--label <label>] [--request-id <id>] --stdin-script < script
   $program [--host <ssh-host>] lookup <request-id>
-  $program [--host <ssh-host>] status
+  $program [--host <ssh-host>] status [--summary | --task <task-id>]
   $program [--host <ssh-host>] logs <task-id> [--tail <lines>]
   $program [--host <ssh-host>] cancel <task-id>
-  $program [--host <ssh-host>] wait <task-id>
-  $program [--host <ssh-host>] remove <task-id>
-  $program [--host <ssh-host>] doctor
+  $program [--host <ssh-host>] wait <task-id> [--timeout <seconds>]
+  $program [--host <ssh-host>] remove <task-id> | --label <label> --confirm
+  $program [--host <ssh-host>] doctor [--full]
+
+  doctor starts the pueued service if it is not running; it is NOT read-only.
 
 Environment:
   AGENTQ_HOST                      Default SSH host when --host is omitted.
@@ -638,6 +663,10 @@ Environment:
   AGENTQ_OPERATION_RETRY_ATTEMPTS  Confirmed transport retries for safe operations.
   AGENTQ_OPERATION_RETRY_DELAY     Delay in seconds between safe-operation retries.
   AGENTQ_PLATFORM_PROBE_TIMEOUT    Maximum seconds for a read-only platform/protocol probe.
+  AGENTQ_PLATFORM_PROBE_CACHE      on (default) caches the resolved platform per
+                                   host for 7 days; off probes every run.
+  AGENTQ_WAIT_TIMEOUT              Default wait --timeout in seconds; the wait
+                                   flag overrides it.
   AGENTQ_SSH                       OpenSSH client path; defaults to ssh found on PATH.
   AGENTQ_JQ                        jq executable used to validate AgentQ JSON responses.
   AGENTQ_REMOTE_PLATFORM           auto, unix, or windows; defaults to auto.
@@ -1049,6 +1078,140 @@ run_operation_ssh() {
     return "$operation_ssh_status"
 }
 
+# wait with a client-side deadline.  The ssh child runs in the background and
+# is polled once per second; when the budget elapses the local ssh is killed
+# and 124 is returned (the probe-timeout convention; the recovery loop's
+# 255-retry branch never sees it).  On unix targets the remote wait itself is
+# also bounded with coreutils `timeout`, because killing the LOCAL ssh does
+# not stop the remote process -- measured 2026-10-15 (session-log mining):
+# those remote orphans kept holding the server operation lock and were the
+# largest reliability pain in real agent usage.  Windows targets have no
+# equivalent guaranteed on PATH, so there the bound is local-only.  On a
+# completed (non-timed-out) run the ssh status is recovered from the child,
+# the server reason token is extracted from a captured stderr exactly as
+# run_ssh_logged does, and the output/log temporaries are LEFT in place for
+# the recovery loop's own cleanup paths.
+run_wait_ssh_with_timeout() {
+    wait_ssh_command=$1
+    wait_ssh_input=${2:-}
+    operation_output_require_file "$agentq_operation_output_file" || return $?
+
+    wait_remote_command=$wait_ssh_command
+    if [ "$remote_platform" != windows ]; then
+        wait_remote_command="timeout ${wait_timeout_seconds}s $wait_ssh_command"
+    fi
+
+    wait_ssh_stderr_capture=$(umask 077; make_client_temporary_file "$agentq_temp_directory" 'agentq-wait-stderr') || {
+        printf '%s: cannot create a temporary stderr capture for wait\n' "$program" >&2
+        return 2
+    }
+    wait_ssh_stderr_capture_identity=$(windows_argument_file_identity "$wait_ssh_stderr_capture") || {
+        wait_ssh_stderr_capture_identity=''
+        if operation_output_remove_file "$wait_ssh_stderr_capture" 2>/dev/null; then
+            :
+        fi
+        printf '%s: cannot track the wait stderr capture temporary: %s\n' "$program" "$wait_ssh_stderr_capture" >&2
+        return 2
+    }
+
+    if [ -n "$wait_ssh_input" ]; then
+        agentq_ssh_input_require_file "$wait_ssh_input" || return $?
+        "$ssh_binary" \
+            -E "$agentq_operation_log_file" \
+            -o LogLevel=ERROR \
+            $ssh_credential_option_lines \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=12 \
+            -o TCPKeepAlive=yes \
+            -- "$host" "$wait_remote_command" < "$wait_ssh_input" > "$agentq_operation_output_file" 2>"$wait_ssh_stderr_capture" &
+    else
+        "$ssh_binary" \
+            -E "$agentq_operation_log_file" \
+            -o LogLevel=ERROR \
+            $ssh_credential_option_lines \
+            -o ConnectTimeout=10 \
+            -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=12 \
+            -o TCPKeepAlive=yes \
+            -- "$host" "$wait_remote_command" > "$agentq_operation_output_file" 2>"$wait_ssh_stderr_capture" &
+    fi
+    agentq_operation_ssh_pid=$!
+    wait_ssh_child_pid=$agentq_operation_ssh_pid
+    wait_ssh_elapsed=0
+    wait_ssh_timed_out=0
+    while kill -0 "$agentq_operation_ssh_pid" >/dev/null 2>&1; do
+        if [ "$wait_ssh_elapsed" -ge "$wait_timeout_seconds" ]; then
+            kill "$agentq_operation_ssh_pid" >/dev/null 2>&1 || true
+            wait "$agentq_operation_ssh_pid" >/dev/null 2>&1 || true
+            wait_ssh_timed_out=1
+            break
+        fi
+        sleep 1
+        wait_ssh_elapsed=$((wait_ssh_elapsed + 1))
+    done
+    # Save before clearing: a bare `wait` with no argument returns the status
+    # of the PREVIOUS command (here the deadline loop's last `kill -0`, which
+    # is 1 for a child that just exited), not the child's own status --
+    # measured 2026-10-15: a completed fast wait was reported as exit 1.
+    agentq_operation_ssh_pid=''
+
+    if [ "$wait_ssh_timed_out" -eq 1 ]; then
+        if operation_output_remove_file "$agentq_operation_output_file"; then
+            :
+        else
+            return $?
+        fi
+        if agentq_ssh_log_remove_file "$agentq_operation_log_file"; then
+            :
+        else
+            return $?
+        fi
+        if windows_argument_remove_file "$wait_ssh_stderr_capture" "$wait_ssh_stderr_capture_identity"; then
+            :
+        else
+            return $?
+        fi
+        return 124
+    fi
+
+    # Condition context for BOTH the wait builtin and the status capture:
+    # under `set -e` a bare `wait <pid>` whose child exited non-zero trips
+    # errexit and kills the shell with the child's code (measured 2026-10-15:
+    # a 255 from ssh exited the shell before `wait_ssh_status=$?` could run,
+    # so the transport-retry branch never saw the 255).
+    if wait "$wait_ssh_child_pid" >/dev/null 2>&1; then
+        wait_ssh_status=0
+    else
+        wait_ssh_status=$?
+    fi
+
+    agentq_remote_failure_reason_value=''
+    if [ -s "$wait_ssh_stderr_capture" ]; then
+        if ssh_failure_reason=$(agentq_remote_failure_reason "$wait_ssh_stderr_capture"); then
+            agentq_remote_failure_reason_value=$ssh_failure_reason
+        fi
+        if [ "$remote_platform" = windows ]; then
+            if ssh_exit_token=$(agentq_remote_exit_token "$wait_ssh_stderr_capture"); then
+                wait_ssh_status=$ssh_exit_token
+            fi
+        fi
+    fi
+    if windows_argument_remove_file "$wait_ssh_stderr_capture" "$wait_ssh_stderr_capture_identity"; then
+        :
+    else
+        printf '%s: failed to remove the wait stderr capture: %s\n' "$program" "$wait_ssh_stderr_capture" >&2
+        if [ "$wait_ssh_status" -eq 0 ]; then
+            wait_ssh_status=$?
+        fi
+    fi
+
+    if [ -s "$agentq_operation_log_file" ]; then
+        write_ssh_diagnostic_metadata "$agentq_operation_log_file"
+    fi
+    return "$wait_ssh_status"
+}
+
 recovery_output_file_is_safe() {
     recovery_output_guard_file=$1
     [ -n "$recovery_output_guard_file" ] || return 1
@@ -1457,8 +1620,33 @@ validate_json_response() {
         lookup)
             response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.request_id | type == "string") and ($response.request_id | length > 0) and (($expected_request_id_present | not) or $response.request_id == $expected_request_id) and ((($response | has("reused")) and (($response | has("state")) | not) and ($response.task_id | nonnegative_integer) and ($response.reused | type == "boolean")) or (($response | has("state")) and (($response | has("reused")) | not) and ($response.state | type == "string") and ($response | has("task_id")) and (if $response.state == "not_found" or $response.state == "not_started" or $response.state == "ambiguous" then $response.task_id == null elif $response.state == "accepted" or $response.state == "removing" or $response.state == "removed" then ($response.task_id | nonnegative_integer) else false end))) then true else false end'
             ;;
-        status|doctor)
+        status)
             response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.tasks | type == "object") and ($response.tasks | to_entries | all(.[]; valid_status_task)) then true else false end'
+            ;;
+        status_summary)
+            # The compact queue view: {"tasks": {"<id>": {id, state, result?,
+            # label}}, "group", "summary": true}.  The summary marker is what
+            # keeps this shape from being mistaken for the full decorated dump
+            # when a caller compares responses.
+            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.summary == true) and ($response.tasks | type == "object") and ($response.tasks | to_entries | all(.[]; ((.value | type) == "object") and (.value.id | nonnegative_integer) and ((.value.state | type) == "string") and ((.value.state | length) > 0))) then true else false end'
+            ;;
+        status_task)
+            # The single-task peek: {"task": {...}} with the decorated task
+            # whose id must match the requested one (same expectation contract
+            # as logs and wait).
+            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.task | type == "object") and ($response.task.id | nonnegative_integer) and (if $expected_task_id_present then ($response.task.id | task_id_matches($expected_task_id)) else true end) and (($response.task.status | type) == "object") then true else false end'
+            ;;
+        doctor)
+            # The default queue section is the compact summary; --full keeps the
+            # historical decorated map.  Both are accepted so a caller can switch
+            # modes without the client refusing one of them.
+            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.tasks | type == "object") and ((($response.tasks | to_entries | all(.[]; valid_status_task)) or (($response.summary == true) and ($response.tasks | to_entries | all(.[]; ((.value | type) == "object") and (.value.id | nonnegative_integer) and ((.value.state | type) == "string") and ((.value.state | length) > 0)))))) then true else false end'
+            ;;
+        remove_batch)
+            # One entry per matched task: {"task_id":N,"removed":true} (as a
+            # single remove returns it) or {"task_id":N,"removed":false,
+            # "state":"failed"}.  An empty array is a successful no-op.
+            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "array") and ($response | all(.[]; ((type == "object") and (.task_id | nonnegative_integer) and ((.removed | type) == "boolean")))) then true else false end'
             ;;
         logs)
             response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.task | type == "object") and ($response.task.id | nonnegative_integer) and (if $expected_task_id_present then ($response.task.id | task_id_matches($expected_task_id)) else true end) and ($response | has("output")) and (((($response.output | type) == "string") and (($response | has("output_encoding") | not)) and (($response | has("output_base64") | not))) or ($response.output == null and $response.output_encoding == "base64" and (if ($response.output_base64 | type) == "string" then (($response.output_base64 | length) > 0 and ($response.output_base64 | test("^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"))) else false end))) then true else false end'
@@ -2692,68 +2880,160 @@ probe_windows_agentq_protocol() {
     return "$windows_protocol_status"
 }
 
+# The platform cache answers ONE question: which platform did this host
+# resolve to last time auto-detection succeeded?  Stored at
+# $HOME/.config/agentq/platform-cache/<safe-host>.json as
+# {"platform":"unix"|"windows","probed_at":<epoch>,"probe_ms":<n>}.
+# A cache hit replaces BOTH probes (platform + launcher protocol): the entry
+# is only written after a full successful resolution, so its verdict already
+# includes the launcher check.  Bypasses: AGENTQ_REMOTE_PLATFORM set
+# explicitly (never reaches auto), AGENTQ_PLATFORM_PROBE_CACHE=off, an
+# unparsable/expired entry (falls through to probing), and any filesystem
+# hiccup (cache problems must never break a working command -- a cache that
+# cannot be read is indistinguishable from an empty one).
+platform_probe_cache_ttl=${AGENTQ_PLATFORM_PROBE_CACHE_TTL:-604800}
+platform_cache_enabled() {
+    [ "${AGENTQ_PLATFORM_PROBE_CACHE:-on}" != off ]
+}
+
+platform_cache_path_for_host() {
+    # Host names are user input; keep only the characters that cannot escape
+    # the cache directory, and hash the rest so distinct hosts never collide.
+    platform_cache_safe=$(printf '%s' "$host" | LC_ALL=C tr -c 'A-Za-z0-9._-' '-')
+    printf '%s/platform-cache/%s.json' "$cache_state_directory" \
+        "$(printf '%s' "$platform_cache_safe" | shasum -a 256 | cut -c1-16)"
+}
+
+platform_cache_read() {
+    platform_cache_enabled || return 1
+    case "$remote_platform" in
+        auto) ;;
+        *) return 1 ;;
+    esac
+    platform_cache_file=$(platform_cache_path_for_host) || return 1
+    [ -f "$platform_cache_file" ] && [ ! -L "$platform_cache_file" ] || return 1
+    platform_cache_platform=$(LC_ALL=C sed -n 's/.*"platform":"\([a-z]*\)".*/\1/p' "$platform_cache_file" | tail -n 1)
+    case "$platform_cache_platform" in
+        unix|windows) ;;
+        *) return 1 ;;
+    esac
+    platform_cache_age=$(LC_ALL=C sed -n 's/.*"probed_at":\([0-9]*\).*/\1/p' "$platform_cache_file" | tail -n 1)
+    case "$platform_cache_age" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    platform_cache_now=$(date +%s) || return 1
+    [ $((platform_cache_now - platform_cache_age)) -le "$platform_probe_cache_ttl" ] || return 1
+    remote_platform=$platform_cache_platform
+    return 0
+}
+
+platform_cache_write() {
+    # Called after a successful probe resolution only.  Failures here are
+    # non-fatal: a cache we cannot write simply means every run probes again,
+    # which is the pre-cache behaviour.
+    platform_cache_enabled || return 0
+    platform_cache_file=$(platform_cache_path_for_host) || return 0
+    if mkdir -p -- "${platform_cache_file%/*}" 2>/dev/null; then
+        platform_cache_now=$(date +%s) || platform_cache_now=0
+        printf '{"platform":"%s","probed_at":%s,"probe_ms":0}\n' \
+            "$remote_platform" "$platform_cache_now" > "$platform_cache_file" 2>/dev/null || true
+    fi
+    return 0
+}
+
+initialize_remote_platform_by_probe() {
+    case "$remote_platform" in
+        auto) ;;
+        *) return 0 ;;
+    esac
+    if local_platform_output=$(run_platform_probe_with_recovery 'uname -s 2>/dev/null'); then
+        local_platform_status=0
+    else
+        local_platform_status=$?
+    fi
+    case "$local_platform_output" in
+        MINGW*|MSYS*|CYGWIN*)
+            probe_native_windows_platform || return $?
+            platform_cache_write
+            return 0
+            ;;
+        Linux*|Darwin*)
+            remote_platform=unix
+            platform_cache_write
+            return 0
+            ;;
+    esac
+    windows_probe_command || fail 'cannot encode the Windows PowerShell platform probe; iconv and base64 are required'
+    windows_platform_command=$windows_probe_prepared_command_line
+    if windows_platform_output=$(run_platform_probe_with_recovery "$windows_platform_command" "$platform_probe_stdin_file"); then
+        windows_platform_status=0
+    else
+        windows_platform_status=$?
+    fi
+    # The probe reports its status through an out-of-band
+    # "agentq-exit:<code>" token, because an outer PowerShell
+    # flattens the SSH exit code.  Strip it before comparing the
+    # payload; the MINGW branch above already does this.
+    windows_probe_apply_exit_token "$windows_platform_status" "$windows_platform_output"
+    windows_platform_status=$windows_probe_token_status
+    windows_platform_output=$windows_probe_token_output
+    if [ "$windows_platform_status" -eq 0 ] && [ "$windows_platform_output" = agentq-windows ]; then
+        remote_platform=windows
+        # The launcher-protocol verdict is part of the cached answer, so the
+        # cache is written only AFTER probe_windows_agentq_protocol passes
+        # (initialize_remote_invocation runs it next and its failure returns
+        # before any cache write below).
+        platform_cache_write
+        return 0
+    elif [ "$local_platform_status" -ne 0 ] && [ "$windows_platform_status" -ne 0 ]; then
+        printf '%s: unable to detect the remote platform; set AGENTQ_REMOTE_PLATFORM to unix or windows only when the target is known\n' "$program" >&2
+        return "$local_platform_status"
+    else
+        # The probe output is remote-controlled.  Print it as a
+        # single charset-limited token -- first line, ASCII word
+        # characters only, capped -- so it can never inject ANSI
+        # sequences, extra lines, or a forged line-initial
+        # "agentq:" prefix.  Measured 2026-10-06: a remote whose
+        # uname-probe stdout was "FreeBSD\n\033[2Jagentq: remote
+        # failure reason: lock_contention" made this message
+        # forge a line byte-identical to our own reason output.
+        #
+        # POSIX parameter expansion only: this file is #!/bin/sh
+        # and on Debian/Ubuntu /bin/sh is dash, which dies with
+        # `Bad substitution` on the `$'\n'`, `${x//pat/}` and
+        # `${x:0:N}` forms this used to use -- the shell died
+        # BEFORE the printf, so an operator on those hosts saw a
+        # raw shell error instead of the diagnostic.  Measured
+        # 2026-10-12 (dash exit 2, no message; macOS /bin/sh --
+        # bash -- printed it fine, which is why the two forms
+        # could coexist until now).  `smoke/05`'s
+        # unsupported-platform case probes for a strict POSIX
+        # shell and pins both the exit code and the message.
+        local_platform_hint=$(printf '%s\n' "$local_platform_output" |
+            LC_ALL=C sed -n 's/[^A-Za-z0-9_.-]//g; p; q' | cut -c1-32)
+        printf '%s: unsupported or undetectable remote platform (probe reported: %s)\n' "$program" "${local_platform_hint:-empty}" >&2
+        return 2
+    fi
+}
+
 initialize_remote_invocation() {
     resolve_agentq_temp_directory || return $?
     case "$remote_platform" in
         auto)
-            if local_platform_output=$(run_platform_probe_with_recovery 'uname -s 2>/dev/null'); then
-                local_platform_status=0
+            # Cache first: a probe costs one full SSH round trip (plus the
+            # measured 30s budget on slow Windows hosts), and the resolved
+            # platform of a given host does not change between calls.  The
+            # cache records the FINAL platform verdict (unix, or windows plus
+            # a passing launcher-protocol verdict), so a hit skips BOTH
+            # probes.  AGENTQ_REMOTE_PLATFORM (explicit) and
+            # AGENTQ_PLATFORM_PROBE_CACHE=off bypass it; an all-probes-failed
+            # run through a cache hit falls back to probing (the target may
+            # have been redeployed), which also invalidates the entry.
+            if platform_cache_read; then
+                :
             else
-                local_platform_status=$?
+                initialize_remote_platform_by_probe
             fi
-            case "$local_platform_output" in
-                MINGW*|MSYS*|CYGWIN*)
-                    probe_native_windows_platform || return $?
-                    ;;
-                Linux*|Darwin*) remote_platform=unix ;;
-                *)
-                    windows_probe_command || fail 'cannot encode the Windows PowerShell platform probe; iconv and base64 are required'
-                    windows_platform_command=$windows_probe_prepared_command_line
-                    if windows_platform_output=$(run_platform_probe_with_recovery "$windows_platform_command" "$platform_probe_stdin_file"); then
-                        windows_platform_status=0
-                    else
-                        windows_platform_status=$?
-                    fi
-                    # The probe reports its status through an out-of-band
-                    # "agentq-exit:<code>" token, because an outer PowerShell
-                    # flattens the SSH exit code.  Strip it before comparing the
-                    # payload; the MINGW branch above already does this.
-                    windows_probe_apply_exit_token "$windows_platform_status" "$windows_platform_output"
-                    windows_platform_status=$windows_probe_token_status
-                    windows_platform_output=$windows_probe_token_output
-                    if [ "$windows_platform_status" -eq 0 ] && [ "$windows_platform_output" = agentq-windows ]; then
-                        remote_platform=windows
-                    elif [ "$local_platform_status" -ne 0 ] && [ "$windows_platform_status" -ne 0 ]; then
-                        printf '%s: unable to detect the remote platform; set AGENTQ_REMOTE_PLATFORM to unix or windows only when the target is known\n' "$program" >&2
-                        return "$local_platform_status"
-                    else
-                        # The probe output is remote-controlled.  Print it as a
-                        # single charset-limited token -- first line, ASCII word
-                        # characters only, capped -- so it can never inject ANSI
-                        # sequences, extra lines, or a forged line-initial
-                        # "agentq:" prefix.  Measured 2026-10-06: a remote whose
-                        # uname-probe stdout was "FreeBSD\n\033[2Jagentq: remote
-                        # failure reason: lock_contention" made this message
-                        # forge a line byte-identical to our own reason output.
-                        #
-                        # POSIX parameter expansion only: this file is #!/bin/sh
-                        # and on Debian/Ubuntu /bin/sh is dash, which dies with
-                        # `Bad substitution` on the `$'\n'`, `${x//pat/}` and
-                        # `${x:0:N}` forms this used to use -- the shell died
-                        # BEFORE the printf, so an operator on those hosts saw a
-                        # raw shell error instead of the diagnostic.  Measured
-                        # 2026-10-12 (dash exit 2, no message; macOS /bin/sh --
-                        # bash -- printed it fine, which is why the two forms
-                        # could coexist until now).  `smoke/05`'s
-                        # unsupported-platform case probes for a strict POSIX
-                        # shell and pins both the exit code and the message.
-                        local_platform_hint=$(printf '%s\n' "$local_platform_output" |
-                            LC_ALL=C sed -n 's/[^A-Za-z0-9_.-]//g; p; q' | cut -c1-32)
-                        printf '%s: unsupported or undetectable remote platform (probe reported: %s)\n' "$program" "${local_platform_hint:-empty}" >&2
-                        return 2
-                    fi
-                    ;;
-            esac
             ;;
         unix|windows)
             ;;
@@ -3349,6 +3629,10 @@ run_safe_operation_with_recovery() {
     agentq_operation_input=$3
     agentq_operation_request_id=${4:-}
     agentq_operation_expected_task_id=${5:-}
+    # The validation profile: usually the operation name, but the status and
+    # doctor modes answer with shapes of their own, so their call sites pass it
+    # explicitly rather than weakening the shared filter.
+    agentq_operation_profile=${6:-$1}
     agentq_operation_attempt=0
     resolve_agentq_temp_directory || return $?
     agentq_operation_output_file=$(mktemp "$agentq_temp_directory/agentq-operation.XXXXXX") || {
@@ -3368,9 +3652,52 @@ run_safe_operation_with_recovery() {
     }
 
     while :; do
-        if run_operation_ssh "$agentq_operation_command" "$agentq_operation_input"; then
+        # Every runner call sits in its own if/else: under `set -e` a bare
+        # call returning non-zero trips errexit before `$?` can be captured
+        # (measured 2026-10-15: 124 from a timed-out wait exited the shell
+        # through the EXIT trap), and an `elif` whose condition is a function
+        # call is NOT exempt on this bash either (a 255 killed the shell
+        # before the else branch could capture it -- measured the same day).
+        agentq_operation_status=0
+        if [ "$agentq_operation_name" = wait ] && [ -n "$wait_timeout_seconds" ]; then
+            if run_wait_ssh_with_timeout "$agentq_operation_command" "$agentq_operation_input"; then
+                :
+            else
+                agentq_operation_status=$?
+            fi
+            if [ "$agentq_operation_status" -eq 124 ]; then
+                # The budget elapsed while the task is still running.  Exit 6
+                # is the contract's "final state could not be confirmed"
+                # class -- a timed-out wait is exactly that, not an error and
+                # not retryable.  Both temporaries are already removed inside
+                # run_wait_ssh_with_timeout.
+                printf '%s: wait budget of %s seconds elapsed; task %s may still be running\n' \
+                    "$program" "$wait_timeout_seconds" "${agentq_operation_expected_task_id:-?}" >&2
+                return 6
+            fi
+        else
+            if run_operation_ssh "$agentq_operation_command" "$agentq_operation_input"; then
+                :
+            else
+                agentq_operation_status=$?
+            fi
+        fi
+        # A transport loss must reach the retry check below WITHOUT passing
+        # through the gate's else, which overwrites the status with `$?` --
+        # by then `$?` is the failed `[` test's 1, not the runner's 255
+        # (measured 2026-10-15: ssh exit 255 arrived at the caller as 1 and
+        # the transport retry never ran).  Head straight to the retry check.
+        if [ "$agentq_operation_status" -eq 255 ]; then
+            :
+        elif [ "$agentq_operation_status" -eq 0 ]; then
+            # Capture the validation result IMMEDIATELY: the gate's else below
+            # cannot read `$?` for this, because by the time the else runs, `$?`
+            # is the failed `[` test's 1, not the validation's code (measured
+            # 2026-10-15: a lock-rejected status 2 surfaced to the caller as 1).
+            agentq_operation_validated=0
             if operation_output_require_existing_file "$agentq_operation_output_file" &&
-                validate_json_response "$agentq_operation_output_file" "$agentq_operation_name" "$agentq_operation_request_id" "$agentq_operation_expected_task_id"; then
+                validate_json_response "$agentq_operation_output_file" "$agentq_operation_profile" "$agentq_operation_request_id" "$agentq_operation_expected_task_id"; then
+                agentq_operation_validated=1
                 if [ "$agentq_operation_name" = wait ]; then
                     if validate_wait_response "$agentq_operation_output_file" 0 "$agentq_operation_expected_task_id"; then
                         :
@@ -3397,6 +3724,11 @@ run_safe_operation_with_recovery() {
                 fi
                 :
             else
+                # The response failed protocol validation (or the output file
+                # vanished).  The failure status is in agentq_operation_validated's
+                # if -- capture it here where `$?` is still the validation's rc,
+                # NOT in the gate's else below (there `$?` is the failed gate
+                # test's 1 -- measured 2026-10-15).
                 agentq_operation_status=$?
                 if operation_output_remove_file "$agentq_operation_output_file"; then
                     :
@@ -3433,7 +3765,12 @@ run_safe_operation_with_recovery() {
             fi
             return "$agentq_operation_output_cleanup_status"
         else
-            agentq_operation_status=$?
+            # Validation failed (or the output file vanished).  Do NOT read
+            # `$?` here: it is the failed gate test's 1, not the validation
+            # status.  The validation status was already folded into
+            # agentq_operation_status inside the then-branch (see the
+            # validated=0 capture), so keep the status as-is.
+            :
         fi
 
         if [ "$agentq_operation_name" = lookup ] && {
@@ -3605,6 +3942,13 @@ while [ "$#" -gt 0 ]; do
             usage
             exit 0
             ;;
+        --version)
+            # Local only: reports the CLIENT's version constant.  The server's
+            # version comes from `doctor` (agentq= line); the two are separate
+            # deployments and deliberately not negotiated (docs/PLAN.md B2).
+            printf '%s %s\n' "$program" "$agentq_client_version"
+            exit 0
+            ;;
         *)
             break
             ;;
@@ -3629,6 +3973,7 @@ case "$operation" in
         workdir=''
         label='command'
         request_id=''
+        stdin_script=false
         while [ "$#" -gt 0 ]; do
             case "$1" in
                 --workdir)
@@ -3646,6 +3991,10 @@ case "$operation" in
                     request_id=$2
                     shift 2
                     ;;
+                --stdin-script)
+                    stdin_script=true
+                    shift
+                    ;;
                 --)
                     shift
                     break
@@ -3656,7 +4005,11 @@ case "$operation" in
             esac
         done
         [ -n "$workdir" ] || fail '--workdir is required'
-        [ "$#" -gt 0 ] || fail 'submit requires a command after --'
+        if [ "$stdin_script" = true ]; then
+            [ "$#" -eq 0 ] || fail 'submit --stdin-script takes the script from standard input; drop the command after --'
+        else
+            [ "$#" -gt 0 ] || fail 'submit requires a command after --, or --stdin-script with the script on standard input'
+        fi
         if [ -z "$request_id" ]; then
             request_id=$(generate_request_id)
         fi
@@ -3670,9 +4023,43 @@ case "$operation" in
         append_arg --request-id
         append_arg "$request_id"
         append_arg --
-        for argument in "$@"; do
-            append_arg "$argument"
-        done
+        if [ "$stdin_script" = true ]; then
+            # The script travels as ONE base64 argument through the documented
+            # decode pattern (`printf %s <b64> | base64 -d | sh`) -- the base64
+            # alphabet needs no quoting, so the payload survives every hop
+            # (ssh, the remote shell, Pueue's argv) byte-exactly.  The bound is
+            # the target's argv limit, which the payload must fit into as a
+            # single argument: Linux caps one argv element at MAX_ARG_STRLEN
+            # (128 KiB); a Windows target re-encodes argv onto a CreateProcess
+            # command line capped at 32767 characters, so the payload plus the
+            # rest of the server invocation must stay under that.  Bigger
+            # scripts belong in a staged file (SKILL.md).
+            if [ -t 0 ]; then
+                fail 'submit --stdin-script needs the script on standard input (pipe or redirect it)'
+            fi
+            command -v base64 >/dev/null 2>&1 || fail 'submit --stdin-script requires base64 on PATH'
+            if stdin_script_b64=$(base64 | tr -d '\n'); then
+                :
+            else
+                fail 'cannot base64-encode the script from standard input'
+            fi
+            [ -n "$stdin_script_b64" ] || fail 'submit --stdin-script received no script on standard input'
+            if [ "$remote_platform" = windows ]; then
+                stdin_script_limit=$stdin_script_windows_limit
+            else
+                stdin_script_limit=$stdin_script_unix_limit
+            fi
+            if [ "${#stdin_script_b64}" -gt "$stdin_script_limit" ]; then
+                fail "the script is too large for --stdin-script (base64 length ${#stdin_script_b64} exceeds $stdin_script_limit on this target); stage it as a file and submit a command that reads it"
+            fi
+            append_arg sh
+            append_arg -c
+            append_arg "printf %s $stdin_script_b64 | base64 -d | sh"
+        else
+            for argument in "$@"; do
+                append_arg "$argument"
+            done
+        fi
 
         if [ "$remote_platform" = windows ]; then
             build_windows_remote_command
@@ -3705,9 +4092,44 @@ case "$operation" in
         append_arg lookup
         append_arg "$1"
         ;;
-    status|doctor)
-        [ "$#" -eq 0 ] || fail "$operation accepts no arguments"
-        append_arg "$operation"
+    status)
+        # Three modes, three server responses: the full decorated queue, the
+        # compact summary, and the single decorated task (wrapped in {"task":
+        # ...} like logs and wait).  A bare numeric id is the local hint the
+        # user probably wanted `logs` -- the server has no positional status.
+        agentq_operation_profile=$operation
+        if [ "$#" -eq 0 ]; then
+            append_arg status
+        elif [ "$#" -eq 2 ] && [ "$1" = '--task' ]; then
+            is_task_id "$2" || fail 'task id must be a non-negative integer'
+            append_arg status
+            append_arg --task
+            append_arg "$2"
+            agentq_operation_profile=status_task
+            status_expected_task_id=$2
+        elif [ "$#" -eq 1 ] && [ "$1" = '--summary' ]; then
+            append_arg status
+            append_arg --summary
+            agentq_operation_profile=status_summary
+        elif [ "$#" -eq 1 ]; then
+            fail 'status accepts --summary or --task <task-id>; for one task log, use logs <task-id>'
+        else
+            fail 'status accepts --summary or --task <task-id>'
+        fi
+        ;;
+    doctor)
+        # Default queue section is the compact summary; --full restores the
+        # historical decorated dump.  doctor itself is NOT read-only (it starts
+        # the pueued service); that warning lives in the usage text.
+        agentq_operation_profile=$operation
+        if [ "$#" -eq 0 ]; then
+            append_arg doctor
+        elif [ "$#" -eq 1 ] && [ "$1" = '--full' ]; then
+            append_arg doctor
+            append_arg --full
+        else
+            fail 'doctor accepts --full or no arguments'
+        fi
         ;;
     logs)
         [ "$#" -eq 1 ] || [ "$#" -eq 3 ] || fail 'logs requires a task id and optional --tail <lines>'
@@ -3721,11 +4143,45 @@ case "$operation" in
             append_arg "$3"
         fi
         ;;
-    cancel|wait|remove)
-        [ "$#" -eq 1 ] || fail "$operation requires one task id"
+    cancel)
+        [ "$#" -eq 1 ] || fail 'cancel requires one task id'
         is_task_id "$1" || fail 'task id must be a non-negative integer'
-        append_arg "$operation"
+        append_arg cancel
         append_arg "$1"
+        ;;
+    remove)
+        if [ "$#" -eq 3 ] && [ "$1" = '--label' ]; then
+            [ "$3" = '--confirm' ] || fail 'remove --label requires --confirm: a batch removal must be explicitly acknowledged'
+            [ -n "$2" ] || fail 'remove --label requires a non-empty label'
+            append_arg remove
+            append_arg --label
+            append_arg "$2"
+            append_arg --confirm
+            remove_batch=1
+        elif [ "$#" -eq 2 ] && [ "$1" = '--label' ]; then
+            fail 'remove --label requires --confirm: a batch removal must be explicitly acknowledged'
+        else
+            [ "$#" -eq 1 ] || fail 'remove requires one task id, or --label <label> --confirm'
+            is_task_id "$1" || fail 'task id must be a non-negative integer'
+            append_arg remove
+            append_arg "$1"
+        fi
+        ;;
+    wait)
+        [ "$#" -eq 1 ] || [ "$#" -eq 3 ] || fail 'wait requires a task id and optional --timeout <seconds>'
+        is_task_id "$1" || fail 'task id must be a non-negative integer'
+        append_arg wait
+        append_arg "$1"
+        if [ "$#" -eq 3 ]; then
+            [ "$2" = '--timeout' ] || fail 'wait accepts only --timeout <seconds>'
+            is_positive_integer "$3" || fail '--timeout must be a positive integer'
+            wait_timeout_seconds=$3
+            append_arg --timeout
+            append_arg "$3"
+        elif [ -n "$wait_timeout" ]; then
+            is_positive_integer "$wait_timeout" || fail 'AGENTQ_WAIT_TIMEOUT must be a positive integer'
+            wait_timeout_seconds=$wait_timeout
+        fi
         ;;
     *)
         fail "unknown command: $operation"
@@ -3742,8 +4198,10 @@ case "$operation" in
             run_safe_operation_with_recovery "$operation" "$remote_command" "$remote_input_file" "$lookup_request_id"
         elif [ "$operation" = logs ] || [ "$operation" = wait ]; then
             run_safe_operation_with_recovery "$operation" "$remote_command" "$remote_input_file" '' "$1"
+        elif [ "$operation" = status ] && [ -n "$status_expected_task_id" ]; then
+            run_safe_operation_with_recovery "$operation" "$remote_command" "$remote_input_file" '' "$status_expected_task_id" "$agentq_operation_profile"
         else
-            run_safe_operation_with_recovery "$operation" "$remote_command" "$remote_input_file"
+            run_safe_operation_with_recovery "$operation" "$remote_command" "$remote_input_file" '' '' "$agentq_operation_profile"
         fi
         exit $?
         ;;
@@ -3754,7 +4212,13 @@ case "$operation" in
         mutation_status=2
         if run_mutation_ssh "$remote_command" "$remote_input_file"; then
             if mutation_output_require_existing_file "$mutation_output_file"; then
-                if validate_json_response "$mutation_output_file" "$operation" '' "$1"; then
+                if [ "$operation" = remove ] && [ "$remove_batch" -eq 1 ]; then
+                    if validate_json_response "$mutation_output_file" remove_batch '' ''; then
+                        mutation_status=0
+                    else
+                        mutation_status=$?
+                    fi
+                elif validate_json_response "$mutation_output_file" "$operation" '' "$1"; then
                     mutation_status=0
                 else
                     mutation_status=$?

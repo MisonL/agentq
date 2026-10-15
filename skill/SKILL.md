@@ -69,11 +69,12 @@ POSIX 客户端的探针都是单行、不受影响，所以**只有「Windows �
 - 默认主机可由环境变量 `AGENTQ_HOST` 提供，或在当前用户的配置文件写入单行 `AGENTQ_HOST=<ssh-host>`：Windows 是 `%USERPROFILE%\.config\agentq\config`，macOS/Linux/WSL 是 `~/.config/agentq/config`。Windows PowerShell、CMD 与 Git Bash 映射到同一 Windows 用户目录；其他平台各自独立。
 - `agentq` 和 `sshp` 会自动探测目标平台：`MINGW`、`MSYS`、`CYGWIN` 只表示 SSH 默认 shell 位于 Windows；客户端仍会用 UTF-16LE Base64 编码的原生 PowerShell probe 复核 Windows 服务入口和工具路径。这样 Git Bash 的 SSH PATH 不能误导 cmd、PowerShell 或计划任务的真实环境。除诊断已知异常外，不要手工设置 `AGENTQ_REMOTE_PLATFORM`。
 - AgentQ 的 POSIX 与原生 Windows 客户端对只读平台和 Windows launcher 协议 probe 默认设置 30 秒命令级上限，可用 `AGENTQ_PLATFORM_PROBE_TIMEOUT` 传入正整数调整。超时返回退出码 `124` 并显式报告；Windows 客户端会终止 probe 进程树。不会把探测超时重试或降级为普通 SSH；该上限不作用于 submit、wait 或其他已提交任务的普通操作。
+- 探测结果按主机缓存（0.1.11）：一次成功的平台判定（unix，或 windows 且 launcher 协议验证通过）写入 `~/.config/agentq/platform-cache/`（TTL 7 天），命中后**跳过两次探测**——重复调用同一主机不再各付 30 秒探测成本。`AGENTQ_REMOTE_PLATFORM` 显式指定仍最高优先；`AGENTQ_PLATFORM_PROBE_CACHE=off` 关闭（每次都探测）；`AGENTQ_PLATFORM_CACHE_DIR` 重定向缓存目录。目标机重装或换平台后，过期或失配的缓存会自动回落到重新探测。
 - 客户端缺失时，先说明对应本地安装器和将写入的用户目录；只有用户已授权本机安装时才运行安装器。安装用户客户端不等于在远端部署 AgentQ 服务。
 
 ## 发现与前置条件
 
-- 调用 `agentq doctor` 检查默认主机；指定目标时使用 `agentq --host <ssh-host> doctor`。**`doctor` 不是只读的**：它先确保 Pueue 守护进程在运行，若未启动会尝试启动它（服务变更），成功路径还会改写 request record。对真实生产主机跑之前，先确认该机 `pueued` 已在运行，这样第一次 `status --json` 就返回、永远走不到启动服务那一步。
+- 调用 `agentq doctor` 检查默认主机；指定目标时使用 `agentq --host <ssh-host> doctor`。**`doctor` 不是只读的**：它先确保 Pueue 守护进程在运行，若未启动会尝试启动它（服务变更），成功路径还会改写 request record。对真实生产主机跑之前，先确认该机 `pueued` 已在运行，这样第一次请求就返回、永远走不到启动服务那一步。doctor 的 stderr 报告版本与服务形态（`agentq=`、`pueue=`、`pueued=`、平台服务行），stdout 的队列区默认是**紧凑摘要**（`{tasks: {...每任务 id/state/result/label...}, group, summary: true}`）；需要逐任务完整元数据时用 `doctor --full`，日常的队列概览更应直接用 `status --summary`。
 - 默认目标由调用环境配置；优先在任务中明确使用 `--host <ssh-host>`，避免隐式选错主机。
 - 目标机必须已经部署兼容的 AgentQ 服务端。Windows 客户端会先只读检查受保护的 `agentq-launcher.ps1` 是否存在且支持当前参数协议；发现旧/不完整部署时会明确要求升级，而不是把 PowerShell 的文件不存在错误暴露给调用端。若 `doctor` 报缺失或不可用，停止并报告原始错误；不要静默降级成普通 SSH 前台执行。
 - `--workdir` 必须是目标主机认可的绝对工作目录。Windows Git Bash 可使用 `/c/Users/name/project` 或 `C:\Users\name\project`；提交前先确认目录存在。`cmd`、PowerShell、Git Bash 只是调用端，目标 Windows AgentQ 统一由 Git Bash 执行队列命令，因此命令本身应写成 Git Bash 可执行的 argv；要运行 Windows 原生命令时使用下一条规则。
@@ -149,28 +150,31 @@ POSIX 客户端的探针都是单行、不受影响，所以**只有「Windows �
 
 ```bash
 agentq [--host <ssh-host>] submit --workdir <remote-directory> [--label <label>] [--request-id <id>] -- <command> [arguments...]
+agentq [--host <ssh-host>] submit --workdir <remote-directory> [--label <label>] [--request-id <id>] --stdin-script < script
 agentq [--host <ssh-host>] lookup <request-id>
-agentq [--host <ssh-host>] status
+agentq [--host <ssh-host>] status [--summary | --task <task-id>]
 agentq [--host <ssh-host>] logs <task-id> [--tail <line-count|all>]
-agentq [--host <ssh-host>] wait <task-id>
+agentq [--host <ssh-host>] wait <task-id> [--timeout <seconds>]
 agentq [--host <ssh-host>] cancel <task-id>
-agentq [--host <ssh-host>] remove <task-id>
-agentq [--host <ssh-host>] doctor
+agentq [--host <ssh-host>] remove <task-id> | remove --label <label> --confirm
+agentq [--host <ssh-host>] doctor [--full]
 ```
 
-- 传给 `submit` 的目标命令必须置于 `--` 后；不要将自然语言 prompt 当成命令。
+- 传给 `submit` 的目标命令必须置于 `--` 后；不要将自然语言 prompt 当成命令。**整段脚本不要再拼引号**：`submit --stdin-script` 把 stdin 读入、base64 编码为**单个 argv 参数**，远端按已文档化的 `printf %s <b64> | base64 -d | sh` 模式解码执行——base64 字母表无需引号，payload 逐字节穿越 ssh、远端 shell 与 Pueue 的 argv。脚本须为 UTF-8 文本；unix 目标的单个 argv 元素受 `MAX_ARG_STRLEN`（128 KiB）约束（客户端上限 100000 个 base64 字符），Windows 目标的 argv 会被重新编码进 CreateProcess 命令行（上限 32767 字符，客户端上限 20000）。超出上限的脚本先把文件放到目标机（scp/sshp 均可），再 `submit -- cat /path/script.sh | sh` 之类的方式执行。
 - 所有成功响应为 JSON。`submit` 返回 `task_id`、`request_id` 和 `reused`。未显式提供 `--request-id` 时，本地客户端会生成一个；将该 ID 连同任务 ID 一起保留，便于恢复失去 SSH 响应的提交。
+- `status` 有三种形态：默认（无参）是全量装饰队列 `{tasks: {...}, group: {...}}`——每个任务带完整元数据，队列大时**很大**；`--summary` 是紧凑摘要 `{tasks: {"<id>": {"id", "state", "result"?, "label"}}, group, summary: true}`（**不**连接 request records，队列再大也只有每任务一行对象，回答「队列里有什么」）；`--task <id>` 返回 `{task: {...}}`，与 `logs`/`wait` 的单任务包装一致。轮询单任务用 `status --task <id>`，看全队列用 `--summary`；两者都经过与服务端形状核对的结构校验。
 - AgentQ/SSHP 调用端在 SSH 退出码为 `0` 后仍必须验证响应结构；malformed JSON、缺少协议字段或不符合操作契约的日志/状态不得被报告为成功。失败诊断只能保留操作名、错误类别和响应字节数等元数据，禁止回显或持久化原始响应内容。OpenSSH `-E` 日志和子进程 stderr 同样只在最终调用端显示安全类别与字节数；原始内容只在受保护的短生命周期临时文件中供 transport 分类使用，并在操作结束时清理。SSHP 的交互链路也保留内部原文供分类，但最终用户输出只显示脱敏元数据。
 - 同一个请求 ID 只能对应完全相同的工作目录、标签和命令。重复提交会返回原任务而不会重复入队；参数不同、已移除，或返回 `state: "ambiguous"` / `"removing"` 时必须停止，不得换新 ID 重试同一命令。
 - 仅当本地 OpenSSH 的错误日志确认网络传输故障且提交以 `255` 退出时，客户端才会使用同一请求 ID 查询 `lookup` 并有限重试；远端命令的 `exit 255`、认证、主机密钥和配置错误会直接返回。重试耗尽时，运行 `agentq --host <host> lookup <request-id>` 恢复；`not_found` 表示服务端没有该请求记录，`not_started` 表示已有持久化请求记录但尚未观察到 Pueue 任务，两者都不是完成结果且只可用相同参数、相同请求 ID 重试。两者退出码均为 `3`；`ambiguous` 的退出码为 `4`，表示服务端无法安全判断，必须停止；`removing` 同样以 `4` 退出，表示删除意图已持久化但任务仍可见，不得重新提交或报告为已删除，只有再次明确执行 `remove` 才会继续删除；`removed` 的退出码为 `5`，表示该 ID 已移除、在 tombstone 保留期内**可以重复读到**（不是一次性消费）。
 - `lookup`、`status`、`logs`、`wait` 与 `doctor` 在同样确认的传输故障下都会有限重试；前四者只读取、等待或完成已持久化的删除归档，绝不新建请求、取消任务或删除仍可见的任务。**但 `doctor` 不是只读的：它会先确保 Pueue 守护进程在运行，若守护进程未启动，会尝试启动它（macOS `launchctl kickstart`、Linux `systemctl --user start agentq-pueued.service`）——那是服务变更，成功路径还会改写 request record。** 要只读地探查一台主机，不要走 AgentQ 协议：直接 ssh 过去看 `~/.local/bin/agentq` 在不在、版本多少。`cancel` 与 `remove` 不自动重试，因为响应丢失后无法把副作用与失败安全地区分；先用 `status`、`logs` 或 `lookup` 重新确认。
 - 处于删除恢复中的可见任务会在 `status`、`logs` 和 `wait` 的 `task.agentq.removal_pending` 中标为 `true`。若 Pueue 任务已不存在但 tombstone 尚未写入，后续安全读取会归档为 `removed`；读取操作不会删除仍可见的任务。
 - `status`、`logs` 和 `wait` 返回任务状态。`logs` 的常规响应使用字符串字段 `output`；若响应包含 `output_encoding: "base64"`，应先解码 `output_base64`，因为目标任务输出并非 UTF-8。解析 JSON 后再呈现日志，避免把 JSON 转义的 `\n` 原样当日志内容展示。
-- 正常的 `wait` 输出 `{task: ...}`；任务失败时，它自身也必须以非零退出码结束。检查退出码和 `task.status.Done.result`，两者均不能省略。若任务在等待期间被移除，`wait` 输出 `{task_id, state: "removed"}` 并以 `5` 退出；若服务端无法确认最终状态，输出 `{task_id, state: "unavailable"}` 并以 `6` 退出。这两种状态都不能报告为任务完成。`logs` 在任务身份歧义（无法安全判断该数字 id 归属哪个请求）时同样输出 `{task_id, state: "unavailable"}` 并以 `6` 退出。
+- 正常的 `wait` 输出 `{task: ...}`；任务失败时，它自身也必须以非零退出码结束（**退出码 `1` 就是任务终态为 Failed**——`wait` 本身成功送达，失败的是任务；据此把「命令失败」与「传输/协议失败」分开报告）。检查退出码和 `task.status.Done.result`，两者均不能省略。`wait --timeout <seconds>`（或 `AGENTQ_WAIT_TIMEOUT`）给等待加**客户端预算**：预算内未到终态时客户端终止等待并以 `6` 退出（stderr 一行 `wait budget ... elapsed`）——语义就是既有的「无法确认终态」：任务**可能仍在跑**，之后用 `status --task <id>` 或 `logs` 继续观察，绝不要把超时当成任务失败。unix 目标上服务端 wait 同时被 `timeout <预算>s` 约束，本地 ssh 被杀后不会在远端留下持锁孤儿。若任务在等待期间被移除，`wait` 输出 `{task_id, state: "removed"}` 并以 `5` 退出；若服务端无法确认最终状态，输出 `{task_id, state: "unavailable"}` 并以 `6` 退出。这两种状态都不能报告为任务完成。`logs` 在任务身份歧义（无法安全判断该数字 id 归属哪个请求）时同样输出 `{task_id, state: "unavailable"}` 并以 `6` 退出。
 - 若任务在首次调用 `wait` 前已从 Pueue 消失，服务端先以同一 `task_id` 匹配活动的 `accepted`/`removing` request record；Pueue 状态可读且任务不可见时归档该 request 并返回 `removed`/`5`，状态不可读或任务仍可见但无法解析时返回 `unavailable`/`6`。仅当没有活动 request record 时才使用 tombstone 作为历史 `removed` 证据，并仍先确认 Pueue 中没有同数字的新任务；若多个活动 request record 共享同一数字 task id，必须报告歧义并停止，不能按数字 id 猜测或归档错误请求。多个历史 tombstone 可以共享已复用的数字 task id，因为它们都只证明该 id 曾被移除。
 - `cancel` 成功返回 `action: "cancel_requested"` 与 `cancellation_requested_at`。若目标在确认时仍为 `Queued`，服务端使用 Pueue `remove`，并额外返回 `cancellation_mode: "queued_removed"`；随后 `wait` 会以 `state: "removed"`、退出码 `5` 表示已从队列移除，而不是报告任务成功。若返回 `state: "cancellation_pending"` 且退出码为 `4`，说明取消意图已持久化，但服务端无法确认 Pueue 是否接收到了取消；这不是取消成功，也不得自动重试。先读取 `status`、`logs` 或 `wait`。任务仍未结束时，只有在用户再次明确要求取消后才能再次调用 `cancel`；任务已结束而仍为 pending 时，必须报告取消结果无法确认。`status`、`logs` 和 `wait` 会在 `task.agentq` 中分别给出 `cancellation_requested_at` 或 `cancellation_pending_at`，以及 `cancellation_reason: "user_requested"`。最终结果仍以 `task.status.Done.result` 为准：`"Success"` 仍是成功，即使取消请求到达得太晚；带已确认取消字段且非成功的结果可报告为取消；没有该字段的 `Failed` 是普通命令失败，即使其退出码恰好为 `1`。不同系统底层取消结果可能是 `Killed` 或 `Failed`。
 
-- 队列操作（`submit`、`cancel`、`remove` 等）在服务端是**独占**的：同一时刻只允许一个。拿不到锁的调用**不是立即失败**——它每 1 秒重试一次、最多 30 次，约 34 秒后才放弃，在 stderr 打印 `AgentQ operation is already in progress` 并**以 `2` 退出**。这个 `2` 是**可重试的瞬时状态**，不是参数错误：被拒绝的调用**零副作用**（无入队、无 request record、无 tombstone、无残留锁），用**同一个 request ID**、相同参数稍后重试即可，绝不能换新 ID。
+- 队列操作（`submit`、`cancel`、`remove` 等）在服务端是**独占**的：同一时刻只允许一个。拿不到锁的调用**不是立即失败**——它每 1 秒重试一次、最多 30 次，约 34 秒后才放弃，在 stderr 打印 `AgentQ operation is already in progress` 并**以 `2` 退出**（消息里附持锁者的 pid、启动身份与锁龄，可用 ssh 核实该进程是否还活着）。这个 `2` 是**可重试的瞬时状态**，不是参数错误：被拒绝的调用**零副作用**（无入队、无 request record、无 tombstone、无残留锁），用**同一个 request ID**、相同参数稍后重试即可，绝不能换新 ID。**`status`、`logs` 与 `doctor` 不参与这把锁**（0.1.11 起）：读命令在写操作进行中也能立即返回，代价是可能读到一次 mid-transition 的瞬时旧视图（prepared→accepted 的瞬间）——所有状态过滤器都容忍这一点，最坏情况是短暂滞后，不需要重试策略；维护锁的检查保留，`lookup` 因其自身会写归档仍持锁。
+- `remove --label <label> --confirm` 按**用户标签**批量删除：匹配 `status` 展示的装饰标签（payload label），**不是** Pueue 的裸标签 `agentq:<request-id>`。候选 id 取自**一次**队列快照，然后逐个走与单任务 `remove <id>` 完全相同的代码路径，整个批量持有一把操作锁（期间其它写操作照常排队）。输出是 JSON 数组，每项 `{"task_id":N,"removed":true}` 或 `{"task_id":N,"removed":false,"state":"failed"}`；**任一项失败（含身份歧义）不中断其余**，汇总里如实标注——有失败时整批退 `1`，全成（或零匹配，返回 `[]`）退 `0`。失败项用 `status --task <id>` 或单任务 `remove <id>` 复查，不要盲目重发整批。`--confirm` 是硬性要求（两份客户端与服务端都本地拒绝缺它的调用）。
 - 退出码 `2` **不止表示参数错误**：服务端把它复用在三类情况上，客户端一律原样透传。**判断类别请读 `reason`，不要匹配消息文本**：服务端在每条以 `2` 退出的失败路径上，都会在 stderr 的消息之后多打一行 `<程序名>: reason=<class>`，`class` 取值只有三个——
   - `protocol_error`：参数/协议错误。改参数。
   - `lock_contention`：队列操作锁竞争（消息含 `already in progress`）。**可重试**，用**同一个 request ID**、相同参数稍后重试。
@@ -182,25 +186,29 @@ agentq [--host <ssh-host>] doctor
 
 ## 执行工作流
 
-1. 先执行 `doctor`，确认指定主机可用。
-2. 用短标签提交用户明确授权的命令：
+1. 先执行 `doctor`，确认指定主机可用（注意：doctor **不是只读的**，见「发现与前置条件」；队列概览请用 `status --summary`，它没有这个副作用）。
+2. 用短标签提交用户明确授权的命令（多行脚本直接走 `--stdin-script`，不要手工拼引号）：
 
    ```bash
    agentq --host build-host submit \
      --workdir /absolute/project/path \
      --label test \
      -- npm test
+
+   cat deploy.sh | agentq --host build-host submit \
+     --workdir /absolute/project/path \
+     --label deploy --stdin-script
    ```
 
-3. 从 `submit` 返回 JSON 取出任务 ID 和请求 ID。耗时任务轮询 `status` 和 `logs N --tail 200`；队列可串行或有限并发，不能假设任务立刻开始。
-4. 完成后执行 `wait N`。仅当退出码为 0 且结果为 `"Success"` 时报告成功；若结果非成功且 `task.agentq.cancellation_requested_at` 存在，报告取消；否则读取 `logs N` 并报告失败。
-5. 用户明确要求停止时才调用 `cancel N`。任务已结束、日志也不再需要时调用 `remove N`。
+3. 从 `submit` 返回 JSON 取出任务 ID 和请求 ID。耗时任务轮询 `status --summary`（全队列）或 `status --task N`（单任务）与 `logs N --tail 200`；队列可串行或有限并发，不能假设任务立刻开始。`wait N --timeout 120` 给等待一个预算，避免无限阻塞。
+4. 完成后执行 `wait N`。仅当退出码为 0 且结果为 `"Success"` 时报告成功；退出码 `1` 表示任务终态为 Failed（wait 已成功送达）；若结果非成功且 `task.agentq.cancellation_requested_at` 存在，报告取消；否则读取 `logs N` 并报告失败。`wait` 以 `6` 退出且 stderr 带 `wait budget ... elapsed` 时是**预算耗尽**，任务可能仍在跑——改用 `status --task N` 继续观察。
+5. 用户明确要求停止时才调用 `cancel N`。任务已结束、日志也不再需要时调用 `remove N`；要清理同一标签的全部任务时用 `remove --label <l> --confirm`（输出数组如实标注每一项）。
 
 ## 运行语义
 
 - AgentQ 防护的是调用端 SSH/终端中断，不承诺目标主机或队列服务发生生命周期变化时任务继续执行。Windows 服务由当前用户的交互式计划任务启动；Linux 使用 systemd 用户服务并启用 linger；macOS 使用由 root 注册、由目标用户运行的系统 LaunchDaemon。不要将调用端重连能力等同于目标任务在服务生命周期变化后的继续执行。
 - Windows 服务资产位于受保护的 `C:\ProgramData\AgentQ`，不应从共享用户目录调用或修改。Linux/macOS 服务资产位于 `~/.agentq`，通过权限为 `0700` 的 Unix socket 通信；不需要也不应暴露队列网络端口。**该「0700 socket」的说法只对 Unix 成立**：Windows 上 Pueue 回落 TCP + TLS（`use_unix_socket` 是 Unix-only 字段），监听回环，其保护来自 `Set-PrivateTreeAcl` 给 `C:\ProgramData\AgentQ` 施加的私有 ACL（只有该用户、SYSTEM、Administrators），而不是文件模式——Pueue 在非 Unix 分支不设置 `shared_secret`/`certs/` 的文件模式（新建文件默认 0644），这是已记录的边界：这些凭据文件的纵深防御依赖父目录 ACL，不依赖 0600 模式（`docs/PLAN.md` A28）。
 - 安装或升级只在目标队列没有活动或非终态任务时执行，历史 `Done` 记录可以保留。安装器会先暂存并校验 Pueue 二进制、验证依赖与服务端语法，再切换服务；Windows 首次启动后还会验证 Pueue 的 TLS 证书、私钥和共享密钥，并重新施加私有 ACL。健康检查失败会恢复上一份部署。**两个安装器在启动时都会拒绝「上一次运行在换根中途崩溃」的现场**：若根目录缺失或旁边残留事务目录（Windows 为 `.AgentQ.backup.*`/`.stage.*`/`.failed.*`，Unix 为 `..agentq.backup.*`/`.stage.*`/`.failed.*`——双点），它会停止并报出这些路径（旧队列与凭据就在 backup 里），等你把 backup 移回根目录恢复、或确认放弃后手动清掉再重跑——它不会自动删除、合并或恢复任何东西。Windows 上该残留优先于一切检查被拒（旧的「wrapper 已存在」提示只在无残留时出现，且不描述这一情形）。运行中的守护进程状态异常时，服务端拒绝擅自干预队列，避免中断未知任务。
-- 已移除任务的请求 tombstone 默认保留 30 天，并由后续 AgentQ 操作按日清理。保留期内同一请求 ID 不能复用；过期并清理后它会变为 `not_found`，因此新任务仍应生成新的请求 ID，避免混淆历史结果。
+- 已移除任务的请求 tombstone 默认保留 30 天，并由后续 AgentQ 操作按日清理。保留期内同一请求 ID 不能复用；过期并清理后它会变为 `not_found`，因此新任务仍应生成新的请求 ID，避免混淆历史结果。**数据留存需知**：每个 request record 以明文 JSON 保存**完整的命令文本**（`payload.argv`）与工作目录，tombstone 同样保留命令文本——队列里跑过的每条命令在 30 天内都能从数据目录读回。提交含敏感内容的命令前先想到这一点；删除痕迹需要连 tombstone 一起处理（手工清理数据目录前先确认没有活动任务，且不要绕过安装器的锁语义）。
 - 不要用它绕过用户确认、安全策略、权限边界或长任务的资源限制。
 - 不要在此链路中启动 `codex exec`；它用于执行目标机命令和回收真实进度/结果。

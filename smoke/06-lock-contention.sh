@@ -312,7 +312,91 @@ jq -e '.reused == true' <<<"$repeat_output" >/dev/null || {
 }
 
 # ---------------------------------------------------------------------------
-# 3. The operation lock must be released, not left behind.
+# 3. Read paths must NOT contend: status --summary / status --task / logs /
+#    doctor succeed while a submit holds the operation lock (lock-free reads
+#    since 0.1.11).  Previously they took the same exclusive lock and were
+#    rejected after the full retry budget exactly like a submit.
+# ---------------------------------------------------------------------------
+: > "$control/add.block"
+"$server" submit --workdir "$workdir" --label readholder \
+    --request-id "lockreadholder-$$-aaaaaaaa" -- true >"$work/readholder.out" 2>"$work/readholder.err" &
+read_holder_shell_pid=$!
+read_holder_ready=0
+for _ in $(seq 1 100); do
+    if [ -e "$control/add.entered" ]; then
+        read_holder_ready=1
+        break
+    fi
+    sleep 0.2
+done
+if [ "$read_holder_ready" -ne 1 ]; then
+    printf '%s\n' 'the read-test lock holder never reached the pueue call' >&2
+    rm -f "$control/add.block"
+    wait "$read_holder_shell_pid" >/dev/null 2>&1 || true
+    exit 1
+fi
+
+# While the lock is provably held, every read path must exit 0 (the contenders
+# above are rejected after ~34s under the same conditions, so exit 0 here is
+# only reachable if the reads skip the lock).
+read_probe_status=0
+read_probe_output=$("$server" status --summary 2>"$work/read-status.err") || read_probe_status=$?
+if [ "$read_probe_status" -ne 0 ]; then
+    printf 'status --summary contended on the held lock (exit %s): %s\n' \
+        "$read_probe_status" "$(head -1 "$work/read-status.err")" >&2
+    rm -f "$control/add.block"
+    wait "$read_holder_shell_pid" >/dev/null 2>&1 || true
+    exit 1
+fi
+jq -e '.summary == true' <<<"$read_probe_output" >/dev/null || {
+    printf 'status --summary under contention returned an unexpected shape: %s\n' \
+        "$read_probe_output" >&2
+    rm -f "$control/add.block"
+    wait "$read_holder_shell_pid" >/dev/null 2>&1 || true
+    exit 1
+}
+
+read_task_status=0
+"$server" status --task "$retry_task_id" >"$work/read-task.out" 2>"$work/read-task.err" || read_task_status=$?
+if [ "$read_task_status" -ne 0 ]; then
+    printf 'status --task contended on the held lock (exit %s): %s\n' \
+        "$read_task_status" "$(head -1 "$work/read-task.err")" >&2
+    rm -f "$control/add.block"
+    wait "$read_holder_shell_pid" >/dev/null 2>&1 || true
+    exit 1
+fi
+
+read_logs_status=0
+"$server" logs "$retry_task_id" >"$work/read-logs.out" 2>"$work/read-logs.err" || read_logs_status=$?
+if [ "$read_logs_status" -ne 0 ]; then
+    printf 'logs contended on the held lock (exit %s): %s\n' \
+        "$read_logs_status" "$(head -1 "$work/read-logs.err")" >&2
+    rm -f "$control/add.block"
+    wait "$read_holder_shell_pid" >/dev/null 2>&1 || true
+    exit 1
+fi
+
+read_doctor_status=0
+read_doctor_output=$("$server" doctor 2>"$work/read-doctor.err") || read_doctor_status=$?
+if [ "$read_doctor_status" -ne 0 ]; then
+    printf 'doctor contended on the held lock (exit %s): %s\n' \
+        "$read_doctor_status" "$(head -1 "$work/read-doctor.err")" >&2
+    rm -f "$control/add.block"
+    wait "$read_holder_shell_pid" >/dev/null 2>&1 || true
+    exit 1
+fi
+
+rm -f "$control/add.block"
+read_holder_wait_status=0
+wait "$read_holder_shell_pid" 2>/dev/null || read_holder_wait_status=$?
+if [ "$read_holder_wait_status" -ne 0 ]; then
+    printf 'the read-test lock holder failed (%s): %s\n' "$read_holder_wait_status" \
+        "$(head -1 "$work/readholder.err")" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# 4. The operation lock must be released, not left behind.
 # ---------------------------------------------------------------------------
 lock_directory="$home/runtime/agentq-operation.lock"
 if [ -e "$lock_directory" ]; then
@@ -320,4 +404,4 @@ if [ -e "$lock_directory" ]; then
     exit 1
 fi
 
-printf 'lock-contention checks passed: rejected=2/lock_contention/no-side-effects retry=ok reused=ok lock=released\n'
+printf 'lock-contention checks passed: rejected=2/lock_contention/no-side-effects retry=ok reused=ok reads=lock-free lock=released\n'

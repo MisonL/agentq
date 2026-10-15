@@ -44,6 +44,16 @@ fi
 
 work=$(mktemp -d /tmp/agentq-smoke-psclient.XXXXXX)
 work=$(unset CDPATH; cd -- "$work" && pwd -P)
+# Keep the client's platform-probe cache inside this run's temp dir (0.1.11).
+# A cache under the real ~/.config/agentq would (a) write into the developer's
+# own config and (b) leak the resolved platform of this check's test hosts into
+# other cases or other suites, which then SKIP the probe they mean to exercise.
+export AGENTQ_PLATFORM_CACHE_DIR="$work/platform-cache"
+# and default the cache OFF: these cases exercise probing itself, and a
+# warm entry (written by an earlier case for the same test host) would skip
+# the probe under test. The dedicated cache case below re-enables it with
+# its own fresh directory.
+export AGENTQ_PLATFORM_PROBE_CACHE=off
 trap 'rm -rf -- "$work"' EXIT
 
 failures=0
@@ -121,7 +131,10 @@ fi
 # --- per-command arity and value validation ----------------------------------
 expect_rejected 'lookup requires one request id' --host smoke-host lookup
 expect_rejected 'lookup requires one request id' --host smoke-host lookup a b
-expect_rejected 'status accepts no arguments' --host smoke-host status extra
+# `status` gained the --summary/--task modes (0.1.11); the client forwards
+# them instead of rejecting, so the only rejection left is an argument that is
+# neither mode.
+expect_rejected 'status accepts --summary or --task' --host smoke-host status extra
 
 # `logs` has its own message because it also accepts --tail; the other three
 # share the plain arity message.  Both were read off the client rather than
@@ -129,8 +142,14 @@ expect_rejected 'status accepts no arguments' --host smoke-host status extra
 expect_rejected 'logs requires a task id' --host smoke-host logs
 expect_rejected 'logs requires a task id' --host smoke-host logs 1 2
 for command in cancel wait remove; do
-    expect_rejected "$command requires one task id" --host smoke-host "$command"
-    expect_rejected "$command requires one task id" --host smoke-host "$command" 1 2
+    if [ "$command" = wait ]; then
+        expect_rejected 'wait requires a task id and optional --timeout <seconds>' --host smoke-host "$command"
+        expect_rejected 'wait accepts only --timeout <seconds>' --host smoke-host "$command" 1 --nope 3
+        expect_rejected '--timeout must be a positive integer' --host smoke-host "$command" 1 --timeout abc
+    else
+        expect_rejected "$command requires one task id" --host smoke-host "$command"
+        expect_rejected "$command requires one task id" --host smoke-host "$command" 1 2
+    fi
     expect_rejected 'task id must be a non-negative integer' --host smoke-host "$command" notanumber
     expect_rejected 'task id must be a non-negative integer' --host smoke-host "$command" -1
 done
@@ -928,10 +947,11 @@ else
     esac
 fi
 
-if [ "$failures" -ne 0 ]; then
-    printf 'ps-client-contract: %s failure(s)\n' "$failures" >&2
-    exit 1
-fi
+# The gate that acts on $failures sits at the END of this file, after every
+# check has had its chance to increment it -- an earlier mid-file gate let the
+# checks appended after it print "checks passed" on a run that had already
+# failed (observed 2026-10-15: the 0.1.11 validator block incremented
+# $failures, the run kept going and printed the passed line, exit 0).
 # Static lock: the probe-path exit-token reader must bound its digit run to
 # three, exactly like the operation-path reader.  An unbounded `\d+` let a
 # remote probe print `agentq-exit:<huge>` and make the following `[int]` cast
@@ -961,5 +981,69 @@ case "$ps_version" in
     5.1.*) ps51_state=covered ;;
     *)     ps51_state=NOT-covered ;;
 esac
-printf 'ps-client-contract checks passed: cases=%s pwsh=%s ps51=%s reason=forwarded/injection-safe\n' \
+
+# --- the 0.1.11 modes: the client must answer them with the RIGHT shapes ------
+# Driving the real operation path needs a stub ssh.exe; instead these call the
+# validator directly on each documented response shape (the same pattern the
+# reason/auth-hint probes use): a client whose status_summary/status_task/
+# remove_batch validator accepted the WRONG shape (or rejected the documented
+# one) fails here.  Measured PS quirk this encodes: ConvertFrom-Json turns `[]`
+# into $null and a single-element array into the bare element, so the batch
+# validator must iterate @(...) rather than test -is [array].
+validator_probe='
+. "'"$client_arg"'" 2>$null
+$summaryJson = "{`"tasks`":{`"3`":{`"id`":3,`"state`":`"Done`",`"result`":`"Success`",`"label`":`"agentq:x`"}},`"group`":null,`"summary`":true}"
+$taskJson = "{`"task`":{`"id`":3,`"group`":`"agentq`",`"created_at`":`"2026-01-01T00:00:00Z`",`"status`":{`"Done`":{`"result`":`"Success`"}}}}"
+$fullJson = "{`"tasks`":{},`"group`":null}"
+$batchEmptyJson = "[]"
+$batchOneJson = "[{`"task_id`":3,`"removed`":true}]"
+$batchTwoJson = "[{`"task_id`":3,`"removed`":true},{`"task_id`":4,`"removed`":false,`"state`":`"failed`"}]"
+$cases = @(
+    @{ n = "summary-ok";      op = "status_summary"; v = $summaryJson; id = ""; want = $true },
+    @{ n = "summary-marker";  op = "status_summary"; v = $fullJson;    id = ""; want = $false },
+    @{ n = "task-ok";         op = "status_task";    v = $taskJson;    id = "3"; want = $true },
+    @{ n = "task-id-mismatch"; op = "status_task";   v = $taskJson;    id = "9"; want = $false },
+    @{ n = "doctor-full-ok";  op = "doctor_full";    v = $fullJson;    id = ""; want = $true },
+    @{ n = "doctor-summary-ok"; op = "doctor";       v = $summaryJson; id = ""; want = $true },
+    @{ n = "batch-empty";     op = "remove_batch";   v = $batchEmptyJson; id = ""; want = $true },
+    @{ n = "batch-one";       op = "remove_batch";   v = $batchOneJson;   id = ""; want = $true },
+    @{ n = "batch-two";       op = "remove_batch";   v = $batchTwoJson;   id = ""; want = $true },
+    @{ n = "batch-bad-entry"; op = "remove_batch";   v = "[{`"task_id`":3}]"; id = ""; want = $false }
+)
+$bad = 0
+foreach ($case in $cases) {
+    $actual = Test-AgentQJsonResponse -Operation $case.op -Output $case.v -ExpectedTaskId $case.id
+    if ($actual -ne $case.want) {
+        [Console]::Error.WriteLine("validator case $($case.n): expected $($case.want) got $actual")
+        $bad += 1
+    }
+}
+if ($bad -ne 0) { exit 1 }
+"mode validator cases ok: $($cases.Count)"
+'
+cases=$((cases + 1))
+status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command "$validator_probe" \
+    >"$work/out" 2>"$work/err" || status=$?
+if [ "$status" -ne 0 ] || ! grep -qF 'mode validator cases ok' "$work/out"; then
+    printf '%s\n' 'ps-client: the 0.1.11 mode response validators misbehave' >&2
+    head -3 "$work/err" >&2
+    failures=$((failures + 1))
+fi
+# Static locks: the stdin-script channel, the batch form, and the doctor --full
+# escape hatch must exist in the client source (behaviour is pinned on the POSIX
+# twin's run; the ps1 side here pins the surface).
+mode_static_failures=0
+grep -q -- '--stdin-script' "$client" || { printf '%s\n' 'ps-client: missing submit --stdin-script' >&2; mode_static_failures=$((mode_static_failures + 1)); }
+grep -q -- '--confirm' "$client" || { printf '%s\n' 'ps-client: missing remove --label --confirm handling' >&2; mode_static_failures=$((mode_static_failures + 1)); }
+grep -q -- '--full' "$client" || { printf '%s\n' 'ps-client: missing doctor --full' >&2; mode_static_failures=$((mode_static_failures + 1)); }
+grep -q -- '--summary' "$client" || { printf '%s\n' 'ps-client: missing status --summary' >&2; mode_static_failures=$((mode_static_failures + 1)); }
+failures=$((failures + mode_static_failures))
+
+printf 'ps-client-contract checks passed: cases=%s pwsh=%s ps51=%s reason=forwarded/injection-safe modes=validated\n' \
     "$cases" "$ps_version" "$ps51_state"
+
+if [ "$failures" -ne 0 ]; then
+    printf 'ps-client-contract: %s failure(s)\n' "$failures" >&2
+    exit 1
+fi

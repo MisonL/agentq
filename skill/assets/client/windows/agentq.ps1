@@ -150,6 +150,15 @@ $script:PlatformProbeTimeout = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLA
 } else {
     "30"
 }
+# Kept in step with the four version constants smoke/01 pins; the client
+# carries its own copy because --version must answer without an SSH round trip.
+$script:ClientVersion = "0.1.11"
+# --stdin-script's payload must fit in ONE argv element on the target; a Windows
+# target re-encodes argv onto a CreateProcess command line capped at 32767
+# characters and the payload shares that line with the rest of the server
+# invocation (the POSIX twin carries the unix-side MAX_ARG_STRLEN bound too).
+# The bound leaves ~12K of headroom on that command line.
+$script:StdinScriptLimit = 20000
 $script:RemotePlatform = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_REMOTE_PLATFORM)) {
     $env:AGENTQ_REMOTE_PLATFORM
 } else {
@@ -176,13 +185,16 @@ function Show-Usage {
     [Console]::Out.WriteLine(@"
 Usage:
   $($script:Program) [--host <ssh-host>] submit --workdir <remote-directory> [--label <label>] [--request-id <id>] -- <command> [arguments...]
+  $($script:Program) [--host <ssh-host>] submit --workdir <remote-directory> [--label <label>] [--request-id <id>] --stdin-script < script
   $($script:Program) [--host <ssh-host>] lookup <request-id>
-  $($script:Program) [--host <ssh-host>] status
+  $($script:Program) [--host <ssh-host>] status [--summary | --task <task-id>]
   $($script:Program) [--host <ssh-host>] logs <task-id> [--tail <lines>]
   $($script:Program) [--host <ssh-host>] cancel <task-id>
-  $($script:Program) [--host <ssh-host>] wait <task-id>
-  $($script:Program) [--host <ssh-host>] remove <task-id>
-  $($script:Program) [--host <ssh-host>] doctor
+  $($script:Program) [--host <ssh-host>] wait <task-id> [--timeout <seconds>]
+  $($script:Program) [--host <ssh-host>] remove <task-id> | --label <label> --confirm
+  $($script:Program) [--host <ssh-host>] doctor [--full]
+
+  doctor starts the pueued service if it is not running; it is NOT read-only.
 
 Environment:
   AGENTQ_HOST                      Default SSH host when --host is omitted.
@@ -200,6 +212,10 @@ Environment:
   AGENTQ_OPERATION_RETRY_ATTEMPTS  Confirmed transport retries for safe operations.
   AGENTQ_OPERATION_RETRY_DELAY     Delay in seconds between safe-operation retries.
   AGENTQ_PLATFORM_PROBE_TIMEOUT    Read-only platform/launcher probe limit in seconds.
+  AGENTQ_PLATFORM_PROBE_CACHE      on (default) caches the resolved platform per
+                                   host for 7 days; off probes every run.
+  AGENTQ_WAIT_TIMEOUT              Default wait --timeout in seconds; the wait
+                                   flag overrides it.
   AGENTQ_SSH                       OpenSSH client path; defaults to ssh.exe found on PATH.
   AGENTQ_REMOTE_PLATFORM           auto, unix, or windows; defaults to auto.
 "@)
@@ -1295,6 +1311,230 @@ function Invoke-SshLogged {
     return $result
 }
 
+function Invoke-WaitSshWithTimeout {
+    # wait with a client-side deadline, modeled on Invoke-SshLogged but
+    # running ssh as a Process so it can be killed when the budget elapses.
+    # Killing the LOCAL ssh does not stop the remote wait (the Windows test
+    # host has no coreutils timeout; the bound is local-only here), which is
+    # the measured 2026-10-15 orphan-lock shape -- the caller surfaces exit 6
+    # and the caller may poll status/logs instead.  On a completed run the
+    # exit token and reason handling match Invoke-SshLogged.
+    param(
+        [string]$RemoteCommand,
+        [AllowNull()][string]$InputPayload,
+        [int]$TimeoutSeconds
+    )
+
+    $sshLogPath = $null
+    $outputPath = $null
+    $errorPath = $null
+    $process = $null
+    $started = $false
+    $timedOut = $false
+    $result = $null
+    $operationError = $null
+    $cleanupFailurePaths = @()
+    try {
+        $sshLogPath = New-TemporaryPath -Prefix "agentq-wait-log"
+        $outputPath = New-TemporaryPath -Prefix "agentq-wait-output"
+        $errorPath = New-TemporaryPath -Prefix "agentq-wait-error"
+        Assert-NonReparseTemporaryFilePath -Path $sshLogPath
+        Assert-NonReparseTemporaryFilePath -Path $outputPath
+        Assert-NonReparseTemporaryFilePath -Path $errorPath
+        $sshArguments = @(
+            "-E", $sshLogPath,
+            "-o", "LogLevel=ERROR") + $script:CredentialOptionLines + @(
+            "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=12",
+            "-o", "TCPKeepAlive=yes",
+            "--", $script:TargetHost, $RemoteCommand
+        )
+
+        $previousErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $previousAskPass = $env:SSH_ASKPASS
+        $previousAskPassRequire = $env:SSH_ASKPASS_REQUIRE
+        try {
+            if ($script:CredentialSource -ne "") {
+                $env:SSH_ASKPASS = $script:AskPassProgram
+                $env:SSH_ASKPASS_REQUIRE = "force"
+            } else {
+                Remove-Item Env:\SSH_ASKPASS -ErrorAction SilentlyContinue
+                Remove-Item Env:\SSH_ASKPASS_REQUIRE -ErrorAction SilentlyContinue
+            }
+            $startInfo = New-SshProcessStartInfo -Arguments $sshArguments
+            $process = [System.Diagnostics.Process]::new()
+            $process.StartInfo = $startInfo
+            if (!$process.Start()) {
+                throw "failed to start OpenSSH client"
+            }
+            $started = $true
+            if ($null -ne $InputPayload) {
+                $process.StandardInput.Write($InputPayload)
+                $process.StandardInput.Close()
+            }
+
+            $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+            while ($true) {
+                if ($process.HasExited) {
+                    break
+                }
+                if ([DateTime]::UtcNow -ge $deadline) {
+                    $timedOut = $true
+                    break
+                }
+                [void]$process.WaitForExit(200)
+            }
+
+            if ($timedOut) {
+                [void](Stop-ProbeProcess -Process $process)
+                $terminationDeadline = [DateTime]::UtcNow.AddMilliseconds(5000)
+                while (!$process.HasExited -and [DateTime]::UtcNow -lt $terminationDeadline) {
+                    [void]$process.WaitForExit(50)
+                }
+                $result = [pscustomobject]@{
+                    ExitCode = 124
+                    Output = ""
+                    TransportDiagnostics = ""
+                    Diagnostics = ""
+                }
+            } else {
+                $exitCode = $process.ExitCode
+                $transportDiagnostics = Get-FileTextOrEmpty -Path $sshLogPath -Bounded
+                $standardError = Get-FileTextOrEmpty -Path $errorPath -Bounded
+                if ($script:RemotePlatform -eq "windows") {
+                    $exitTokenMatches = [regex]::Matches($standardError, '(?m)^agentq-exit:(\d{1,3})\s*$')
+                    if ($exitTokenMatches.Count -gt 0) {
+                        $tokenCode = [int]$exitTokenMatches[$exitTokenMatches.Count - 1].Groups[1].Value
+                        if ($tokenCode -le 255) {
+                            $exitCode = $tokenCode
+                        }
+                    }
+                }
+                $result = [pscustomobject]@{
+                    ExitCode = $exitCode
+                    Output = (Get-FileTextOrEmpty -Path $outputPath)
+                    TransportDiagnostics = $transportDiagnostics
+                    Diagnostics = $transportDiagnostics
+                }
+            }
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+            if ($null -eq $previousAskPass) {
+                Remove-Item Env:\SSH_ASKPASS -ErrorAction SilentlyContinue
+            } else {
+                $env:SSH_ASKPASS = $previousAskPass
+            }
+            if ($null -eq $previousAskPassRequire) {
+                Remove-Item Env:\SSH_ASKPASS_REQUIRE -ErrorAction SilentlyContinue
+            } else {
+                $env:SSH_ASKPASS_REQUIRE = $previousAskPassRequire
+            }
+        }
+    } catch {
+        $operationError = $_
+    } finally {
+        if ($started -and ($null -ne $process) -and !$process.HasExited) {
+            [void](Stop-ProbeProcess -Process $process)
+            [void]$process.WaitForExit(5000)
+        }
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
+        foreach ($path in @($sshLogPath, $outputPath, $errorPath)) {
+            if (!(Remove-SafeTemporaryFile -Path $path)) {
+                $cleanupFailurePaths += $path
+            }
+        }
+    }
+    if ($null -ne $operationError) {
+        if ($cleanupFailurePaths.Count -gt 0) {
+            $cleanupDiagnostics = ($cleanupFailurePaths | ForEach-Object {
+                "$($script:Program): temporary cleanup failed: $_"
+            }) -join [Environment]::NewLine
+            throw "$($operationError.Exception.Message); $cleanupDiagnostics"
+        }
+        throw $operationError
+    }
+    if ($cleanupFailurePaths.Count -gt 0 -and $null -ne $result) {
+        $cleanupDiagnostics = ($cleanupFailurePaths | ForEach-Object {
+            "$($script:Program): temporary cleanup failed: $_"
+        }) -join [Environment]::NewLine
+        $result.Diagnostics += $cleanupDiagnostics
+    }
+    return $result
+}
+
+function Get-PlatformProbeCachePath {
+    # Host names are user input; keep only characters that cannot escape the
+    # cache directory, hash the rest so distinct hosts never collide.
+    $safe = ($script:TargetHost -replace '[^A-Za-z0-9._-]', '-')
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($safe)
+        $hash = ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join ''
+    } finally {
+        $sha.Dispose()
+    }
+    $baseDir = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLATFORM_CACHE_DIR)) { $env:AGENTQ_PLATFORM_CACHE_DIR } else { Join-Path $env:USERPROFILE ".config\agentq" }
+    return (Join-Path (Join-Path $baseDir "platform-cache") "$($hash.Substring(0, 16)).json")
+}
+
+function Read-PlatformProbeCache {
+    if (([string]::IsNullOrWhiteSpace($env:AGENTQ_PLATFORM_PROBE_CACHE) -or ($env:AGENTQ_PLATFORM_PROBE_CACHE -ne "off")) -eq $false) {
+        return $false
+    }
+    if ($script:RemotePlatform -ne "auto") {
+        return $false
+    }
+    $path = Get-PlatformProbeCachePath
+    if (!(Test-Path -LiteralPath $path -PathType Leaf)) {
+        return $false
+    }
+    try {
+        $entry = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    } catch {
+        return $false
+    }
+    if (($entry.platform -ne "unix") -and ($entry.platform -ne "windows")) {
+        return $false
+    }
+    $probedAt = 0
+    if (!([int64]::TryParse("$($entry.probed_at)", [ref]$probedAt))) {
+        return $false
+    }
+    $ttl = 604800
+    if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLATFORM_PROBE_CACHE_TTL)) {
+        [void][int64]::TryParse($env:AGENTQ_PLATFORM_PROBE_CACHE_TTL, [ref]$ttl)
+    }
+    $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $probedAt
+    if ($age -gt $ttl) {
+        return $false
+    }
+    $script:RemotePlatform = $entry.platform
+    return $true
+}
+
+function Write-PlatformProbeCache {
+    if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLATFORM_PROBE_CACHE) -and ($env:AGENTQ_PLATFORM_PROBE_CACHE -eq "off")) {
+        return
+    }
+    try {
+        $path = Get-PlatformProbeCachePath
+        $dir = Split-Path -Parent $path
+        if (!(Test-Path -LiteralPath $dir)) {
+            [void](New-Item -ItemType Directory -Path $dir -Force)
+        }
+        $entry = @{ platform = $script:RemotePlatform; probed_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); probe_ms = 0 }
+        $json = $entry | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText($path, $json + [Environment]::NewLine)
+    } catch {
+        # A cache we cannot write simply means every run probes again, which
+        # is the pre-cache behaviour -- never fatal.
+    }
+}
+
 function Invoke-PlatformProbeWithRecovery {
     param([Parameter(Mandatory = $true)]$Probe)
 
@@ -1485,6 +1725,70 @@ function Test-Base64String {
     }
 }
 
+function Test-JsonSummaryMap {
+    # The compact queue view's tasks: keys are canonical id strings, values
+    # carry {id, state, result?, label}.  `state` must be a non-empty string;
+    # `result` and `label` are accepted as-is (the server owns their shape).
+    param([AllowNull()][object]$Tasks)
+
+    if ($null -eq $Tasks -or $Tasks -isnot [pscustomobject]) {
+        return $false
+    }
+
+    foreach ($property in $Tasks.PSObject.Properties) {
+        if ($property.Name -notmatch '^[0-9]+$') {
+            return $false
+        }
+        $canonicalKey = $property.Name.TrimStart('0')
+        if ([string]::IsNullOrEmpty($canonicalKey)) {
+            $canonicalKey = "0"
+        }
+        if ($canonicalKey -cne $property.Name) {
+            return $false
+        }
+        $task = $property.Value
+        if ($task -isnot [pscustomobject] -or
+            !(Test-JsonObjectProperty -Object $task -Name "id") -or
+            !(Test-JsonNumber -Value $task.id) -or
+            !(Test-TaskIdMatch -Actual $task.id -Expected $property.Name) -or
+            !(Test-JsonObjectProperty -Object $task -Name "state") -or
+            !($task.state -is [string]) -or
+            $task.state.Length -eq 0) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Test-JsonBatchRemoveResult {
+    # The batch-removal response is a JSON ARRAY of per-task results.  PS 5.1
+    # and 7 both turn a JSON array into an object stream: `[]` arrives as $null
+    # (measured in pwsh 7; 5.1 behaves the same for an empty array), and a
+    # single-element array arrives UNWRAPPED as the element itself.  So the
+    # array-ness cannot be tested with -is [array]; every entry must instead be
+    # validated with @() wrapping.  But @($null) is still a ONE-element array
+    # whose only element is $null (measured in pwsh 7.5.4), so an empty array
+    # would be rejected unless the null input is handled explicitly here.
+    param([AllowNull()][object]$Response)
+
+    if ($null -eq $Response) {
+        return $true
+    }
+
+    foreach ($entry in @($Response)) {
+        if ($entry -isnot [pscustomobject] -or
+            !(Test-JsonObjectProperty -Object $entry -Name "task_id") -or
+            !(Test-JsonNumber -Value $entry.task_id) -or
+            !(Test-JsonObjectProperty -Object $entry -Name "removed") -or
+            !($entry.removed -is [bool])) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
 function Test-JsonTimestamp {
     param([AllowNull()][object]$Value)
 
@@ -1574,9 +1878,39 @@ function Test-AgentQJsonResponse {
                 $stateTaskIdValid
             $valid = $hasAcceptedFields -or $hasState
         }
-        { $_ -eq "status" -or $_ -eq "doctor" } {
+        { $_ -eq "status" -or $_ -eq "doctor_full" } {
             $valid = (Test-JsonObjectProperty -Object $response -Name "tasks") -and
                 (Test-JsonTaskMap -Tasks $response.tasks)
+        }
+        { $_ -eq "status_summary" -or $_ -eq "doctor" } {
+            # The compact queue view (status --summary, and doctor's default
+            # queue section).  `summary: true` distinguishes this shape from
+            # the full decorated map; requiring it keeps a caller from reading
+            # full-status fields off a summary response.
+            $valid = (Test-JsonObjectProperty -Object $response -Name "summary") -and
+                ($response.summary -eq $true) -and
+                (Test-JsonObjectProperty -Object $response -Name "tasks") -and
+                (Test-JsonSummaryMap -Tasks $response.tasks)
+        }
+        "status_task" {
+            $taskObject = if (Test-JsonObjectProperty -Object $response -Name "task") {
+                $response.task
+            } else {
+                $null
+            }
+            $taskIdValue = if (Test-JsonObjectProperty -Object $taskObject -Name "id") {
+                $taskObject.id
+            } else {
+                $null
+            }
+            $valid = ($taskObject -is [pscustomobject]) -and
+                (Test-JsonNumber -Value $taskIdValue) -and
+                (Test-TaskIdMatch -Actual $taskIdValue -Expected $ExpectedTaskId) -and
+                (Test-JsonObjectProperty -Object $taskObject -Name "status") -and
+                ($taskObject.status -is [pscustomobject])
+        }
+        "remove_batch" {
+            $valid = Test-JsonBatchRemoveResult -Response $response
         }
         "logs" {
             $taskObject = if (Test-JsonObjectProperty -Object $response -Name "task") {
@@ -2122,6 +2456,15 @@ function Confirm-NativeWindowsPlatform {
 function Initialize-RemoteInvocation {
     switch ($script:RemotePlatform) {
         "auto" {
+            # Cache first, mirroring the POSIX twin: the cache records the
+            # FINAL verdict (written only after a full resolution including
+            # the launcher-protocol check), so a hit skips both probes.
+            # AGENTQ_PLATFORM_PROBE_CACHE=off, an unparsable/expired entry, or
+            # any filesystem hiccup falls through to probing -- a broken cache
+            # must never break a working command.
+            if (Read-PlatformProbeCache) {
+                return
+            }
             $unixProbe = Invoke-PlatformProbeWithRecovery -Probe ([pscustomobject]@{
                 Command = "uname -s 2>/dev/null"
                 Input = $null
@@ -2130,10 +2473,12 @@ function Initialize-RemoteInvocation {
                 switch ($unixProbe.Output.Trim()) {
                     { $_ -like "MINGW*" -or $_ -like "MSYS*" -or $_ -like "CYGWIN*" } {
                         [void](Confirm-NativeWindowsPlatform)
+                        Write-PlatformProbeCache
                         return
                     }
                     { $_ -like "Linux*" -or $_ -like "Darwin*" } {
                         $script:RemotePlatform = "unix"
+                        Write-PlatformProbeCache
                         return
                     }
                 }
@@ -2153,6 +2498,7 @@ function Initialize-RemoteInvocation {
             if (($windowsProbe.ExitCode -eq 0) -and ($windowsProbe.Output.Trim() -eq "agentq-windows")) {
                 $script:RemotePlatform = "windows"
                 Confirm-WindowsAgentQProtocol
+                Write-PlatformProbeCache
                 return
             }
             Write-Diagnostics -Diagnostics $windowsProbe.Diagnostics
@@ -2250,14 +2596,32 @@ function Invoke-SafeOperationWithRecovery {
         [string]$OperationName,
         [pscustomobject]$Invocation,
         [string]$ExpectedRequestId = "",
-        [string]$ExpectedTaskId = ""
+        [string]$ExpectedTaskId = "",
+        [int]$WaitTimeoutSeconds = 0,
+        # The validation profile: usually the operation name, but the status
+        # and doctor modes answer with shapes of their own, so their call sites
+        # pass it explicitly rather than weakening the shared validator.
+        [string]$ResponseProfile = ""
     )
+    $validationProfile = if (![string]::IsNullOrEmpty($ResponseProfile)) { $ResponseProfile } else { $OperationName }
 
     $attempt = 0
     while ($true) {
-        $result = Invoke-SshLogged -RemoteCommand $Invocation.Command -InputPayload $Invocation.Input
+        if (($OperationName -eq "wait") -and ($WaitTimeoutSeconds -gt 0)) {
+            $result = Invoke-WaitSshWithTimeout -RemoteCommand $Invocation.Command -InputPayload $Invocation.Input -TimeoutSeconds $WaitTimeoutSeconds
+            if ($result.ExitCode -eq 124) {
+                # The budget elapsed while the task is still running.  Exit 6
+                # is the contract's "final state could not be confirmed"
+                # class -- a timed-out wait is exactly that, not an error and
+                # not retryable.
+                [Console]::Error.WriteLine("$($script:Program): wait budget of $WaitTimeoutSeconds seconds elapsed; task $ExpectedTaskId may still be running")
+                return 6
+            }
+        } else {
+            $result = Invoke-SshLogged -RemoteCommand $Invocation.Command -InputPayload $Invocation.Input
+        }
         if ($result.ExitCode -eq 0) {
-            if (!(Test-AgentQJsonResponse -Operation $OperationName -Output $result.Output -ExpectedRequestId $ExpectedRequestId -ExpectedTaskId $ExpectedTaskId)) {
+            if (!(Test-AgentQJsonResponse -Operation $validationProfile -Output $result.Output -ExpectedRequestId $ExpectedRequestId -ExpectedTaskId $ExpectedTaskId)) {
                 Write-Diagnostics -Diagnostics $result.Diagnostics
                 return 2
             }
@@ -2298,12 +2662,16 @@ function Invoke-Mutation {
     param(
         [string]$OperationName,
         [pscustomobject]$Invocation,
-        [string]$ExpectedTaskId = ""
+        [string]$ExpectedTaskId = "",
+        # The validation profile: "remove_batch" for the batch form, whose
+        # response is an array of per-task results rather than one object.
+        [string]$ResponseProfile = ""
     )
+    $validationProfile = if (![string]::IsNullOrEmpty($ResponseProfile)) { $ResponseProfile } else { $OperationName }
 
     $result = Invoke-SshLogged -RemoteCommand $Invocation.Command -InputPayload $Invocation.Input
     Write-Diagnostics -Diagnostics $result.Diagnostics
-    if ($result.ExitCode -eq 0 -and !(Test-AgentQJsonResponse -Operation $OperationName -Output $result.Output -ExpectedTaskId $ExpectedTaskId)) {
+    if ($result.ExitCode -eq 0 -and !(Test-AgentQJsonResponse -Operation $validationProfile -Output $result.Output -ExpectedTaskId $ExpectedTaskId)) {
         return 2
     }
     if (($OperationName -eq "cancel") -and ($result.ExitCode -eq 4) -and
@@ -2354,6 +2722,13 @@ while ($position -lt $arguments.Count) {
         Show-Usage
         exit 0
     }
+    if ($arguments[$position] -eq "--version") {
+        # Local only: the CLIENT's version constant (see the POSIX twin).  The
+        # server's version comes from doctor's agentq= line; the two are
+        # separate deployments and deliberately not negotiated.
+        Write-Output "$($script:Program) $($script:ClientVersion)"
+        exit 0
+    }
     break
 }
 
@@ -2375,6 +2750,7 @@ switch ($operation) {
         $workdir = ""
         $label = "command"
         $requestId = ""
+        $stdinScript = $false
         $commandStart = -1
         while ($position -lt $arguments.Count) {
             switch ($arguments[$position]) {
@@ -2402,6 +2778,11 @@ switch ($operation) {
                     $position += 2
                     continue
                 }
+                "--stdin-script" {
+                    $stdinScript = $true
+                    $position += 1
+                    continue
+                }
                 "--" {
                     $commandStart = $position + 1
                     $position = $arguments.Count
@@ -2415,8 +2796,14 @@ switch ($operation) {
         if ([string]::IsNullOrWhiteSpace($workdir)) {
             Stop-AgentQ "--workdir is required"
         }
-        if ($commandStart -lt 0 -or $commandStart -ge $arguments.Count) {
-            Stop-AgentQ "submit requires a command after --"
+        if ($stdinScript) {
+            if ($commandStart -ge 0 -and $commandStart -lt $arguments.Count) {
+                Stop-AgentQ "submit --stdin-script takes the script from standard input; drop the command after --"
+            }
+        } else {
+            if ($commandStart -lt 0 -or $commandStart -ge $arguments.Count) {
+                Stop-AgentQ "submit requires a command after --, or --stdin-script with the script on standard input"
+            }
         }
         if ([string]::IsNullOrWhiteSpace($requestId)) {
             $requestId = "aq-" + ([Guid]::NewGuid().ToString("N"))
@@ -2426,7 +2813,41 @@ switch ($operation) {
         }
 
         Initialize-ClientTransport
-        $commandArguments = @($arguments[$commandStart..($arguments.Count - 1)])
+        if ($stdinScript) {
+            # The script travels as ONE base64 argument through the documented
+            # decode pattern (`printf %s <b64> | base64 -d | sh`) -- the base64
+            # alphabet needs no quoting, so the payload survives every hop
+            # (ssh, the remote shell, Pueue's argv) byte-exactly.  The bound is
+            # the target's argv limit, which the payload must fit into as a
+            # single argument: a Windows target re-encodes argv onto a
+            # CreateProcess command line capped at 32767 characters, and the
+            # payload shares that line with the rest of the server invocation
+            # (the POSIX twin carries the unix-side MAX_ARG_STRLEN bound).
+            # Bigger scripts belong in a staged file (SKILL.md).
+            if (![Console]::IsInputRedirected) {
+                Stop-AgentQ "submit --stdin-script needs the script on standard input (pipe or redirect it)"
+            }
+            $stdinStream = [Console]::OpenStandardInput()
+            $stdinMemory = New-Object System.IO.MemoryStream
+            try {
+                $stdinStream.CopyTo($stdinMemory)
+            } finally {
+                $stdinStream.Dispose()
+            }
+            $scriptBytes = $stdinMemory.ToArray()
+            $stdinMemory.Dispose()
+            if ($scriptBytes.Length -eq 0) {
+                Stop-AgentQ "submit --stdin-script received no script on standard input"
+            }
+            $scriptBase64 = [Convert]::ToBase64String($scriptBytes)
+            if ($scriptBase64.Length -gt $script:StdinScriptLimit) {
+                Stop-AgentQ ("the script is too large for --stdin-script (base64 length " + $scriptBase64.Length +
+                    " exceeds $script:StdinScriptLimit on this target); stage it as a file and submit a command that reads it")
+            }
+            $commandArguments = @("sh", "-c", "printf %s $scriptBase64 | base64 -d | sh")
+        } else {
+            $commandArguments = @($arguments[$commandStart..($arguments.Count - 1)])
+        }
         $submitArguments = @("submit", "--workdir", $workdir, "--label", $label, "--request-id", $requestId, "--") + $commandArguments
         $lookupArguments = @("lookup", $requestId)
         $submitInvocation = New-RemoteInvocation -Arguments $submitArguments
@@ -2445,20 +2866,46 @@ switch ($operation) {
         exit (Invoke-SafeOperationWithRecovery -OperationName "lookup" -Invocation $invocation -ExpectedRequestId $arguments[$position])
     }
     "status" {
-        if (($arguments.Count - $position) -ne 0) {
-            Stop-AgentQ "status accepts no arguments"
+        # Three modes, three server responses: the full decorated queue, the
+        # compact summary ({"tasks":{...},"summary":true}), and the single
+        # decorated task wrapped in {"task":...} like logs and wait.  A bare
+        # numeric id is almost certainly a `logs` call -- say so instead of
+        # burning a round trip on the server's rejection.
+        $remaining = $arguments.Count - $position
+        $statusProfile = "status"
+        $remoteStatusArgs = @("status")
+        if ($remaining -eq 2 -and $arguments[$position] -eq "--task") {
+            if (!(Test-TaskId -Value $arguments[$position + 1])) {
+                Stop-AgentQ "task id must be a non-negative integer"
+            }
+            $remoteStatusArgs = @("status", "--task", $arguments[$position + 1])
+            $statusProfile = "status_task"
+        } elseif ($remaining -eq 1 -and $arguments[$position] -eq "--summary") {
+            $remoteStatusArgs = @("status", "--summary")
+            $statusProfile = "status_summary"
+        } elseif ($remaining -ne 0) {
+            Stop-AgentQ "status accepts --summary or --task <task-id>"
         }
         Initialize-ClientTransport
-        $invocation = New-RemoteInvocation -Arguments @("status")
-        exit (Invoke-SafeOperationWithRecovery -OperationName "status" -Invocation $invocation)
+        $invocation = New-RemoteInvocation -Arguments $remoteStatusArgs
+        exit (Invoke-SafeOperationWithRecovery -OperationName "status" -Invocation $invocation -ResponseProfile $statusProfile)
     }
     "doctor" {
-        if (($arguments.Count - $position) -ne 0) {
-            Stop-AgentQ "doctor accepts no arguments"
+        # Default queue section is the compact summary; --full restores the
+        # historical decorated dump.  doctor itself is NOT read-only (it starts
+        # the pueued service); that warning lives in the usage text.
+        $remaining = $arguments.Count - $position
+        $doctorProfile = "doctor"
+        $remoteDoctorArgs = @("doctor")
+        if ($remaining -eq 1 -and $arguments[$position] -eq "--full") {
+            $remoteDoctorArgs = @("doctor", "--full")
+            $doctorProfile = "doctor_full"
+        } elseif ($remaining -ne 0) {
+            Stop-AgentQ "doctor accepts --full or no arguments"
         }
         Initialize-ClientTransport
-        $invocation = New-RemoteInvocation -Arguments @("doctor")
-        exit (Invoke-SafeOperationWithRecovery -OperationName "doctor" -Invocation $invocation)
+        $invocation = New-RemoteInvocation -Arguments $remoteDoctorArgs
+        exit (Invoke-SafeOperationWithRecovery -OperationName "doctor" -Invocation $invocation -ResponseProfile $doctorProfile)
     }
     "logs" {
         $remaining = $arguments.Count - $position
@@ -2495,19 +2942,58 @@ switch ($operation) {
         exit (Invoke-Mutation -OperationName "cancel" -Invocation $invocation -ExpectedTaskId $arguments[$position])
     }
     "wait" {
-        if (($arguments.Count - $position) -ne 1) {
-            Stop-AgentQ "wait requires one task id"
+        $waitArgs = $arguments.Count - $position
+        if (($waitArgs -ne 1) -and ($waitArgs -ne 3)) {
+            Stop-AgentQ "wait requires a task id and optional --timeout <seconds>"
         }
         if (!(Test-TaskId -Value $arguments[$position])) {
             Stop-AgentQ "task id must be a non-negative integer"
         }
+        $waitTimeoutSeconds = 0
+        $remoteWaitArgs = @("wait", $arguments[$position])
+        if ($waitArgs -eq 3) {
+            if ($arguments[$position + 1] -ne "--timeout") {
+                Stop-AgentQ "wait accepts only --timeout <seconds>"
+            }
+            if (!($arguments[$position + 2] -match '^[1-9][0-9]*$')) {
+                Stop-AgentQ "--timeout must be a positive integer"
+            }
+            $waitTimeoutSeconds = [int]$arguments[$position + 2]
+            $remoteWaitArgs = @("wait", $arguments[$position], "--timeout", $arguments[$position + 2])
+        } elseif (![string]::IsNullOrWhiteSpace($env:AGENTQ_WAIT_TIMEOUT)) {
+            if ($env:AGENTQ_WAIT_TIMEOUT -notmatch '^[1-9][0-9]*$') {
+                Stop-AgentQ "AGENTQ_WAIT_TIMEOUT must be a positive integer"
+            }
+            $waitTimeoutSeconds = [int]$env:AGENTQ_WAIT_TIMEOUT
+        }
         Initialize-ClientTransport
-        $invocation = New-RemoteInvocation -Arguments @("wait", $arguments[$position])
+        $invocation = New-RemoteInvocation -Arguments $remoteWaitArgs
+        if ($waitTimeoutSeconds -gt 0) {
+            exit (Invoke-SafeOperationWithRecovery -OperationName "wait" -Invocation $invocation -ExpectedTaskId $arguments[$position] -WaitTimeoutSeconds $waitTimeoutSeconds)
+        }
         exit (Invoke-SafeOperationWithRecovery -OperationName "wait" -Invocation $invocation -ExpectedTaskId $arguments[$position])
     }
     "remove" {
-        if (($arguments.Count - $position) -ne 1) {
-            Stop-AgentQ "remove requires one task id"
+        $remaining = $arguments.Count - $position
+        if ($remaining -eq 3 -and $arguments[$position] -eq "--label") {
+            # Batch removal by user label.  --confirm is mandatory: a batch
+            # deletion must be explicitly acknowledged, locally AND on the
+            # server, so a typo cannot wipe a queue with one round trip.
+            if ($arguments[$position + 2] -ne "--confirm") {
+                Stop-AgentQ "remove --label requires --confirm: a batch removal must be explicitly acknowledged"
+            }
+            if ([string]::IsNullOrEmpty($arguments[$position + 1])) {
+                Stop-AgentQ "remove --label requires a non-empty label"
+            }
+            Initialize-ClientTransport
+            $invocation = New-RemoteInvocation -Arguments @("remove", "--label", $arguments[$position + 1], "--confirm")
+            exit (Invoke-Mutation -OperationName "remove" -Invocation $invocation -ResponseProfile "remove_batch")
+        }
+        if ($remaining -eq 2 -and $arguments[$position] -eq "--label") {
+            Stop-AgentQ "remove --label requires --confirm: a batch removal must be explicitly acknowledged"
+        }
+        if ($remaining -ne 1) {
+            Stop-AgentQ "remove requires one task id, or --label <label> --confirm"
         }
         if (!(Test-TaskId -Value $arguments[$position])) {
             Stop-AgentQ "task id must be a non-negative integer"

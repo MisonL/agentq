@@ -67,7 +67,13 @@ expect_rejected wait-non-numeric 'task id must be a non-negative integer' protoc
 expect_rejected logs-no-task 'logs requires one task id' protocol_error logs
 expect_rejected cancel-no-task 'cancel requires one task id' protocol_error cancel
 expect_rejected remove-no-task 'remove requires one task id' protocol_error remove
-expect_rejected status-extra-arg 'status accepts no arguments' protocol_error status extra
+expect_rejected status-extra-arg 'status accepts --summary or --task <id>' protocol_error status extra
+# The batch form must demand --confirm (a mass deletion needs an explicit
+# acknowledgement) and reject a malformed form before anything touches Pueue.
+expect_rejected remove-label-no-confirm 'remove --label requires exactly a label and --confirm' protocol_error remove --label smoke
+expect_rejected remove-label-missing-flag 'remove --label requires --confirm' protocol_error remove --label smoke --nope
+expect_rejected remove-label-empty 'remove --label requires a non-empty label' protocol_error remove --label '' --confirm
+expect_rejected doctor-extra-arg 'doctor accepts --full or no arguments' protocol_error doctor --bogus
 
 # A malformed Pueue status must NOT surface as exit 5.  The contract reserves 5
 # for a REMOVED task; but compact_status's jq filter ends in
