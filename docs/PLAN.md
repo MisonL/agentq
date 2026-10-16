@@ -829,3 +829,43 @@ A5b 随之修复并经两列双向验证——见 A5b 正文与本节 A5b 行。
 2 个 `.cmd`（8 行，`01` 已有结构断言）与声明式配置（`.plist`/`.yml`/`.service`，110 行）。
 分母已于 2026-10-14（晚）重算为 **27,821**（0.1.10 落地后：`agentq.ps1` 2,516→2,522、launcher 442→466、stdin 读循环与 launcher try/catch；此前为 27,782，0.1.8 落地后）（`skill/assets/` 全部 23 个资产 `wc -l` 之和）。
 别再引用旧的 25.9%、13.8%、4.8%、1.6%、1.5%、25,536 或 26,264。
+
+**0.1.13 修复之后的平行实现清查（2026-10-16，用户「继续」）**：0.1.13 修了 POSIX 安装器的
+不可粘贴占位符；两份安装器是平行实现，Windows 侧按同一类缺陷清查，**查实同类缺陷仍在**
+并连带发现两处 0.1.13 的锁根本没锁住，落地为 **0.1.14**：
+
+- **Windows 安装器残留指引仍是 `Move-Item <the .AgentQ.backup directory> $RootDirectory`**
+  （`Assert-NoCrashLeftoverTransactions` 的 missing-root 分支）——与 POSIX 侧修掉的同一缺陷。
+  修法对齐 POSIX 侧：`$restoreCommands` 从**扫描到的真实路径**构造，
+  `Convert-ToPowerShellSingleQuotedString`（本文件既有 helper）整路径单引号引用，
+  每个 backup 一条 `Move-Item '<residue>' '<root>';`；无 backup（如只有 `.stage`）时走独立分支
+  明说「没有可恢复的 backup 目录」（POSIX 侧同形态）。present-root 分支措辞不变（本就带真实路径）。
+- **smoke/13（Windows 安装器 W5 锁）此前只断言消息片段**，占位符回归不会被抓住——新增可粘贴性锁：
+  断言角度占位符不存在、恢复段**用 PowerShell 解析器实际解析**（oracle 是解析器，
+  **不是**安装器自己的 quoting helper——用它自证会放过坏 helper，变异 M6 证之），解析出的
+  串常量必须含真实残留路径与 root。残留目录名故意带**单引号**（`.AgentQ.backup.Smoke'AbC`）：
+  变异 M4 实测，普通名字下「裸拼接 + 内层引号」与正确输出逐字节相同、全部检查绿，
+  有了单引号才解析出**不同的路径**、当场红。五个变异全红（M1 占位符回归、M2 无命令、
+  M3 stage 分支措辞、M4 裸拼接、M5 backup/stage 过滤翻转、M6 弄坏 quoting helper）。
+- **smoke/11（POSIX 安装器）同样只断言片段**：0.1.13 修了资产，但**没有锁**钉「可粘贴」——
+  把 `mv $(quote_shell_word …)` 改回 `mv <the .backup directory>` 占位符，该文件 29 例照旧全绿
+  （实测）。新增**行为锁**：从 stderr 抽出 `Restore it with:` 到 `then restart` 之间的命令，
+  断言无 `<`，然后**原样执行**并断言 backup 真的回到了 root（残留名带空格+单引号，
+  P2 变异去掉 quote_shell_word 即红）。P1（占位符回归）/P3（backup/stage 过滤翻转）均红。
+- **`--stdin-script` 的 0.1.13 守卫同样没有锁**：smoke/05 的提取正则匹配
+  `printf %s <b64> | base64 -d | sh`，**守卫删掉也照样绿**（实测 Q1：38 例全绿）。
+  smoke/05 新增**行为锁**：捕获客户端发出的**真实远端命令串**，在一个**只有 sh、没有 base64** 的
+  PATH 上原样执行——无守卫时退 0（正是 0.1.13 修的那个 fail-open），有守卫必须退 2 且报错点名
+  base64；再在 base64 **存在**的 PATH 上跑一遍断言脚本真执行了。变异 Q1（删守卫）红、
+  Q2（守卫追加在管道之后）红、Q2b（守卫挂成管道恢复子句 `| sh || { … }`）红。
+  **实测修正一处认知**：Q2 的「无条件追加在管道之后」形态**能通过**该锁（它使任务失败、
+  不再 fail-open，终态等价），故锁断言的是**终态**（base64 缺失时不得静默成功）而非 token 位置。
+- **smoke/12（ps1 客户端）的 stdin-script 静态锁升级为结构锁**：原 `grep -q -- '--stdin-script'`
+  连解码命令都不检查。ps1 侧不能复用 smoke/05 的行为锁（那是 POSIX 客户端发出的串），
+  改为断言**同一条串里**「守卫块 → `;` → 管道」的形状（注释行排除，防止留注释删真守卫）。
+  变异 W1（删守卫）/W2（追加在管道后）/W3（恢复子句）全红；W2/W3 落在
+  「守卫块直接接管道」检查上——该检查按位置否定恢复子句形态，与 smoke/05 的终态锁互补
+  （一个测资产形状、一个测行为，两层各承重）。
+- 资产注释随之更正：三处「a check appended after it would never fire」的说法**过强**——
+  追加的**无条件**检查在 base64 缺失时确实会触发（任务退 2）；永不触发的是**恢复子句**
+  形态（`||` 只在管道已退 0 后才轮到它）。已按实测改写。

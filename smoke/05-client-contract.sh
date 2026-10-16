@@ -450,6 +450,71 @@ if [ "$empty_script_status" -ne 2 ] || ! grep -qF 'received no script on standar
     failures=$((failures + 1))
 fi
 
+# ...and the decode guard must be on the TARGET and BEFORE the pipeline.  0.1.13
+# fixed that fail-open (remote `base64` absent -> `base64 -d` dies, the LAST
+# stage `sh` reads empty input and exits 0, and the task lands Done/Success
+# having run nothing) -- and until 2026-10-16 NOTHING pinned it: the extraction
+# regex above matches `printf %s <b64> | base64 -d | sh` whether or not a guard
+# precedes it.  Measured: deleting the guard from the asset left this check at
+# 38 green cases, so a regression to the exact defect 0.1.13 fixed would ship
+# silently.  The lock is behavioural, on the exact remote command string the
+# client emitted: run it on a target whose PATH has `sh` but NOT `base64`, then
+# with base64 present.  What it pins is the terminal state, not a token's
+# position: a base64-less target must NOT be able to produce a silent success.
+# Measured shapes -- deleting the guard and attaching it as a pipeline recovery
+# clause (`... | sh || { command -v base64 ... || exit 2; }`) both leave exit 0
+# and both red here; an UNCONDITIONAL append (`... | sh; command -v base64 ...`)
+# exits 2 and passes, which is correct -- it ends in the same failed task.
+cases=$((cases + 1))
+: > "$work/guard.argv"
+guard_script='printf hello-from-stdin'
+guard_status=0
+printf '%s\n' "$guard_script" |
+    AGENTQ_ARGV_CAPTURE="$work/guard.argv" AGENTQ_SSH="$work/bin/ssh-modes" \
+    AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+    "$client" submit --workdir /tmp --stdin-script >"$work/guard.out" 2>"$work/guard.err" || guard_status=$?
+guard_remote_command=$(tail -n 1 "$work/guard.argv")
+if [ "$guard_status" -ne 0 ] || [ -z "$guard_remote_command" ]; then
+    printf 'client stdin-script guard: could not capture the remote command (exit %s): %s\n' \
+        "$guard_status" "$(head -1 "$work/guard.err")" >&2
+    failures=$((failures + 1))
+else
+    # A fake server at the path the remote command hardcodes lets the captured
+    # string run LOCALLY as the exact bytes the client would send: the wrapper
+    # is skipped and the payload after `--` is executed, so the guard's
+    # behaviour on a base64-less target is observed rather than inferred.
+    guard_path="$work/guard-path"
+    guard_home="$work/guard-home"
+    mkdir -p "$guard_path" "$guard_home/.local/bin"
+    ln -s /bin/sh "$guard_path/sh"
+    cat > "$guard_home/.local/bin/agentq" <<'GUARDSERVER'
+#!/bin/sh
+while [ "$#" -gt 0 ]; do [ "$1" = "--" ] && shift && break; shift; done
+exec "$@"
+GUARDSERVER
+    chmod 700 "$guard_home/.local/bin/agentq"
+    guard_absent_status=0
+    env -i PATH="$guard_path" HOME="$guard_home" /bin/sh -c "$guard_remote_command" \
+        >"$work/guard-target.out" 2>"$work/guard-target.err" || guard_absent_status=$?
+    if [ "$guard_absent_status" -ne 2 ]; then
+        printf 'client stdin-script guard: on a target WITHOUT base64 the remote command exited %s; it must exit 2, or the task lands Done/Success after running nothing: %s\n' \
+            "$guard_absent_status" "$(head -1 "$work/guard-target.err")" >&2
+        failures=$((failures + 1))
+    elif ! grep -qF -- '--stdin-script requires base64 on the target' "$work/guard-target.err"; then
+        printf 'client stdin-script guard: the target refusal does not name base64: %s\n' \
+            "$(head -1 "$work/guard-target.err")" >&2
+        failures=$((failures + 1))
+    fi
+    guard_present_status=0
+    env -i PATH="$guard_path:/usr/bin:/bin" HOME="$guard_home" /bin/sh -c "$guard_remote_command" \
+        >"$work/guard-present.out" 2>"$work/guard-present.err" || guard_present_status=$?
+    if [ "$guard_present_status" -ne 0 ] || [ "$(cat "$work/guard-present.out")" != "hello-from-stdin" ]; then
+        printf 'client stdin-script guard: with base64 present the remote command exited %s and printed [%s], expected the script to run (exit 0, hello-from-stdin)\n' \
+            "$guard_present_status" "$(head -1 "$work/guard-present.out")" >&2
+        failures=$((failures + 1))
+    fi
+fi
+
 expect_rejected 'unknown command: bogus' bogus
 expect_rejected 'lookup requires one request id' lookup
 expect_rejected 'request id must be'     lookup abc

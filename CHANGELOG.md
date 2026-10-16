@@ -7,6 +7,7 @@
 
 每个 `v0.1.x` tag 指向该版本落地时版本常量所在的提交；`.github/workflows/release.yml` 会核对 tag 与资产内的版本常量一致（[运行记录](https://github.com/MisonL/agentq/actions/workflows/release.yml)）。详细变更与实测证据看下方日志区对应日期的条目。
 
+- **[v0.1.14](https://github.com/MisonL/agentq/releases/tag/v0.1.14)**（2026-10-16）— 0.1.13 的平行实现清查：Windows 安装器残留指引同款占位符已修，且 0.1.13 的三组锁（安装器可粘贴性、stdin-script 守卫）实为「改了资产没锁」，补行为/结构锁
 - **[v0.1.13](https://github.com/MisonL/agentq/releases/tag/v0.1.13)**（2026-10-16）— 第五轮审查「如实记录」的未修项全部修复：smoke S2–S13 断言加固、服务端记录消失竞态、两份客户端 `--stdin-script` 目标端解码守卫、三处 nits、安装器残留指引改为可粘贴
 - **[v0.1.12](https://github.com/MisonL/agentq/releases/tag/v0.1.12)**（2026-10-16）— 第五轮全维度审查：修 P0（`wait --timeout` 在两个客户端上都完全不可用，三个独立成因）+ 12 组缺陷；未修项如实记录在 `docs/PLAN.md`
 - **[v0.1.11](https://github.com/MisonL/agentq/releases/tag/v0.1.11)**（2026-10-15）— Agent-UX 优化 P1–P7 一次落地：wait --timeout、读免锁、status 摘要/单任务形态、--version 防呆、探针缓存、submit --stdin-script、remove --label 批量删除
@@ -33,6 +34,8 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 怎么读：**最新的在最上面**；文件尾部另有一段**升序的早期记录**（2026-09-29 纳入 git 之前的 baseline），两段都是刻意保留的，不要「修复」顺序。每条条目末尾以 `|` 开头的那一行是**该次变更的实测验证结果**——写的是跑出来的输出与计数，不是期望值。历史段落里出现的待办**不是**待办：唯一权威的待办清单是 `docs/PLAN.md`。
 
 **格式约定（2026-10-15 起）**：新条目用**短格式**——一行说清改了什么与对行为的影响，验证只留退出码与关键计数；排查过程、变异证明、教训写进 `docs/PLAN.md`，不进这里。2026-10-14 及之前的长条目按当时约定写成，保留原样。
+
+2026-10-16  **v0.1.14：0.1.13 修复之后的平行实现清查**——① Windows 安装器 `install-agentq.ps1` 的崩溃残留指引仍是 `Move-Item <the .AgentQ.backup directory>` 占位符（与 0.1.13 在 POSIX 侧修掉的同款缺陷），改为从真实扫描路径构造、`Convert-ToPowerShellSingleQuotedString` 整路径单引号引用，无 backup 时走独立分支；② 0.1.13 的三组修复**实测均无锁**——smoke/11/13 只断言消息片段（把 POSIX 修复换回占位符 29 例照旧全绿）、smoke/05 的提取正则不区分有无守卫（删守卫 38 例照旧全绿）——分别补上：`13` 恢复段用 PowerShell 解析器实际解析并断言真实路径（残留名带单引号，裸拼接才解析得出不同路径）、`11` 抽出打印的命令**原样执行**并断言备份真的回到 root、`05` 捕获真实远端命令串在无 base64 的 PATH 上执行断言退 2（及有 base64 时脚本真跑）、`12` stdin-script 静态锁升级为「守卫块直接接管道」结构锁；三处资产注释按实测更正（追加的无条件检查在 base64 缺失时**会**触发，永不触发的只是恢复子句形态）。全部先证能红（P1–P3/M1–M6/Q1–Q2b/W1–W3）。  |  AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq ./run-tests.sh → 29 ran 0 skipped 0 partial 0 failed (588s), exit 0；--quick → version=0.1.14
 
 2026-10-16  **v0.1.13：第五轮审查「如实记录」的未修项全部修复**——smoke S2–S13 断言加固（`05` 模式用例改原始-argv 精确匹配、`12` 良构 askpass 改断言「ssh 桩被调用」/authhint 钉死 host 与凭据源/`\d{1,3}` 锁改逐读取器计数/validator 加 doctor 负例/成功行移到失败门后、`03` doctor 断言加强且失败路径改由 EXIT trap 清理（覆盖本检查创建的每个任务）、`02` reason 断言锚定、`10` `mv <` 整行排除改引号奇偶判定）、服务端 `load_request_records` 跳过记录时发 `null` 占位符修位置绑定失配（原先报 `invalid AgentQ request record` 且 `recover_removing_requests` 无声吞掉）+ 其调用点补 `|| return $?`、两份客户端 `--stdin-script` 的 `base64` 守卫移到**目标端且在管道之前**（原先本地检查、远端缺 base64 时任务 Done/Success 却什么都没跑）、`doctor_with_operation_lock` 转发 `"$@"`、批量删除失败条目 jq 赋值补 `|| fail`、锁龄钳零、安装器残留指引改为从真实路径构造（可粘贴）。每条新锁先证能红；修法与证据见 `docs/PLAN.md`。  |  ./run-tests.sh → 29 ran 0 skipped 0 partial 0 failed (1451s), exit 0；--quick → version=0.1.13
 

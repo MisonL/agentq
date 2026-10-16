@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.13'
+agentq_client_version='0.1.14'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072); a Windows target re-encodes
 # argv onto a CreateProcess command line capped at 32767 characters, and the
@@ -4188,11 +4188,13 @@ case "$operation" in
             # exits 0, and the task lands in Done/Success having executed
             # NOTHING -- a fail-open, because the client's own
             # `command -v base64` check runs on the LOCAL machine.  The guard
-            # must therefore be on the TARGET and BEFORE the pipeline: a
-            # pipeline's status is its last command's, so a check appended
-            # after it would never fire.  This keeps the documented
-            # `printf %s <b64> | base64 -d | sh` shape (SKILL.md) and the
-            # script's exit code is still the task's status.
+            # therefore has to make the pipeline's own terminal status nonzero:
+            # it sits BEFORE the pipeline, on the `||`, so the failure is
+            # produced instead of executed.  (An `||`-attached recovery clause
+            # after the pipeline does NOT do this -- it runs only after the
+            # pipeline already exited 0.  Measured 2026-10-16.)  This keeps the
+            # documented `printf %s <b64> | base64 -d | sh` shape (SKILL.md)
+            # and the script's exit code is still the task's status.
             append_arg sh
             append_arg -c
             append_arg "command -v base64 >/dev/null 2>&1 || { echo 'agentq: --stdin-script requires base64 on the target' >&2; exit 2; }; printf %s $stdin_script_b64 | base64 -d | sh"
