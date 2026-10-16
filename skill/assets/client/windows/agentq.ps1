@@ -152,7 +152,7 @@ $script:PlatformProbeTimeout = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLA
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.13"
+$script:ClientVersion = "0.1.14"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's argv limit, not this machine's platform: a unix
 # target takes up to 100000 base64 characters (the POSIX twin's MAX_ARG_STRLEN
@@ -2969,10 +2969,13 @@ switch ($operation) {
             # input and exits 0, and the task lands in Done/Success having
             # executed NOTHING -- a fail-open, because the client's own
             # `command -v base64` check runs on the LOCAL machine.  The guard
-            # must therefore be on the TARGET and BEFORE the pipeline: a
-            # pipeline's status is its last command's, so a check appended
-            # after it would never fire.  Same shape as the POSIX twin's
-            # `--stdin-script` arm (smoke/05 and smoke/12 lock both).
+            # therefore has to make the pipeline's own terminal status
+            # nonzero: it sits BEFORE the pipeline, on the `||`, so the
+            # failure is produced instead of executed.  (An `||`-attached
+            # recovery clause after the pipeline does NOT do this -- it runs
+            # only after the pipeline already exited 0.  Measured 2026-10-16.)
+            # Same shape as the POSIX twin's `--stdin-script` arm (smoke/05
+            # and smoke/12 lock both).
             $commandArguments = @("sh", "-c", "command -v base64 >/dev/null 2>&1 || { echo 'agentq: --stdin-script requires base64 on the target' >&2; exit 2; }; printf %s $scriptBase64 | base64 -d | sh")
         } else {
             $commandArguments = @($arguments[$commandStart..($arguments.Count - 1)])

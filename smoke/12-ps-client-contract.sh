@@ -1186,8 +1186,35 @@ fi
 # Static locks: the stdin-script channel, the batch form, and the doctor --full
 # escape hatch must exist in the client source (behaviour is pinned on the POSIX
 # twin's run; the ps1 side here pins the surface).
+# The stdin-script guard is pinned by STRUCTURE, not by `grep -q -- 'command -v
+# base64'`: that token also sits in the client's LOCAL check, so a guard deleted
+# from the remote string stays green on a name-only grep (the twin's behavioural
+# lock in smoke/05 cannot reach this copy -- it runs the POSIX client's emitted
+# command).  What is asserted is the position of the guard INSIDE the same
+# string as the decode pipeline: the remote command must carry the guard
+# followed by `;` and the pipeline, and the guard must not be attached as a
+# pipeline recovery clause (`| sh || { ... }` runs only after the pipeline has
+# already exited 0 -- measured on the POSIX twin).  Comment lines are excluded
+# so removing the real guard while keeping its explanation cannot pass.
 mode_static_failures=0
 grep -q -- '--stdin-script' "$client" || { printf '%s\n' 'ps-client: missing submit --stdin-script' >&2; mode_static_failures=$((mode_static_failures + 1)); }
+ps1_stdin_guard_line=$(/usr/bin/grep -v '^[[:space:]]*#' "$client" | /usr/bin/grep -F -- '$commandArguments = @("sh", "-c", "command -v base64' || true)
+ps1_stdin_guard_problem=''
+if [ -z "$ps1_stdin_guard_line" ]; then
+    ps1_stdin_guard_problem='the stdin-script decode command with a target-side guard is not in the client'
+elif ! printf '%s\n' "$ps1_stdin_guard_line" | /usr/bin/grep -qF -- 'command -v base64 >/dev/null 2>&1 || { echo'; then
+    ps1_stdin_guard_problem='the stdin-script decode command lost its target-side base64 guard'
+elif ! printf '%s\n' "$ps1_stdin_guard_line" | /usr/bin/grep -qF -- 'exit 2; }; printf %s $scriptBase64 | base64 -d | sh'; then
+    # The guard's block must be followed directly by the pipeline: that is what
+    # pins it BEFORE the pipeline.  A recovery clause (`| sh || { ... }`) would
+    # put the pipeline first and run the guard only after the pipeline already
+    # exited 0 (the fail-open shape, measured on the POSIX twin).
+    ps1_stdin_guard_problem='the stdin-script decode guard is not positioned before the pipeline (or is attached as a pipeline recovery clause)'
+fi
+if [ -n "$ps1_stdin_guard_problem" ]; then
+    printf 'ps-client: %s\n' "$ps1_stdin_guard_problem" >&2
+    mode_static_failures=$((mode_static_failures + 1))
+fi
 grep -q -- '--confirm' "$client" || { printf '%s\n' 'ps-client: missing remove --label --confirm handling' >&2; mode_static_failures=$((mode_static_failures + 1)); }
 grep -q -- '--full' "$client" || { printf '%s\n' 'ps-client: missing doctor --full' >&2; mode_static_failures=$((mode_static_failures + 1)); }
 grep -q -- '--summary' "$client" || { printf '%s\n' 'ps-client: missing status --summary' >&2; mode_static_failures=$((mode_static_failures + 1)); }

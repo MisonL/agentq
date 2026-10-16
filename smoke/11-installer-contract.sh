@@ -1110,6 +1110,50 @@ crash_case 'crash leftover, root present' \
     'exists beside the AgentQ root' yes
 rm -rf "$home"/..agentq.backup.* "$home"/.agentq
 
+# The guidance must be RUNNABLE, not just present.  Measured 2026-10-16: the
+# message used to read `Restore it with: mv <the .backup directory>
+# $agentq_home` -- a placeholder the operator had to hand-edit in a refusing
+# path where one wrong edit destroys the queue.  0.1.13 rebuilt it from the
+# scanned paths, and NOTHING pinned that property: the cases above assert only
+# message fragments, so a regression back to a placeholder would keep them all
+# green (measured -- this case is the only one that reds on that mutation).
+# The lock is behavioural: run the printed command, then check the backup
+# actually landed on the root.  The residue name carries a SPACE and an
+# APOSTROPHE on purpose -- pasteability is only proven when the quoting has to
+# escape something; with a plain name, an unquoted expansion behaves identically.
+rm -rf "$home"/..agentq.backup.* "$home"/..agentq.stage.* "$home"/.agentq "$home"/.local
+mkdir -p "$home/..agentq.backup.Smoke 'AbC"
+cases=$((cases + 1))
+status=0
+env HOME="$home" PATH="$stub_bare" \
+    /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+if [ "$status" -ne 2 ]; then
+    printf 'installer recovery-command: expected the residue refusal (exit 2), got %s\n' "$status" >&2
+    failures=$((failures + 1))
+else
+    recovery_message=$(sed -n '/Restore it with:/{s/^[^:]*: //;p;}' "$work/err")
+    recovery_command=$(printf '%s' "$recovery_message" |
+        sed -e 's/.*Restore it with://' -e 's/ *then restart the AgentQ daemon.*//' -e 's/^ *//')
+    if [ -z "$recovery_command" ]; then
+        printf 'installer recovery-command: the refusal printed no restore command:\n' >&2
+        sed 's/^/      /' "$work/err" >&2 || true
+        failures=$((failures + 1))
+    elif printf '%s' "$recovery_command" | grep -q '<'; then
+        printf 'installer recovery-command: the restore command still contains a placeholder: %s\n' "$recovery_command" >&2
+        failures=$((failures + 1))
+    else
+        # Run exactly what was printed, then assert the effect.
+        /bin/sh -c "$recovery_command" >/dev/null 2>&1 || true
+        if [ ! -d "$home/.agentq" ] || [ -e "$home/..agentq.backup.Smoke 'AbC" ]; then
+            printf 'installer recovery-command: running the printed command did not restore the backup:\n' >&2
+            printf '      command: %s\n' "$recovery_command" >&2
+            find "$home" -mindepth 1 2>/dev/null | LC_ALL=C sed 's/^/      /' >&2
+            failures=$((failures + 1))
+        fi
+    fi
+fi
+rm -rf "$home"/..agentq.backup.* "$home"/.agentq
+
 # Fail-closed: an UNLISTABLE parent must refuse, not see "no residue" and
 # proceed.  Without this case the fail-open mutation (dropping the `||
 # crash_scan_failed=true`) passes the whole file -- measured: it did.

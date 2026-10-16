@@ -18,7 +18,7 @@ $expectedClientHash = "28b0756d54ec16ce13d78b251d086aa62e0057089cb27f793cd649f97
 $expectedDaemonHash = "aafa05e2f26cda9aff3eeb9be261e8f9f67752d1e9bb7fbcb47318e35c52ab1d"
 $releaseVersion = "4.0.4"
 $releaseBaseUrl = "https://github.com/Nukesor/pueue/releases/download/v$releaseVersion"
-$agentqVersion = "0.1.13"
+$agentqVersion = "0.1.14"
 $clientAssetName = "pueue-x86_64-pc-windows-msvc.exe"
 $daemonAssetName = "pueued-x86_64-pc-windows-msvc.exe"
 $gitBashPath = $null
@@ -2380,11 +2380,27 @@ function Assert-NoCrashLeftoverTransactions {
     if (@($leftovers | Where-Object { $_.Kind -eq 'scan-failed' }).Count -gt 0) {
         throw "refusing to install: cannot inspect $ParentDirectory for leftover AgentQ transaction directories. Refusing to risk a silent empty deployment over an unreadable directory; check permissions and re-run. Nothing was modified."
     }
+    # The restore guidance is built from the REAL residue paths, exactly as
+    # install-agentq.sh builds its `mv` line: the message used to say
+    # "Move-Item <the .AgentQ.backup directory> $RootDirectory", which the reader
+    # had to hand-edit -- in a refusing path, where a wrong edit destroys the
+    # queue.  Each path is quoted as ONE PowerShell literal (a `<dir>\<name>`
+    # path may contain spaces or an apostrophe), so the command pastes as-is.
+    $restoreCommands = ''
+    foreach ($leftover in $leftovers) {
+        if ($leftover.Kind -ne 'backup') {
+            continue
+        }
+        $restoreCommands += " Move-Item $(Convert-ToPowerShellSingleQuotedString -Value $leftover.Path) $(Convert-ToPowerShellSingleQuotedString -Value $RootDirectory);"
+    }
     $rootItem = Get-Item -LiteralPath $RootDirectory -Force -ErrorAction SilentlyContinue
     if ($null -eq $rootItem) {
-        throw "refusing to install: AgentQ root $RootDirectory is missing but a previous run's transaction residue exists ($leftoverPaths). A run crashed between moving the old root aside and installing the new one; the previous deployment (queue data, shared secret, certificates) is still in the .backup directory above. Restore it with: Move-Item <the .AgentQ.backup directory> $RootDirectory -- then restart the AgentQ daemon (the crashed run stopped it) and re-run; or remove it to confirm a fresh install. Inspect first with: Get-ChildItem -Force $ParentDirectory. Nothing was modified."
+        if ($restoreCommands -ne '') {
+            throw "refusing to install: AgentQ root $RootDirectory is missing but a previous run's transaction residue exists ($leftoverPaths). A run crashed between moving the old root aside and installing the new one; the previous deployment (queue data, shared secret, certificates) is still in the backup directory listed above. Restore it with:$restoreCommands then restart the AgentQ daemon (the crashed run stopped it) and re-run; or remove the residue to confirm a fresh install. Inspect first with: Get-ChildItem -Force $ParentDirectory. Nothing was modified."
+        }
+        throw "refusing to install: AgentQ root $RootDirectory is missing but a previous run's transaction residue exists ($leftoverPaths), and none of it is a backup directory that could be restored. Inspect it with: Get-ChildItem -Force $ParentDirectory -- then remove the residue to confirm a fresh install and re-run. Nothing was modified."
     }
-    throw "refusing to install: a previous run's transaction residue exists beside the AgentQ root ($leftoverPaths). Either an install crashed after the swap or another install is in progress; inspect these directories with: Get-ChildItem -Force $ParentDirectory -- then restore the .AgentQ.backup to $RootDirectory or remove it as intended, and re-run. Nothing was modified."
+    throw "refusing to install: a previous run's transaction residue exists beside the AgentQ root ($leftoverPaths). Either an install crashed after the swap or another install is in progress; inspect these directories with: Get-ChildItem -Force $ParentDirectory -- then restore the .backup to $RootDirectory or remove it as intended, and re-run. Nothing was modified."
 }
 
 function Get-ProcessIdentityState {

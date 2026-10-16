@@ -169,7 +169,10 @@ $tokens = $null
 $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($installerPath, [ref]$tokens, [ref]$errors)
 if ($errors.Count -gt 0) { [Console]::Error.WriteLine("installer did not parse"); exit 3 }
-$wanted = @("Find-AgentQCrashLeftovers", "Assert-NoCrashLeftoverTransactions")
+# Convert-ToPowerShellSingleQuotedString is extracted too: the refusal builds its
+# recovery command with the same helper the installer uses elsewhere, so the
+# extraction has to carry it or Invoke-Expression would fail on the call.
+$wanted = @("Find-AgentQCrashLeftovers", "Assert-NoCrashLeftoverTransactions", "Convert-ToPowerShellSingleQuotedString")
 $functions = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
 $source = [System.Text.StringBuilder]::new()
 foreach ($name in $wanted) {
@@ -197,11 +200,12 @@ function Expect-Refusal([string]$label, [string]$fragment) {
     try {
         Assert-NoCrashLeftoverTransactions -ParentDirectory $parent -RootName "AgentQ" -RootDirectory $root
     } catch {
-        if ($_.Exception.Message -notlike "refusing to install:*") {
-            [Console]::Error.WriteLine("W5 ${label}: threw, but not the controlled refusal: $($_.Exception.Message)"); exit 1
+        $script:refusalMessage = $_.Exception.Message
+        if ($script:refusalMessage -notlike "refusing to install:*") {
+            [Console]::Error.WriteLine("W5 ${label}: threw, but not the controlled refusal: $($script:refusalMessage)"); exit 1
         }
-        if ($_.Exception.Message -notlike "*$fragment*") {
-            [Console]::Error.WriteLine("W5 ${label}: refused for the wrong reason (wanted *$fragment*): $($_.Exception.Message)"); exit 1
+        if ($script:refusalMessage -notlike "*$fragment*") {
+            [Console]::Error.WriteLine("W5 ${label}: refused for the wrong reason (wanted *$fragment*): $($script:refusalMessage)"); exit 1
         }
         return
     }
@@ -225,19 +229,82 @@ Reset-Tree
 [System.IO.Directory]::CreateDirectory($root) | Out-Null
 Expect-Pass "clean-with-root"
 
-# 3. THE DEFECT: root missing, `.AgentQ.backup.1234` present -> refuse.
+# 3. THE DEFECT: root missing, a backup leftover present -> refuse.  The residue
+#    name carries an APOSTROPHE on purpose: pasteability is only proven when the
+#    quoting actually has to escape something.  Measured (mutation M4): with a
+#    plain name, `'a path'` built by string concatenation is byte-identical to the
+#    properly quoted one and passed every check below.
 Reset-Tree
-[System.IO.Directory]::CreateDirectory((Join-Path $parent ".AgentQ.backup.1234")) | Out-Null
+[System.IO.Directory]::CreateDirectory((Join-Path $parent ".AgentQ.backup.Smoke'AbC")) | Out-Null
 Expect-Refusal "missing-root-with-backup" "is missing but a previous run's transaction residue exists"
 # ...and the recovery guidance must name the daemon restart (a crashed run has
 # already stopped the daemon, so moving the backup back alone leaves the operator
 # stuck on the NEXT check).  Same measured reason as smoke/11.
 Expect-Refusal "missing-root-names-daemon-restart" "restart the AgentQ daemon"
 
-# 4. A stage leftover beside a missing root -> refuse.
+# 3b. The recovery command must WORK WHEN PASTED.  The message used to read
+#     "Move-Item <the .AgentQ.backup directory> $RootDirectory" -- the reader had
+#     to hand-edit a placeholder, in a refusing path where a wrong edit destroys
+#     the queue.  The POSIX twin got real commands built from the scanned paths
+#     in 0.1.13; this side still carried the placeholder (found 2026-10-16 in the
+#     parallel-implementation sweep that fix prompted).
+#     The oracle is the PowerShell PARSER, not a comparison against the
+#     installer's own quoting helper -- using the helper here would let a broken
+#     helper satisfy its own test.  The residue name carries an apostrophe, so a
+#     command assembled by naive concatenation parses to a DIFFERENT path.
+#     Measured (mutation M4): with an apostrophe-free name that command is
+#     byte-identical to the correct one and passes every check here.
+$realBackup = (Join-Path $parent ".AgentQ.backup.Smoke'AbC")
+if ($script:refusalMessage -like "*<*") {
+    [Console]::Error.WriteLine("W5 recovery-command: the refusal still contains an angle-bracket placeholder: $($script:refusalMessage)"); exit 1
+}
+$commandLabel = "Restore it with:"
+$commandStart = $script:refusalMessage.IndexOf($commandLabel)
+$commandEnd = $script:refusalMessage.IndexOf(" then restart the AgentQ daemon")
+if ($commandStart -lt 0 -or $commandEnd -lt $commandStart) {
+    [Console]::Error.WriteLine("W5 recovery-command: the refusal frames no restore command: $($script:refusalMessage)"); exit 1
+}
+$restoreCommand = $script:refusalMessage.Substring($commandStart + $commandLabel.Length, $commandEnd - $commandStart - $commandLabel.Length).Trim()
+$commandTokens = $null
+$commandErrors = $null
+$parsedCommand = [System.Management.Automation.Language.Parser]::ParseInput($restoreCommand, [ref]$commandTokens, [ref]$commandErrors)
+if ($commandErrors.Count -gt 0) {
+    [Console]::Error.WriteLine("W5 recovery-command: the restore command does not parse: $restoreCommand"); exit 1
+}
+$commandArguments = @($parsedCommand.FindAll({ param($node) $node -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { $_.Value })
+if ($commandArguments -notcontains $realBackup) {
+    [Console]::Error.WriteLine("W5 recovery-command: the restore command does not name the real residue path (parsed: $($commandArguments -join ' | ')): $restoreCommand"); exit 1
+}
+if ($commandArguments -notcontains $root) {
+    [Console]::Error.WriteLine("W5 recovery-command: the restore command does not name the AgentQ root (parsed: $($commandArguments -join ' | ')): $restoreCommand"); exit 1
+}
+# The present-root refusal carries the same real paths and had the sibling
+# "restore the .backup" wording with no command at all -- pin that it is
+# placeholder-free too.
+Reset-Tree
+[System.IO.Directory]::CreateDirectory($root) | Out-Null
+[System.IO.Directory]::CreateDirectory((Join-Path $parent ".AgentQ.backup.9012")) | Out-Null
+Expect-Refusal "present-root-has-no-placeholder" "exists beside the AgentQ root"
+if ($script:refusalMessage -like "*<*") {
+    [Console]::Error.WriteLine("W5 recovery-command: the present-root refusal contains an angle-bracket placeholder: $($script:refusalMessage)"); exit 1
+}
+
+# 4. A stage leftover beside a missing root -> refuse, and the guidance must say
+#    that NOTHING here is restorable: a `.stage` directory is the half-written
+#    NEW root, so offering a `Move-Item` for it would deploy a partial tree over
+#    a missing one.  Same two-way split as the POSIX twin; without this case the
+#    second branch is unreachable by any other assertion (mutation M3 proved it:
+#    the absence check did not fire until this case existed).
 Reset-Tree
 [System.IO.Directory]::CreateDirectory((Join-Path $parent ".AgentQ.stage.999")) | Out-Null
 Expect-Refusal "missing-root-with-stage" "is missing but a previous run's transaction residue exists"
+Expect-Refusal "missing-root-stage-not-restorable" "none of it is a backup directory that could be restored"
+if ($script:refusalMessage -like "*<*") {
+    [Console]::Error.WriteLine("W5 missing-root-with-stage: the refusal contains an angle-bracket placeholder: $($script:refusalMessage)"); exit 1
+}
+if ($script:refusalMessage.Contains("Move-Item")) {
+    [Console]::Error.WriteLine("W5 missing-root-with-stage: offers a restore command although the residue holds no backup: $($script:refusalMessage)"); exit 1
+}
 
 # 5. Residue beside a PRESENT root -> refuse too (crash after swap / concurrent).
 Reset-Tree
