@@ -19,7 +19,11 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-client="$root/skill/assets/client/windows/agentq.ps1"
+# The client path can be overridden (mirrors smoke/05's AGENTQ_SMOKE_CLIENT and
+# smoke/18's AGENTQ_SMOKE_SERVER) so a mutation proof can point this whole check
+# at a modified copy -- without the hook, red-proofing a source-level fix means
+# swapping the real asset under the check while it runs.
+client=${AGENTQ_SMOKE_PS_CLIENT:-$root/skill/assets/client/windows/agentq.ps1}
 # Windows PowerShell 5.1 does not accept a POSIX path for -File (pwsh 7.5
 # does), so when this check runs under it on a real Windows host the path has to
 # be handed over in Windows form.  `cygpath` exists only under Git Bash, so this
@@ -235,6 +239,19 @@ fi
 # value.
 authhint_probe='
 . "'"$client_arg"'" 2>$null
+# Hermetic state, set AFTER sourcing: without this the probe inherits whatever
+# the real user config and environment left behind.  Two independent vacuity
+# bugs lived here until 2026-10-16: (a) `$script:TargetHost` came from the real
+# ~/.config/agentq (or was empty, e.g. on CI), and the host assertion below was
+# `$text -notmatch [regex]::Escape("")`, which is ALWAYS false -- an empty
+# pattern matches everything, so "the hint names the host" was never actually
+# checked; (b) `$script:CredentialSource` came from the ambient
+# AGENTQ_ASKPASS/AGENTQ_PASSWORD, which picks the OTHER hint branch (the one
+# without the BatchMode sentence) and would fail the $has assertion on a
+# developer machine that exports one.  Both are pinned to literals now, and the
+# caller also passes AGENTQ_CONFIG pointing at a file that does not exist.
+$script:TargetHost = "authhint-target"
+$script:CredentialSource = ""
 $cases = @(
     @{ n = "permission";  v = "user@host: Permission denied (publickey,password,keyboard-interactive).`r`n"; want = $true },
     @{ n = "hostkey";     v = "Host key verification failed.`r`n";                                    want = $true },
@@ -259,8 +276,9 @@ foreach ($case in $cases) {
         $bad += 1
     }
     # The hint must name the host, or it does not tell the operator which key to
-    # install.
-    if ($case.want -and $text -notmatch [regex]::Escape([string]$script:TargetHost)) {
+    # install.  An empty pattern would make this pass unconditionally, so the
+    # host is asserted to be the literal set above, not merely "some string".
+    if ($case.want -and $text -notmatch [regex]::Escape($script:TargetHost)) {
         [Console]::Error.WriteLine("auth hint case $($case.n): hint does not name the target host")
         $bad += 1
     }
@@ -270,7 +288,9 @@ if ($bad -ne 0) { exit 1 }
 '
 cases=$((cases + 1))
 status=0
-"$pwsh_binary" -NoProfile -NonInteractive -Command "$authhint_probe" \
+env -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD -u AGENTQ_PASSWORD_PROMPT \
+    AGENTQ_CONFIG="$work/absent-config" \
+    "$pwsh_binary" -NoProfile -NonInteractive -Command "$authhint_probe" \
     >"$work/out" 2>"$work/err" || status=$?
 if [ "$status" -ne 0 ] || ! grep -qF 'auth hint cases ok' "$work/out"; then
     printf '%s\n' 'ps-client: the authentication hint is missing or misfires' >&2
@@ -486,6 +506,12 @@ fi
 # exit inside a dot-sourced script ends the whole script -- a try/catch cannot
 # see it, so an in-process probe would report success for a refusal that never
 # happened.
+#
+# `status=0` before the call: without the reset the check below reads whatever
+# the PREVIOUS case left behind when this command exits 0 (the `|| status=$?`
+# only fires on failure), so a vanished refusal could pass on a stale 2.  This
+# was the one pwsh case in the file without the reset (2026-10-16).
+status=0
 AGENTQ_PASSWORD=secret AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
     "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
     >"$work/out" 2>"$work/err" || status=$?
@@ -563,16 +589,43 @@ done
 
 # The other direction: a well-formed single path must PASS the guard.  Without
 # this, a guard that refuses everything would satisfy every case above.  The
-# client is pointed at a host that cannot resolve, so it must get past the
-# credential check and fail later -- the assertion is that the failure is NOT a
-# credential refusal.  (Mutation-tested: making the guard unconditional left the
-# earlier cases green, which is why this one exists.)
+# client is pointed at a stub ssh that records its invocation and exits 255
+# (transport failure): reaching the stub at all PROVES the credential guard let
+# the value through.  The assertion is positive -- the stub must have been
+# CALLED -- not merely that two refusal messages are absent: until 2026-10-16
+# this case only checked stderr for the refusals, so a client that died before
+# the guard (e.g. an unresolvable cache directory, or a probe failure that
+# exits 2 with a different message) passed green while exercising nothing.
+# The recorded call count and the forced `AGENTQ_REMOTE_PLATFORM=unix` are what
+# turn "no refusal text" into "the guard was really consulted and passed".
 #
 # Two well-formed shapes, and the second one is the reason this matters: a path
 # containing a SPACE is legal, because ssh executes the whole value as a single
 # file name and never splits it.  "C:\Program Files\..." is the everyday case.
 # An earlier revision rejected any value containing a space, which refused such
 # paths outright -- so both are asserted.
+askpass_ssh_dir="$work/askpass-ssh"
+mkdir -p "$askpass_ssh_dir"
+if [ "$client_arg" != "$client" ]; then
+    askpass_ssh_stub="$askpass_ssh_dir/ssh.cmd"
+    printf '%s\r\n' \
+        '@echo off' \
+        'echo called>>"%AQ_SSH_CALLS%"' \
+        'exit /b 255' > "$askpass_ssh_stub"
+    askpass_ssh_arg=$(cygpath -w "$askpass_ssh_stub")
+    askpass_calls_arg=$(cygpath -w "$work/askpass-ssh.calls")
+else
+    askpass_ssh_stub="$askpass_ssh_dir/ssh"
+    cat > "$askpass_ssh_stub" <<'STUB'
+#!/bin/sh
+cat > /dev/null 2>&1 || true
+printf 'called\n' >> "$AQ_SSH_CALLS"
+exit 255
+STUB
+    chmod 700 "$askpass_ssh_stub"
+    askpass_ssh_arg="$askpass_ssh_stub"
+    askpass_calls_arg="$work/askpass-ssh.calls"
+fi
 for shape in 'plain' 'space'; do
     cases=$((cases + 1))
     status=0
@@ -584,12 +637,20 @@ for shape in 'plain' 'space'; do
     fi
     printf '#!/bin/sh\nprintf "%%s\\n" "x"\n' > "$real_askpass"
     chmod 700 "$real_askpass"
-    AGENTQ_ASKPASS="$real_askpass" AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+    : > "$askpass_calls_arg"
+    AGENTQ_SSH="$askpass_ssh_arg" AGENTQ_REMOTE_PLATFORM=unix \
+        AQ_SSH_CALLS="$askpass_calls_arg" \
+        AGENTQ_ASKPASS="$real_askpass" AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
         "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
         >"$work/out" 2>"$work/err" || status=$?
     if grep -qF 'must be a single executable path' "$work/err" ||
        grep -qF 'is not a regular non-reparse file' "$work/err"; then
         printf 'ps-client: a well-formed AGENTQ_ASKPASS (%s) was refused by the credential guard\n' "$shape" >&2
+        head -3 "$work/err" >&2 || true
+        failures=$((failures + 1))
+    elif [ ! -s "$askpass_calls_arg" ]; then
+        printf 'ps-client: a well-formed AGENTQ_ASKPASS (%s) never reached ssh -- the client stopped before or at the credential guard (exit %s)\n' \
+            "$shape" "${status:-0}" >&2
         head -3 "$work/err" >&2 || true
         failures=$((failures + 1))
     fi
@@ -1027,11 +1088,28 @@ fi
 # repo keeps hitting, so both are pinned here.
 cases=$((cases + 1))
 # (the ps1 path is the existing $client)
-if ! grep -q "agentq-exit:(\\\\d{1,3})" "$client"; then
-    printf '%s\n' 'ps-client-contract: the probe-path exit-token reader does not bound its digit run to {1,3}' >&2
+# EVERY reader of the out-of-band token must bound its digit run, not merely one
+# of them.  Until 2026-10-16 this was a single `grep -q "agentq-exit:(\\d{1,3})"`
+# -- "at least one occurrence exists" -- so deleting the probe-path reader
+# (Resolve-ProbeExitToken) left the lock green as long as the two operation-path
+# readers remained, and a new UNBOUNDED reader elsewhere was invisible.  The
+# invariant is per-reader: a reader is a `[regex]::Matches` call that reads the
+# token, and each one must carry `\d{1,3}`.  The count is pinned so a reader
+# cannot be deleted unnoticed either (a raw `grep -c` over the whole file would
+# count COMMENT mentions too -- there are two -- so the count is taken over
+# reader lines only).
+exit_readers=$(grep -F '[regex]::Matches' "$client" | grep -cF 'agentq-exit:' || true)
+exit_readers_bounded=$(grep -F '[regex]::Matches' "$client" | grep -cF 'agentq-exit:(\d{1,3})' || true)
+if [ "$exit_readers" -ne 3 ]; then
+    printf 'ps-client-contract: expected 3 exit-token readers, found %s\n' "$exit_readers" >&2
     failures=$((failures + 1))
 fi
-if grep -q "agentq-exit:(\\\\d+)" "$client"; then
+if [ "$exit_readers_bounded" -ne "$exit_readers" ]; then
+    printf 'ps-client-contract: %s of %s exit-token readers bound their digit run to {1,3}\n' \
+        "$exit_readers_bounded" "$exit_readers" >&2
+    failures=$((failures + 1))
+fi
+if grep -qF 'agentq-exit:(\d+)' "$client"; then
     printf '%s\n' 'ps-client-contract: an unbounded \d+ exit-token reader is present; a huge token would crash the [int] cast' >&2
     failures=$((failures + 1))
 fi
@@ -1066,10 +1144,20 @@ $batchTwoJson = "[{`"task_id`":3,`"removed`":true},{`"task_id`":4,`"removed`":fa
 $cases = @(
     @{ n = "summary-ok";      op = "status_summary"; v = $summaryJson; id = ""; want = $true },
     @{ n = "summary-marker";  op = "status_summary"; v = $fullJson;    id = ""; want = $false },
+    # The plain `status` (full decorated map) arm was not exercised at all here.
+    @{ n = "status-full-ok";  op = "status";         v = $fullJson;    id = ""; want = $true },
     @{ n = "task-ok";         op = "status_task";    v = $taskJson;    id = "3"; want = $true },
     @{ n = "task-id-mismatch"; op = "status_task";   v = $taskJson;    id = "9"; want = $false },
     @{ n = "doctor-full-ok";  op = "doctor_full";    v = $fullJson;    id = ""; want = $true },
     @{ n = "doctor-summary-ok"; op = "doctor";       v = $summaryJson; id = ""; want = $true },
+    # The doctor directions are BOTH ways, not just the accept: doctor must
+    # reject the full body.  Without that negative, folding `{doctor,
+    # doctor_full}` into the single `status` arm -- which accepts either shape,
+    # measured 2026-10-16 -- kept every case above green.  (The reverse
+    # negative, doctor_full rejecting a summary body, is NOT asserted because
+    # it is not true: Test-JsonTaskMap accepts the summary map, and asserting
+    # it would pin a behaviour the client does not have.)
+    @{ n = "doctor-rejects-full"; op = "doctor"; v = $fullJson; id = ""; want = $false },
     @{ n = "batch-empty";     op = "remove_batch";   v = $batchEmptyJson; id = ""; want = $true },
     @{ n = "batch-one";       op = "remove_batch";   v = $batchOneJson;   id = ""; want = $true },
     @{ n = "batch-two";       op = "remove_batch";   v = $batchTwoJson;   id = ""; want = $true },
@@ -1105,10 +1193,13 @@ grep -q -- '--full' "$client" || { printf '%s\n' 'ps-client: missing doctor --fu
 grep -q -- '--summary' "$client" || { printf '%s\n' 'ps-client: missing status --summary' >&2; mode_static_failures=$((mode_static_failures + 1)); }
 failures=$((failures + mode_static_failures))
 
-printf 'ps-client-contract checks passed: cases=%s pwsh=%s ps51=%s reason=forwarded/injection-safe modes=validated\n' \
-    "$cases" "$ps_version" "$ps51_state"
-
+# The success line is printed only AFTER the failure gate: until 2026-10-16 it
+# came first, so a red run printed "checks passed: cases=..." and then the
+# failures on stderr -- a tail of stdout alone read as a green summary.
 if [ "$failures" -ne 0 ]; then
     printf 'ps-client-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
+
+printf 'ps-client-contract checks passed: cases=%s pwsh=%s ps51=%s reason=forwarded/injection-safe modes=validated\n' \
+    "$cases" "$ps_version" "$ps51_state"

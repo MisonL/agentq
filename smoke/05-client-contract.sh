@@ -302,8 +302,20 @@ failures=$((failures + static_failures))
 # actually travelled on the remote command.  The pair is what makes these
 # non-vacuous: an empty response would fail the exit code, and a client that
 # dropped the flag would fail the fragment check.
+# expect_mode_ok <expected-raw-args> <label> [args...]
+#
+# `expected-raw-args` is the EXACT quoted argument list that must follow the
+# final `agentq_run ` in the raw remote command -- not a substring.  Until
+# 2026-10-16 this was a `grep -qF` substring test, and `agentq_run status` is a
+# substring of `agentq_run status --summary`, so a bare `status` that wrongly
+# appended `--summary` passed every mode case here (and smoke/12's
+# `grep -q -- '--summary'`).  The comparison is on the RAW argv the client handed
+# to ssh -- the last line of `modes.argv` -- because the stub's `tr -d "'"`
+# de-quoting is NOT the inverse of the client's `quote_remote` (`'\''`) and
+# would corrupt any argument carrying a single quote; the raw string has no
+# such ambiguity.
 expect_mode_ok() {
-    local fragment=$1
+    local expected=$1
     local label=$2
     shift 2
     cases=$((cases + 1))
@@ -319,19 +331,22 @@ expect_mode_ok() {
         failures=$((failures + 1))
         return
     fi
-    if ! grep -qF -- "$fragment" "$work/modes.argv.cmd"; then
-        printf 'client %s: the remote command did not carry %s; command was: %s\n' \
-            "$label" "$fragment" "$(tr '\n' '|' < "$work/modes.argv.cmd")" >&2
+    local invocation
+    invocation=$(tail -n 1 "$work/modes.argv")
+    invocation=${invocation##*agentq_run }
+    if [ "$invocation" != "$expected" ]; then
+        printf 'client %s: the remote invocation was %s, expected %s\n' \
+            "$label" "$invocation" "$expected" >&2
         failures=$((failures + 1))
     fi
 }
-expect_mode_ok 'agentq_run status' status status
-expect_mode_ok 'agentq_run status --summary' status-summary status --summary
-expect_mode_ok 'agentq_run status --task 3' status-task status --task 3
-expect_mode_ok 'agentq_run doctor' doctor doctor
-expect_mode_ok 'agentq_run doctor --full' doctor-full doctor --full
-expect_mode_ok 'agentq_run remove --label smoke --confirm' remove-label remove --label smoke --confirm
-expect_mode_ok 'agentq_run wait' wait-plain wait 3
+expect_mode_ok "'status'"                               status        status
+expect_mode_ok "'status' '--summary'"                   status-summary status --summary
+expect_mode_ok "'status' '--task' '3'"                  status-task   status --task 3
+expect_mode_ok "'doctor'"                               doctor        doctor
+expect_mode_ok "'doctor' '--full'"                      doctor-full   doctor --full
+expect_mode_ok "'remove' '--label' 'smoke' '--confirm'" remove-label  remove --label smoke --confirm
+expect_mode_ok "'wait' '3'"                             wait-plain    wait 3
 
 # wait --timeout: the budget is CLIENT-side, and two things must hold at once.
 # Neither was checked before 2026-10-16, which is how both halves of this

@@ -36,10 +36,62 @@ done
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/agentq-smoke-protocol.XXXXXX")
 work=$(unset CDPATH; cd -- "$work" && pwd -P)
-trap 'rm -rf -- "$work"' EXIT
 
 server="$runtime_home/agentq-server"
 request_id="smoke-$$-$(date -u '+%Y%m%dT%H%M%SZ')"
+
+# Every task this check creates is tidied on EXIT, so a failure in the middle of
+# a case cannot leave a live request record behind.  The batch block was the case
+# that made this necessary (2026-10-16): it used to remove its two tasks only as
+# its LAST assertion, so any earlier failure exited 1 with both tasks and both
+# records still in the runtime -- and because Pueue reuses numeric task ids, the
+# next run could then see two active records sharing one id and get a genuine
+# "ambiguous AgentQ identity" failure, blaming the protocol for this check's
+# residue.
+#
+# The trap is composed with the temp-dir removal rather than replacing it, and
+# both functions it calls are defined before the first task can exist.
+#
+# The trap covers EVERY task this check creates, not just the batch pair: the
+# first submit, the failing task, the binary-log task, the queued-cancel victim
+# and the ambiguous-identity task all register here too (the 2026-10-16 fix
+# registered only the batch pair, which is the same defect one case narrower).
+# The `cancel_cleanup_ids` list is tidied by the explicit loop below, which runs
+# only on the success path -- the trap is the backstop for the failure path.
+#
+# A/B proof that the trap is load-bearing (2026-10-16, sandbox runtime): the
+# same injected mid-block failure, run twice -- with the trap the runtime is left
+# with 0 request records; with the trap registration removed it is left with the
+# batch pair's 2 records.  The residue is not cosmetic: Pueue reuses numeric task
+# ids, so the next run can see two active records sharing one id and get a
+# genuine "ambiguous AgentQ identity" failure, blaming the protocol for this
+# check's residue.
+request_record_directory="$runtime_home/data/agentq-requests"
+record_still_active() {
+    [ -d "$request_record_directory" ] || return 1
+    # `-s ... any(...)`: with several files, plain `-e` keys its exit status off
+    # the LAST file only, so a match in an earlier record would be missed.
+    jq -e -s --argjson id "$1" 'any(.[]; .task_id == $id)' "$request_record_directory"/*.json >/dev/null 2>&1
+}
+cleanup_task_ids=''
+cleanup_registered_tasks() {
+    local id
+    # Land anything still alive in a terminal state first: Pueue refuses to
+    # remove a Running task instantly, so a remove-only loop would spin for its
+    # whole budget (see the cancel-case cleanup comment below).
+    for id in $cleanup_task_ids; do
+        "$server" cancel "$id" >/dev/null 2>&1 || true
+        "$server" remove "$id" >/dev/null 2>&1 || true
+    done
+    for id in $cleanup_task_ids; do
+        for _ in $(seq 1 20); do
+            record_still_active "$id" || break
+            "$server" remove "$id" >/dev/null 2>&1 || true
+            sleep 0.5
+        done
+    done
+}
+trap 'cleanup_registered_tasks || true; rm -rf -- "$work"' EXIT
 
 # The two instance-binding fixtures below plant files into the runtime's data
 # directories.  Their paths are declared here, before any protocol work, so a
@@ -76,6 +128,7 @@ task_id=$(jq -er '.task_id' <<<"$submit_output") || {
     printf 'submit returned no task_id: %s\n' "$submit_output" >&2
     exit 1
 }
+cleanup_task_ids="$cleanup_task_ids $task_id"
 
 # lookup must find the same task
 lookup_output=$("$server" lookup "$request_id") || {
@@ -127,6 +180,7 @@ failure_task_id=$(jq -er '.task_id' <<<"$failure_submit") || {
     printf 'failing submit returned no task_id: %s\n' "$failure_submit" >&2
     exit 1
 }
+cleanup_task_ids="$cleanup_task_ids $failure_task_id"
 failure_status=0
 failure_output=$("$server" wait "$failure_task_id") || failure_status=$?
 if [ "$failure_status" -eq 0 ]; then
@@ -311,6 +365,7 @@ binary_task_id=$(jq -er '.task_id' <<<"$binary_submit") || {
     exit 1
 }
 cancel_cleanup_ids="$cancel_cleanup_ids $binary_task_id"
+cleanup_task_ids="$cleanup_task_ids $binary_task_id"
 binary_wait_status=0
 "$server" wait "$binary_task_id" >/dev/null 2>&1 || binary_wait_status=$?
 if [ "$binary_wait_status" -ne 0 ]; then
@@ -391,6 +446,7 @@ victim_task_id=$(jq -er '.task_id' <<<"$victim_submit") || {
     exit 1
 }
 cancel_cleanup_ids="$cancel_cleanup_ids $victim_task_id"
+cleanup_task_ids="$cleanup_task_ids $victim_task_id"
 
 victim_queued=0
 for _ in $(seq 1 20); do
@@ -603,14 +659,8 @@ jq -e '.state == "removed"' <<<"$queued_lookup" >/dev/null || {
 # not "remove exited 0": the victim is already removed, so `remove` on it exits
 # 2, which is equally clean.  Checking the records themselves also means a
 # server that wrongly reports success cannot fake the cleanup.
-request_record_directory="$runtime_home/data/agentq-requests"
-record_still_active() {
-    [ -d "$request_record_directory" ] || return 1
-    # `-s ... any(...)`: with several files, plain `-e` keys its exit status off
-    # the LAST file only, so a match in an earlier record would be missed.
-    jq -e -s --argjson id "$1" 'any(.[]; .task_id == $id)' "$request_record_directory"/*.json >/dev/null 2>&1
-}
-
+# (`request_record_directory` and `record_still_active` are defined at the top,
+# next to the EXIT trap that also uses them -- one definition, two callers.)
 cleanup_remaining=''
 for id in $cancel_cleanup_ids; do
     "$server" cancel "$id" >/dev/null 2>&1 || true
@@ -759,6 +809,10 @@ if record_still_active "$ambiguous_task_id"; then
     printf 'cleanup left an active request record for ambiguous task %s\n' "$ambiguous_task_id" >&2
     exit 1
 fi
+# Registered for the EXIT trap as well: the assertion above runs only on the
+# success path, and a failure between here and the end of the script would
+# otherwise leave this record behind.
+cleanup_task_ids="$cleanup_task_ids $ambiguous_task_id"
 
 # ---------------------------------------------------------------------------
 # The compact views (0.1.11): status --summary, status --task <id>, and
@@ -778,6 +832,10 @@ for suffix in a b; do
         printf 'batch-roundtrip submit returned no task_id: %s\n' "$submit_json" >&2
         exit 1
     }
+    # Registered for the EXIT trap: every assertion below this point can fail,
+    # and until 2026-10-16 a failure here left both tasks and both request
+    # records in the runtime (the block removed them only as its last step).
+    cleanup_task_ids="$cleanup_task_ids $tid"
     "$server" wait "$tid" >/dev/null || {
         printf 'batch-roundtrip wait for task %s failed\n' "$tid" >&2
         exit 1
@@ -816,12 +874,53 @@ jq -e --argjson id "$batch_a_id" '.task.id == $id and (.task.status.Done.result 
 }
 
 # doctor's default queue section is the same summary; --full keeps the map.
-"$server" doctor 2>/dev/null | jq -e '.summary == true and (.tasks | type == "object")' >/dev/null || {
-    printf '%s\n' 'doctor default did not answer with the summary shape' >&2
+# Both are asserted against the batch tasks this block just created.  Until
+# 2026-10-16 the first assertion only required `summary == true and tasks is an
+# object`, which `{"summary":true,"tasks":{}}` satisfies, and the second only
+# required that --full's summary marker is absent -- so a doctor answering an
+# EMPTY summary, or one whose queue section had lost every task, stayed green.
+# Both also sent stderr to /dev/null, hiding doctor's own failure diagnostics;
+# stderr is captured now and the version lines are re-asserted, because the
+# shape switch is exactly the kind of change that can drop them.
+doctor_default_status=0
+doctor_default_out=$("$server" doctor 2>"$work/doctor-shape.err") || doctor_default_status=$?
+if [ "$doctor_default_status" -ne 0 ]; then
+    printf 'doctor (summary shape) exited %s: %s\n' \
+        "$doctor_default_status" "$(head -1 "$work/doctor-shape.err")" >&2
+    exit 1
+fi
+jq -e --argjson a "$batch_a_id" --argjson b "$batch_b_id" '
+    .summary == true
+    and (.tasks | type == "object")
+    and (.tasks[($a|tostring)].id == $a)
+    and (.tasks[($a|tostring)].state == "Done")
+    and (.tasks[($b|tostring)].id == $b)
+' <<<"$doctor_default_out" >/dev/null || {
+    printf 'doctor default did not answer the batch tasks in the summary shape: %s\n' \
+        "$(head -c 200 <<<"$doctor_default_out")" >&2
     exit 1
 }
-"$server" doctor --full 2>/dev/null | jq -e '(.summary == null or .summary == false) and (.tasks | type == "object")' >/dev/null 2>&1 || {
-    printf '%s\n' 'doctor --full did not answer with the full map' >&2
+grep -q '^pueue=' "$work/doctor-shape.err" || {
+    printf 'doctor (summary shape) dropped its version lines: %s\n' \
+        "$(head -c 200 "$work/doctor-shape.err")" >&2
+    exit 1
+}
+
+doctor_full_status=0
+doctor_full_out=$("$server" doctor --full 2>"$work/doctor-full.err") || doctor_full_status=$?
+if [ "$doctor_full_status" -ne 0 ]; then
+    printf 'doctor --full exited %s: %s\n' \
+        "$doctor_full_status" "$(head -1 "$work/doctor-full.err")" >&2
+    exit 1
+fi
+jq -e --argjson a "$batch_a_id" '
+    (.summary == null or .summary == false)
+    and (.tasks | type == "object")
+    and (.tasks[($a|tostring)].id == $a)
+    and (.tasks[($a|tostring)].status.Done.result == "Success")
+' <<<"$doctor_full_out" >/dev/null || {
+    printf 'doctor --full did not answer the decorated map for the batch task: %s\n' \
+        "$(head -c 200 <<<"$doctor_full_out")" >&2
     exit 1
 }
 

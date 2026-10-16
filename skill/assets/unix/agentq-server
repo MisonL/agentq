@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.12'
+agentq_version='0.1.13'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -1811,7 +1811,17 @@ acquire_operation_lock() {
         current_epoch=$(date +%s) || current_epoch=''
         case "$lock_mtime$current_epoch" in
             *[!0-9]*) ;;
-            *) lock_holder_age=$((current_epoch - lock_mtime)) ;;
+            *)
+                # Clamp at zero.  A negative age (the lock directory's mtime is
+                # in the FUTURE -- clock skew, or an NFS/VM clock correction)
+                # would print `lock age -3s`, which reads as nonsense to the
+                # operator this line exists for and could be mistaken for a
+                # sentinel.  `0s` is the honest answer: "just now, by this
+                # clock".  Measured 2026-10-16: with only the arithmetic, a
+                # future mtime printed a negative age.
+                lock_holder_age=$((current_epoch - lock_mtime))
+                [ "$lock_holder_age" -ge 0 ] || lock_holder_age=0
+                ;;
         esac
     fi
     operation_lock_message="AgentQ operation is already in progress: $candidate"
@@ -2560,7 +2570,13 @@ def valid_request:
   else . end
 | [ range(0; length) as $index
     | .[$index] as $record
-    | if ($record | valid_record($request_ids[$index])) then $record
+    # `null` is the placeholder the producer emits for a record that vanished
+    # between the glob and the read (see load_request_records).  It is dropped
+    # here, AFTER the positional binding, so a skip cannot shift a later record
+    # onto the id of the record before it.  `null` can never be a real record:
+    # the binding below rejects it, which is what made a bare `continue` fatal.
+    | if $record == null then empty
+      elif ($record | valid_record($request_ids[$index])) then $record
       else error("invalid AgentQ request record")
       end ]
 | if all(.[]; valid_request) then . else error("invalid AgentQ request record") end
@@ -2611,7 +2627,19 @@ load_request_records() {
         # lock-holding command with a transient protocol_error (measured
         # 2026-10-13, review round 4).  A file that EXISTS but fails the guard
         # below is still fatal.
-        [ -e "$record_path" ] || continue
+        #
+        # The skip MUST emit a placeholder.  `record_ids` is collected in the
+        # parent shell from the same glob, and the aggregate jq binds ids to
+        # records POSITIONALLY, so a bare `continue` shifts every later record
+        # onto its predecessor's id: the binding check then rejects the pair and
+        # the whole load errors out.  Measured 2026-10-16 with a deterministic
+        # window: `status` printed `jq: error (at <stdin>:1): invalid AgentQ
+        # request record` on stderr and lost the vanished task's label
+        # decoration, and `recover_removing_requests` swallowed the failure
+        # (its `records=$(load_request_records)` has no guard), so the command
+        # still exited 0.  A `null` keeps one JSON value per glob entry, so the
+        # alignment survives any skip and the filter drops the placeholder.
+        [ -e "$record_path" ] || { printf 'null\n'; continue; }
         [ -d "$record_parent" ] && [ ! -L "$record_parent" ] ||
             fail "invalid AgentQ request record path: $record_path"
         [ -f "$record_path" ] && [ ! -L "$record_path" ] ||
@@ -3727,7 +3755,15 @@ recover_removing_requests() {
     local request_id
     local reconcile_status
 
-    records=$(load_request_records)
+    # `|| return $?` is load-bearing, and its absence was measured: this
+    # function is called as `recover_removing_requests || fail ...`, a
+    # CONDITIONAL context where `set -e` is suspended, so a bare `$( )` whose
+    # command failed left `records` empty and the function returned 0 -- the
+    # caller saw success.  Measured 2026-10-16: with a record vanishing mid-scan,
+    # `load_request_records` wrote `jq: error ... invalid AgentQ request record`
+    # to stderr while `status` still exited 0 and lost a task's label
+    # decoration.  Same fail-open shape as the batch-removal snapshot guard.
+    records=$(load_request_records) || return $?
     # The request id and the record's own serialisation are emitted together,
     # one pair of lines per removing record, so the second jq invocation the
     # original ran per record disappears.  `tojson` is byte-identical to the
@@ -5474,7 +5510,14 @@ doctor_with_read_lock() {
 }
 
 doctor_with_operation_lock() {
-    with_operation_lock doctor
+    # The locked twin of doctor_with_read_lock.  `"$@"` is forwarded for the
+    # same reason the read-lock twin does it: doctor takes `--full`, and a
+    # wrapper that swallowed it would silently answer the DEFAULT (summary)
+    # shape to a caller that asked for the full one -- a wrong-shaped success,
+    # which is exactly the class of defect this round fixed in the dispatch
+    # arm.  No caller today, but the omission was a live trap for the first
+    # one.
+    with_operation_lock doctor "$@"
 }
 
 # Replaying a cancel whose task has already left Pueue.
@@ -5720,6 +5763,7 @@ remove_tasks_by_label() {
     local item_id
     local item_output
     local item_status
+    local item_failure_entry
     local result_lines=''
     local removed_count=0
     local failed_count=0
@@ -5752,7 +5796,15 @@ remove_tasks_by_label() {
             result_lines="$result_lines$item_output"$'\n'
             removed_count=$((removed_count + 1))
         else
-            result_lines="$result_lines$(jq -cn --argjson task_id "$item_id" '{task_id: $task_id, removed: false, state: "failed"}')"$'\n'
+            # The guard sits OUTSIDE the `$( )`: a `|| fail` inside it would only
+            # end the substitution subshell, leaving `result_lines` unchanged
+            # and the batch reporting one fewer entry with exit 0 -- the
+            # fail-open this repository has measured twice (2026-10-06).  Every
+            # other `$( )` in this function carries its guard this way; this one
+            # carried none.
+            item_failure_entry=$(jq -cn --argjson task_id "$item_id" '{task_id: $task_id, removed: false, state: "failed"}') ||
+                fail 'cannot render an AgentQ batch removal failure entry'
+            result_lines="$result_lines$item_failure_entry"$'\n'
             failed_count=$((failed_count + 1))
         fi
     done <<<"$label_ids"

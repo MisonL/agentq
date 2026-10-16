@@ -113,8 +113,11 @@ STUB
         failures=$((failures + 1))
         return
     fi
-    if ! grep -q 'reason=protocol_error' "$work/bad.$op.err"; then
-        printf 'a malformed Pueue status made `%s` exit 2 without reason=protocol_error\n' "$op" >&2
+    # Anchored exactly like expect_rejected above: an unanchored grep would
+    # also match a reason line embedded in some longer message, and the
+    # contract is a LINE `agentq-server: reason=<class>` at the end of stderr.
+    if ! grep -qxF -- 'agentq-server: reason=protocol_error' "$work/bad.$op.err"; then
+        printf 'a malformed Pueue status made `%s` exit 2 without a reason=protocol_error line\n' "$op" >&2
         head -3 "$work/bad.$op.err" >&2 || true
         failures=$((failures + 1))
     fi

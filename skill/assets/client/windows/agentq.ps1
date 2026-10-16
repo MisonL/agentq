@@ -152,7 +152,7 @@ $script:PlatformProbeTimeout = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLA
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.12"
+$script:ClientVersion = "0.1.13"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's argv limit, not this machine's platform: a unix
 # target takes up to 100000 base64 characters (the POSIX twin's MAX_ARG_STRLEN
@@ -2964,7 +2964,16 @@ switch ($operation) {
                 Stop-AgentQ ("the script is too large for --stdin-script (base64 length " + $scriptBase64.Length +
                     " exceeds $stdinScriptLimit on this target); stage it as a file and submit a command that reads it")
             }
-            $commandArguments = @("sh", "-c", "printf %s $scriptBase64 | base64 -d | sh")
+            # The decode pipeline's LAST stage is `sh`, so on a target
+            # without `base64` the `base64 -d` stage dies, `sh` reads empty
+            # input and exits 0, and the task lands in Done/Success having
+            # executed NOTHING -- a fail-open, because the client's own
+            # `command -v base64` check runs on the LOCAL machine.  The guard
+            # must therefore be on the TARGET and BEFORE the pipeline: a
+            # pipeline's status is its last command's, so a check appended
+            # after it would never fire.  Same shape as the POSIX twin's
+            # `--stdin-script` arm (smoke/05 and smoke/12 lock both).
+            $commandArguments = @("sh", "-c", "command -v base64 >/dev/null 2>&1 || { echo 'agentq: --stdin-script requires base64 on the target' >&2; exit 2; }; printf %s $scriptBase64 | base64 -d | sh")
         } else {
             $commandArguments = @($arguments[$commandStart..($arguments.Count - 1)])
         }

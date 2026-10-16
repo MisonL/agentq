@@ -78,6 +78,11 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+# The installer paths can be overridden (mirrors smoke/05's AGENTQ_SMOKE_CLIENT
+# and smoke/12's AGENTQ_SMOKE_PS_CLIENT) so a mutation proof can point the rule
+# scan at a modified copy -- without the hook, red-proofing a source-level fix
+# means swapping the real asset under the check while it runs.
+AGENTQ_SMOKE_INSTALLER_DIR=${AGENTQ_SMOKE_INSTALLER_DIR:-$root/skill/assets}
 
 failures=0
 rules_checked=0
@@ -360,7 +365,7 @@ fi
 # Scope: the two POSIX installers only.  The Windows installers replace files
 # through .NET APIs (Move-Item / File.Replace) inside an ACL'd transaction, so
 # the shell idiom does not apply there and asserting it would be a false rule.
-posix_installers="$root/skill/assets/client/unix/install-client.sh $root/skill/assets/unix/install-agentq.sh"
+posix_installers="$AGENTQ_SMOKE_INSTALLER_DIR/client/unix/install-client.sh $AGENTQ_SMOKE_INSTALLER_DIR/unix/install-agentq.sh"
 for posix_installer in $posix_installers; do
     [ -f "$posix_installer" ] || {
         printf 'installer-invariants: missing %s\n' "${posix_installer#"$root"/}" >&2
@@ -377,13 +382,28 @@ for posix_installer in $posix_installers; do
         [ -n "$mv_line" ] || continue
         # A bare `mv` mentioned inside a required-command list is not a move.
         case "$mv_text" in *required_command*) continue ;; esac
-        # A `mv` inside a double-quoted *message string* is guidance text for a
-        # human (measured 2026-10-15: the residue-refusal message tells the user
-        # `Restore it with: mv <the .backup directory> $agentq_home`), not an
-        # executed move.  Real moves in this file all take real arguments --
-        # quoted variable expansions or `--` -- never a `<` placeholder.
-        case "$mv_text" in
-            *'mv <'*|*'mv -f <'*) continue ;;
+        # A `mv` inside an OPEN double-quoted string is guidance text for a
+        # human, not an executed move.  Two generations of that text exist here:
+        # until 2026-10-16 the residue-refusal message said `Restore it with:
+        # mv <the .backup directory> $agentq_home`, and the fix that made it
+        # pasteable builds the command from the real path at runtime
+        # (`crash_restore_commands="... mv $(quote_shell_word ...)"`).  The old
+        # exclusion keyed on the literal `mv <` placeholder -- exactly the thing
+        # the fix removes -- so it was replaced by the structural property that
+        # holds for BOTH generations: in every real move site in these files the
+        # `mv` token sits OUTSIDE any quoting, and in every text mention it sits
+        # inside an opened double-quoted string.  Quote parity before the token
+        # is that test; a site with an even (or zero) count is treated as real,
+        # so the rule still fails closed on any shape this classifier does not
+        # recognise as text.
+        mv_quote_prefix=${mv_text%%mv*}
+        case "$mv_quote_prefix" in
+            *'"'*)
+                mv_quote_count=${mv_quote_prefix//[!\"]/}
+                if [ $(( ${#mv_quote_count} % 2 )) -eq 1 ]; then
+                    continue
+                fi
+                ;;
         esac
         # `end` must be the FIRST `^}` after the move -- the enclosing
         # function's closing brace.  My first version kept overwriting `end`
