@@ -4,7 +4,7 @@ set -eu
 
 program=${0##*/}
 release_version='4.0.4'
-agentq_version='0.1.12'
+agentq_version='0.1.13'
 asset_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 agentq_home=${AGENTQ_HOME:-"$HOME/.agentq"}
 artifact_source_directory=${AGENTQ_PUEUE_SOURCE_DIR:-}
@@ -99,6 +99,17 @@ is_positive_integer() {
         ''|*[!0-9]*|0) return 1 ;;
         *) return 0 ;;
     esac
+}
+
+quote_shell_word() {
+    # Single-quote a word for a PASTEABLE command line.  The only character a
+    # single-quoted POSIX word cannot hold is the single quote itself, so it is
+    # closed, escaped and reopened -- the same shape the POSIX client's
+    # quote_remote uses.  Guidance text is printed through this so that a line
+    # the operator copies out of a failure message actually runs.
+    printf "'"
+    printf '%s' "$1" | sed "s/'/'\\\\''/g"
+    printf "'"
 }
 
 process_identity_state() {
@@ -469,8 +480,31 @@ $crash_matches"
     fi
     [ -n "$crash_leftovers" ] || return 0
     crash_leftover_list=$(printf '%s\n' "$crash_leftovers" | tr '\n' ' ')
+    # The restore guidance is built from the REAL residue paths and printed
+    # through quote_shell_word, so the operator can paste it.  Until 2026-10-16
+    # it read `Restore it with: mv <the .backup directory> $agentq_home` -- and
+    # `<` is a redirection in a POSIX shell, so the line could never run; the
+    # placeholder was flagged in review and the fix is to name the path.
+    # smoke/10's rule G excludes this message from its move scan, and that
+    # exclusion used to key on the `mv <` placeholder -- it now keys on the line
+    # starting with the failure printer, because this fix is precisely what
+    # removes the placeholder it matched.
+    crash_restore_commands=''
+    while IFS= read -r crash_leftover; do
+        [ -n "$crash_leftover" ] || continue
+        case "$crash_leftover" in
+            *".${agentq_base}.backup."*)
+                crash_restore_commands="$crash_restore_commands mv $(quote_shell_word "$crash_leftover") $(quote_shell_word "$agentq_home");"
+                ;;
+        esac
+    done <<EOF
+$crash_leftovers
+EOF
     if [ ! -e "$agentq_home" ] && [ ! -L "$agentq_home" ]; then
-        fail "refusing to install: AgentQ root $agentq_home is missing but a previous run's transaction residue exists ($crash_leftover_list). A run crashed between moving the old root aside and installing the new one; the previous deployment (queue data and credentials) is still in the .backup directory above. Restore it with: mv <the .backup directory> $agentq_home -- then restart the AgentQ daemon (the crashed run stopped it) and re-run; or remove it to confirm a fresh install. Inspect first with: ls -la $agentq_parent. Nothing was modified."
+        if [ -n "$crash_restore_commands" ]; then
+            fail "refusing to install: AgentQ root $agentq_home is missing but a previous run's transaction residue exists ($crash_leftover_list). A run crashed between moving the old root aside and installing the new one; the previous deployment (queue data and credentials) is still in the backup directory listed above. Restore it with:$crash_restore_commands then restart the AgentQ daemon (the crashed run stopped it) and re-run; or remove the residue to confirm a fresh install. Inspect first with: ls -la $agentq_parent. Nothing was modified."
+        fi
+        fail "refusing to install: AgentQ root $agentq_home is missing but a previous run's transaction residue exists ($crash_leftover_list), and none of it is a backup directory that could be restored. Inspect it with: ls -la $agentq_parent -- then remove the residue to confirm a fresh install and re-run. Nothing was modified."
     fi
     fail "refusing to install: a previous run's transaction residue exists beside the AgentQ root ($crash_leftover_list). Either an install crashed after the swap or another install is in progress; inspect these directories with: ls -la $agentq_parent -- then restore the .backup to $agentq_home or remove it as intended, and re-run. Nothing was modified."
 }

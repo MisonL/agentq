@@ -478,25 +478,66 @@ SSH 走 **2222** 端口
   以上的脚本仍会被任务执行层截断。已把 ③ 作为显式边界写入（不改上限：真机未测，不
   猜测），并把脚本要求由「UTF-8 文本」更正为「**POSIX sh** 文本」（远端是 `sh`）。
 
-**审查发现但未修（如实记录）**：
-- smoke 质量 agent 的 S2/S4/S5/S6/S7/S8/S11/S12/S13：多为**断言过弱**而非假绿（如
-  `expect_mode_ok 'agentq_run status'` 是子串匹配，裸 `status` 若错误地加发 `--summary`
-  不会被发现；`smoke/12` 的 authhint 探针在无 host 时断言恒真；`smoke/03` 新批量块失败
-  路径不清理真实 runtime；`smoke/12` 的 `\d{1,3}` 静态锁是「至少一处存在」语义，删掉
-  probe 路径那一处不会被发现）。**S1 经本人 A/B 复核后降级**：`smoke/06` 第 3 节复用的
-  `add.entered` 是第 1 节留下的陈旧标记，使就绪检查失去意义（死守卫）——已修（第 1 节
-  末尾删除标记）；但用「读仍取锁」的变异服务器做 A/B 时**两侧都红**，即**未能造出可
-  观测的假绿**，故这是夹具健壮性缺陷而非已证的假绿。
-- **服务端记录消失竞态**：`load_request_records` 的 `[ -e ]` 与随后的 `$(<"$path")`
-  之间记录被并发归档 → 读命令退 2 并报 `invalid AgentQ request record`（像数据损坏）。
-  锁免读把该窗口从「仅 logs/wait 中途放锁时」扩大到「每次读」。真实但窗口极窄。
-- **`--stdin-script` 的远端解码失败会退 0**（fail-open）：管道末段是 `sh`，远端缺
-  `base64` 时 `sh` 读到空输入退 0 → 任务 Done/**Success** 而脚本从未执行；客户端的
-  `command -v base64` 检查的是**本地**。需 sentinel 输出校验才能关闭，属设计变更。
-- `doctor_with_operation_lock` 未转发 `"$@"`（当前无调用点）；`result_lines` 的 jq 赋值
-  缺 `|| fail`（当前不可达）；锁龄可能为负——均为 nits。
-- 安装器残留指引里的 `<the .backup directory>` 占位符不可直接粘贴（shell 里 `<` 是
-  重定向）；`smoke/10` 的 `mv <` 整行排除因此仍需要。
+**审查发现（S2–S13 + 竞态 + fail-open + nits + 安装器占位符）：已于 2026-10-16 全部修复，落地为 0.1.13。** 原描述与修法如下：
+
+- smoke 质量 agent 的 S2/S4/S5/S6/S7/S8/S11/S12/S13：多为**断言过弱**而非假绿。**全部加固，且每条新锁都先证能红**：
+  - **S3**（`smoke/05`）：`expect_mode_ok 'agentq_run status'` 是子串匹配，裸 `status` 若错误地加发
+    `--summary` 不会被发现 → 改为从**原始 argv**（`modes.argv` 末行）取出 `agentq_run ` 之后的**精确**
+    参数串比对（顺带关掉 S12：桩的 `tr -d "'"` 不是 `quote_remote` 的逆，原始串无歧义）。**变异
+    `--summary` 转发被删 → 红**（`expected exit 0, got 2`）。
+  - **S7**（`smoke/12`）：authhint 探针的「点名 host」断言在无 host 时**恒真**（`[regex]::Escape("")`
+    空模式匹配一切），且非 hermetic（读开发机自己的 config）→ 探针里显式钉 `$script:TargetHost`
+    与 `$script:CredentialSource` 为字面量，调用方加 `AGENTQ_CONFIG` 与 `env -u` 凭据变量。**变异
+    「提示不再点名 host」→ 红**。
+  - **S8**（`smoke/12`）：`\d{1,3}` 静态锁是「至少一处存在」语义，删掉 probe 路径那一处不会被发现 →
+    改为**逐读取器**不变量（3 个 `[regex]::Matches` 读取器，`exit_readers == exit_readers_bounded`
+    且计数钉为 3）。**变异 ① 把 probe 读取器改成 `\d+` → 红；② 删掉该读取器 → 红**。
+  - **S2**（`smoke/12`）：良构 askpass 用例只断言 stderr 缺两条拒绝消息，客户端在守卫**之前**就死
+    （缓存目录不可解析、或探针退 2）也照样绿，且 `status=0` 是死变量 → 改为指向一个**记录调用**的
+    ssh 桩并断言**桩被调用过**（正命题：真到了传输阶段）+ 强制 `AGENTQ_REMOTE_PLATFORM=unix`。
+    **变异「守卫后立即停、不到 ssh」→ 红**。
+  - **S4**（`smoke/12`）：validator 探针缺 doctor 方向的负例；把 `{doctor, doctor_full}` 并进
+    `status` 臂全绿 → 加 `status-full-ok` 与 `doctor-rejects-full`。**变异「合并两臂」→ 红**。
+    （反向负例 `doctor_full` 拒摘要**不**断言——实测 `Test-JsonTaskMap` 接受摘要 map，断言它会钉住一个
+    客户端没有的行为。）
+  - **S5**（`smoke/03`）：新批量块失败路径不清理真实 runtime，任一早于末尾断言的失败都留下两个 task 与
+    两条 record → 加 EXIT trap（与临时目录清理组合），`cleanup_task_ids` 登记批量 id，失败即
+    cancel+remove 到 record 消失。**实跑 sandbox 全绿**。
+  - **S6**（`smoke/03`）：doctor 断言过弱（`{"summary":true,"tasks":{}}` 即通过、`--full` 只查
+    summary 不为真、stderr 丢 /dev/null）→ 断言批量 task 真出现在两种形态里、`--full` 带装饰 map、
+    捕获 stderr 并复验版本行。
+  - **S9/S10**（`smoke/12`）：成功行打印在失败门**之前**（tail 单看 stdout 读成绿）；`AGENTQ_PASSWORD`
+    用例缺 `status=0` 复位（上一条用例留下的 status 可掩盖失败）→ 均修。
+  - **S11**（`smoke/02`）：坏元数据用例的 `grep -q 'reason=protocol_error'` 未锚定 → 改
+    `grep -qxF 'agentq-server: reason=protocol_error'`。
+  - **S13**（`smoke/10`）：`mv <` **整行**排除过宽 → 换成**引号奇偶**判定（真实 move 的 `mv` 在任何
+    引号之外，文本提及的 `mv` 在一个打开的 `"` 之内）。**变异 ① 真实 move 去掉复核 → 红；② 真实
+    move 行尾加 `mv <x>` 提及且去掉复核（旧排除会漏掉）→ 红；③ 关掉排除 → 资格行被报为无复核 move
+    （证明例外承重）**。
+  - **S1**（`smoke/06`）经本人 A/B 复核后**降级**：第 3 节复用的 `add.entered` 是第 1 节留下的陈旧
+    标记，使就绪检查失去意义（死守卫）——已修（第 1 节末尾删除标记，0.1.12）；但用「读仍取锁」的变异
+    服务器做 A/B 时**两侧都红**，即**未能造出可观测的假绿**，故这是夹具健壮性缺陷而非已证的假绿。
+- **服务端记录消失竞态**（已修）：`load_request_records` 的 `[ -e ]` 与随后的读取之间记录被并发归档
+  → 读命令退 2 并报 `invalid AgentQ request record`（像数据损坏）。根因是**父 shell 预收集的 id 列表
+  与 aggregate jq 实际读到的记录数失配**：跳过一条却不发占位符，位置绑定把后一条记录挪到前一条的 id
+  上，绑定检查随即报错。修法：跳过时发一个 `null` 占位符（每条 glob 项对应一个 JSON 值），
+  `request_records_filter` **在绑定之后**丢弃它；`recover_removing_requests` 的
+  `records=$(load_request_records)` 补 `|| return $?`（条件上下文里 `set -e` 失效，原先无声吞掉失败）。
+  用确定性合成运行时复现（4s 窗口内删记录），修后 stderr 噪声消失。
+- **`--stdin-script` 的远端解码失败会退 0**（已修）：管道末段是 `sh`，远端缺 `base64` 时 `sh` 读到空
+  输入退 0 → 任务 Done/**Success** 而脚本从未执行；客户端的 `command -v base64` 检查的是**本地**。
+  修法：守卫移到**目标端**且**在管道之前**（管道状态是其末段命令的状态，追加在后的检查永不触发）——
+  `command -v base64 >/dev/null 2>&1 || { echo ...; exit 2; }; printf %s <b64> | base64 -d | sh`，
+  保持 SKILL.md 记录的形态与 smoke/05 的提取正则。**posix 与 ps1 两份客户端同步**（ps1 的 stdin-script
+  臂从此前无守卫改为同形态）。**ps1 的另两处 `base64 -d`（`Convert-ToPosixScriptCommand`/`New-UnixRemoteInvocation`、
+  sshp 的探针/安装）刻意不加**：那两条路径的客户端会校验 JSON 响应/哨兵标记，`sh` 读空 → 空输出 →
+  校验失败，是 **fail-closed**，与 `--stdin-script`（空输出=任务成功执行了空脚本）不同。
+- `doctor_with_operation_lock` 未转发 `"$@"`、`result_lines` 的 jq 赋值缺 `|| fail`、锁龄可能为负
+  ——**三处 nits 均已修**（前两者当前不可达，但都是给第一个调用者/第一次到达埋的陷阱；锁龄加
+  `[ "$lock_holder_age" -ge 0 ] || lock_holder_age=0`）。
+- 安装器残留指引里的 `<the .backup directory>` 占位符不可直接粘贴（shell 里 `<` 是重定向）——**已修**：
+  指引改为从**真实**残留路径构造（新增 `quote_shell_word`，单引号引用），实测带单引号的路径可粘贴运行；
+  `smoke/10` 的 `mv <` 整行排除随之换成引号奇偶判定（见 S13）。
 
 **Agent-UX 优化 P1–P7（2026-10-15 完成，用户对计划文件 `greedy-forging-moore` 的
 「全部优化好」授权）**：基于全量历史会话挖掘确认的七项真实摩擦，一次性落地为
