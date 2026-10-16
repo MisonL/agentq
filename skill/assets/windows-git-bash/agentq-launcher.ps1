@@ -376,6 +376,27 @@ $rootDirectory = $PSScriptRoot
 $serverPath = Join-Path $rootDirectory "agentq"
 $gitBashPath = '__AGENTQ_GIT_BASH_LAUNCHER__'
 
+# Every throw that is not already inside a catch reaches this trap: the
+# top-level required-file asserts (server or Git Bash missing -- reachable, the
+# client's protocol probe only inspects the launcher itself), the five
+# Get-CurrentWindowsUserEnvironment throws, New-AgentQLauncherRuntimePath's
+# exhaustion throw, and a WriteAllText / git-bash spawn failure inside the
+# try/finally below (a finally without a catch lets the throw continue).  With
+# no trap any of these exits 1 with a CLIXML stack trace; the wrapper's
+# agentq-exit token never executes, so the client reports an unclassified 1
+# instead of the contract's 2 (measured 2026-10-17: an uncaught throw in a
+# -File script exits 1, and the `& launcher` in-process wrapper propagates it
+# with no token on stderr).  A trap does not intercept `exit` (the deliberate
+# exit-2 sites, the inner parse catch and the env-overflow catch, keep their
+# own exact shapes -- measured), and the client's exit-token reader takes the
+# LAST token, so the wrapper re-emitting `agentq-exit:2` after ours is harmless.
+trap {
+    [Console]::Error.WriteLine("agentq: $($_.Exception.Message)")
+    [Console]::Error.WriteLine("agentq: reason=protocol_error")
+    [Console]::Error.WriteLine("agentq-exit:2")
+    exit 2
+}
+
 Assert-AgentQLauncherRequiredFile -Path $serverPath -Description "AgentQ server"
 Assert-AgentQLauncherRequiredFile -Path $gitBashPath -Description "Git Bash launcher"
 

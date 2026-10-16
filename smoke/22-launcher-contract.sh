@@ -626,6 +626,63 @@ if ! awk '
     printf '%s\n' 'launcher-contract: the argument environment write is not wrapped in try/catch with reason=protocol_error, so an environment-block overflow exits 1 instead of the contract 2' >&2
     failures=$((failures + 1))
 fi
+
+cases=$((cases + 1))
+# The top-level trap: every throw OUTSIDE the two guarded sites (the parse
+# catch and the env-overflow catch) — the top-level required-file asserts, the
+# five profile-resolution throws, runtime-path exhaustion, WriteAllText / the
+# git-bash spawn — reaches the top of a -File script and, with no trap, exits 1
+# with a CLIXML stack; the client wrapper's `agentq-exit` token never runs, so
+# the operator gets an unclassified 1 instead of the contract's 2.  Measured
+# 2026-10-17 on the real asset with the server file absent (exit 1, no token)
+# and after the fix (exit 2 + reason + token).  The lock asserts the trap's
+# whole contract shape: message, reason class, exit token, exit 2.  The two
+# guarded sites are NOT intercepted by the trap (`exit` is not an exception —
+# measured: the inner parse catch still emits only its own message), so this
+# lock and the two site locks above pin three disjoint paths.
+if ! awk '
+    { lines[NR] = $0 }
+    END {
+        found = 0
+        for (i = 1; i <= NR - 5; i++) {
+            if (lines[i] == "trap {") {
+                found = 1
+                ok = 0
+                reason = 0
+                token = 0
+                for (j = i + 1; j <= i + 6 && j <= NR; j++) {
+                    if (lines[j] ~ /agentq: \$\(\$_\.Exception\.Message\)/) ok = 1
+                    if (lines[j] ~ /reason=protocol_error/) reason = 1
+                    if (lines[j] ~ /agentq-exit:2/) token = 1
+                }
+                if (!ok || !reason || !token) exit 1
+            }
+        }
+        exit found ? 0 : 1
+    }
+' "$launcher"; then
+    printf '%s\n' 'launcher-contract: the top-level trap is missing or does not emit message + reason=protocol_error + agentq-exit:2, so an uncaught throw exits 1 with no token instead of the contract 2' >&2
+    failures=$((failures + 1))
+fi
+
+cases=$((cases + 1))
+# Behavioural half: the real launcher, executed as a subprocess in a directory
+# that lacks the server file, must exit 2 with the reason line and the exit
+# token on stderr -- the exact shape the wrapper's `agentq-exit` reader (and
+# the POSIX client's tail -n 1 reader) consumes.  The static lock above pins
+# the shape; this pins that the shape is REACHED, which is what the mutation
+# "trap renamed to trapx" fails at runtime as well as statically.
+trap_dir="$work/trap-behaviour"
+mkdir -p "$trap_dir"
+cp "$launcher" "$trap_dir/agentq-launcher.ps1"
+trap_status=0
+(cd "$trap_dir" && "$pwsh_binary" -NoProfile -NonInteractive -File ./agentq-launcher.ps1 -ArgumentsBase64 "c3RhdHVzAA==") >/dev/null 2>"$work/trap-behaviour.err" || trap_status=$?
+if [ "$trap_status" -ne 2 ] || ! grep -qF 'reason=protocol_error' "$work/trap-behaviour.err" || ! grep -qF 'agentq-exit:2' "$work/trap-behaviour.err"; then
+    printf 'launcher-contract: the top-level trap did not produce exit 2 + reason + token for a missing server file (got exit %s)\n' "$trap_status" >&2
+    head -3 "$work/trap-behaviour.err" >&2 || true
+    failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'launcher-contract: %s failure(s)\n' "$failures" >&2
     exit 1
