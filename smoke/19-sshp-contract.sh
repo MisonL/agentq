@@ -54,6 +54,7 @@ trap cleanup_sandbox EXIT HUP INT TERM
 
 home="$work/home"
 mkdir -p "$home" "$work/bin" "$work/tmp"
+printf 'y\n' > "$work/yes-stdin"
 # sshp puts its runtime directory under TMPDIR and removes it in the EXIT trap.
 # Pointing TMPDIR at a sandbox directory is what turns "leaves no residue" into
 # an assertion instead of a hope.
@@ -230,6 +231,30 @@ if [ -s "$work/count" ]; then
     failures=$((failures + 1))
 fi
 
+# Help is recognised on the first token after the optional --check, like the
+# Windows twin.  `--check --help` used to fall through to host validation and
+# exit 2 here while `sshp.ps1 --check --help` printed usage and exited 0
+# (measured 2026-10-17); smoke/20's help-after-check case pins the ps1 side,
+# this pins the POSIX side of the same contract.  --check alone must still
+# reach the probe -- a guard that swallowed every token after --check would
+# pass the help case and break the client.
+cases=$((cases + 1))
+if SSHP_STUB_DIR="$stub_dir" SSHP_SSH="$work/bin/ssh" HOME="$home" TMPDIR="$work/tmp" \
+        PATH="$work/bin:/usr/bin:/bin" \
+        /bin/sh "$client" --check --help >"$work/out" 2>"$work/err"; then status=0; else status=$?; fi
+if [ "$status" -ne 0 ] || ! grep -qF 'Usage:' "$work/out"; then
+    printf 'sshp-contract: --check --help: expected exit 0 with usage on stdout, got %s\n' "$status" >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if SSHP_STUB_DIR="$stub_dir" SSHP_SSH="$work/bin/ssh" HOME="$home" TMPDIR="$work/tmp" \
+        PATH="$work/bin:/usr/bin:/bin" \
+        /bin/sh "$client" --check --check >"$work/out" 2>"$work/err"; then status=0; else status=$?; fi
+if [ "$status" -eq 0 ]; then
+    printf 'sshp-contract: --check --check: a repeated flag must not be treated as help or a host\n' >&2
+    failures=$((failures + 1))
+fi
+
 # ---------------------------------------------------------------------------
 # Probe dispatch.  Each case plans what the stub answers and asserts the exit
 # code and message sshp derives from it.
@@ -243,8 +268,48 @@ fi
 
 # An empty session name must be ACCEPTED and fall back to the default, not
 # refused.  This is the other half of the guard asserted above: a guard that
-# rejected everything would pass those cases and fail this one.
+# rejected everything would pass those cases and fail this one.  The Windows
+# twin assigned the empty string and then refused it until 2026-10-17, so the
+# same input was accepted by one client and rejected by the other.
 run_case 'empty session name is accepted' 0 '' -- --check smoke-host ''
+
+# A whitespace-only host must be refused.  The Windows twin's IsNullOrWhiteSpace
+# rejected it from the start; this side only refused '' and '-', so a name that
+# ssh would have to quote its way through reached ssh (2026-10-17).
+run_case 'whitespace host is refused' 2 'SSH host must not contain whitespace' -- --check ' '
+# ... and ANY whitespace, not only a whitespace-only name.  `*[[:space:]]*` is
+# the guard; a whitespace-only case alone cannot distinguish it from an
+# IsNullOrWhiteSpace-style test, and the Windows twin had exactly that weaker
+# form until 2026-10-17 (measured: `sshp.ps1 --check 'foo bar'` exited 0 and
+# ran the probe while this side refused).  The tab form is here because
+# `[[:space:]]` covers it and a space-only fixture would not notice a guard
+# that only looked for ' '.
+run_case 'host with an embedded space is refused' 2 'SSH host must not contain whitespace' -- --check 'foo bar'
+run_case 'host with an embedded tab is refused' 2 'SSH host must not contain whitespace' -- --check "$(printf 'host\ttab')"
+
+# The reconnect delay is a 32-bit non-negative integer on BOTH clients.  The
+# charset-only check here accepted a 20-digit value and the failure surfaced
+# later as a bare `sleep` usage error with exit 1 -- a code the contract does
+# not define, disconnected from the variable that caused it (measured
+# 2026-10-17).  Both bounds are asserted: the largest legal value passes, one
+# past it is refused.
+reconnect_boundary_case() {
+    local name=$1 value=$2 expected=$3
+    cases=$((cases + 1))
+    local status=0
+    plan_stub "$(printf '0\t__SSHP_READY__:Linux')"
+    SSHP_STUB_DIR="$stub_dir" SSHP_SSH="$work/bin/ssh" SSHP_RECONNECT_DELAY="$value" \
+    HOME="$home" TMPDIR="$work/tmp" PATH="$work/bin:/usr/bin:/bin" \
+        /bin/sh "$client" --check smoke-host >"$work/out" 2>"$work/err" || status=$?
+    if [ "$status" -ne "$expected" ]; then
+        printf 'sshp-contract: %s: expected exit %s, got %s\n' "$name" "$expected" "$status" >&2
+        sed 's/^/    stderr: /' "$work/err" >&2
+        failures=$((failures + 1))
+    fi
+}
+reconnect_boundary_case 'reconnect delay at the 32-bit maximum is accepted' 2147483647 0
+reconnect_boundary_case 'reconnect delay one past the 32-bit maximum is refused' 2147483648 2
+reconnect_boundary_case 'reconnect delay with a leading plus is refused' '+5' 2
 
 # `--check` must NEVER install.  The probe says a dependency is missing and a
 # package manager exists; sshp must refuse rather than run the installer.  The
@@ -264,6 +329,68 @@ fi
 
 plan_stub '127	__SSHP_INSTALL_UNAVAILABLE__:Linux'
 run_case 'check: no supported package manager' 127 'install tmux, GNU screen, or Zellij manually' -- --check smoke-host
+
+# A flattened Windows install status (A5b).  An sshd whose DefaultShell is
+# powershell.exe turns the probe's 42 into 1; the MARKER is the contract, not
+# the exact code.  sshp.ps1 has been marker-first since 0.1.16; this side still
+# demanded exactly 42, so the same answer was "installable" on the Windows
+# client and "invalid Windows install status" (exit 2) here -- measured
+# 2026-10-17.  --check must therefore answer 127 (installable, not installing),
+# not 2.
+plan_stub '43	__SSHP_WINDOWS_SHELL__:MINGW64_NT-10.0-19045
+1	__SSHP_INSTALL_REQUIRED__:Windows'
+run_case 'probe: flattened install status is still installable' 127     'native Zellij is required on Windows' -- --check smoke-host
+
+# A marker must START a line.  The Windows twin matches `(?m)^...$`; this side
+# matched the marker ANYWHERE in the output (glob), so a banner or shell-profile
+# line that merely CONTAINS the phrase was read as a protocol answer.  Measured
+# 2026-10-17: `banner: __SSHP_READY__:Linux is a phrase` was accepted as READY
+# (exit 0) here while sshp.ps1 refused it (exit 2).  Each case below feeds a
+# mid-line marker on the first call and a failing answer on the second (the
+# client falls through to the Windows probe when the Unix answer is not
+# recognised), and asserts the "both shells" verdict -- not READY, and not the
+# Windows-only wording that a successful Windows-shell route would produce.
+plan_stub '0	banner: __SSHP_READY__:Linux is a phrase
+2	'
+run_case 'probe: mid-line READY marker is not READY' 2 \
+    'remote dependency probe failed for both Unix and Windows shells' -- --check smoke-host
+plan_stub '42	note __SSHP_INSTALL_REQUIRED__:Linux here
+2	'
+run_case 'probe: mid-line INSTALL_REQUIRED marker is not installable' 2 \
+    'remote dependency probe failed for both Unix and Windows shells' -- --check smoke-host
+plan_stub '43	x __SSHP_WINDOWS_SHELL__:MINGW64 here
+2	'
+run_case 'probe: mid-line Windows shell marker does not route to Windows' 2 \
+    'remote dependency probe failed for both Unix and Windows shells' -- --check smoke-host
+
+# SKILL.md's promise -- "the first connection asks before installing it; with
+# no TTY the client refuses explicitly and never installs silently" -- had no
+# behavioural lock on EITHER client until 2026-10-17.  The stronger form is
+# asserted: stdin is a PIPE carrying `y`, so a client that merely checked
+# whether stdin had data (or read the answer without a tty test) would install.
+# Three assertions: exit 1, the refusal message, and exactly ONE ssh call (the
+# probe) -- an install attempt is a second call.
+plan_stub '42	__SSHP_INSTALL_REQUIRED__:Linux'
+cases=$((cases + 1))
+install_status=0
+SSHP_STUB_DIR="$stub_dir" SSHP_SSH="$work/bin/ssh" HOME="$home" TMPDIR="$work/tmp" \
+    PATH="$work/bin:/usr/bin:/bin" \
+    /bin/sh "$client" smoke-host <"$work/yes-stdin" >"$work/out" 2>"$work/err" || install_status=$?
+install_calls=$(cat "$work/count" 2>/dev/null || printf '0')
+install_calls=${install_calls:-0}
+if [ "$install_status" -ne 1 ]; then
+    printf 'sshp-contract: piped-y install: expected exit 1, got %s\n' "$install_status" >&2
+    sed 's/^/    stderr: /' "$work/err" >&2
+    failures=$((failures + 1))
+fi
+if ! grep -qF 'dependency installation requires an interactive local terminal' "$work/err"; then
+    printf 'sshp-contract: piped-y install: the no-tty refusal message is missing\n' >&2
+    failures=$((failures + 1))
+fi
+if [ "$install_calls" -ne 1 ]; then
+    printf 'sshp-contract: piped-y install: made %s ssh call(s); a piped confirmation must never reach the installer\n' "$install_calls" >&2
+    failures=$((failures + 1))
+fi
 
 # An unsupported remote platform must be refused, not guessed at.
 plan_stub '127	__SSHP_INSTALL_UNAVAILABLE__:FreeBSD'

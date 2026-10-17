@@ -62,7 +62,13 @@ control="$work/control"
 
 cp "$source_home/pueue" "$home/pueue.real"
 cp "$source_home/pueued" "$home/pueued"
-cp "$source_home/agentq-server" "$home/agentq-server"
+# The SERVER under test is the repo asset, not the runtime's snapshot (same fix
+# as smoke/04/06, 2026-10-21): "$source_home/agentq-server" is whatever
+# sandbox.sh wrote when the SANDBOX was created -- measured at 247276 bytes
+# against the repo asset's 248213 -- so server-side changes after that moment
+# were invisible here.
+root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+cp "${AGENTQ_SMOKE_SERVER:-$root/skill/assets/unix/agentq-server}" "$home/agentq-server"
 chmod 700 "$home/pueue.real" "$home/pueued" "$home/agentq-server"
 
 # The server runs pueue through `env -i`, so the control channel has to be a
@@ -271,7 +277,11 @@ for probe_command in logs cancel remove; do
     printf '2\n' > "$control/status.target"
     printf '0\n' > "$control/status.count"
     probe_status=0
-    probe_output=$("$server" "$probe_command" "$probe_task_id" 2>"$work/probe.stderr") || probe_status=$?
+    # stdout is discarded, not captured: the assertions are on stderr, the exit
+    # code, and the surviving state.  (A captured-but-unread variable here is
+    # what shellcheck reports as SC2034, the shape this repo deleted from the
+    # server's remove_task -- it reads like a value about to be tested.)
+    "$server" "$probe_command" "$probe_task_id" >/dev/null 2>"$work/probe.stderr" || probe_status=$?
     printf '0\n' > "$control/status.target"
 
     if grep -q 'unknown AgentQ task id' "$work/probe.stderr"; then
@@ -357,7 +367,10 @@ elif [ "$probe_state" != "Running" ] && [ "$probe_state" != "Queued" ]; then
     note "the probe task did not survive the injected failures: state=$probe_state"
     failures=$((failures + 1))
 fi
-if ! probe_logs=$("$server" logs "$probe_task_id" 2>/dev/null); then
+# The log BODY is not asserted: the probe task is `sh -c 'sleep 300'`, which
+# prints nothing, so an emptiness assertion would be measuring the fixture.  What
+# matters is that `logs` succeeds again.
+if ! "$server" logs "$probe_task_id" >/dev/null 2>/dev/null; then
     note 'logs failed for the probe task after Pueue recovered'
     failures=$((failures + 1))
 fi

@@ -40,6 +40,21 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+
+# python3 is a real dependency of this check: the extraction / parsing steps
+# below are Python.  Probe that it RUNS, not that a name resolves -- measured
+# 2026-10-20 on a zh-CN Windows 10, where `python3` is the Microsoft Store
+# alias: the check died at its first Python step with exit 49 and ZERO output,
+# which run-tests.sh can only report as a bare FAIL with no cause.  Same rule as
+# the pwsh usability probes: an interpreter that cannot execute is an
+# ENVIRONMENT fault, say so and do not claim the contract ran.
+python3_probe_status=0
+python3 -c 'import sys' >/dev/null 2>&1 || python3_probe_status=$?
+if [ "$python3_probe_status" -ne 0 ]; then
+    printf '%s\n' 'jq-reserved-identifiers NOT run: the python3 on PATH cannot execute (a Microsoft Store alias cannot run scripts).' >&2
+    printf '%s\n' 'Install a real Python 3 and put it on PATH, then re-run.' >&2
+    exit 1
+fi
 work=$(mktemp -d "${TMPDIR:-/tmp}/agentq-smoke-jqreserved.XXXXXX")
 work=$(unset CDPATH; cd -- "$work" && pwd -P)
 trap 'rm -rf -- "$work"' EXIT
@@ -53,8 +68,26 @@ real_jq=$(command -v jq) || {
 # with an extra NUL (so invocations are separable) -- the same shim smoke/08
 # uses, which is proven to capture this server's jq traffic.
 mkdir -p "$work/shim"
+# The record file is a stream of NUL-separated argv with a DOUBLE NUL between
+# invocations, and the reader below splits on that double NUL.  That encoding
+# has a shape it cannot represent: an EMPTY argument produces `\0\0` on its own
+# (the empty value's terminator plus the next value's), so an invocation that
+# carries one is split into two records -- and two invocations appended by
+# overlapping writers can lose the separator and fuse into one.  Both were
+# measured on synthetic streams: one empty argument turns 1 record into 2, and a
+# fused pair turns 2 records into 1 with the program count rising by one.  The
+# second is exactly the 133/135 signature seen once in a full-suite run whose
+# own 30 standalone reruns were all 134/134, so the count is not trustworthy as
+# a "how many calls did we see" number.
+#
+# So the count is now measured TWICE, independently: the byte-count line below
+# (a single line per invocation, appended with one write) and the NUL stream.
+# They must agree, and the check refuses to report if they do not -- the same
+# stance as the classifier self-test, for the same reason: a check that cannot
+# account for its own inputs has no business judging the server.
 cat > "$work/shim/jq" <<SHIM
 #!/bin/sh
+printf 'x\\n' >>"$work/jq-count"
 {
     for arg in "\$@"; do
         printf '%s\\0' "\$arg"
@@ -67,6 +100,7 @@ chmod 700 "$work/shim/jq"
 PATH="$work/shim:$PATH"
 export PATH
 : >"$work/jq-argv"
+: >"$work/jq-count"
 
 # A minimal runtime the server accepts, with Pueue stubs that answer the JSON
 # queries so the jq calls downstream are actually reached.  Copied from
@@ -138,7 +172,7 @@ if [ "$invocations" -lt 5 ]; then
     exit 1
 fi
 
-python3 - "$work/jq-argv" <<'PY'
+python3 - "$work/jq-argv" "$work/jq-count" <<'PY'
 import re
 import sys
 
@@ -222,14 +256,34 @@ if selftest_failures:
 
 # --- walk the recorded jq argv -------------------------------------------
 raw = open(sys.argv[1], "rb").read()
-# Split into invocations on the double NUL the shim emits between them.
-invocations = [chunk for chunk in raw.split(b"\0\0") if chunk]
-# A trailing single NUL leaves one empty chunk; drop empties.
+counted = sum(1 for line in open(sys.argv[2], "rb") if line.strip())
+
+# The NUL stream is decoded exactly as before -- one record per double-NUL
+# chunk.  It is NOT repaired: a chunk whose separator was lost cannot be split
+# apart again (the fused record's second half also begins with a flag), so any
+# "fix" here would be a guess.  What the check can do is refuse to judge a
+# capture it cannot account for, which the cross-check below does.
+chunks = [chunk for chunk in raw.split(b"\0\0") if chunk]
 records = []
-for chunk in invocations:
+for chunk in chunks:
     args = [a.decode("utf-8", "surrogateescape") for a in chunk.split(b"\0") if a != b""]
     if args:
         records.append(args)
+
+# The two recorders must agree.  They are independent: the line counter appends
+# one byte per invocation with a single write, the NUL stream appends the whole
+# argv in several writes.  A disagreement means the stream lost or gained a
+# record -- the measured signature of two overlapping appends (2 records -> 1,
+# program count +1) -- and every count derived from it would be a precise-
+# looking number that is not true.  Refuse instead.
+if len(records) != counted:
+    print(
+        "jq-reserved-identifiers: the recorders disagree (%d invocation(s) in "
+        "the NUL stream, %d in the line counter); the capture is malformed and "
+        "this check cannot vouch for what it saw" % (len(records), counted),
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 # Options whose next argument(s) are values, not jq programs.
 VALUE_OPTS_1 = {"--arg", "--argjson", "--slurpfile"}
@@ -237,8 +291,10 @@ FILE_OPTS_1 = {"-f", "--from-file", "--rawfile", "--argfile"}
 
 violations = []
 programs_seen = 0
+per_record_programs = []
 for args in records:
     i = 0
+    record_programs = 0
     n = len(args)
     while i < n:
         tok = args[i]
@@ -279,9 +335,33 @@ for args in records:
             continue
         # First non-option, not a consumed value: the jq PROGRAM.
         programs_seen += 1
+        record_programs += 1
         for name, matched, line in classify_program(tok):
             violations.append((name, matched, line))
         i += 1
+    per_record_programs.append(record_programs)
+
+# Every jq invocation carries exactly ONE program.  A record with two means two
+# invocations were fused by a lost separator -- the measured 133/135 signature
+# (records -1, programs +1) -- and a record with none means the split landed
+# inside one.  This is the invariant the recorder cross-check above is a proxy
+# for; asserting it directly catches the fusion even if both recorders happen
+# to agree on a wrong count.
+bad_records = [i for i, count in enumerate(per_record_programs) if count != 1]
+if bad_records:
+    print(
+        "jq-reserved-identifiers: %d record(s) do not carry exactly one jq "
+        "program (index:count %s).  A record with TWO means two invocations "
+        "were fused by a lost separator -- the measured 133/135 signature.  A "
+        "record with NONE means the split landed inside one.  A count above one "
+        "can also mean jq is now given a positional input FILE (a path after "
+        "the program), which no call in this server does: paths are "
+        "redirections, pinned by smoke/08.  Adjudicate before trusting any "
+        "count this check prints."
+        % (len(bad_records), ", ".join("%d:%d" % (i, per_record_programs[i]) for i in bad_records[:8])),
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 if programs_seen < 1:
     print(

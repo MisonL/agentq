@@ -19,6 +19,21 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+
+# python3 is a real dependency of this check: the extraction / parsing steps
+# below are Python.  Probe that it RUNS, not that a name resolves -- measured
+# 2026-10-20 on a zh-CN Windows 10, where `python3` is the Microsoft Store
+# alias: the check died at its first Python step with exit 49 and ZERO output,
+# which run-tests.sh can only report as a bare FAIL with no cause.  Same rule as
+# the pwsh usability probes: an interpreter that cannot execute is an
+# ENVIRONMENT fault, say so and do not claim the contract ran.
+python3_probe_status=0
+python3 -c 'import sys' >/dev/null 2>&1 || python3_probe_status=$?
+if [ "$python3_probe_status" -ne 0 ]; then
+    printf '%s\n' 'ps-client-contract NOT run: the python3 on PATH cannot execute (a Microsoft Store alias cannot run scripts).' >&2
+    printf '%s\n' 'Install a real Python 3 and put it on PATH, then re-run.' >&2
+    exit 1
+fi
 # The client path can be overridden (mirrors smoke/05's AGENTQ_SMOKE_CLIENT and
 # smoke/18's AGENTQ_SMOKE_SERVER) so a mutation proof can point this whole check
 # at a modified copy -- without the hook, red-proofing a source-level fix means
@@ -44,6 +59,23 @@ if [ -z "$pwsh_binary" ] || ! command -v "$pwsh_binary" >/dev/null 2>&1; then
     printf 'SKIPPED: pwsh is not available (AGENTQ_SMOKE_PWSH=%s); the PowerShell client was not executed\n' \
         "${AGENTQ_SMOKE_PWSH:-<unset>}"
     exit 0
+fi
+
+# Present is not the same as working.  A corrupt pwsh startup cache makes
+# every launch die (measured five times in this repo, with four different
+# messages: "String cannot have zero length", "Stack overflow",
+# FileLoadException, and Abort trap: 6).  The existence test above cannot see
+# that, so every case below would run against a pwsh that never starts and
+# report its failures as asset defects -- the misdiagnosis smoke/01 fixed for
+# itself in 2026-09-28.  Probe once: an unusable interpreter is an ENVIRONMENT
+# fault, say so with the fix, and do not claim the check ran.
+pwsh_probe_status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command 'exit 0' >/dev/null 2>&1 || pwsh_probe_status=$?
+if [ "$pwsh_probe_status" -ne 0 ]; then
+    printf '%s\n' \
+        'PowerShell client contract NOT run: the pwsh on PATH cannot execute (startup cache).' >&2
+    printf '%s\n' 'Try: mv ~/.cache/powershell/StartupProfileData-NonInteractive{,.broken}' >&2
+    exit 1
 fi
 
 work=$(mktemp -d /tmp/agentq-smoke-psclient.XXXXXX)
@@ -91,7 +123,7 @@ expect_rejected() {
         failures=$((failures + 1))
         return
     fi
-    if ! flatten_err "$work/err" | grep -qF -- "$expected"; then
+    if ! grep -qF -- "$expected" <<< "$(flatten_err "$work/err")"; then
         printf 'ps-client %s: stderr does not contain %s\n' "${label:-<no args>}" "$expected" >&2
         head -3 "$work/err" >&2 || true
         failures=$((failures + 1))
@@ -170,16 +202,157 @@ expect_rejected '--request-id requires a value' \
 # --- environment validation --------------------------------------------------
 # The client validates these before any transport work, so a bad value must be
 # rejected on the --help path too.
-cases=$((cases + 1))
+# Both ends of the accepted range, for the same reason the POSIX twin's loop
+# tests three shapes (see smoke/05): `0` pins the lower end, `05` pins the shape
+# the two clients used to disagree about (measured 2026-10-21: this client
+# refused it, the POSIX one accepted it), and 2147483648 pins the upper end
+# against the [int] behind Start-Sleep.  2147483647 must be ACCEPTED -- the
+# positive control that keeps the bound from quietly tightening.
+for numeric_case in "0:2" "05:2" "2147483648:2" "2147483647:0"; do
+    numeric_value=${numeric_case%:*}
+    numeric_expected=${numeric_case#*:}
+    cases=$((cases + 1))
+    numeric_status=0
+    AGENTQ_HOST=smoke-host AGENTQ_SUBMIT_RETRY_ATTEMPTS="$numeric_value" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" --help \
+        >"$work/out" 2>"$work/err" || numeric_status=$?
+    if [ "$numeric_status" -ne "$numeric_expected" ]; then
+        printf 'ps-client AGENTQ_SUBMIT_RETRY_ATTEMPTS=%s: expected exit %s, got %s\n' \
+            "$numeric_value" "$numeric_expected" "$numeric_status" >&2
+        head -3 "$work/err" >&2 || true
+        failures=$((failures + 1))
+    elif [ "$numeric_expected" -eq 2 ] && ! grep -qF 'must be a positive 32-bit integer' "$work/err"; then
+        printf 'ps-client AGENTQ_SUBMIT_RETRY_ATTEMPTS=%s: stderr lacks the controlled message\n' \
+            "$numeric_value" >&2
+        failures=$((failures + 1))
+    fi
+done
+
+# An AGENTQ_SSH that cannot be launched must be REFUSED with the contract's
+# exit 2, not die as an unhandled throw.  Measured 2026-10-21 on this platform
+# with a non-executable regular file: exit 1, empty stdout and stderr -- a
+# failure with no diagnosis at all -- while the POSIX twin refused the same
+# configuration at startup with exit 2 and a controlled message.  Windows has no
+# execute bit, so what this asserts is the LAUNCH, which is the only question
+# that can be answered on both platforms.
+unlaunchable_dir="$work/unlaunchable"
+mkdir -p "$unlaunchable_dir"
+unlaunchable="$unlaunchable_dir/ssh-not-executable"
+printf 'not an executable\n' > "$unlaunchable"
+chmod 644 "$unlaunchable"
+if [ "$client_arg" != "$client" ]; then
+    unlaunchable_arg=$(cygpath -w "$unlaunchable")
+else
+    unlaunchable_arg="$unlaunchable"
+fi
 status=0
-AGENTQ_HOST=smoke-host AGENTQ_SUBMIT_RETRY_ATTEMPTS=0 \
-    "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" --help \
+AGENTQ_SSH="$unlaunchable_arg" AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
     >"$work/out" 2>"$work/err" || status=$?
-if [ "$status" -ne 2 ] || ! grep -qF 'must be a positive 32-bit integer' "$work/err"; then
-    printf '%s\n' 'ps-client AGENTQ_SUBMIT_RETRY_ATTEMPTS=0: expected exit 2 and "must be a positive 32-bit integer"' >&2
+cases=$((cases + 1))
+if [ "$status" -ne 2 ]; then
+    printf 'ps-client: an unlaunchable AGENTQ_SSH exited %s, expected 2 (not an unhandled throw)\n' \
+        "$status" >&2
     head -3 "$work/err" >&2 || true
     failures=$((failures + 1))
+elif ! grep -qF 'AGENTQ_SSH cannot be launched' "$work/err"; then
+    printf 'ps-client: an unlaunchable AGENTQ_SSH lacked the controlled message: %s\n' \
+        "$(head -2 "$work/err" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
 fi
+
+# AGENTQ_REMOTE_PLATFORM is matched case-insensitively here (the `switch` is by
+# language rule) and the POSIX twin now normalises the value on read.  Both
+# accept every case form and both refuse an unrecognised one; measured
+# 2026-10-21 that only this client accepted `AUTO`/`Unix`, so the same
+# instruction was a no-op on one platform and an argument error on the other.
+# Driven through a stub ssh that fails like an unreachable host: every accepted
+# form must get PAST the switch and reach ssh (255).
+platform_stub_dir="$work/platform-ssh"
+mkdir -p "$platform_stub_dir"
+if [ "$client_arg" != "$client" ]; then
+    platform_stub="$platform_stub_dir/ssh.cmd"
+    printf '%s\r\n' '@echo off' 'exit /b 255' > "$platform_stub"
+    platform_stub_arg=$(cygpath -w "$platform_stub")
+else
+    platform_stub="$platform_stub_dir/ssh"
+    printf '#!/bin/sh\nexit 255\n' > "$platform_stub"
+    chmod 700 "$platform_stub"
+    platform_stub_arg="$platform_stub"
+fi
+for platform_case in auto unix windows AUTO Unix WINDOWS bogus; do
+    cases=$((cases + 1))
+    platform_status=0
+    AGENTQ_REMOTE_PLATFORM="$platform_case" AGENTQ_SSH="$platform_stub_arg" \
+        AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+        AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+        AGENTQ_PLATFORM_PROBE_CACHE=off \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
+        >"$work/out" 2>"$work/err" || platform_status=$?
+    case "$platform_case" in
+        bogus)
+            if [ "$platform_status" -ne 2 ] || ! grep -qF 'AGENTQ_REMOTE_PLATFORM must be auto, unix, or windows' "$work/err"; then
+                printf 'ps-client AGENTQ_REMOTE_PLATFORM=bogus: expected exit 2 and the controlled message, got %s\n' \
+                    "$platform_status" >&2
+                head -2 "$work/err" >&2 || true
+                failures=$((failures + 1))
+            fi
+            ;;
+        *)
+            # NOT "must be 255": a `windows` value also runs the launcher
+            # protocol probe, whose own failure code is legitimate here.  What
+            # must NOT happen is the argument error -- 2 with the switch's
+            # message -- which is what a case-sensitive match produced.
+            if [ "$platform_status" -eq 2 ] && grep -qF 'AGENTQ_REMOTE_PLATFORM must be auto, unix, or windows' "$work/err"; then
+                printf 'ps-client AGENTQ_REMOTE_PLATFORM=%s was refused as an invalid value; it is accepted case-insensitively\n' \
+                    "$platform_case" >&2
+                failures=$((failures + 1))
+            fi
+            ;;
+    esac
+done
+
+# --tail's shape must be the same on both clients.  Measured 2026-10-21: the
+# POSIX client accepted `05` (forwarded it to the server, which canonicalizes
+# leading zeros) while this one refused it, so the same command line meant
+# different things depending on which client the caller happened to run.  Both
+# now take `^[1-9][0-9]*$` or the literal `all`; the accepted forms are asserted
+# too, or a validator that refused everything would pass the refusal cases.
+# A stub that fails like an unreachable host: the accepted forms must get PAST
+# validation and reach ssh (255), which is what distinguishes "accepted" from
+# "refused" here -- without it the accepted rows would pass on any error.  Two
+# shapes for the same reason as the askpass stub below: this check runs the
+# client under a native pwsh AND, under Git Bash, against the Windows-form
+# path, and AGENTQ_SSH must name something that platform can execute.
+tail_stub_dir="$work/tail-ssh"
+mkdir -p "$tail_stub_dir"
+if [ "$client_arg" != "$client" ]; then
+    tail_stub_win="$tail_stub_dir/ssh.cmd"
+    printf '%s\r\n' '@echo off' 'exit /b 255' > "$tail_stub_win"
+    tail_stub_arg=$(cygpath -w "$tail_stub_win")
+else
+    tail_stub_win="$tail_stub_dir/ssh"
+    printf '#!/bin/sh\nexit 255\n' > "$tail_stub_win"
+    chmod 700 "$tail_stub_win"
+    tail_stub_arg="$tail_stub_win"
+fi
+for tail_case in "05:2" "00:2" "x:2" "5:255" "all:255"; do
+    tail_value=${tail_case%:*}
+    tail_expected=${tail_case#*:}
+    cases=$((cases + 1))
+    tail_status=0
+    AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+        AGENTQ_SSH="$tail_stub_arg" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" logs 1 --tail "$tail_value" \
+        >"$work/out" 2>"$work/err" || tail_status=$?
+    if [ "$tail_status" -ne "$tail_expected" ]; then
+        printf 'ps-client logs --tail %s: expected exit %s, got %s\n' \
+            "$tail_value" "$tail_expected" "$tail_status" >&2
+        head -2 "$work/err" >&2 || true
+        failures=$((failures + 1))
+    fi
+done
 
 # --- the reason channel must survive the client's redaction -------------------
 # Write-Diagnostics deliberately withholds raw SSH diagnostics and prints only a
@@ -539,6 +712,46 @@ elif ! grep -qF 'AGENTQ_PASSWORD_PROMPT is not supported on Windows' "$work/err"
     head -3 "$work/err" >&2 || true
     failures=$((failures + 1))
 fi
+
+# Two credential sources set at once must be refused, not silently resolved in
+# one direction.  Measured 2026-10-21: with AGENTQ_ASKPASS and
+# AGENTQ_PASSWORD_PROMPT both set, the POSIX twin exited 2 with "set only one"
+# while this client accepted the pair and used askpass -- so the same
+# environment meant "ambiguous, fix it" on one platform and "fine" on the other.
+# The refusal carries a second, Windows-specific reason: PASSWORD_PROMPT is not
+# supported here at all, so whoever set it expected it to be used.
+#
+# Both orders of the pair are NOT asserted separately: the check is on the
+# presence of both, so one case pins the rule.  The ASKPASS+AGENTQ_PASSWORD
+# pair has its own case above.
+#
+# The askpass value must be a file that EXISTS: the file-shape guard runs before
+# the ambiguity guard, so a nonexistent path would be refused for being absent
+# first and this case would pass without ever reaching the rule it names.
+# Measured 2026-10-21: with $work/absent-askpass, stderr is
+# "AGENTQ_ASKPASS is not a regular non-reparse file" -- exit 2, wrong reason.
+# The file is never executed: the ambiguity guard fires before any ssh call.
+ambiguous_askpass="$work/ambiguous-askpass"
+printf '#!/bin/sh\nexit 1\n' > "$ambiguous_askpass"
+chmod 755 "$ambiguous_askpass"
+status=0
+AGENTQ_ASKPASS="$ambiguous_askpass" AGENTQ_PASSWORD_PROMPT=1 \
+    AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
+    >"$work/out" 2>"$work/err" || status=$?
+cases=$((cases + 1))
+if [ "${status:-0}" -ne 2 ]; then
+    printf 'ps-client: AGENTQ_ASKPASS and AGENTQ_PASSWORD_PROMPT were both set without a refusal (expected exit 2, got %s)\n' "${status:-0}" >&2
+    head -3 "$work/err" >&2 || true
+    failures=$((failures + 1))
+elif ! grep -qF 'AGENTQ_ASKPASS and AGENTQ_PASSWORD_PROMPT are both set' "$work/err"; then
+    printf '%s\n' 'ps-client: both credential sources were set and the refusal did not name the ambiguity' >&2
+    head -3 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+
+# A nonexistent AGENTQ_ASKPASS is refused on its own; the pair case just above
+# must not be confused with it.
 status=0
 AGENTQ_ASKPASS="$work/absent-askpass" AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
     "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
@@ -553,7 +766,6 @@ elif ! grep -qF 'AGENTQ_ASKPASS is not a regular non-reparse file' "$work/err"; 
     head -3 "$work/err" >&2 || true
     failures=$((failures + 1))
 fi
-status=0
 
 # ssh executes the WHOLE SSH_ASKPASS value as a single file name -- no shell, no
 # word splitting -- so an argument or a surrounding quote can never be part of it.
@@ -975,13 +1187,69 @@ fi
 # defect lives in what PowerShell does with the rewritten text.
 probe_work="$work/probe"
 mkdir -p "$probe_work"
+# The probe bodies hardcode C:\ProgramData\AgentQ\agentq-launcher.ps1 and take
+# the 42 branch only when that file is ABSENT.  The fixture used to rely on the
+# HOST lacking it: true on a clean macOS, false on any machine where AgentQ is
+# installed.  Measured 2026-10-20 on a real Windows host running 0.1.8: the
+# launcher was present, the probe correctly reached `ready`, and the case
+# reported 6 failures that all read like asset defects.  A case whose premise
+# the environment can supply is not a test, so the extraction below rewrites
+# that one literal to a path under the fixture directory that nothing creates.
+# The rest of the body -- every exit site the rewrite must preserve -- is still
+# the asset's own text, which is what these cases are about.
 python3 - "$root" "$probe_work" <<'PYEXT'
-import io, re, subprocess, sys
+import io, os, re, subprocess, sys
 root, out = sys.argv[1], sys.argv[2]
 
 # POSIX asset: its protocol-probe body and its own sed program.
+# A path under the fixture dir that nothing ever creates: the probe's
+# `Get-Item -ErrorAction SilentlyContinue` returns null there on every host, so
+# the 42 branch is reachable even where AgentQ is deployed for real.
+missing_launcher = os.path.abspath(os.path.join(out, 'no-such-launcher.ps1'))
+
+# The launcher path must be READ FROM THE ASSET, not written down here.  A
+# literal copy is a second source of truth that can silently drift out of step
+# with the asset -- and the drift is invisible, because the Windows asset names
+# this path TWICE (once in the protocol probe's existence check, once in the
+# actual invocation) while the POSIX asset embeds it once.  Measured 2026-10-20
+# by editing the run-time occurrence only: every case stayed green, since the
+# probe kept reading a path that no longer matched what the client would run.
+# `expected` is what both assets must agree on; the retarget below is applied to
+# a body only after it is shown to carry exactly that value.
+LAUNCHER_PATH_RE = re.compile(
+    r'[A-Za-z]:[\\/]ProgramData[\\/]AgentQ[\\/][A-Za-z0-9._-]+\.ps1')
+
+def launcher_literal_from(asset_text, label):
+    # The pattern matches ANY .ps1 under ProgramData\\AgentQ, not just the
+    # current file name -- a rename of ONE site must show up as two values, not
+    # as an invisible non-match (measured: a name-specific pattern let the
+    # invocation site drift while the probe kept reading the old path).
+    # Both slash styles occur in every asset (the probe and the invocation use
+    # backslashes, the operator-facing diagnostics use forward slashes), so
+    # uniqueness is judged on the NORMALIZED value; the value actually RETARGETED
+    # is the backslash form, which is what the probe body carries (counted on the
+    # body itself, so this cannot mask an extra occurrence there).
+    raw = {m.group(0) for m in LAUNCHER_PATH_RE.finditer(asset_text)}
+    normalized = {v.replace(chr(92), '/') for v in raw}
+    if len(normalized) != 1:
+        raise SystemExit(
+            'extraction: the %s asset names %d distinct launcher paths %r; '
+            'update this fixture with the asset.' % (label, len(normalized), sorted(normalized)))
+    target = normalized.pop()
+    backslashed = {v for v in raw if chr(92) in v}
+    return backslashed.pop() if backslashed else target
+
+def retarget(body, literal, label):
+    if body.count(literal) != 1:
+        raise SystemExit(
+            'extraction: the %s probe body no longer contains exactly one '
+            'launcher literal (%d); update this fixture with the asset.'
+            % (label, body.count(literal)))
+    return body.replace(literal, missing_launcher)
+
 posix = io.open(root + '/skill/assets/client/unix/agentq', encoding='utf-8').read()
-body = re.search(r"windows_protocol_script='([^']*)'", posix).group(1)
+posix_launcher = launcher_literal_from(posix, 'POSIX')
+body = retarget(re.search(r"windows_protocol_script='([^']*)'", posix).group(1), posix_launcher, 'POSIX')
 sedprog = re.search(r"sed -E '(s/.*?)'\)", posix, re.S).group(1)
 rewritten = subprocess.run(['sed', '-E', sedprog], input=body + '\n',
                            capture_output=True, text=True, check=True).stdout
@@ -991,7 +1259,8 @@ io.open(out + '/posix-probe.ps1', 'w').write(
 # Windows asset: its body plus the exact regex and replacement of its rewrite.
 win = io.open(root + '/skill/assets/client/windows/agentq.ps1', encoding='utf-8').read()
 seg = win[win.index('function Get-WindowsAgentQProtocolProbeCommand'):]
-body2 = re.search(r"\$script = @'\n(.*?)\n'@", seg, re.S).group(1)
+win_launcher = launcher_literal_from(win, 'Windows')
+body2 = retarget(re.search(r"\$script = @'\n(.*?)\n'@", seg, re.S).group(1), win_launcher, 'Windows')
 line = [l for l in win.split('\n') if '[regex]::Replace($Script' in l][0]
 pat = line[line.index("Replace($Script, '") + len("Replace($Script, '"):line.rindex("', '")]
 rep = line[line.rindex("', '") + 4:-2]
@@ -1202,9 +1471,9 @@ ps1_stdin_guard_line=$(/usr/bin/grep -v '^[[:space:]]*#' "$client" | /usr/bin/gr
 ps1_stdin_guard_problem=''
 if [ -z "$ps1_stdin_guard_line" ]; then
     ps1_stdin_guard_problem='the stdin-script decode command with a target-side guard is not in the client'
-elif ! printf '%s\n' "$ps1_stdin_guard_line" | /usr/bin/grep -qF -- 'command -v base64 >/dev/null 2>&1 || { echo'; then
+elif ! /usr/bin/grep -qF -- 'command -v base64 >/dev/null 2>&1 || { echo' <<< "$ps1_stdin_guard_line"; then
     ps1_stdin_guard_problem='the stdin-script decode command lost its target-side base64 guard'
-elif ! printf '%s\n' "$ps1_stdin_guard_line" | /usr/bin/grep -qF -- 'exit 2; }; printf %s $scriptBase64 | base64 -d | sh'; then
+elif ! /usr/bin/grep -qF -- 'exit 2; }; printf %s $scriptBase64 | base64 -d | sh' <<< "$ps1_stdin_guard_line"; then
     # The guard's block must be followed directly by the pipeline: that is what
     # pins it BEFORE the pipeline.  A recovery clause (`| sh || { ... }`) would
     # put the pipeline first and run the guard only after the pipeline already
@@ -1215,10 +1484,326 @@ if [ -n "$ps1_stdin_guard_problem" ]; then
     printf 'ps-client: %s\n' "$ps1_stdin_guard_problem" >&2
     mode_static_failures=$((mode_static_failures + 1))
 fi
+
+# The platform cache must live under the SAME SID-resolved profile as the config
+# path.  The client's stated rule is that USERPROFILE is not trusted (Git Bash,
+# OpenSSH, runas and stale sessions pollute it), and it resolves the profile
+# from the process SID for exactly that reason -- but the cache path read the
+# raw environment until 2026-10-21, i.e. a second location the same rule was
+# meant to cover.  A source-level lock, because the behavioural difference only
+# appears on Windows with a polluted USERPROFILE (off Windows both spellings
+# resolve to the same fallback, so a fixture cannot distinguish them).
+cache_path_body=$(awk '/^function Get-PlatformProbeCachePath/,/^}/' "$client" \
+    | /usr/bin/grep -v '^[[:space:]]*#')
+if [ -z "$cache_path_body" ]; then
+    printf '%s\n' 'ps-client: Get-PlatformProbeCachePath is missing from the client' >&2
+    mode_static_failures=$((mode_static_failures + 1))
+elif /usr/bin/grep -qF -- '$env:USERPROFILE' <<< "$cache_path_body"; then
+    printf '%s\n' 'ps-client: the platform cache path reads $env:USERPROFILE (must use $script:UserProfileDirectory, the SID-resolved profile)' >&2
+    mode_static_failures=$((mode_static_failures + 1))
+elif ! /usr/bin/grep -qF -- '$script:UserProfileDirectory' <<< "$cache_path_body"; then
+    printf '%s\n' 'ps-client: the platform cache path no longer derives from $script:UserProfileDirectory' >&2
+    mode_static_failures=$((mode_static_failures + 1))
+fi
 grep -q -- '--confirm' "$client" || { printf '%s\n' 'ps-client: missing remove --label --confirm handling' >&2; mode_static_failures=$((mode_static_failures + 1)); }
 grep -q -- '--full' "$client" || { printf '%s\n' 'ps-client: missing doctor --full' >&2; mode_static_failures=$((mode_static_failures + 1)); }
 grep -q -- '--summary' "$client" || { printf '%s\n' 'ps-client: missing status --summary' >&2; mode_static_failures=$((mode_static_failures + 1)); }
 failures=$((failures + mode_static_failures))
+
+# --version must be byte-identical to the POSIX twin's line.  Measured
+# 2026-10-21: this client printed `agentq.ps1 0.1.16` while the POSIX client
+# printed `agentq 0.1.16` -- the program name came from $script:Program, which
+# is the FILE name (right for error prefixes, wrong for this line), and no case
+# pinned the output at all.
+cases=$((cases + 1))
+version_out=$("$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" --version 2>/dev/null | tr -d '\r')
+case $version_out in
+    'agentq '[0-9]*.[0-9]*.[0-9]*) ;;
+    *) printf 'ps-client --version: expected "agentq <x.y.z>", got "%s"\n' "$version_out" >&2
+       failures=$((failures + 1)) ;;
+esac
+
+# A configured-but-bad cache TTL must be REFUSED at startup, not silently
+# replaced by the default.  Measured 2026-10-21: the POSIX client refused it
+# while this one fell back to 604800 -- `AGENTQ_PLATFORM_PROBE_CACHE_TTL=abc`
+# quietly meant "seven days", and no check covered the Windows side at all.
+# A malformed cache entry is a MISS, never an error.  Measured 2026-10-21: a
+# file holding valid JSON with a missing field (`{}`, `null`,
+# `{"platform":"unix"}`) made StrictMode throw PropertyNotFoundException
+# OUTSIDE the old try, so an uncaught error escaped as exit 1 with a stack and
+# every later command against that host failed -- until the file was deleted by
+# hand.  This drives the real function against each shape and requires a clean
+# `false`, which is exactly what the cache's contract promises.
+cache_miss_probe=$(cat <<'PSCACHE'
+$ErrorActionPreference = "Stop"
+. "__CLIENT__" 2>$null
+$dir = Join-Path ([System.IO.Path]::GetTempPath()) ("aq-cache-shape-" + $PID)
+$env:AGENTQ_PLATFORM_CACHE_DIR = $dir
+$env:AGENTQ_PLATFORM_PROBE_CACHE = "on"
+[void](New-Item -ItemType Directory -Path (Join-Path $dir "platform-cache") -Force)
+$path = Get-PlatformProbeCachePath
+$bad = 0
+foreach ($body in @('{}', 'null', '{"platform":"unix"}', '{"platform":"bogus","probed_at":1}', 'not json at all')) {
+    [System.IO.File]::WriteAllText($path, $body)
+    $script:RemotePlatform = "auto"
+    try {
+        $hit = Read-PlatformProbeCache
+        if ($hit) { [Console]::Error.WriteLine("cache shape " + $body + ": treated as a HIT"); $bad += 1 }
+    } catch {
+        [Console]::Error.WriteLine("cache shape " + $body + ": threw " + $_.Exception.GetType().Name)
+        $bad += 1
+    }
+}
+Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+if ($bad -eq 0) { [Console]::Out.WriteLine("cache-miss-shapes-ok") }
+PSCACHE
+)
+cache_miss_probe=${cache_miss_probe//__CLIENT__/$client_arg}
+
+# Validation runs before any ssh call, so no stub is needed here.
+cases=$((cases + 1))
+ttl_status=0
+AGENTQ_PLATFORM_PROBE_CACHE_TTL=abc AGENTQ_HOST=smoke-host \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
+    >"$work/out" 2>"$work/err" || ttl_status=$?
+if [ "$ttl_status" -ne 2 ] || ! grep -qF 'AGENTQ_PLATFORM_PROBE_CACHE_TTL must be a positive' "$work/err"; then
+    printf 'ps-client: AGENTQ_PLATFORM_PROBE_CACHE_TTL=abc was not refused at startup (exit %s)\n' "$ttl_status" >&2
+    head -2 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+
+cases=$((cases + 1))
+cache_miss_status=0
+cache_miss_out=$("$pwsh_binary" -NoProfile -NonInteractive -Command "$cache_miss_probe" 2>"$work/cache-miss.err") || cache_miss_status=$?
+# The dot-source prints the client's usage on stdout (no arguments), so the
+# verdict is "the probe's own token is present", not "stdout is exactly it".
+if [ "$cache_miss_status" -ne 0 ] || ! grep -qF 'cache-miss-shapes-ok' <<< "$cache_miss_out"; then
+    printf 'ps-client: a malformed platform-cache entry is not treated as a cache miss (exit %s)\n' "$cache_miss_status" >&2
+    head -3 "$work/cache-miss.err" >&2 || true
+    failures=$((failures + 1))
+fi
+
+# --- the platform-probe cache write must not use a .NET Core-only overload ---
+# Write-PlatformProbeCache used `[System.IO.File]::Move($temporary, $path,
+# $true)`.  The three-argument overwrite overload exists on .NET Core 3.0+
+# (pwsh 7 -- measured here: GetMethods lists Move(String, String, Boolean)) but
+# NOT on .NET Framework, which is what Windows PowerShell 5.1 runs on.  There it
+# is a binding failure, the function's own catch swallows it as "no cache", and
+# the cache silently never works -- on the interpreter the .cmd/.bash launchers
+# actually use.  No other check could see this: every check sets
+# AGENTQ_PLATFORM_PROBE_CACHE=off, so the write path was never executed.
+#
+# The lock is behavioural, not a grep for the bad call: it dot-sources the
+# client and drives Write-PlatformProbeCache twice (fresh write, then overwrite)
+# against a private cache directory.  A grep would pass on any rewrite that
+# reintroduces the overload somewhere else, and would also pass if the function
+# were broken in a new way.
+cache_probe='
+$ErrorActionPreference = "Stop"
+. "'"$client_arg"'" 2>$null
+$dir = Join-Path ([System.IO.Path]::GetTempPath()) ("aq-cache-lock-" + $PID)
+$env:AGENTQ_PLATFORM_CACHE_DIR = $dir
+$env:AGENTQ_PLATFORM_PROBE_CACHE = "on"
+$script:RemotePlatform = "unix"
+$bad = 0
+Write-PlatformProbeCache
+$path = Get-PlatformProbeCachePath
+if (!(Test-Path -LiteralPath $path -PathType Leaf)) { [Console]::Error.WriteLine("cache: the first write created no file"); $bad += 1 }
+else {
+    $first = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    if ($first.platform -ne "unix") { [Console]::Error.WriteLine("cache: first entry has platform=$($first.platform)"); $bad += 1 }
+}
+# Second write must OVERWRITE an existing entry.  This is the arm that used the
+# 5.1-incompatible overload; on a correct implementation the file is replaced
+# and no .bak / .tmp is left behind.
+$script:RemotePlatform = "windows"
+Write-PlatformProbeCache
+if (!(Test-Path -LiteralPath $path -PathType Leaf)) { [Console]::Error.WriteLine("cache: the overwrite removed the file"); $bad += 1 }
+else {
+    $second = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+    if ($second.platform -ne "windows") { [Console]::Error.WriteLine("cache: the overwrite did not take (platform=$($second.platform))"); $bad += 1 }
+}
+$leftovers = @(Get-ChildItem -LiteralPath $dir -Recurse -Force -File | Where-Object { $_.FullName -ne $path })
+if ($leftovers.Count -ne 0) { [Console]::Error.WriteLine("cache: temporary/backup files left behind: " + (($leftovers | ForEach-Object Name) -join ",")); $bad += 1 }
+Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+if ($bad -ne 0) { exit 1 }
+"cache write cases ok"
+'
+cases=$((cases + 1))
+status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command "$cache_probe" \
+    >"$work/out" 2>"$work/err" || status=$?
+if [ "$status" -ne 0 ] || ! grep -qF 'cache write cases ok' "$work/out"; then
+    printf '%s\n' 'ps-client: the platform-probe cache write is broken (a .NET Framework runtime would silently never cache)' >&2
+    head -3 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+
+# An unguarded `ConvertFrom-Json -Depth` is a PARAMETER binding failure on
+# Windows PowerShell 5.1 (measured on this host with PSScriptAnalyzer's 5.1
+# profile: "The parameter 'Depth' is not available for command
+# 'ConvertFrom-Json' by default in PowerShell version '5.1.17763.316'"), and
+# the catch around both call sites would turn it into "invalid JSON response"
+# for every call.  The asset guards both sites with
+# `Parameters.ContainsKey("Depth")`; that guard is load-bearing and had no
+# lock.  The check is structural (AST ancestor, not a line window or a grep
+# count): every ConvertFrom-Json command carrying -Depth must sit inside an
+# if whose condition tests the parameter.  It self-calibrates on a fixture
+# with one unguarded and one guarded site, so a scanner that has stopped
+# matching cannot read as a clean tree.
+cases=$((cases + 1))
+# The fixture is materialized by bash (a quoted heredoc has no quoting layers
+# to fight); the PowerShell probe only reads two files.  Calibration: the
+# fixture holds one guarded and one unguarded site, so a scanner that has
+# stopped matching (or that matches everything) fails here before the asset is
+# judged.
+cat > "$work/depth-fixture.ps1" <<'AQPSEOF'
+function Test-Good {
+    if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey("Depth")) {
+        $x = "{}" | ConvertFrom-Json -Depth 100
+    } else {
+        $x = "{}" | ConvertFrom-Json
+    }
+}
+function Test-Bad {
+    $y = "{}" | ConvertFrom-Json -Depth 100
+}
+AQPSEOF
+depth_probe='
+param([string]$FixturePath, [string]$ClientPath)
+$ErrorActionPreference = "Stop"
+function Get-UnguardedDepthSites([string]$Path) {
+    $err = $null; $tok = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tok, [ref]$err)
+    $bad = @()
+    foreach ($c in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+        $elements = $c.CommandElements
+        if ($elements.Count -lt 1) { continue }
+        if ($elements[0].Extent.Text -ne "ConvertFrom-Json") { continue }
+        # -Depth may be written `-Depth 100` OR `-Depth:100`; the colon form is
+        # a single CommandParameterAst whose extent text is "-Depth:100", so
+        # comparing Extent.Text to "-Depth" misses it.  ParameterName is
+        # "Depth" in both spellings (measured), so test that instead.
+        $hasDepth = $false
+        for ($i = 1; $i -lt $elements.Count; $i++) {
+            if ($elements[$i] -is [System.Management.Automation.Language.CommandParameterAst] -and
+                $elements[$i].ParameterName -ieq "Depth") { $hasDepth = $true }
+        }
+        if (-not $hasDepth) { continue }
+        $guarded = $false
+        $p = $c.Parent
+        while ($null -ne $p) {
+            if ($p -is [System.Management.Automation.Language.IfStatementAst]) {
+                foreach ($clause in $p.Clauses) {
+                    if ($clause.Item1.Extent.Text -match "Parameters\.ContainsKey\(\s*`"Depth`"\s*\)") { $guarded = $true }
+                }
+            }
+            $p = $p.Parent
+        }
+        if (-not $guarded) { $bad += $c.Extent.StartLineNumber }
+    }
+    return $bad
+}
+$calibration = @(Get-UnguardedDepthSites -Path $FixturePath)
+if ($calibration.Count -ne 1) {
+    [Console]::Error.WriteLine("depth guard: calibration found $($calibration.Count) unguarded site(s) in the fixture, expected 1")
+    exit 1
+}
+$real = @(Get-UnguardedDepthSites -Path $ClientPath)
+if ($real.Count -ne 0) {
+    [Console]::Error.WriteLine("depth guard: unguarded ConvertFrom-Json -Depth at line(s): " + ($real -join ","))
+    exit 1
+}
+"depth guard cases ok"
+'
+# The fixture path is passed as a NAMED PARAMETER to a -File script -- the same
+# shape as the other -File fixtures in this check (win-probe.ps1,
+# bom-driver.ps1), which the windows CI job runs under real 5.1.  Those cases
+# pass there with POSIX /tmp paths, which is the evidence that this one can too
+# (Git Bash converts arguments for native binaries; that mechanism is inference,
+# the passing cases are the measurement).  Only the client path gets an explicit
+# cygpath at the top, because the check invokes the client through -File from
+# contexts where no conversion happens.  This block runs under 5.1 in CI too.
+printf '%s\n' "$depth_probe" > "$work/depth-guard.ps1"
+status=0
+"$pwsh_binary" -NoProfile -NonInteractive -File "$work/depth-guard.ps1" \
+    -FixturePath "$work/depth-fixture.ps1" -ClientPath "$client_arg" \
+    >"$work/out" 2>"$work/err" || status=$?
+if [ "$status" -ne 0 ] || ! grep -qF 'depth guard cases ok' "$work/out"; then
+    printf '%s\n' 'ps-client: a ConvertFrom-Json -Depth call is not guarded by Parameters.ContainsKey("Depth") (a parameter binding failure on Windows PowerShell 5.1)' >&2
+    head -3 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+
+# The launcher path is stated in FIVE places across the two clients -- the POSIX
+# asset's protocol probe, its launcher wrapper (the ACTUAL invocation), and the
+# Windows asset's probe plus two (invocation + diagnostic) -- and nothing else
+# can keep them in step.  Measured 2026-10-20: editing the Windows asset's
+# invocation line alone left every case above green, because the probe -- the
+# only path these cases exercise -- still read the old value.  A probe that
+# checks a path the client would never call is a false green.  So: extract every
+# occurrence of the path from both assets (both slash styles), normalize, and
+# require ONE value across the pair.  Reading them from the assets (not a
+# literal here) is the whole point: a literal is a second source of truth that
+# drifts on its own.
+cases=$((cases + 1))
+launcher_parity=$(python3 - "$root" <<'PYPARITY' 2>&1
+import io, re, sys
+root = sys.argv[1]
+# Any .ps1 under ProgramData\\AgentQ, in either slash style -- a rename of ONE
+# site must read as a second value, not as an invisible non-match.
+pattern = re.compile(r'[A-Za-z]:[\\/]ProgramData[\\/]AgentQ[\\/][A-Za-z0-9._-]+\.ps1')
+found = {}
+for rel in ('skill/assets/client/unix/agentq', 'skill/assets/client/windows/agentq.ps1'):
+    text = io.open(root + '/' + rel, encoding='utf-8').read()
+    values = {m.group(0).replace(chr(92), '/') for m in pattern.finditer(text)}
+    if len(values) != 1:
+        sys.exit('%s names %d launcher paths %r; expected exactly one'
+                  % (rel, len(values), sorted(values)))
+    found[rel] = values.pop()
+if len(set(found.values())) != 1:
+    sys.exit('the launcher path drifts between the two clients: %r' % found)
+print('ok')
+PYPARITY
+) || true
+if [ "$launcher_parity" != ok ]; then
+    printf 'ps-client: the two clients do not name the same Windows launcher path: %s\n' "$launcher_parity" >&2
+    failures=$((failures + 1))
+fi
+
+# cancel exit 4: the CODE is the contract, the body is decoration.  Until
+# 2026-10-21 Invoke-Mutation replaced 4 with 2 whenever the body failed its
+# `cancellation_pending` validation -- i.e. it reported "protocol/parameter
+# error, fix your arguments and retry" for the one state whose documented
+# meaning is "the server cannot decide safely; STOP, do not retry".  The POSIX
+# twin's behaviour is pinned in smoke/05; this is the same lock on this copy,
+# driven by overriding Invoke-SshLogged rather than a stub binary.
+cases=$((cases + 1))
+cancel4_probe='
+$ErrorActionPreference = "Stop"
+. "__CLIENT__" 2>$null
+function Invoke-SshLogged {
+    param([string]$RemoteCommand, [AllowNull()][string]$InputPayload)
+    return [pscustomobject]@{ ExitCode = 4; Output = $script:FakeCancelBody; Diagnostics = "" }
+}
+$bad = 0
+$script:FakeCancelBody = "{`"task_id`":1,`"state`":`"bogus_state`"}"
+$code = Invoke-Mutation -OperationName "cancel" -Invocation ([pscustomobject]@{ Command = "x"; Input = "" }) -ExpectedTaskId "1"
+if ($code -ne 4) { [Console]::Error.WriteLine("cancel with exit 4 and an unvalidated body returned $code, expected 4"); $bad += 1 }
+$script:FakeCancelBody = "{`"task_id`":1,`"state`":`"cancellation_pending`",`"cancellation_requested_at`":`"2026-10-21T00:00:00Z`"}"
+$code = Invoke-Mutation -OperationName "cancel" -Invocation ([pscustomobject]@{ Command = "x"; Input = "" }) -ExpectedTaskId "1"
+if ($code -ne 4) { [Console]::Error.WriteLine("cancel with exit 4 and a valid cancellation_pending body returned $code, expected 4"); $bad += 1 }
+if ($bad -eq 0) { [Console]::Out.WriteLine("cancel4-ok") }
+'
+cancel4_probe=${cancel4_probe//__CLIENT__/$client_arg}
+cases=$((cases + 1))
+cancel4_status=0
+cancel4_out=$("$pwsh_binary" -NoProfile -NonInteractive -Command "$cancel4_probe" 2>"$work/cancel4.err") || cancel4_status=$?
+if [ "$cancel4_status" -ne 0 ] || ! grep -qF 'cancel4-ok' <<< "$cancel4_out"; then
+    printf 'ps-client: cancel with exit 4 does not preserve the code (exit %s)\n' "$cancel4_status" >&2
+    head -3 "$work/cancel4.err" >&2 || true
+    failures=$((failures + 1))
+fi
 
 # The success line is printed only AFTER the failure gate: until 2026-10-16 it
 # came first, so a red run printed "checks passed: cases=..." and then the

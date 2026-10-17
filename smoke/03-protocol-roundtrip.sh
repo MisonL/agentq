@@ -37,7 +37,39 @@ done
 work=$(mktemp -d "${TMPDIR:-/tmp}/agentq-smoke-protocol.XXXXXX")
 work=$(unset CDPATH; cd -- "$work" && pwd -P)
 
+# The runtime supplies pueue/pueued (binaries, and the only reason this check
+# needs a runtime at all); the SERVER must be the one in this repo.  Until
+# 2026-10-21 it was "$runtime_home/agentq-server" -- a copy the sandbox made at
+# its own creation time -- so every server-side change after that moment was
+# invisible here.  Measured: the sandbox copy was 247276 bytes (the previous
+# commit's asset) while the repo asset was 248213, and this check passed
+# regardless.
+#
+# The server resolves its root from its OWN DIRECTORY ($0), and that root must
+# be the runtime home: it refuses a symlinked data directory
+# (ensure_data_directory), and the request records this check plants have to
+# live where the running daemon's tasks are.  Its $program (and therefore every
+# `agentq-server: reason=...` line this check asserts) is the basename of $0,
+# so the file has to be NAMED agentq-server -- a staged copy under another name
+# reports `agentq-server.smoke-under-test: reason=...` and fails the contract
+# for a reason that has nothing to do with the code (measured 2026-10-21).
+# So the runtime's own copy is swapped for the duration and restored by the
+# EXIT trap; the original is kept beside it under a name a crashed run cannot
+# mistake for the real one.
+root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 server="$runtime_home/agentq-server"
+server_backup="$runtime_home/agentq-server.smoke-original"
+if [ ! -f "$server_backup" ]; then
+    cp -p "$server" "$server_backup" || {
+        printf '%s\n' 'protocol-roundtrip: cannot back up the runtime server before staging the repo asset' >&2
+        exit 2
+    }
+fi
+cp "$root/skill/assets/unix/agentq-server" "$server" || {
+    printf '%s\n' 'protocol-roundtrip: cannot stage the repo server into the runtime home' >&2
+    exit 2
+}
+chmod 700 "$server"
 request_id="smoke-$$-$(date -u '+%Y%m%dT%H%M%SZ')"
 
 # Every task this check creates is tidied on EXIT, so a failure in the middle of
@@ -91,7 +123,7 @@ cleanup_registered_tasks() {
         done
     done
 }
-trap 'cleanup_registered_tasks || true; rm -rf -- "$work"' EXIT
+trap 'cleanup_registered_tasks || true; if [ -f "$server_backup" ]; then mv -f -- "$server_backup" "$server"; fi; rm -rf -- "$work"' EXIT
 
 # The two instance-binding fixtures below plant files into the runtime's data
 # directories.  Their paths are declared here, before any protocol work, so a

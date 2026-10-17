@@ -478,7 +478,29 @@ try {
     [System.IO.File]::WriteAllText($runtimeScriptPath, $runtimeScriptContent, [System.Text.UTF8Encoding]::new($false))
     Assert-AgentQLauncherRuntimeFilePath -Path $runtimeScriptPath
     & $gitBashPath --noprofile --norc $runtimeScriptPath
-    $exitCode = $LASTEXITCODE
+    # StrictMode: a CreateProcess failure (AV or a policy blocking bash.exe) is
+    # a NON-terminating error that never sets $LASTEXITCODE.  The bare read
+    # threw, and the top-level trap reported "The variable '$LASTEXITCODE'
+    # cannot be retrieved" -- the exit code was still the contract's 2, but the
+    # diagnostic pointed at PowerShell instead of the spawn that failed
+    # (measured 2026-10-17 in pwsh 7.5: the direct read throws, Get-Variable
+    # returns null).  Fail closed with the real cause; `exit` inside try still
+    # runs the finally cleanup below.
+    # The variable is deliberately NOT named $lastExitCode: PowerShell
+    # identifiers are case-insensitive, so that name IS the automatic
+    # $LASTEXITCODE, and assigning it at SCRIPT scope replaces the integer with
+    # a PSVariable object -- the next .Value read then throws "Cannot convert
+    # System.Management.Automation.PSVariable to System.Int32" (measured
+    # 2026-10-18 in pwsh 7.5).  Inside a function the assignment merely shadows
+    # the global, which is why the same idiom is safe in the helpers.
+    $spawnProbe = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
+    if ($null -eq $spawnProbe) {
+        [Console]::Error.WriteLine("agentq: Git Bash could not be executed: $gitBashPath")
+        [Console]::Error.WriteLine("agentq: reason=protocol_error")
+        [Console]::Error.WriteLine("agentq-exit:2")
+        exit 2
+    }
+    $exitCode = [int]$spawnProbe.Value
 } finally {
     if ($runtimeScriptCreated) {
         if (!(Remove-AgentQLauncherRuntimeFile -Path $runtimeScriptPath)) {

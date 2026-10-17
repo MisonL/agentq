@@ -143,6 +143,76 @@ for signal_name in TERM INT HUP; do
     fi
 done
 
+# --- the backgrounded wait ssh must be stopped, not orphaned ---------------
+# `wait --timeout` is the one path that runs ssh in the BACKGROUND.  A signal
+# handler that only exits leaves that child alive: the client returns 130 while
+# the remote `wait` keeps holding the server operation lock until its own
+# budget elapses.  The stub records its own pid (and `exec`s the sleep, so the
+# recorded pid IS the process the client spawned), which makes "the child is
+# gone" a direct assertion rather than an inference from timing.
+cases=$((cases + 1))
+cat > "$work/ssh-hang" <<EOF
+#!/bin/sh
+: > "$work/ssh-hang-invoked"
+printf '%s\n' "\$\$" > "$work/ssh-hang-pid"
+exec sleep 30
+EOF
+chmod 700 "$work/ssh-hang"
+rm -f "$work/ssh-hang-invoked" "$work/ssh-hang-pid"
+hang_status=0
+env -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD_PROMPT \
+    TMPDIR="$client_tmp" \
+    AGENTQ_SSH="$work/ssh-hang" \
+    AGENTQ_HOST=127.0.0.1 \
+    AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_CONFIG="$work/absent-config" \
+    "$client" wait 1 --timeout 300 >"$work/hang-out" 2>"$work/hang-err" &
+hang_client_pid=$!
+hang_reached=0
+for _ in $(seq 1 100); do
+    if [ -f "$work/ssh-hang-invoked" ]; then
+        hang_reached=1
+        break
+    fi
+    kill -0 "$hang_client_pid" 2>/dev/null || break
+    sleep 0.1
+done
+if [ "$hang_reached" -ne 1 ]; then
+    printf '%s\n' 'client-interrupt: wait --timeout never reached its background SSH call, so the orphan window was not exercised' >&2
+    kill "$hang_client_pid" 2>/dev/null || true
+    wait "$hang_client_pid" 2>/dev/null || true
+    failures=$((failures + 1))
+else
+    kill -TERM "$hang_client_pid" 2>/dev/null || true
+    wait "$hang_client_pid" 2>/dev/null || hang_status=$?
+    if [ "$hang_status" -ne 130 ]; then
+        printf 'client-interrupt: SIGTERM during wait --timeout exited %s, expected 130\n' "$hang_status" >&2
+        failures=$((failures + 1))
+    fi
+    hang_ssh_pid=$(cat "$work/ssh-hang-pid" 2>/dev/null || true)
+    if [ -z "$hang_ssh_pid" ]; then
+        printf '%s\n' 'client-interrupt: the background wait stub did not record its pid; the orphan assertion cannot run' >&2
+        failures=$((failures + 1))
+    else
+        # A kill is delivered immediately; the loop only absorbs scheduler lag.
+        # 3s is far below the stub's own 30s, so a surviving child means the
+        # client left it behind, not that the poll was impatient.
+        hang_alive=1
+        for _ in $(seq 1 30); do
+            if ! kill -0 "$hang_ssh_pid" 2>/dev/null; then
+                hang_alive=0
+                break
+            fi
+            sleep 0.1
+        done
+        if [ "$hang_alive" -eq 1 ]; then
+            printf 'client-interrupt: the backgrounded wait ssh (pid %s) survived the client exit; the remote wait keeps holding the operation lock\n' "$hang_ssh_pid" >&2
+            kill "$hang_ssh_pid" 2>/dev/null || true
+            failures=$((failures + 1))
+        fi
+    fi
+fi
+
 # A control case with no signal at all.  Without it, a client that simply always
 # exited 130 -- or that never allocated a temporary in the first place -- would
 # satisfy every case above while being broken in the ordinary path.  This is the

@@ -60,7 +60,13 @@ control="$work/control"
 
 cp "$source_home/pueue" "$home/pueue.real"
 cp "$source_home/pueued" "$home/pueued"
-cp "$source_home/agentq-server" "$home/agentq-server"
+# The SERVER under test is the repo asset, not the runtime's snapshot: the
+# runtime supplies pueue/pueued (the only thing it is needed for), and until
+# 2026-10-21 this copied "$source_home/agentq-server", which is whatever the
+# sandbox held at ITS creation time -- measured: 247276 bytes against the repo
+# asset's 248213, with every check here green either way.
+root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+cp "${AGENTQ_SMOKE_SERVER:-$root/skill/assets/unix/agentq-server}" "$home/agentq-server"
 chmod 700 "$home/pueue.real" "$home/pueued" "$home/agentq-server"
 
 # The server invokes pueue through `env -i`, so a control flag cannot travel as

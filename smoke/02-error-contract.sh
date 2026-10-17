@@ -218,7 +218,7 @@ fi
 # hardcoded 0: a literal would keep reading "reason-gaps=0" if the guard were
 # ever separated from the summary.  It is 0 whenever this line is reached.
 if [ -n "$reason_gap_sites" ]; then
-    reason_gap_count=$(printf '%s\n' "$reason_gap_sites" | grep -c .)
+    reason_gap_count=$(grep -c . <<< "$reason_gap_sites")
 else
     reason_gap_count=0
 fi

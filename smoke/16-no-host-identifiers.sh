@@ -137,14 +137,14 @@ first_match() {
     local rule=$1 line=$2 got
     case "$rule" in
     R1)
-        got=$(printf '%s' "$line" | grep -oE "$RE_R1" | grep -vE "$RE_R1_ALLOW" | head -1 || true)
+        got=$(grep -oE "$RE_R1" <<< "$line" | grep -vE "$RE_R1_ALLOW" | head -1 || true)
         ;;
-    R2) got=$(printf '%s' "$line" | grep -oE "$RE_R2" | head -1 || true) ;;
-    R3) got=$(printf '%s' "$line" | grep -oE "$RE_R3" | head -1 || true) ;;
-    R4) got=$(printf '%s' "$line" | grep -oE "$RE_R4" | head -1 || true) ;;
-    R5) got=$(printf '%s' "$line" | grep -oE "$RE_R5" | head -1 || true) ;;
-    R6) got=$(printf '%s' "$line" | grep -oE "$RE_R6" | head -1 || true) ;;
-    R7) got=$(printf '%s' "$line" | grep -oE "$RE_R7" | head -1 || true) ;;
+    R2) got=$(grep -oE "$RE_R2" <<< "$line" | head -1 || true) ;;
+    R3) got=$(grep -oE "$RE_R3" <<< "$line" | head -1 || true) ;;
+    R4) got=$(grep -oE "$RE_R4" <<< "$line" | head -1 || true) ;;
+    R5) got=$(grep -oE "$RE_R5" <<< "$line" | head -1 || true) ;;
+    R6) got=$(grep -oE "$RE_R6" <<< "$line" | head -1 || true) ;;
+    R7) got=$(grep -oE "$RE_R7" <<< "$line" | head -1 || true) ;;
     esac
     printf '%s' "$got"
 }
@@ -181,7 +181,7 @@ scan_file() {
     if [ -n "$hits" ]; then
         while IFS= read -r ln; do
             [ -n "$ln" ] || continue
-            tok=$(printf '%s' "${ln#*:}" | grep -oE "$RE_R1" | grep -vE "$RE_R1_ALLOW" | head -1 || true)
+            tok=$(grep -oE "$RE_R1" <<< "${ln#*:}" | grep -vE "$RE_R1_ALLOW" | head -1 || true)
             [ -n "$tok" ] && report "$file" "${ln%%:*}" R1 "$tok"
         done <<EOF
 $hits
@@ -198,7 +198,7 @@ EOF
         [ -n "$hits" ] || continue
         while IFS= read -r ln; do
             [ -n "$ln" ] || continue
-            tok=$(printf '%s' "${ln#*:}" | grep -oE "$re" | head -1 || true)
+            tok=$(grep -oE "$re" <<< "${ln#*:}" | head -1 || true)
             [ -n "$tok" ] && report "$file" "${ln%%:*}" "$rule" "$tok"
         done <<EOF
 $hits

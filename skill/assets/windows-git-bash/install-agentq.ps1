@@ -18,11 +18,33 @@ $expectedClientHash = "28b0756d54ec16ce13d78b251d086aa62e0057089cb27f793cd649f97
 $expectedDaemonHash = "aafa05e2f26cda9aff3eeb9be261e8f9f67752d1e9bb7fbcb47318e35c52ab1d"
 $releaseVersion = "4.0.4"
 $releaseBaseUrl = "https://github.com/Nukesor/pueue/releases/download/v$releaseVersion"
-$agentqVersion = "0.1.15"
+$agentqVersion = "0.1.16"
 $clientAssetName = "pueue-x86_64-pc-windows-msvc.exe"
 $daemonAssetName = "pueued-x86_64-pc-windows-msvc.exe"
 $gitBashPath = $null
 $gitBashRuntimePath = $null
+
+function Get-NativeExitCode {
+    # Every site below reads the exit code of a native process (pueue.exe,
+    # powershell.exe, Git Bash).  Under Set-StrictMode -Version Latest a bare
+    # `$LASTEXITCODE` read THROWS when the process never started (a CreateProcess
+    # failure -- AV or a policy blocking the binary -- is a non-terminating
+    # error and does not set the variable), so the installer exited 1 with a
+    # PowerShell error instead of its own diagnostic (measured 2026-10-17 in
+    # pwsh 7.5: the direct read throws, Get-Variable returns null).  1 is the
+    # fail-closed answer: every call site treats non-zero as failure.
+    # Not named $lastExitCode: PowerShell identifiers are case-insensitive, so
+    # that name IS the automatic $LASTEXITCODE.  Inside a function the
+    # assignment only shadows the global (safe), but the same idiom at script
+    # scope replaces the integer with a PSVariable object and the .Value read
+    # throws (measured 2026-10-18) -- one name for both scopes removes the trap.
+    $nativeProbe = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
+    if ($null -eq $nativeProbe) {
+        return 1
+    }
+    return [int]$nativeProbe.Value
+}
+
 
 function Test-NonReparseWindowsProfilePath {
     param([string]$Path)
@@ -327,7 +349,7 @@ function Resolve-GitBashMsystem {
     param([string]$GitBashPath)
 
     $output = @(Invoke-GitBashScript -GitBashPath $GitBashPath -Script 'printf "%s" "$MSYSTEM"')
-    if ($LASTEXITCODE -ne 0) {
+    if ((Get-NativeExitCode) -ne 0) {
         throw "Git Bash did not report its MSYSTEM value"
     }
     $msystem = ([string]($output | Select-Object -Last 1)).Trim()
@@ -562,7 +584,7 @@ function Test-PueueConnection {
     try {
         $ErrorActionPreference = "Continue"
         & $ClientPath --config $ConfigPath status --json 1> $null 2> $null
-        return ($LASTEXITCODE -eq 0)
+        return ((Get-NativeExitCode) -eq 0)
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
     }
@@ -672,7 +694,7 @@ function Stop-PueueDaemon {
         try {
             $ErrorActionPreference = "Continue"
             & $ClientPath --config $ConfigPath shutdown 1> $null 2> $null
-            if ($LASTEXITCODE -ne 0) {
+            if ((Get-NativeExitCode) -ne 0) {
                 throw "Failed to stop Pueue daemon: $ClientPath"
             }
         } finally {
@@ -812,7 +834,7 @@ function Start-PueueDaemon {
 
     Assert-NonReparseFilePath -Path $StartupPath -Description "AgentQ startup launcher"
     & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $StartupPath 1> $null 2> $null
-    if ($LASTEXITCODE -ne 0) {
+    if ((Get-NativeExitCode) -ne 0) {
         throw "Failed to launch AgentQ Pueue daemon"
     }
     Wait-ForDaemon -ClientPath $ClientPath -ConfigPath $ConfigPath -DaemonPath $DaemonPath
@@ -1122,7 +1144,7 @@ function Get-PueueGroupsFromTemporaryFile {
         try {
             $ErrorActionPreference = "Continue"
             & $ClientPath --config $ConfigPath group --json 1> $temporaryPath 2> $null
-            $exitCode = $LASTEXITCODE
+            $exitCode = Get-NativeExitCode
         } finally {
             $ErrorActionPreference = $previousErrorActionPreference
         }
@@ -1574,7 +1596,7 @@ jq -er --arg task_id "$AGENTQ_SMOKE_TASK_ID" '.tasks[$task_id].status.Done.resul
 '@
         try {
             $resultOutput = @(Invoke-GitBashScript -GitBashPath $GitBashPath -Script $statusCommand -Login)
-            $exitCode = $LASTEXITCODE
+            $exitCode = Get-NativeExitCode
         } catch {
             $exitCode = 1
         }
@@ -1640,22 +1662,31 @@ function Assert-PueueSmokeLogContainsToken {
     try {
         $temporaryPath = New-AgentQInstallerTemporaryFile -Directory $TemporaryDirectory -Prefix "smoke-log"
         Assert-NonReparseFilePath -Path $temporaryPath -Description "Pueue shell smoke log temporary file"
+        # pueue log --full writes its table to STDERR in a session without a
+        # console (measured 2026-10-14 on the test VM: out-len=24,
+        # err-len=1466).  Under $ErrorActionPreference = "Stop" PS 5.1 turns
+        # the first native stderr line into a terminating NativeCommandError
+        # EVEN when stderr is redirected (measured: EAP=Stop + 2> file still
+        # throws) -- so the smoke's log read failed and ROLLED BACK the whole
+        # install ("Pueue shell smoke log could not be read").  Local
+        # EAP=Continue for this one call is what fixes that; the `2> $null` is
+        # there so the child's stderr cannot reach this process's own stderr
+        # (the launcher upstream reads that stream for its diagnostics).
+        #
+        # The 2026-10-14 change wrote `2> $smokeLogErrorPath` instead, a name
+        # assigned only `$null`, in the CALLING function -- the redirect found
+        # it through PowerShell's dynamic scope, so the effective redirect was
+        # `2> $null` and its cleanup branch (`if ($null -ne ...)`) could never
+        # run.  Nothing was captured either way (the file was to be deleted in
+        # this finally before any error surfaced), so this is written as the
+        # discard it always was; `1> $null`/`2> $null` is this file's existing
+        # idiom (see the daemon and launcher readiness probes).
         try {
-            # pueue log --full writes its table to STDERR in a session without
-            # a console (measured 2026-10-14 on the test VM: out-len=24,
-            # err-len=1466).  Under $ErrorActionPreference = "Stop" PS 5.1
-            # turns the first native stderr line into a terminating
-            # NativeCommandError EVEN when stderr is redirected (measured:
-            # EAP=Stop + 2> file still throws) -- so the smoke's log read
-            # failed and ROLLED BACK the whole install ("Pueue shell smoke log
-            # could not be read").  Local EAP=Continue for this one call:
-            # the child's exit code is the contract, and stderr is routed to
-            # its own file where the redirect still captures the bytes.
             $previousSmokeEAP = $ErrorActionPreference
             $ErrorActionPreference = "Continue"
             try {
-                & $ClientPath --config $ConfigPath log --full $TaskId 1> $temporaryPath 2> $smokeLogErrorPath
-                $exitCode = $LASTEXITCODE
+                & $ClientPath --config $ConfigPath log --full $TaskId 1> $temporaryPath 2> $null
+                $exitCode = Get-NativeExitCode
             } finally {
                 $ErrorActionPreference = $previousSmokeEAP
             }
@@ -1686,9 +1717,6 @@ function Assert-PueueSmokeLogContainsToken {
         } catch {
             $cleanupError = "Pueue shell smoke log cleanup failed: $temporaryPath"
         }
-        if ($null -ne $smokeLogErrorPath) {
-            Remove-Item -LiteralPath $smokeLogErrorPath -Force -ErrorAction SilentlyContinue
-        }
     }
     if ($null -ne $operationError) {
         if ($null -ne $cleanupError) {
@@ -1715,7 +1743,6 @@ function Invoke-PueueShellCommandSmoke {
     $taskRemoved = $false
     $smokeFailure = $null
     $cleanupFailure = $null
-    $smokeLogErrorPath = $null
 
     try {
         $addArguments = @(
@@ -1730,7 +1757,7 @@ function Invoke-PueueShellCommandSmoke {
             "printf", "%s\n", $smokeToken
         )
         $taskIdOutput = @(& $ClientPath @addArguments)
-        if ($LASTEXITCODE -ne 0) {
+        if ((Get-NativeExitCode) -ne 0) {
             throw "Pueue shell smoke task could not be submitted"
         }
 
@@ -1740,7 +1767,7 @@ function Invoke-PueueShellCommandSmoke {
         }
 
         & $ClientPath --config $ConfigPath wait --quiet $taskId 1> $null
-        if ($LASTEXITCODE -ne 0) {
+        if ((Get-NativeExitCode) -ne 0) {
             throw "Pueue shell smoke task failed: $taskId"
         }
 
@@ -1757,7 +1784,7 @@ function Invoke-PueueShellCommandSmoke {
     if ($null -ne $taskId) {
         try {
             & $ClientPath --config $ConfigPath remove $taskId 1> $null
-            if ($LASTEXITCODE -ne 0) {
+            if ((Get-NativeExitCode) -ne 0) {
                 throw "Pueue shell smoke task cleanup failed: $taskId"
             }
             $taskRemoved = $true
@@ -1817,7 +1844,7 @@ function Invoke-AgentQLauncherSmoke {
             # Capture it below instead of allowing PowerShell to promote it to a terminating error.
             $ErrorActionPreference = "Continue"
             & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $LauncherPath -ArgumentsBase64 $payload 1> $statusPath 2> $errorPath
-            $exitCode = $LASTEXITCODE
+            $exitCode = Get-NativeExitCode
         } finally {
             $ErrorActionPreference = $previousErrorActionPreference
         }
@@ -2066,7 +2093,7 @@ function Invoke-BashSyntaxCheck {
         [Environment]::SetEnvironmentVariable($environmentVariable, $Path, "Process")
         $syntaxCommand = 'script_path=$(cygpath -u -- "$AGENTQ_SYNTAX_PATH") || exit 2; bash -n -- "$script_path"'
         Invoke-GitBashScript -GitBashPath $gitBashPath -Script $syntaxCommand -Login
-        if ($LASTEXITCODE -ne 0) {
+        if ((Get-NativeExitCode) -ne 0) {
             throw "AgentQ server shell syntax check failed: $Path"
         }
     } finally {
@@ -2081,7 +2108,7 @@ function Invoke-BashSyntaxCheck {
 function Get-GitBashMissingRuntimeDependencies {
     $probeCommand = 'for dependency in jq base64 date find grep mktemp tail tr cygpath ps powershell.exe; do command -v "$dependency" >/dev/null 2>&1 || printf "%s\n" "$dependency"; done'
     $output = @(Invoke-GitBashScript -GitBashPath $gitBashPath -Script $probeCommand -Login)
-    if ($LASTEXITCODE -ne 0) {
+    if ((Get-NativeExitCode) -ne 0) {
         throw "Git Bash runtime dependency probe failed"
     }
 
@@ -2134,7 +2161,7 @@ function Install-GitBashJq {
         throw "Git Bash is missing jq and no supported Windows package manager is available"
     }
 
-    if ($LASTEXITCODE -ne 0) {
+    if ((Get-NativeExitCode) -ne 0) {
         throw "Failed to install missing Git Bash dependency jq"
     }
 
@@ -2191,14 +2218,18 @@ function Restore-LegacyDaemon {
 
     if ($hasLegacyStartupPath) {
         & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $legacyStartupPath 1> $null 2> $null
-        if ($LASTEXITCODE -ne 0) {
+        if ((Get-NativeExitCode) -ne 0) {
             throw "Failed to restore the legacy AgentQ Pueue daemon"
         }
         Wait-ForDaemon -ClientPath $legacyClientPath -ConfigPath $legacyConfigPath -DaemonPath $legacyDaemonPath
         return
     }
     if ($hasLegacyDaemonPath) {
-        Start-Process -FilePath $legacyDaemonPath -ArgumentList @("--config", $legacyConfigPath) -WindowStyle Hidden | Out-Null
+        # Quote explicitly: Start-Process -ArgumentList joins with spaces and
+        # does not quote (measured on pwsh 7; see agentq-start-daemon.ps1).
+        Start-Process -FilePath $legacyDaemonPath `
+            -ArgumentList @('"--config"', ('"' + $legacyConfigPath + '"')) `
+            -WindowStyle Hidden | Out-Null
         Wait-ForDaemon -ClientPath $legacyClientPath -ConfigPath $legacyConfigPath -DaemonPath $legacyDaemonPath
         return
     }
@@ -2953,11 +2984,11 @@ try {
     Assert-PowerShellSyntax -Path (Join-Path $stageRootDirectory "agentq-launcher.ps1")
     Assert-PowerShellSyntax -Path (Join-Path $stageRootDirectory "agentq-durable-move.ps1")
     & (Join-Path $stageRootDirectory "pueue.exe") --version 1> $null
-    if ($LASTEXITCODE -ne 0) {
+    if ((Get-NativeExitCode) -ne 0) {
         throw "Staged Pueue client cannot run"
     }
     & (Join-Path $stageRootDirectory "pueued.exe") --version 1> $null
-    if ($LASTEXITCODE -ne 0) {
+    if ((Get-NativeExitCode) -ne 0) {
         throw "Staged Pueue daemon cannot run"
     }
     Set-PrivateTreeAcl -Path $stageRootDirectory
@@ -3019,10 +3050,16 @@ try {
     } else {
         & $newClientPath --config $newConfigPath group add --parallel 1 agentq 1> $null
     }
-    if ($LASTEXITCODE -ne 0) {
+    if ((Get-NativeExitCode) -ne 0) {
         throw "Staged Pueue AgentQ group setup failed"
     }
-    $health = Get-PueueHealthFromTemporaryFile -ClientPath $newClientPath -ConfigPath $newConfigPath -RuntimeDirectory $runtimeDirectory
+    # Discarded on purpose: this call of `pueue status` is a validation -- it
+    # throws on a bad or absent payload -- and its return is the whole status
+    # document, which nothing between here and the response needs.  `[void]`,
+    # not a bare call: the installer's success stream IS its JSON response
+    # (the ConvertTo-Json at the end of the top-level try), so an unconsumed
+    # return would land in front of it and corrupt the response.
+    [void](Get-PueueHealthFromTemporaryFile -ClientPath $newClientPath -ConfigPath $newConfigPath -RuntimeDirectory $runtimeDirectory)
     Invoke-PueueShellCommandSmoke -ClientPath $newClientPath -ConfigPath $newConfigPath -WorkingDirectory $rootDirectory -GitBashPath $gitBashPath
     Invoke-AgentQLauncherSmoke -LauncherPath $newLauncherPath -ExpectMaintenanceRejection
     Set-PrivateTreeAcl -Path $rootDirectory

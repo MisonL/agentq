@@ -150,9 +150,22 @@ $script:PlatformProbeTimeout = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLA
 } else {
     "30"
 }
+# Validated by the same startup pass as the retry knobs: a configured-but-bad
+# value must be REFUSED, not silently replaced by the default.  Read only when a
+# cache entry is checked, a value that failed to parse would leave $ttl at its
+# initial 604800 -- i.e. `AGENTQ_PLATFORM_PROBE_CACHE_TTL=abc` would quietly mean
+# "seven days".  The POSIX twin has always refused it (is_bounded_positive_
+# integer); measured 2026-10-21 that the two clients disagreed on exactly this
+# variable, which is the kind of drift a user only notices on the platform they
+# are not testing on.
+$script:PlatformProbeCacheTtl = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLATFORM_PROBE_CACHE_TTL)) {
+    $env:AGENTQ_PLATFORM_PROBE_CACHE_TTL
+} else {
+    "604800"
+}
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.15"
+$script:ClientVersion = "0.1.16"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's argv limit, not this machine's platform: a unix
 # target takes up to 100000 base64 characters (the POSIX twin's MAX_ARG_STRLEN
@@ -500,6 +513,18 @@ function Resolve-CredentialSource {
         if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PASSWORD)) {
             Stop-Credential "AGENTQ_ASKPASS and AGENTQ_PASSWORD are both set; set only one"
         }
+        # Same rule for the prompt source, and for the same reason the POSIX twin
+        # gives: with an askpass program configured the prompt is silently
+        # unreachable, and silently ignoring a credential setting is exactly what
+        # Stop-Credential exists to refuse.  Measured 2026-10-21: with both set,
+        # POSIX exited 2 with this message while this client accepted the pair
+        # and used askpass -- so the same environment meant "ambiguous, fix it"
+        # on one platform and "fine" on the other.  The refusal has a second,
+        # Windows-specific justification: AGENTQ_PASSWORD_PROMPT is not supported
+        # here at all, so a user who set it clearly expected it to be used.
+        if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PASSWORD_PROMPT)) {
+            Stop-Credential "AGENTQ_ASKPASS and AGENTQ_PASSWORD_PROMPT are both set; set only one"
+        }
 
         $script:CredentialSource = "askpass"
         $script:AskPassProgram = $program
@@ -548,6 +573,38 @@ function Resolve-SshPath {
         }
         if (!(Test-NonReparseWindowsFilePath -Path $env:AGENTQ_SSH)) {
             Stop-AgentQ "AGENTQ_SSH is not a regular non-reparse file: $env:AGENTQ_SSH"
+        }
+        # Windows has no execute bit, so there is nothing to test here the way
+        # the POSIX twin's `[ -x ]` does.  What CAN be answered -- and was not,
+        # until 2026-10-21 -- is whether launching the file will work at all.
+        # Without this, a directory-permission or extension problem reached
+        # Start-Process, whose exception propagated out of Invoke-SshLogged
+        # (it re-throws by design, so its caller can decide) with NO top-level
+        # trap in this script: the client died with exit 1, a stack trace on
+        # stderr and no controlled `agentq:` line -- while the POSIX twin
+        # refused the same configuration at startup with exit 2.  Measured on
+        # macOS pwsh: a non-executable regular file gave POSIX 2 and Windows 1.
+        #
+        # The probe is a real launch with an argument ssh rejects immediately,
+        # so it costs no connection and touches no remote host.
+        $probeError = $null
+        try {
+            $probeInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $probeInfo.FileName = [System.IO.Path]::GetFullPath($env:AGENTQ_SSH)
+            $probeInfo.Arguments = "-V"
+            $probeInfo.UseShellExecute = $false
+            $probeInfo.CreateNoWindow = $true
+            $probeInfo.RedirectStandardOutput = $true
+            $probeInfo.RedirectStandardError = $true
+            $probe = [System.Diagnostics.Process]::Start($probeInfo)
+            [void]$probe.StandardOutput.ReadToEnd()
+            [void]$probe.StandardError.ReadToEnd()
+            $probe.WaitForExit(10000) | Out-Null
+        } catch {
+            $probeError = $_.Exception.Message
+        }
+        if ($null -ne $probeError) {
+            Stop-AgentQ "AGENTQ_SSH cannot be launched: $($env:AGENTQ_SSH): $probeError"
         }
         return [System.IO.Path]::GetFullPath($env:AGENTQ_SSH)
     }
@@ -768,11 +825,15 @@ function Get-FileTextOrEmpty {
 }
 
 function Get-LastExitCodeOrFailure {
-    $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
-    if ($null -eq $lastExitCode) {
+    # Not named $lastExitCode: PowerShell identifiers are case-insensitive, so
+    # that name IS the automatic $LASTEXITCODE (safe here, inside a function,
+    # but the same idiom at script scope corrupts the automatic variable --
+    # measured 2026-10-18).  One name for both scopes removes the trap.
+    $nativeProbe = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
+    if ($null -eq $nativeProbe) {
         return 1
     }
-    return [int]$lastExitCode.Value
+    return [int]$nativeProbe.Value
 }
 
 function Convert-ToProcessArgument {
@@ -854,6 +915,15 @@ function New-SshProcessStartInfo {
     $startInfo.RedirectStandardInput = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
+    # ssh emits UTF-8 (protocol responses, and task logs verbatim).  The .NET
+    # default for a redirected stream is Console.OutputEncoding -- on a zh-CN
+    # Windows that is GBK, and the repo has measured this exact class on the
+    # real test host: a CJK word came back as `????` (PLAN.md, 2026-10-08; smoke/22
+    # pins the same encoding in its driver for the same reason).  Pinned for
+    # every child this client starts; the server installer already does this
+    # for its own child (install-agentq.ps1).
+    $startInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $startInfo.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
     $hasArgumentList = @($startInfo.PSObject.Properties.Match("ArgumentList")).Count -gt 0
     if ($hasArgumentList) {
         foreach ($argument in $Arguments) {
@@ -1564,7 +1634,14 @@ function Get-PlatformProbeCachePath {
     } finally {
         $sha.Dispose()
     }
-    $baseDir = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLATFORM_CACHE_DIR)) { $env:AGENTQ_PLATFORM_CACHE_DIR } else { Join-Path $env:USERPROFILE ".config\agentq" }
+    # $script:UserProfileDirectory, NOT $env:USERPROFILE: this client resolves
+    # the profile from the process SID precisely because USERPROFILE can be
+    # polluted by Git Bash, OpenSSH, runas or a stale session (see the config
+    # path above and SKILL.md).  Using the raw environment here would let a
+    # polluted value redirect the cache -- a second location the same rule was
+    # meant to cover.  Measured 2026-10-21: this was the only remaining direct
+    # read of USERPROFILE outside the documented non-Windows fallback.
+    $baseDir = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLATFORM_CACHE_DIR)) { $env:AGENTQ_PLATFORM_CACHE_DIR } else { Join-Path $script:UserProfileDirectory ".config\agentq" }
     return (Join-Path (Join-Path $baseDir "platform-cache") "$($hash.Substring(0, 16)).json")
 }
 
@@ -1575,31 +1652,48 @@ function Read-PlatformProbeCache {
     if ($script:RemotePlatform -ne "auto") {
         return $false
     }
-    $path = Get-PlatformProbeCachePath
-    if (!(Test-Path -LiteralPath $path -PathType Leaf)) {
-        return $false
-    }
-    # A reparse point is refused, like the POSIX twin's `[ ! -L ]`: another
-    # local process could otherwise redirect the read to a file of its choosing.
-    if (!(Test-NonReparseWindowsFilePath -Path $path)) {
-        return $false
-    }
+    # EVERYTHING here is inside the try, including the path computation and the
+    # field reads.  Measured 2026-10-21: a cache file holding valid JSON with a
+    # missing field (`{}`, `null`, `{"platform":"unix"}`) made StrictMode Latest
+    # throw PropertyNotFoundException at `$entry.platform` -- outside the old
+    # try -- so an uncaught error escaped as exit 1 with a PowerShell stack and
+    # every later command against that host failed, contradicting this
+    # function's own contract that a broken cache must never break a working
+    # command.  An unusable AGENTQ_PLATFORM_CACHE_DIR threw from Join-Path the
+    # same way.  A malformed entry is a cache MISS, never an error.
     try {
+        $path = Get-PlatformProbeCachePath
+        if (!(Test-Path -LiteralPath $path -PathType Leaf)) {
+            return $false
+        }
+        # A reparse point is refused, like the POSIX twin's `[ ! -L ]`: another
+        # local process could otherwise redirect the read to a file of its choosing.
+        if (!(Test-NonReparseWindowsFilePath -Path $path)) {
+            return $false
+        }
         $entry = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+        if ($null -eq $entry) {
+            return $false
+        }
+        $platformProperty = $entry.PSObject.Properties["platform"]
+        $probedAtProperty = $entry.PSObject.Properties["probed_at"]
+        if (($null -eq $platformProperty) -or ($null -eq $probedAtProperty)) {
+            return $false
+        }
+        $platform = "$($platformProperty.Value)"
+        if (($platform -ne "unix") -and ($platform -ne "windows")) {
+            return $false
+        }
+        $probedAt = 0
+        if (!([int64]::TryParse("$($probedAtProperty.Value)", [ref]$probedAt))) {
+            return $false
+        }
     } catch {
         return $false
     }
-    if (($entry.platform -ne "unix") -and ($entry.platform -ne "windows")) {
-        return $false
-    }
-    $probedAt = 0
-    if (!([int64]::TryParse("$($entry.probed_at)", [ref]$probedAt))) {
-        return $false
-    }
-    $ttl = 604800
-    if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLATFORM_PROBE_CACHE_TTL)) {
-        [void][int64]::TryParse($env:AGENTQ_PLATFORM_PROBE_CACHE_TTL, [ref]$ttl)
-    }
+    # Already validated at startup (positive 32-bit integer); no reparsing here,
+    # so there is no way for a bad value to fall back to a default silently.
+    $ttl = $script:PlatformProbeCacheTtl
     $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $probedAt
     # A timestamp from the future (clock skew, or an entry written while the
     # clock was ahead) must not make the entry immortal: with only the `-gt`
@@ -1610,7 +1704,7 @@ function Read-PlatformProbeCache {
     if ($age -gt $ttl) {
         return $false
     }
-    $script:RemotePlatform = $entry.platform
+    $script:RemotePlatform = $platform
     return $true
 }
 
@@ -1638,7 +1732,23 @@ function Write-PlatformProbeCache {
         $json = $entry | ConvertTo-Json -Compress
         $temporary = "$path.$PID.tmp"
         [System.IO.File]::WriteAllText($temporary, $json + [Environment]::NewLine)
-        [System.IO.File]::Move($temporary, $path, $true)
+        # An overwrite is only atomic through File.Replace: the three-argument
+        # File.Move(move, destination, overwrite) overload this once called
+        # exists on .NET Core 3.0+ (then-measured: pwsh 7.5 lists Move(String,
+        # String, Boolean) in GetMethods) but NOT on .NET Framework, so under
+        # Windows PowerShell 5.1 -- the interpreter the .cmd/.bash launchers
+        # actually use -- it threw "cannot find an overload" and the catch
+        # turned the whole cache into a silent permanent no-op.  Replace
+        # requires the destination to exist, which is exactly the split below;
+        # its backup file is removed in the same breath and both arms keep the
+        # read-then-replace race small the way the POSIX twin's `mv -f` does.
+        if ([System.IO.File]::Exists($path)) {
+            $backupPath = "$path.$PID.bak"
+            [System.IO.File]::Replace($temporary, $path, $backupPath, $true)
+            Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+        } else {
+            [System.IO.File]::Move($temporary, $path)
+        }
     } catch {
         # A cache we cannot write simply means every run probes again, which
         # is the pre-cache behaviour -- never fatal.
@@ -2543,7 +2653,21 @@ function Confirm-WindowsAgentQProtocol {
     if (($protocolProbe.ExitCode -eq 45) -and ($protocolProbe.Output.Trim() -eq "agentq-windows-launcher-too-large")) {
         Stop-AgentQ "remote Windows AgentQ deployment is incompatible: C:/ProgramData/AgentQ/agentq-launcher.ps1 exceeds the protocol probe size limit; repair the protected deployment before using it"
     }
-    Stop-AgentQ "native Windows AgentQ service protocol probe failed on $($script:TargetHost)"
+    # The probe's OWN status, like the POSIX twin, not a flat 2.  The two
+    # clients disagreed here until 2026-10-21: a probe that failed because the
+    # SSH transport died returned 255 there and 2 here, and those two codes
+    # mean opposite things to a caller (255 = transport, retry; 2 = protocol
+    # or argument error, do not).  Measured with a stub ssh that exits 255 and
+    # writes the real `Connection refused` line: POSIX 255, Windows 2.
+    # Codes 42-45 and 124 were already handled explicitly above; this is the
+    # remaining arm, so it must propagate too.  A 0 with a mismatched payload
+    # is still a protocol failure -- 2 -- exactly as the POSIX side does.
+    $protocolExitCode = $protocolProbe.ExitCode
+    if ($protocolExitCode -eq 0) {
+        $protocolExitCode = 2
+    }
+    [Console]::Error.WriteLine("$($script:Program): native Windows AgentQ service protocol probe failed on $($script:TargetHost)")
+    exit $protocolExitCode
 }
 
 function Confirm-NativeWindowsPlatform {
@@ -2597,9 +2721,23 @@ function Initialize-RemoteInvocation {
                 }
             } elseif ($unixProbe.ExitCode -eq 255) {
                 Write-Diagnostics -Diagnostics $unixProbe.Diagnostics
-                if (Test-SshTransportError -Diagnostics $unixProbe.TransportDiagnostics) {
-                    Stop-AgentQ "SSH transport failed while detecting the remote platform"
-                }
+                # 255 is OpenSSH's own failure code, and the POSIX twin returns
+                # it without running the Windows probe: either the recovery
+                # loop already spent its whole transport-retry budget, or ssh
+                # failed for a reason the Windows probe would hit identically
+                # (authentication, host key, name resolution).  This arm used
+                # to fall through unless the diagnostics happened to contain a
+                # recognised transport line, so with a failed ssh that wrote no
+                # log the client still spent a SECOND full retry budget on the
+                # Windows probe -- and then reported "unable to detect the
+                # remote platform" (exit 2) instead of the transport failure
+                # (255), which a caller reads as "fix your arguments" rather
+                # than "the connection is down".  Measured 2026-10-21 with a
+                # stub ssh exiting 255 and writing no -E log: POSIX 255,
+                # Windows 2.  Deliberately NOT applied to 124 (a slow host says
+                # nothing about the platform).
+                [Console]::Error.WriteLine("$($script:Program): SSH transport failed while detecting the remote platform")
+                exit 255
             } elseif ($unixProbe.ExitCode -eq 124) {
                 Write-Diagnostics -Diagnostics $unixProbe.Diagnostics
                 exit 124
@@ -2787,9 +2925,19 @@ function Invoke-Mutation {
     if ($result.ExitCode -eq 0 -and !(Test-AgentQJsonResponse -Operation $validationProfile -Output $result.Output -ExpectedTaskId $ExpectedTaskId)) {
         return 2
     }
-    if (($OperationName -eq "cancel") -and ($result.ExitCode -eq 4) -and
-        !(Test-AgentQJsonResponse -Operation "cancel_pending" -Output $result.Output -ExpectedTaskId $ExpectedTaskId)) {
-        return 2
+    if (($OperationName -eq "cancel") -and ($result.ExitCode -eq 4)) {
+        # The exit code stays 4: it is the server's own contract statement
+        # ("cannot decide safely; STOP, do not retry").  A body that fails
+        # validation is a reason to trust the response LESS, not to downgrade
+        # it to 2 -- which reads as "protocol/parameter error, fix your
+        # arguments and try again", the opposite of what a cancellation_pending
+        # state requires.  Only a body that PASSED validation may reach stdout;
+        # the validator has already printed its diagnostic.  Same rule as the
+        # POSIX twin.
+        if (Test-AgentQJsonResponse -Operation "cancel_pending" -Output $result.Output -ExpectedTaskId $ExpectedTaskId) {
+            Write-OperationOutput -Output $result.Output
+        }
+        return 4
     }
     Write-OperationOutput -Output $result.Output
     return $result.ExitCode
@@ -2800,6 +2948,21 @@ $script:SubmitRetryDelay = Convert-ToPositiveInt32 -Value $script:SubmitRetryDel
 $script:OperationRetryAttempts = Convert-ToPositiveInt32 -Value $script:OperationRetryAttempts -Name "AGENTQ_OPERATION_RETRY_ATTEMPTS"
 $script:OperationRetryDelay = Convert-ToPositiveInt32 -Value $script:OperationRetryDelay -Name "AGENTQ_OPERATION_RETRY_DELAY"
 $script:PlatformProbeTimeout = Convert-ToPositiveInt32 -Value $script:PlatformProbeTimeout -Name "AGENTQ_PLATFORM_PROBE_TIMEOUT"
+$script:PlatformProbeCacheTtl = Convert-ToPositiveInt32 -Value $script:PlatformProbeCacheTtl -Name "AGENTQ_PLATFORM_PROBE_CACHE_TTL"
+
+# Both directions are UTF-8: ssh emits UTF-8 (protocol responses and task logs
+# verbatim), and this client's own output is UTF-8 like the POSIX twin's.
+# PS 5.1 decodes a native child's stdout with Console.OutputEncoding, and on a
+# zh-CN Windows that is GBK -- measured on the real test host: a CJK word came back
+# as `????` (PLAN.md 2026-10-08).  `[Console]::Out` uses the same property, so
+# this one line pins decode AND encode for the `& ssh ... 1> file` path (the
+# ProcessStartInfo path pins its own encodings).  Guarded: with no usable
+# console handle the setter throws, and the platform default is then simply the
+# old behaviour.
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+} catch {
+}
 
 # Resolved before anything reaches ssh: the platform probe is itself an ssh call
 # and runs before operation dispatch, so a source applied only to the operation
@@ -2839,7 +3002,11 @@ while ($position -lt $arguments.Count) {
         # Local only: the CLIENT's version constant (see the POSIX twin).  The
         # server's version comes from doctor's agentq= line; the two are
         # separate deployments and deliberately not negotiated.
-        Write-Output "$($script:Program) $($script:ClientVersion)"
+        # The POSIX twin prints `<program> <version>` with program = "agentq";
+        # $script:Program is "agentq.ps1" (useful in error prefixes, wrong
+        # here).  Measured 2026-10-21: the two clients disagreed on this line,
+        # so a script parsing --version had to special-case the platform.
+        Write-Output "agentq $($script:ClientVersion)"
         exit 0
     }
     break
