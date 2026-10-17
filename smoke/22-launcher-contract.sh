@@ -15,6 +15,9 @@
 # written in several places, only one gets fixed" pathology -- A9, A19, rule E),
 # and start-daemon itself is otherwise unreachable here.  Asserting BOTH copies
 # behave identically is what catches a fix applied to one and not the other.
+# The same reasoning, one round later, pulled in the StrictMode LASTEXITCODE
+# guard across all five PowerShell assets that have one (see the guard section
+# below); the two Windows clients were the copies the first sweep missed.
 #
 # What runs here and what does not, measured, not assumed:
 #   - RUNS: Read-AgentQArguments (the NUL-separated base64 payload decoder), the
@@ -36,15 +39,61 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+
+# python3 is a real dependency of this check: the extraction / parsing steps
+# below are Python.  Probe that it RUNS, not that a name resolves -- measured
+# 2026-10-20 on a zh-CN Windows 10, where `python3` is the Microsoft Store
+# alias: the check died at its first Python step with exit 49 and ZERO output,
+# which run-tests.sh can only report as a bare FAIL with no cause.  Same rule as
+# the pwsh usability probes: an interpreter that cannot execute is an
+# ENVIRONMENT fault, say so and do not claim the contract ran.
+python3_probe_status=0
+python3 -c 'import sys' >/dev/null 2>&1 || python3_probe_status=$?
+if [ "$python3_probe_status" -ne 0 ]; then
+    printf '%s\n' 'launcher-contract NOT run: the python3 on PATH cannot execute (a Microsoft Store alias cannot run scripts).' >&2
+    printf '%s\n' 'Install a real Python 3 and put it on PATH, then re-run.' >&2
+    exit 1
+fi
 launcher=${AGENTQ_SMOKE_LAUNCHER:-$root/skill/assets/windows-git-bash/agentq-launcher.ps1}
-start_daemon="$root/skill/assets/windows-git-bash/agentq-start-daemon.ps1"
+# Overridable like the launcher, so the static LASTEXITCODE lock can be
+# proven red by a mutated copy (the repo rule: a lock without a red proof is
+# not a lock).
+start_daemon=${AGENTQ_SMOKE_START_DAEMON:-$root/skill/assets/windows-git-bash/agentq-start-daemon.ps1}
+installer=${AGENTQ_SMOKE_INSTALLER:-$root/skill/assets/windows-git-bash/install-agentq.ps1}
+# The two Windows CLIENT assets carry the same guard (agentq.ps1 has TWO sites,
+# sshp.ps1 has two: the shared Get-LastExitCodeOrFailure helper and a wrapper
+# tail).  They were already fail-closed before this round, but unlocked -- the
+# lock was written for the three server-side assets and the sweep stopped
+# there.  A guard with no lock is exactly what the eighth round proved can be
+# silently regressed.
+ps_client=${AGENTQ_SMOKE_PS_CLIENT:-$root/skill/assets/client/windows/agentq.ps1}
+sshp_client=${AGENTQ_SMOKE_SSHP_PS_CLIENT:-$root/skill/assets/client/windows/sshp.ps1}
 [ -f "$launcher" ] || { printf '%s\n' 'launcher-contract: missing launcher asset' >&2; exit 1; }
 [ -f "$start_daemon" ] || { printf '%s\n' 'launcher-contract: missing start-daemon asset' >&2; exit 1; }
+[ -f "$installer" ] || { printf '%s\n' 'launcher-contract: missing installer asset' >&2; exit 1; }
+[ -f "$ps_client" ] || { printf '%s\n' 'launcher-contract: missing Windows client asset' >&2; exit 1; }
+[ -f "$sshp_client" ] || { printf '%s\n' 'launcher-contract: missing Windows sshp asset' >&2; exit 1; }
 
 pwsh_binary=${AGENTQ_SMOKE_PWSH:-$(command -v pwsh || true)}
 if [ -z "$pwsh_binary" ]; then
     printf '%s\n' 'SKIPPED: pwsh is not available; the launcher was not executed'
     exit 0
+fi
+
+# Present is not the same as working.  A corrupt pwsh startup cache makes
+# every launch die (measured five times in this repo, with four different
+# messages: "String cannot have zero length", "Stack overflow",
+# FileLoadException, and Abort trap: 6).  The existence tests above cannot see
+# that, so every case below would run against a pwsh that never starts and
+# report its failures as asset defects -- the misdiagnosis smoke/01 fixed for
+# itself in 2026-09-28.  Probe once: an unusable interpreter is an ENVIRONMENT
+# fault, say so with the fix, and do not claim the check ran.
+pwsh_probe_status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command 'exit 0' >/dev/null 2>&1 || pwsh_probe_status=$?
+if [ "$pwsh_probe_status" -ne 0 ]; then
+    printf '%s\n' 'Launcher contract NOT run: the pwsh on PATH cannot execute (startup cache).' >&2
+    printf '%s\n' 'Try: mv ~/.cache/powershell/StartupProfileData-NonInteractive{,.broken}' >&2
+    exit 1
 fi
 
 # The launcher's path guards reject any path whose chain contains a symlink, and
@@ -69,15 +118,20 @@ driver="$work/driver.ps1"
 # non-ASCII literals below (decoded.unicode0/1) were re-decoded byte-wise at
 # PARSE time and reached the decoder as mojibake -- `任务` -> `ä»»åŠ¡` -- which
 # is exactly what the first real CI run reported (run 37810470283, windows job).
-# pwsh 7 assumes UTF-8 and hid this; the BOM is the signal 5.1 honours.  The
-# EMIT side needed nothing: the mojibake reached the shell as well-formed UTF-8
-# for both literals, so the runner's stdout already carries UTF-8 and only the
-# parse side was wrong -- no [Console]::OutputEncoding pin, because none was
-# measured broken.
+# pwsh 7 assumes UTF-8 and hid this; the BOM is the signal 5.1 honours.
+# The EMIT side ALSO needs a pin: the earlier note here said "none was measured
+# broken", and that was true only on the English CI image.  Measured 2026-10-20
+# on a zh-CN Windows 10 (PS 5.1.19041): stdout defaults to the console code page
+# (GBK), so `任务` reached the shell as `????` and both unicode assertions failed
+# while the decoder was correct.  Pinning [Console]::OutputEncoding to UTF-8 is
+# the emitting half of the same rule the BOM applies to the parsing half.
 printf '\xEF\xBB\xBF' > "$driver"
 cat >> "$driver" <<'PS1'
 param([string]$LauncherPath, [string]$StartDaemonPath, [string]$WorkDirectory)
 $ErrorActionPreference = "Stop"
+# Emit UTF-8 regardless of the host's console code page (measured 2026-10-20 on
+# a zh-CN Windows: GBK stdout turned the non-ASCII round-trip fixture into ????).
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 # Mirror the asset's own strictness.  The launcher sets Set-StrictMode -Version
 # Latest at its top; a driver that omits it expands an unset $script: variable
 # to the empty string instead of throwing, so a cleanup branch that references
@@ -541,6 +595,239 @@ if [ "$sd_ok_status" -ne 0 ]; then
     failures=$((failures + 1))
 fi
 
+# --- LASTEXITCODE guards: start-daemon, the launcher, the installer, the two
+# --- Windows clients ----------------------------------------------------------
+# A CreateProcess failure (AV or a policy blocking the binary) is a
+# NON-terminating error that never sets $LASTEXITCODE.  All five assets set
+# Set-StrictMode -Version Latest, where a bare read THROWS "The variable
+# '$LASTEXITCODE' cannot be retrieved" -- measured 2026-10-17 in pwsh 7.5: the
+# direct read throws, Get-Variable returns null.  start-daemon then exited 1
+# with a PowerShell error (the defect fixed this round); the launcher's trap
+# kept the contract's 2 but reported the wrong cause; the installer's 18 sites
+# would each exit 1 the same way.  The two Windows CLIENT assets already had
+# fail-closed guards (a shared Get-LastExitCodeOrFailure helper plus a wrapper
+# tail each) but no lock -- the sweep initially stopped at the three
+# server-side assets, so those two are locked here too.  STATIC locks, because
+# the top level of each file is unreachable on this host (WindowsIdentity / a
+# real Git Bash / a real ssh).
+#
+# The rule has TWO halves, and the second is the one that matters: the guard
+# EXISTING is not the fix -- the fail-closed BRANCH is.  Measured: deleting
+# only the `if ($null -eq ...)` block (keeping the Get-Variable assignment and
+# the .Value read) left a guard-presence-only lock green, while the real
+# behaviour under StrictMode is the original exit-1 throw.  And EVERY
+# Get-Variable site is checked, not just the last: the client assets have two
+# sites each, and a version that tracked only the last assignment would stay
+# green when the FIRST site's null branch was deleted (measured: client-m1).
+# PowerShell identifiers are CASE-INSENSITIVE and `${VAR}` is the same variable
+# as `$VAR` -- measured 2026-10-18 in pwsh 7.5: `${LASTEXITCODE}` and
+# `$LastExitCode` both return the value a native child set, and
+# `Get-Variable -Name LastExitCode` resolves the same variable.  A case-sensitive
+# scan therefore misses two real forms of the very defect this lock exists for:
+# measured mutants M7 (`$LastExitCode` bare read) and M8 (`${LASTEXITCODE}` bare
+# read) both stayed green at 74 cases.  The scanner lowercases the line first and
+# also matches the brace form.
+bare_last_exitcode_lines() {
+    awk '
+        { line = $0; sub(/^[ \t]+/, "", line); if (substr(line, 1, 1) == "#") next }
+        {
+            lowered = tolower(line)
+            # `${...}` form, and the plain form guarded against `$NAME` prefixes.
+            if (lowered ~ /[$][{]lastexitcode[}]/) { print NR; next }
+            if (lowered ~ /(^|[^[:alnum:]_.])[$]lastexitcode([^[:alnum:]_]|$)/) { print NR }
+        }
+    ' "$1"
+}
+
+assert_last_exitcode_guard() {
+    # $1 = file, $2 = label, $3 = fail-closed token(s), `|`-separated
+    # (`exit 2` / `return 1`; the client files reach different tokens at their
+    # two sites -- `return 1` in the helper, `exit 1` in the wrapper tail).
+    # EVERY assignment site is checked: an earlier version tracked only the
+    # LAST one, so a file with two sites passed when either single site was
+    # intact -- the same "at least one vs every" pathology this repo keeps
+    # finding in assertions.
+    #
+    # The token must be INSIDE the `if ($null -eq $var) { ... }` block, not
+    # merely near it.  Measured: a mutant whose null branch does nothing while
+    # an `exit 2` sits a few lines later passed a proximity rule -- and when
+    # $LASTEXITCODE is unset that shape falls through to the .Value read and
+    # throws, which is the defect this lock exists to prevent.  Brace depth is
+    # tracked from the null-test line; the token only counts at depth > 0.
+    # A `.Value` read INSIDE the null branch is always a defect (the variable
+    # is null there, so it throws), as is one BEFORE the null test.
+    local guard_file=$1 guard_label=$2 guard_token=$3
+    cases=$((cases + 1))
+    local guard_bare
+    guard_bare=$(bare_last_exitcode_lines "$guard_file")
+    if [ -n "$guard_bare" ]; then
+        printf 'launcher-contract: %s reads $LASTEXITCODE directly at line(s) %s; under StrictMode an unset variable throws and a process that never started exits 1 instead of a controlled failure\n' "$guard_label" "$guard_bare" >&2
+        failures=$((failures + 1))
+    fi
+    cases=$((cases + 1))
+    if ! awk -v tokens="$guard_token" '
+        BEGIN { token_count = split(tokens, token_list, "|") }
+        # Character-wise brace tracking.  A line-level net delta is not enough:
+        # `} else {` nets to zero, so a token in the ELSE branch would count as
+        # inside the null branch -- a still-wrong program satisfying the rule
+        # (measured: mutant M5 passed a delta-based rule).  scan() fills two
+        # globals: `any` = text at depth >= 1 (a .Value read there is a defect:
+        # the variable is null), `top` = text at depth 1 (only there does a
+        # fail-closed token count; a token nested deeper is conditional and may
+        # not run -- mutant M6).  Known boundary: a string literal with an
+        # UNBALANCED brace would skew the count; the real assets use balanced
+        # format strings (`{0}`/`{1}`), and an unbalanced one inside a null
+        # branch would only cause a false RED, never a false green.
+        #
+        # Everything below matches on the LOWERCASED line: PowerShell
+        # identifiers, `Get-Variable`/`-Name`, `$null`, `.Value` and the
+        # `exit`/`return` keywords are all case-insensitive, so a case-sensitive
+        # scan would accept `$LastExitCode`, `Get-Variable -name lastexitcode`,
+        # `.value` etc. as "not the thing we are looking for".
+        function scan(s,   i, n, c) {
+            any = ""; top = ""
+            n = length(s)
+            for (i = 1; i <= n; i++) {
+                c = substr(s, i, 1)
+                if (c == "{") { depth++; continue }
+                if (c == "}") { depth--; if (depth <= 0) { depth = 0; return }; continue }
+                if (depth >= 1) any = any c
+                if (depth == 1) top = top c
+            }
+        }
+        { line = $0; sub(/^[ \t]+/, "", line); line = tolower(line) }
+        substr(line, 1, 1) == "#" { next }
+        match(line, /^[$][A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[[:space:]]*get-variable[ \t]+-name[ \t]+lastexitcode/) {
+            if (probe_var != "" && !(null_seen && closed)) bad_site = assign_line
+            probe_var = line
+            sub(/^[$]/, "", probe_var)
+            sub(/[[:space:]]*=.*$/, "", probe_var)
+            assign_line = NR
+            null_seen = 0; closed = 0; depth = 0; sites++
+            next
+        }
+        probe_var == "" { next }
+        !null_seen && index(line, "$" probe_var ".value") > 0 { bad_site = NR }
+        !null_seen && index(line, "$null -eq $" probe_var) > 0 {
+            null_seen = 1
+            depth = 0
+            scan(line)
+            for (i = 1; i <= token_count; i++) { if (index(top, tolower(token_list[i])) > 0) closed = 1 }
+            next
+        }
+        null_seen && depth > 0 {
+            scan(line)
+            if (index(any, "$" probe_var ".value") > 0) bad_site = NR
+            for (i = 1; i <= token_count; i++) { if (index(top, tolower(token_list[i])) > 0) closed = 1 }
+            next
+        }
+        END {
+            if (probe_var != "" && !(null_seen && closed)) bad_site = assign_line
+            exit (sites > 0 && bad_site == 0) ? 0 : 1
+        }
+    ' "$guard_file"; then
+        printf 'launcher-contract: %s does not fail closed on an unset LASTEXITCODE at every Get-Variable site (the `%s` must be directly INSIDE the null branch, with no .Value read before it or inside it) -- under StrictMode the .Value read throws\n' "$guard_label" "$guard_token" >&2
+        failures=$((failures + 1))
+    fi
+}
+
+# A guard variable named like the automatic variable is the same variable.
+# PowerShell identifiers are case-insensitive, so `$lastExitCode = Get-Variable
+# -Name LASTEXITCODE ...` assigns THROUGH to $LASTEXITCODE itself.  Inside a
+# function that only shadows the global; at SCRIPT scope it replaces the
+# integer with a PSVariable object and the next `.Value` read throws "Cannot
+# convert System.Management.Automation.PSVariable to System.Int32" (measured
+# 2026-10-18 in pwsh 7.5).  Two real sites had this shape (the launcher's
+# top-level try, sshp's generated installer script) and BOTH were introduced by
+# this same self-review series -- a rename that looks cosmetic and is not.
+# The rule is deliberately scope-blind: one name that is correct in both
+# scopes is simpler to keep correct than "this name is fine here, not there".
+assert_last_exitcode_alias() {
+    # $1 = file, $2 = label
+    local alias_file=$1 alias_label=$2
+    cases=$((cases + 1))
+    local alias_sites
+    alias_sites=$(awk '
+        { line = $0; sub(/^[ \t]+/, "", line); if (substr(line, 1, 1) == "#") next }
+        {
+            lowered = tolower(line)
+            if (match(lowered, /^[$][a-z_][a-z0-9_]*[ \t]*=[ \t]*get-variable[ \t]+-name[ \t]+lastexitcode/)) {
+                name = lowered
+                sub(/^[$]/, "", name)
+                sub(/[ \t]*=.*$/, "", name)
+                if (name == "lastexitcode") print NR
+            }
+        }
+    ' "$alias_file")
+    if [ -n "$alias_sites" ]; then
+        printf 'launcher-contract: %s assigns the LASTEXITCODE guard to a variable whose name IS the automatic variable (line(s) %s); at script scope that replaces the integer with a PSVariable and the .Value read throws\n' "$alias_label" "$alias_sites" >&2
+        failures=$((failures + 1))
+    fi
+}
+
+assert_last_exitcode_alias "$start_daemon" 'start-daemon probe'
+assert_last_exitcode_alias "$launcher" 'launcher Git Bash spawn'
+assert_last_exitcode_alias "$installer" 'installer native calls'
+assert_last_exitcode_alias "$ps_client" 'Windows client'
+assert_last_exitcode_alias "$sshp_client" 'Windows sshp'
+
+assert_last_exitcode_guard "$start_daemon" 'start-daemon probe' 'exit 2'
+assert_last_exitcode_guard "$launcher" 'launcher Git Bash spawn' 'exit 2'
+assert_last_exitcode_guard "$installer" 'installer native calls' 'return 1'
+assert_last_exitcode_guard "$ps_client" 'Windows client' 'return 1|exit 1'
+assert_last_exitcode_guard "$sshp_client" 'Windows sshp' 'return 1|exit 1'
+
+# Behavioural half for the installer's helper: it is a pure function, so it can
+# be extracted from the REAL asset and driven in a real child pwsh.  The static
+# rule above proves the shape; this proves the answer -- unset must fail closed
+# (1), a real 0 must stay 0, and a real non-zero must pass through unchanged
+# (a helper that always returned 1 would satisfy the fail-closed direction and
+# silently turn every successful pueue call into an installer failure).
+lec_driver="$work/lec-driver.ps1"
+# The child shell is resolved HERE, not inside the driver: this check also runs
+# in the windows job with real PowerShell 5.1 (AGENTQ_SMOKE_PWSH=powershell.exe),
+# and a literal `/bin/sh` in the driver would resolve to `\bin\sh` there and
+# throw CommandNotFoundException -- the same "hand a POSIX path to a native
+# interpreter" mistake this file's own header warns about.  `command -v sh` in
+# Git Bash gives an MSYS path, which MSYS converts when it crosses into the
+# native process (the same mechanism every other -File invocation here relies on).
+lec_shell=$(command -v sh || true)
+[ -n "$lec_shell" ] || { printf '%s\n' 'launcher-contract: no sh on PATH for the exit-code driver' >&2; exit 1; }
+printf '\xEF\xBB\xBF' > "$lec_driver"
+cat >> "$lec_driver" <<'PS1'
+param([string]$InstallerPath, [string]$ShellPath)
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+function Get-Fn([string]$src, [string]$name) {
+    $pattern = '(?s)function ' + [regex]::Escape($name) + ' \{.*?\n\}\n'
+    $m = [regex]::Match($src, $pattern)
+    if (-not $m.Success) { throw "could not extract function $name" }
+    return $m.Value
+}
+$src = Get-Content -Raw $InstallerPath
+Invoke-Expression (Get-Fn $src 'Get-NativeExitCode')
+"unset=$(Get-NativeExitCode)"
+# A POSIX shell rather than COMSPEC: any native child sets $LASTEXITCODE
+# identically, and Git Bash provides sh in the windows job.
+& $ShellPath -c "exit 0"
+"zero=$(Get-NativeExitCode)"
+& $ShellPath -c "exit 7"
+"seven=$(Get-NativeExitCode)"
+PS1
+cases=$((cases + 1))
+lec_status=0
+"$pwsh_binary" -NoProfile -NonInteractive -File "$lec_driver" -InstallerPath "$installer" -ShellPath "$lec_shell" \
+    >"$work/lec.out" 2>"$work/lec.err" || lec_status=$?
+lec_unset=$(sed -n 's/^unset=//p' "$work/lec.out")
+lec_zero=$(sed -n 's/^zero=//p' "$work/lec.out")
+lec_seven=$(sed -n 's/^seven=//p' "$work/lec.out")
+if [ "$lec_status" -ne 0 ] || [ "$lec_unset" != "1" ] || [ "$lec_zero" != "0" ] || [ "$lec_seven" != "7" ]; then
+    printf 'launcher-contract: installer exit-code helper: unset=%s (want 1) zero=%s (want 0) seven=%s (want 7)\n' \
+        "${lec_unset:-?}" "${lec_zero:-?}" "${lec_seven:-?}" >&2
+    sed 's/^/    stderr: /' "$work/lec.err" | head -3 >&2 || true
+    failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'launcher-contract: %s failure(s)\n' "$failures" >&2
     exit 1
@@ -687,5 +974,5 @@ if [ "$failures" -ne 0 ]; then
     printf 'launcher-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'launcher-contract checks passed: cases=%s pwsh=%s decoder=covered pathguards=covered roundtrip=covered windows-api=NOT-covered(needs-Windows) malformed-payload=exit2\n' "$cases" \
+printf 'launcher-contract checks passed: cases=%s pwsh=%s decoder=covered pathguards=covered roundtrip=covered lastexitcode-guards=5/5 windows-api=NOT-covered(needs-Windows) malformed-payload=exit2\n' "$cases" \
     "$("$pwsh_binary" -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()' 2>/dev/null || printf 'unknown')"

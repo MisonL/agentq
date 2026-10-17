@@ -54,6 +54,21 @@ is_nonnegative_integer() {
     esac
 }
 
+is_bounded_nonnegative_integer() {
+    # Same 32-bit bound the Windows twin's [int]::TryParse enforces.  The
+    # charset-only check used to accept a 20-digit value and the failure only
+    # surfaced later, as a bare `sleep` usage error with exit 1 -- a
+    # non-contract code, disconnected from the variable that caused it (measured
+    # 2026-10-17 with SSHP_RECONNECT_DELAY=2147483648).  Digits-only stays:
+    # `+5` and ` 5` are still refused.
+    is_nonnegative_integer "$1" || return 1
+    bounded_value=${1#"${1%%[!0]*}"}
+    [ -n "$bounded_value" ] || bounded_value=0
+    [ "${#bounded_value}" -le 10 ] || return 1
+    [ "${#bounded_value}" -lt 10 ] && return 0
+    [ "$bounded_value" -le 2147483647 ]
+}
+
 runtime_path_is_safe() {
     runtime_guard_path=$1
     case "$runtime_guard_path" in
@@ -353,6 +368,20 @@ case "${1:-}" in
     --check)
         check_only=true
         shift
+        # Help is recognised on the first token AFTER the optional --check,
+        # exactly like the Windows twin (`$arguments[0]` after the shift) and
+        # like this side's own `-h extra` case below (help wins over the extra
+        # token).  Without this inner case, `sshp --check --help` fell through
+        # to host validation and was refused with "must not be empty or begin
+        # with a hyphen" (exit 2) while `sshp.ps1 --check --help` printed
+        # usage and exited 0 -- measured 2026-10-17, the same input accepted
+        # by one client and rejected by the other.  smoke/19 pins both forms.
+        case "${1:-}" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+        esac
         ;;
     -h|--help)
         usage
@@ -374,6 +403,14 @@ case "$host" in
         ;;
 esac
 
+# Whitespace-only matches the Windows twin's IsNullOrWhiteSpace: a name ssh
+# would have to quote its way through is not a name at all.
+case "$host" in
+    *[[:space:]]*)
+        fail 'SSH host must not contain whitespace'
+        ;;
+esac
+
 case "$session" in
     ''|-*|*[!A-Za-z0-9_.-]*)
         fail 'session name must contain only letters, numbers, dots, underscores, or hyphens'
@@ -381,7 +418,7 @@ case "$session" in
 esac
 
 resolve_ssh_binary
-is_nonnegative_integer "$reconnect_delay" || fail 'SSHP_RECONNECT_DELAY must be a non-negative integer'
+is_bounded_nonnegative_integer "$reconnect_delay" || fail 'SSHP_RECONNECT_DELAY must be a non-negative integer'
 # Bind BOTH traps BEFORE initialize_ssh_runtime creates the private runtime
 # directory.  If the signal traps are set only after runtime creation, a signal
 # landing in the microsecond window between the two leaves the just-made
@@ -1013,6 +1050,27 @@ install_remote_unix() {
         -- "$host" "$remote_install_command"
 }
 
+probe_reports_marker() {
+    # $1 = probe output, $2 = an ERE anchored at BOTH ends of a line.
+    #
+    # The Windows twin matches `(?m)^__SSHP_READY__:Windows$` -- the marker
+    # must be a WHOLE LINE.  This side matched a glob against the entire
+    # output (`*__SSHP_READY__:*`), so a banner, motd, or shell-profile line
+    # that merely CONTAINED the phrase was read as a protocol answer: measured
+    # 2026-10-17, `banner: __SSHP_READY__:Linux is a phrase` exited 0 with
+    # "persistent remote session: ..." while sshp.ps1 refused it (exit 2).
+    # A remote that answers with a diagnostic mentioning a marker must not be
+    # able to steer the client; the marker is the contract, and a contract is
+    # a line, not a substring.
+    #
+    # CR is stripped first: the twin normalises CRLF (ConvertTo-MarkerText),
+    # and a PowerShell-side answer can arrive with CRLF through sshd -- with a
+    # `$`-anchored pattern a trailing CR would silently break every match.
+    # grep -E is already a local dependency (ssh_transport_error uses it);
+    # a `while read` pipeline would run in a subshell and lose the result.
+    printf '%s\n' "$1" | LC_ALL=C tr -d '\r' | LC_ALL=C grep -E -q "$2"
+}
+
 prepare_remote() {
     allow_install=$1
     installation_attempted=0
@@ -1026,16 +1084,13 @@ prepare_remote() {
         windows_probe_required=false
 
         if probe_output=$(probe_remote_unix "$probe_diagnostic_file"); then
-            case "$probe_output" in
-                *__SSHP_WINDOWS_SHELL__:MINGW*|*__SSHP_WINDOWS_SHELL__:MSYS*|*__SSHP_WINDOWS_SHELL__:CYGWIN*)
-                    remote_platform=windows
-                    windows_probe_required=true
-                    ;;
-                *__SSHP_READY__:*)
-                    remote_platform=unix
-                    remote_ready=true
-                    ;;
-            esac
+            if probe_reports_marker "$probe_output" '^__SSHP_WINDOWS_SHELL__:(MINGW|MSYS|CYGWIN).*$'; then
+                remote_platform=windows
+                windows_probe_required=true
+            elif probe_reports_marker "$probe_output" '^__SSHP_READY__:.+$'; then
+                remote_platform=unix
+                remote_ready=true
+            fi
         else
             unix_probe_status=$?
             if [ "$unix_probe_status" -eq 255 ] && ssh_transport_error "$probe_diagnostic_file"; then
@@ -1049,19 +1104,17 @@ prepare_remote() {
                 continue
             fi
 
-            case "$probe_output" in
-                *__SSHP_WINDOWS_SHELL__:MINGW*|*__SSHP_WINDOWS_SHELL__:MSYS*|*__SSHP_WINDOWS_SHELL__:CYGWIN*|*__SSHP_INSTALL_REQUIRED__:MINGW*|*__SSHP_INSTALL_REQUIRED__:MSYS*|*__SSHP_INSTALL_REQUIRED__:CYGWIN*|*__SSHP_INSTALL_UNAVAILABLE__:MINGW*|*__SSHP_INSTALL_UNAVAILABLE__:MSYS*|*__SSHP_INSTALL_UNAVAILABLE__:CYGWIN*)
-                    remote_platform=windows
-                    windows_probe_required=true
-                    ;;
-                *__SSHP_INSTALL_REQUIRED__:*)
-                    remote_platform=unix
-                    ;;
-                *__SSHP_INSTALL_UNAVAILABLE__:*)
-                    printf '%s\n' "$program: persistent remote session unavailable: install tmux, GNU screen, or Zellij manually on the remote host." >&2
-                    return 127
-                    ;;
-            esac
+            if probe_reports_marker "$probe_output" '^__SSHP_WINDOWS_SHELL__:(MINGW|MSYS|CYGWIN).*$' ||
+                probe_reports_marker "$probe_output" '^__SSHP_INSTALL_REQUIRED__:(MINGW|MSYS|CYGWIN).*$' ||
+                probe_reports_marker "$probe_output" '^__SSHP_INSTALL_UNAVAILABLE__:(MINGW|MSYS|CYGWIN).*$'; then
+                remote_platform=windows
+                windows_probe_required=true
+            elif probe_reports_marker "$probe_output" '^__SSHP_INSTALL_REQUIRED__:.+$'; then
+                remote_platform=unix
+            elif probe_reports_marker "$probe_output" '^__SSHP_INSTALL_UNAVAILABLE__:.+$'; then
+                printf '%s\n' "$program: persistent remote session unavailable: install tmux, GNU screen, or Zellij manually on the remote host." >&2
+                return 127
+            fi
         fi
 
         if [ "$remote_platform" = unix ]; then
@@ -1096,16 +1149,12 @@ prepare_remote() {
         # Use native PowerShell for every Windows target, including Git Bash.
         # This avoids stale SSH-server PATH values after WinGet, Scoop, or Chocolatey installs.
         if probe_output=$(run_windows_remote_command "$probe_diagnostic_file" false "$windows_probe_script"); then
-            case "$probe_output" in
-                *__SSHP_READY__:Windows*)
-                    remote_platform=windows
-                    return 0
-                    ;;
-                *)
-                    printf '%s\n' "$program: remote dependency probe returned an unexpected Windows response." >&2
-                    return 2
-                    ;;
-            esac
+            if probe_reports_marker "$probe_output" '^__SSHP_READY__:Windows$'; then
+                remote_platform=windows
+                return 0
+            fi
+            printf '%s\n' "$program: remote dependency probe returned an unexpected Windows response." >&2
+            return 2
         else
             windows_probe_status=$?
             if [ "$windows_probe_status" -eq 255 ] && ssh_transport_error "$probe_diagnostic_file"; then
@@ -1118,27 +1167,34 @@ prepare_remote() {
                 sleep "$reconnect_delay"
                 continue
             fi
-            case "$probe_output" in
-                *__SSHP_INSTALL_REQUIRED__:Windows*)
-                    [ "$windows_probe_status" -eq 42 ] || {
-                        printf '%s\n' "$program: remote dependency probe returned an invalid Windows install status." >&2
-                        return 2
-                    }
-                    remote_platform=windows
-                    ;;
-                *__SSHP_INSTALL_UNAVAILABLE__:Windows*)
-                    printf '%s\n' "$program: persistent remote session unavailable: native Zellij is required on Windows and no supported installer was found." >&2
-                    return 127
-                    ;;
-                *)
-                    if [ "$windows_probe_required" = true ]; then
-                        printf '%s\n' "$program: remote dependency probe failed for the Windows shell." >&2
-                    else
-                        printf '%s\n' "$program: remote dependency probe failed for both Unix and Windows shells." >&2
-                    fi
-                    return "$windows_probe_status"
-                    ;;
-            esac
+            # Marker-first, status-second -- the Windows twin's routing
+            # since 0.1.16.  An sshd whose DefaultShell is powershell.exe
+            # flattens a native child's exit code to 1 (A5b), so an
+            # installable host answers 1+REQUIRED; the old exact-42 check
+            # called that "invalid Windows install status" (exit 2) and
+            # pointed at the protocol instead of the missing dependency.
+            # Measured 2026-10-17: this side exited 2 while sshp.ps1 exited
+            # 127 on the same answer -- the same one-side-only divergence
+            # 0.1.16 set out to end.  A zero status with this marker never
+            # reaches this branch (that is the success branch above, which
+            # refuses an unrecognised success response), and a transport
+            # failure without our marker takes the 255 branch before this.
+            # The markers are line-anchored (probe_reports_marker), like the
+            # twin's `(?m)^...$`: a diagnostic that merely mentions one must
+            # not route the client.
+            if probe_reports_marker "$probe_output" '^__SSHP_INSTALL_REQUIRED__:Windows$'; then
+                remote_platform=windows
+            elif probe_reports_marker "$probe_output" '^__SSHP_INSTALL_UNAVAILABLE__:Windows$'; then
+                printf '%s\n' "$program: persistent remote session unavailable: native Zellij is required on Windows and no supported installer was found." >&2
+                return 127
+            else
+                if [ "$windows_probe_required" = true ]; then
+                    printf '%s\n' "$program: remote dependency probe failed for the Windows shell." >&2
+                else
+                    printf '%s\n' "$program: remote dependency probe failed for both Unix and Windows shells." >&2
+                fi
+                return "$windows_probe_status"
+            fi
         fi
 
         if [ "$allow_install" != true ]; then

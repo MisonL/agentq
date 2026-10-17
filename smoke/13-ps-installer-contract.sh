@@ -41,9 +41,88 @@ if ! command -v "$pwsh_binary" >/dev/null 2>&1; then
     exit 0
 fi
 
+# Present is not the same as working.  A corrupt pwsh startup cache makes
+# every launch die (measured five times in this repo, with four different
+# messages: "String cannot have zero length", "Stack overflow",
+# FileLoadException, and Abort trap: 6).  The existence tests above cannot see
+# that, so every case below would run against a pwsh that never starts and
+# report its failures as asset defects -- the misdiagnosis smoke/01 fixed for
+# itself in 2026-09-28.  Probe once: an unusable interpreter is an ENVIRONMENT
+# fault, say so with the fix, and do not claim the check ran.
+pwsh_probe_status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command 'exit 0' >/dev/null 2>&1 || pwsh_probe_status=$?
+if [ "$pwsh_probe_status" -ne 0 ]; then
+    printf '%s\n' 'PowerShell installer contract NOT run: the pwsh on PATH cannot execute (startup cache).' >&2
+    printf '%s\n' 'Try: mv ~/.cache/powershell/StartupProfileData-NonInteractive{,.broken}' >&2
+    exit 1
+fi
+
 work=$(mktemp -d /tmp/agentq-smoke-psinstaller.XXXXXX)
 work=$(unset CDPATH; cd -- "$work" && pwd -P)
 trap 'rm -rf -- "$work"' EXIT
+
+# --- Binder messages are LOCALISED (2026-10-20, measured on a zh-CN Windows 10) -
+# The rejection cases below assert the exact wording PowerShell's parameter
+# binder produces.  That wording follows [Thread]::CurrentThread.CurrentUICulture,
+# so on a non-English Windows the SAME refusal reads `找不到与参数名称"Bogus"匹配的参数`
+# and every case fails -- reporting a correct asset as broken.  CI's windows-latest
+# is an English image, which is why this stayed invisible; a real test host is not.
+# Measured on Windows PowerShell 5.1.19041 (zh-CN) with the real asset: setting
+# CurrentUICulture to en-US in-process makes all four messages byte-identical to
+# the English strings asserted here.
+#
+# So: probe the UI culture once.  English -> run the asset directly (the shipped
+# path, unchanged).  Anything else -> run it through a wrapper that sets en-US
+# first, and SAY SO in the summary.  If an invocation still fails, that is an
+# environment fault and must not be read as an asset defect.
+pwsh_ui_culture=$("$pwsh_binary" -NoProfile -NonInteractive \
+    -Command '[System.Globalization.CultureInfo]::CurrentUICulture.Name' 2>/dev/null | tr -d '\r\n')
+case $pwsh_ui_culture in
+    ''|en|en-*) pwsh_binder=en ;;
+    *) pwsh_binder="en-US-via-wrapper(host=$pwsh_ui_culture)" ;;
+esac
+if [ "$pwsh_binder" != en ]; then
+    cat > "$work/binder-en.ps1" <<'WRAPPER'
+param(
+    [Parameter(Mandatory = $true)][string]$Target,
+    [Parameter(Mandatory = $true)][string]$ArgumentFile
+)
+# Binder messages follow the UI culture; the checks assert the English wording,
+# so pin it BEFORE the target script binds its parameters.
+[System.Threading.Thread]::CurrentThread.CurrentUICulture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
+[System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
+# Arguments arrive NUL-delimited from the check.
+#
+# They are re-assembled into a command line rather than splatted as an array.
+# Measured 2026-10-20 on Windows PowerShell 5.1: `& $target @array` passes every
+# element POSITIONALLY -- '-Bogus' becomes a value, not a parameter name -- so the
+# refusal names a different parameter and looks like an asset defect.  A token
+# that starts with '-' is therefore emitted verbatim (that is exactly how
+# PowerShell's own -File parser reads it); everything else is single-quoted with
+# '' doubling, which also preserves the empty argument as ''.
+$bytes = [System.IO.File]::ReadAllBytes($ArgumentFile)
+$text = [System.Text.Encoding]::UTF8.GetString($bytes)
+if ($text.EndsWith([char]0)) { $text = $text.Substring(0, $text.Length - 1) }
+$targetArguments = if ($text.Length -eq 0) { @() } else { $text -split [char]0 }
+$escapedTarget = $Target.Replace("'", "''")
+$builder = New-Object System.Text.StringBuilder
+[void]$builder.Append("& '").Append($escapedTarget).Append("'")
+foreach ($argument in $targetArguments) {
+    if ($argument -match '^-[A-Za-z?]') {
+        [void]$builder.Append(' ').Append($argument)
+    } else {
+        [void]$builder.Append(" '").Append($argument.Replace("'", "''")).Append("'")
+    }
+}
+try {
+    Invoke-Expression $builder.ToString()
+    exit $LASTEXITCODE
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
+WRAPPER
+fi
 
 failures=0
 
@@ -53,7 +132,30 @@ failures=0
 # message text.  Same mechanism, one definition per file by design (12/13/23
 # each define it; 12 and 13 gained it after 23's CI red proved the gap).
 strip_ansi() { sed -E $'s/\x1b\\[[0-9;]*m//g' "$1"; }
-flatten_err() { strip_ansi "$1" | tr -d '\r' | tr '\n' ' ' | sed -E 's/ +/ /g'; }
+# PowerShell formats a terminating error to the CONSOLE BUFFER WIDTH and hard-
+# wraps at that column -- mid-word when the message crosses it.  Measured
+# 2026-10-21 on a real Windows host: width 120, and the refusals these checks
+# assert arrived as `SourcePa` + `th` and `B` + `ogus`.  Flattening the newline
+# to a SPACE then splits the word for good and a correct asset reads as broken
+# (intermittent: it depends on where the column lands).  So rejoin a line that
+# fills the buffer (>= width-1) with NO separator -- that break was inside a
+# word -- and join the rest with a space.  The width is probed, not assumed.
+pwsh_wrap_width=$("$pwsh_binary" -NoProfile -NonInteractive \
+    -Command '$Host.UI.RawUI.BufferSize.Width' 2>/dev/null | tr -d '\r\n')
+case $pwsh_wrap_width in ''|*[!0-9]*) pwsh_wrap_width=0 ;; esac
+flatten_err() {
+    strip_ansi "$1" | tr -d '\r' | awk -v w="$pwsh_wrap_width" '
+        { line[NR] = $0 }
+        END {
+            out = ""
+            for (i = 1; i <= NR; i++) {
+                out = out line[i]
+                if (i < NR) { out = out ((w > 0 && length(line[i]) >= w - 1) ? "" : " ") }
+            }
+            gsub(/[ \t]+/, " ", out)
+            print out
+        }'
+}
 
 cases=0
 
@@ -62,20 +164,45 @@ cases=0
 # The installer's own parameter binding rejects these before a single statement
 # of the script body runs, so nothing is written anywhere; the exit code is 1
 # (PowerShell's terminating-error code), not the 2 the POSIX installer uses.
+# Run the asset under the current UI culture (the shipped path), or through the
+# en-US wrapper when the host is not English.  $1 = the asset path, rest = args.
+# The wrapper takes the arguments as an ARRAY, so an empty argument stays empty
+# and a leading-dash argument stays a parameter name -- quoting them would
+# change what PowerShell's binder sees (measured 2026-10-20: quoting turned
+# `-SourcePath` into a positional value and the refusal moved to another
+# parameter, which looked exactly like an asset defect).
+run_asset() {
+    local asset_path=$1
+    shift
+    if [ "$pwsh_binder" = en ]; then
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$asset_path" "$@"
+    else
+        local arg_file="$work/binder-args.$$"
+        : > "$arg_file"
+        for a in "$@"; do
+            printf '%s\0' "$a" >> "$arg_file"
+        done
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$work/binder-en.ps1" \
+            -Target "$asset_path" -ArgumentFile "$arg_file"
+        local wrapper_status=$?
+        rm -f "$arg_file"
+        return $wrapper_status
+    fi
+}
+
 expect_rejected() {
     local expected=$1
     shift
     local label=$*
     cases=$((cases + 1))
     local status=0
-    (cd "$work" && HOME="$work/home" "$pwsh_binary" -NoProfile -NonInteractive \
-        -File "$installer" "$@" >"$work/out" 2>"$work/err") || status=$?
+    (cd "$work" && HOME="$work/home" run_asset "$installer" "$@" >"$work/out" 2>"$work/err") || status=$?
     if [ "$status" -eq 0 ]; then
         printf 'ps-installer %s: expected a non-zero exit, got 0\n' "${label:-<no args>}" >&2
         failures=$((failures + 1))
         return
     fi
-    if ! flatten_err "$work/err" | grep -qF -- "$expected"; then
+    if ! grep -qF -- "$expected" <<< "$(flatten_err "$work/err")"; then
         printf 'ps-installer %s: stderr does not contain %s\n' "${label:-<no args>}" "$expected" >&2
         head -2 "$work/err" >&2 || true
         failures=$((failures + 1))
@@ -93,63 +220,113 @@ expect_rejected "Missing an argument for parameter 'StageDirectory'." -StageDire
 expect_rejected "Cannot validate argument on parameter 'StageDirectory'." -StageDirectory ''
 expect_rejected "A parameter cannot be found that matches parameter name 'Bogus'." -Bogus x
 
+# Portable sha256 over a directory tree.  Git for Windows ships coreutils'
+# `sha256sum` but NOT `shasum` (a perl script from perl modules on macOS), so a
+# plain `find -exec shasum` died here with "shasum: No such file" on 2026-10-20
+# -- an environment fact about the platform this check now runs on (the windows
+# CI job and the real Windows host), not about the asset under test.  Emit one
+# digest per file, sorted by path, so the comparison is stable and a file added
+# or removed between before/after shows up as a changed line, not a shifted one.
+stage_digests() {
+    local target=$1 hash_util file rel digest
+    # The two utilities take the algorithm differently: `shasum -a 256 FILE`
+    # versus `sha256sum FILE`.  Passing shasum's flag to sha256sum fails with
+    # "invalid option -- a" -- measured 2026-10-20, after a first version of
+    # this helper did exactly that and would have broken the Windows CI job.
+    if command -v shasum >/dev/null 2>&1; then
+        hash_util=shasum
+    elif command -v sha256sum >/dev/null 2>&1; then
+        hash_util=sha256sum
+    else
+        printf 'ps-installer: neither shasum nor sha256sum is on PATH; the staged-asset check cannot run\n' >&2
+        return 127
+    fi
+    while IFS= read -r file; do
+        rel=${file#"$target"/}
+        if [ "$hash_util" = shasum ]; then
+            digest=$(shasum -a 256 "$file")
+        else
+            digest=$(sha256sum "$file")
+        fi
+        printf '%s  %s\n' "${digest%% *}" "$rel"
+    done < <(find "$target" -type f | LC_ALL=C sort)
+}
+
 # --- the platform gate --------------------------------------------------------
-# A valid invocation on a non-Windows platform must fail without side effects.
-# The stage directory is populated with every asset the installer's own staging
-# list requires, so the ONLY thing that can stop it here is the platform gate --
-# if a future edit moves staging validation ahead of the gate, this case starts
-# exercising that path and will say so.
-stage="$work/stage"
-mkdir -p "$stage"
-for asset in agentq agentq-launcher.ps1 agentq-start-daemon.ps1 agentq-durable-move.ps1 pueue.yml; do
-    cp "$stage_source/$asset" "$stage/$asset"
-done
-stage_before=$(find "$stage" -type f -exec shasum -a 256 {} + | LC_ALL=C sort)
+# NON-WINDOWS ONLY, and the boundary belongs to the case rather than to the
+# effort spent on it: the thing under test is the `Windows Principal
+# functionality is not supported on this platform` throw, which by definition
+# cannot fire ON Windows.  Measured 2026-10-20 on a real Windows 10 host: with
+# a populated stage directory the installer does not stop at the gate -- it
+# proceeds to install the daemon and rewrite the launcher's install state.  That
+# is correct behaviour for the asset and a HAZARD for this check, which must
+# never be the thing that installs AgentQ onto a developer's machine.  So on a
+# Windows host the case is skipped and declared rather than run.
+host_kind=$(uname -s 2>/dev/null || printf 'unknown')
+case $host_kind in
+    MINGW*|MSYS*|CYGWIN*) host_is_windows=true ;;
+    *) host_is_windows=false ;;
+esac
+if [ "$host_is_windows" = true ]; then
+    printf 'ps-installer: the platform-gate cases are NOT-covered(needs-non-Windows) on %s; the installer was not invoked with a valid argument set\n' "$host_kind"
+else
+    # A valid invocation on a non-Windows platform must fail without side effects.
+    # The stage directory is populated with every asset the installer's own staging
+    # list requires, so the ONLY thing that can stop it here is the platform gate --
+    # if a future edit moves staging validation ahead of the gate, this case starts
+    # exercising that path and will say so.
+    stage="$work/stage"
+    mkdir -p "$stage"
+    for asset in agentq agentq-launcher.ps1 agentq-start-daemon.ps1 agentq-durable-move.ps1 pueue.yml; do
+        cp "$stage_source/$asset" "$stage/$asset"
+    done
+    stage_before=$(stage_digests "$stage")
 
-cases=$((cases + 1))
-gate_status=0
-(cd "$work" && HOME="$work/home" "$pwsh_binary" -NoProfile -NonInteractive \
-    -File "$installer" -StageDirectory "$stage" >"$work/gate.out" 2>"$work/gate.err") || gate_status=$?
-if [ "$gate_status" -eq 0 ]; then
-    printf '%s\n' 'ps-installer: a non-Windows run exited 0 instead of failing' >&2
-    failures=$((failures + 1))
-elif ! grep -qF 'Windows Principal functionality is not supported on this platform' "$work/gate.err"; then
-    printf 'ps-installer: the platform gate reported something unexpected: %s\n' \
-        "$(head -1 "$work/gate.err")" >&2
-    failures=$((failures + 1))
-fi
+    cases=$((cases + 1))
+    gate_status=0
+    (cd "$work" && HOME="$work/home" "$pwsh_binary" -NoProfile -NonInteractive \
+        -File "$installer" -StageDirectory "$stage" >"$work/gate.out" 2>"$work/gate.err") || gate_status=$?
+    if [ "$gate_status" -eq 0 ]; then
+        printf '%s\n' 'ps-installer: a non-Windows run exited 0 instead of failing' >&2
+        failures=$((failures + 1))
+    elif ! grep -qF 'Windows Principal functionality is not supported on this platform' "$work/gate.err"; then
+        printf 'ps-installer: the platform gate reported something unexpected: %s\n' \
+            "$(head -1 "$work/gate.err")" >&2
+        failures=$((failures + 1))
+    fi
 
-# The gate must run BEFORE staging validation -- that ordering is the whole
-# reason this file can say anything at all off Windows, and it is the thing a
-# future edit could silently invert.  An EMPTY stage directory proves it: if the
-# gate still runs first the error is the platform error, and if the ordering
-# ever flips the error becomes a missing-asset error instead.  (Measured before
-# this case existed: a nonexistent stage directory and a fully populated one
-# produce the identical platform error.)
-empty_stage="$work/empty-stage"
-mkdir -p "$empty_stage"
-cases=$((cases + 1))
-empty_status=0
-(cd "$work" && HOME="$work/home" "$pwsh_binary" -NoProfile -NonInteractive \
-    -File "$installer" -StageDirectory "$empty_stage" >"$work/empty.out" 2>"$work/empty.err") || empty_status=$?
-if [ "$empty_status" -eq 0 ]; then
-    printf '%s\n' 'ps-installer: an empty stage directory did not fail' >&2
-    failures=$((failures + 1))
-elif ! grep -qF 'Windows Principal functionality is not supported on this platform' "$work/empty.err"; then
-    printf 'ps-installer: staging validation now runs before the platform gate: %s\n' \
-        "$(head -1 "$work/empty.err")" >&2
-    failures=$((failures + 1))
-fi
-if [ -n "$(find "$empty_stage" -mindepth 1 -print -quit)" ]; then
-    printf '%s\n' 'ps-installer: the empty stage directory was written to' >&2
-    failures=$((failures + 1))
-fi
+    # The gate must run BEFORE staging validation -- that ordering is the whole
+    # reason this file can say anything at all off Windows, and it is the thing a
+    # future edit could silently invert.  An EMPTY stage directory proves it: if the
+    # gate still runs first the error is the platform error, and if the ordering
+    # ever flips the error becomes a missing-asset error instead.  (Measured before
+    # this case existed: a nonexistent stage directory and a fully populated one
+    # produce the identical platform error.)
+    empty_stage="$work/empty-stage"
+    mkdir -p "$empty_stage"
+    cases=$((cases + 1))
+    empty_status=0
+    (cd "$work" && HOME="$work/home" "$pwsh_binary" -NoProfile -NonInteractive \
+        -File "$installer" -StageDirectory "$empty_stage" >"$work/empty.out" 2>"$work/empty.err") || empty_status=$?
+    if [ "$empty_status" -eq 0 ]; then
+        printf '%s\n' 'ps-installer: an empty stage directory did not fail' >&2
+        failures=$((failures + 1))
+    elif ! grep -qF 'Windows Principal functionality is not supported on this platform' "$work/empty.err"; then
+        printf 'ps-installer: staging validation now runs before the platform gate: %s\n' \
+            "$(head -1 "$work/empty.err")" >&2
+        failures=$((failures + 1))
+    fi
+    if [ -n "$(find "$empty_stage" -mindepth 1 -print -quit)" ]; then
+        printf '%s\n' 'ps-installer: the empty stage directory was written to' >&2
+        failures=$((failures + 1))
+    fi
 
-# ...and it must not have modified the staged assets it was handed.
-stage_after=$(find "$stage" -type f -exec shasum -a 256 {} + | LC_ALL=C sort)
-if [ "$stage_before" != "$stage_after" ]; then
-    printf '%s\n' 'ps-installer: the platform gate modified the staged assets' >&2
-    failures=$((failures + 1))
+    # ...and it must not have modified the staged assets it was handed.
+    stage_after=$(stage_digests "$stage")
+    if [ "$stage_before" != "$stage_after" ]; then
+        printf '%s\n' 'ps-installer: the platform gate modified the staged assets' >&2
+        failures=$((failures + 1))
+    fi
 fi
 
 # --- W5: crash-leftover detection, driven on the extracted functions ----------
@@ -345,5 +522,23 @@ if [ "$failures" -ne 0 ]; then
     printf 'ps-installer-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'ps-installer-contract checks passed: cases=%s pwsh=%s crash-leftover=covered staging=NOT-covered(needs-Windows)\n' \
-    "$cases" "$("$pwsh_binary" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')"
+# The platform-gate coverage is reported, not assumed: on a Windows host those
+# cases did not run (the gate cannot fire there), and saying "covered" would be
+# the same false claim in the other direction.
+# staging is a SEPARATE boundary with a DIFFERENT reason on each host, and the
+# old unconditional `staging=NOT-covered(needs-Windows)` became self-
+# contradictory the moment this check entered the Windows CI job: a Windows log
+# line reading "needs-Windows" claims the very thing it is denying, and it also
+# implied that running the check ON Windows would exercise staging -- it does
+# not, and it must not.  On Windows the accurate reason is that a valid
+# invocation is deliberately never issued here (measured 2026-10-20: doing so
+# ran the client installer and rewrote the user's PATH).
+if [ "$host_is_windows" = true ]; then
+    platform_gate_state='platform-gate=NOT-covered(needs-non-Windows)'
+    staging_state='staging=NOT-covered(deliberately-not-exercised)'
+else
+    platform_gate_state='platform-gate=covered'
+    staging_state='staging=NOT-covered(needs-Windows)'
+fi
+printf 'ps-installer-contract checks passed: cases=%s pwsh=%s binder=%s crash-leftover=covered %s %s\n' \
+    "$cases" "$("$pwsh_binary" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')" "$pwsh_binder" "$platform_gate_state" "$staging_state"

@@ -86,7 +86,12 @@ ssh-keygen -q -t ed25519 -N 'agentq-smoke-passphrase' -f "$ssh_dir/id" -C agentq
 remote_home="$work/remote"
 mkdir -p "$remote_home/.local/bin"
 chmod 700 "$remote_home"
-cp "$source_home/agentq-server" "$remote_home/.local/bin/agentq"
+# The SERVER under test is the repo asset, not the runtime's snapshot (same fix
+# as smoke/04/06, 2026-10-21): "$source_home/agentq-server" is whatever
+# sandbox.sh wrote when the SANDBOX was created -- measured at 247276 bytes
+# against the repo asset's 248213 -- so server-side changes after that moment
+# were invisible here.
+cp "${AGENTQ_SMOKE_SERVER:-$root/skill/assets/unix/agentq-server}" "$remote_home/.local/bin/agentq"
 cp "$source_home/pueue" "$remote_home/.local/bin/pueue"
 cp "$source_home/pueued" "$remote_home/.local/bin/pueued"
 chmod 700 "$remote_home/.local/bin/agentq" "$remote_home/.local/bin/pueue" "$remote_home/.local/bin/pueued"

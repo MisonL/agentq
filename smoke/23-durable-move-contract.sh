@@ -43,9 +43,88 @@ if ! command -v "$pwsh_binary" >/dev/null 2>&1; then
     exit 0
 fi
 
+# Present is not the same as working.  A corrupt pwsh startup cache makes
+# every launch die (measured five times in this repo, with four different
+# messages: "String cannot have zero length", "Stack overflow",
+# FileLoadException, and Abort trap: 6).  The existence tests above cannot see
+# that, so every case below would run against a pwsh that never starts and
+# report its failures as asset defects -- the misdiagnosis smoke/01 fixed for
+# itself in 2026-09-28.  Probe once: an unusable interpreter is an ENVIRONMENT
+# fault, say so with the fix, and do not claim the check ran.
+pwsh_probe_status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command 'exit 0' >/dev/null 2>&1 || pwsh_probe_status=$?
+if [ "$pwsh_probe_status" -ne 0 ]; then
+    printf '%s\n' 'Durable-move contract NOT run: the pwsh on PATH cannot execute (startup cache).' >&2
+    printf '%s\n' 'Try: mv ~/.cache/powershell/StartupProfileData-NonInteractive{,.broken}' >&2
+    exit 1
+fi
+
 work=$(mktemp -d /tmp/agentq-smoke-durable.XXXXXX)
 work=$(unset CDPATH; cd -- "$work" && pwd -P)
 trap 'rm -rf -- "$work"' EXIT
+
+# --- Binder messages are LOCALISED (2026-10-20, measured on a zh-CN Windows 10) -
+# The rejection cases below assert the exact wording PowerShell's parameter
+# binder produces.  That wording follows [Thread]::CurrentThread.CurrentUICulture,
+# so on a non-English Windows the SAME refusal reads `找不到与参数名称"Bogus"匹配的参数`
+# and every case fails -- reporting a correct asset as broken.  CI's windows-latest
+# is an English image, which is why this stayed invisible; a real test host is not.
+# Measured on Windows PowerShell 5.1.19041 (zh-CN) with the real asset: setting
+# CurrentUICulture to en-US in-process makes all four messages byte-identical to
+# the English strings asserted here.
+#
+# So: probe the UI culture once.  English -> run the asset directly (the shipped
+# path, unchanged).  Anything else -> run it through a wrapper that sets en-US
+# first, and SAY SO in the summary.  If an invocation still fails, that is an
+# environment fault and must not be read as an asset defect.
+pwsh_ui_culture=$("$pwsh_binary" -NoProfile -NonInteractive \
+    -Command '[System.Globalization.CultureInfo]::CurrentUICulture.Name' 2>/dev/null | tr -d '\r\n')
+case $pwsh_ui_culture in
+    ''|en|en-*) pwsh_binder=en ;;
+    *) pwsh_binder="en-US-via-wrapper(host=$pwsh_ui_culture)" ;;
+esac
+if [ "$pwsh_binder" != en ]; then
+    cat > "$work/binder-en.ps1" <<'WRAPPER'
+param(
+    [Parameter(Mandatory = $true)][string]$Target,
+    [Parameter(Mandatory = $true)][string]$ArgumentFile
+)
+# Binder messages follow the UI culture; the checks assert the English wording,
+# so pin it BEFORE the target script binds its parameters.
+[System.Threading.Thread]::CurrentThread.CurrentUICulture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
+[System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
+# Arguments arrive NUL-delimited from the check.
+#
+# They are re-assembled into a command line rather than splatted as an array.
+# Measured 2026-10-20 on Windows PowerShell 5.1: `& $target @array` passes every
+# element POSITIONALLY -- '-Bogus' becomes a value, not a parameter name -- so the
+# refusal names a different parameter and looks like an asset defect.  A token
+# that starts with '-' is therefore emitted verbatim (that is exactly how
+# PowerShell's own -File parser reads it); everything else is single-quoted with
+# '' doubling, which also preserves the empty argument as ''.
+$bytes = [System.IO.File]::ReadAllBytes($ArgumentFile)
+$text = [System.Text.Encoding]::UTF8.GetString($bytes)
+if ($text.EndsWith([char]0)) { $text = $text.Substring(0, $text.Length - 1) }
+$targetArguments = if ($text.Length -eq 0) { @() } else { $text -split [char]0 }
+$escapedTarget = $Target.Replace("'", "''")
+$builder = New-Object System.Text.StringBuilder
+[void]$builder.Append("& '").Append($escapedTarget).Append("'")
+foreach ($argument in $targetArguments) {
+    if ($argument -match '^-[A-Za-z?]') {
+        [void]$builder.Append(' ').Append($argument)
+    } else {
+        [void]$builder.Append(" '").Append($argument.Replace("'", "''")).Append("'")
+    }
+}
+try {
+    Invoke-Expression $builder.ToString()
+    exit $LASTEXITCODE
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
+WRAPPER
+fi
 
 failures=0
 cases=0
@@ -62,13 +141,62 @@ strip_ansi() { sed -E $'s/\x1b\\[[0-9;]*m//g' "$1"; }
 # CR drop matters: a 5.1 CRLF wrap keeps the trailing space of the wrapped line
 # ("...of one \r\nmore..."), and the fragment spells it "one or more" -- without
 # collapsing whitespace runs the 5.1 text does not match (measured 2026-10-13).
-flatten_err() { strip_ansi "$1" | tr -d '\r' | tr '\n' ' ' | sed -E 's/ +/ /g'; }
+# PowerShell formats a terminating error to the CONSOLE BUFFER WIDTH and hard-
+# wraps at that column -- mid-word when the message crosses it.  Measured
+# 2026-10-21 on a real Windows host: width 120, and the refusals these checks
+# assert arrived as `SourcePa` + `th` and `B` + `ogus`.  Flattening the newline
+# to a SPACE then splits the word for good and a correct asset reads as broken
+# (intermittent: it depends on where the column lands).  So rejoin a line that
+# fills the buffer (>= width-1) with NO separator -- that break was inside a
+# word -- and join the rest with a space.  The width is probed, not assumed.
+pwsh_wrap_width=$("$pwsh_binary" -NoProfile -NonInteractive \
+    -Command '$Host.UI.RawUI.BufferSize.Width' 2>/dev/null | tr -d '\r\n')
+case $pwsh_wrap_width in ''|*[!0-9]*) pwsh_wrap_width=0 ;; esac
+flatten_err() {
+    strip_ansi "$1" | tr -d '\r' | awk -v w="$pwsh_wrap_width" '
+        { line[NR] = $0 }
+        END {
+            out = ""
+            for (i = 1; i <= NR; i++) {
+                out = out line[i]
+                if (i < NR) { out = out ((w > 0 && length(line[i]) >= w - 1) ? "" : " ") }
+            }
+            gsub(/[ \t]+/, " ", out)
+            print out
+        }'
+}
+# Run the asset under the current UI culture (the shipped path), or through the
+# en-US wrapper when the host is not English.  $1 = the asset path, rest = args.
+# The wrapper takes the arguments as an ARRAY, so an empty argument stays empty
+# and a leading-dash argument stays a parameter name -- quoting them would
+# change what PowerShell's binder sees (measured 2026-10-20: quoting turned
+# `-SourcePath` into a positional value and the refusal moved to another
+# parameter, which looked exactly like an asset defect).
+run_asset() {
+    local asset_path=$1
+    shift
+    if [ "$pwsh_binder" = en ]; then
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$asset_path" "$@"
+    else
+        local arg_file="$work/binder-args.$$"
+        : > "$arg_file"
+        for a in "$@"; do
+            printf '%s\0' "$a" >> "$arg_file"
+        done
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$work/binder-en.ps1" \
+            -Target "$asset_path" -ArgumentFile "$arg_file"
+        local wrapper_status=$?
+        rm -f "$arg_file"
+        return $wrapper_status
+    fi
+}
+
 expect_rejected() {
     local label=$1 expected=$2
     shift 2
     cases=$((cases + 1))
     local status=0
-    "$pwsh_binary" -NoProfile -NonInteractive -File "$asset" "$@" >"$work/out" 2>"$work/err" || status=$?
+    run_asset "$asset" "$@" >"$work/out" 2>"$work/err" || status=$?
     # PowerShell writes terminating errors to stderr and exits 1.  Assert non-zero
     # rather than exactly 1: the point is that the call was refused, and pinning
     # the numeric code would couple this to PowerShell's version.
@@ -77,7 +205,7 @@ expect_rejected() {
         failures=$((failures + 1))
         return
     fi
-    if ! flatten_err "$work/err" | grep -qF -- "$expected"; then
+    if ! grep -qF -- "$expected" <<< "$(flatten_err "$work/err")"; then
         printf 'durable-move %s: stderr does not contain %s\n' "$label" "$expected" >&2
         strip_ansi "$work/err" | head -2 >&2 || true
         failures=$((failures + 1))
@@ -108,7 +236,7 @@ access_line=$(grep -nE 'uint access = ' "$asset" | head -1) || true
 if [ -z "$access_line" ]; then
     printf 'durable-move: could not find the access-mask line in OpenForFlush\n' >&2
     failures=$((failures + 1))
-elif ! printf '%s' "$access_line" | grep -q 'GenericRead | GenericWrite'; then
+elif ! grep -q 'GenericRead | GenericWrite' <<< "$access_line"; then
     printf 'durable-move: FlushFileBuffers handle no longer requests write access: %s\n' "$access_line" >&2
     printf '%s\n' '  (FlushFileBuffers requires GENERIC_WRITE; a read-only handle fails with ERROR_ACCESS_DENIED)' >&2
     failures=$((failures + 1))
@@ -134,5 +262,5 @@ if [ "$failures" -ne 0 ]; then
     printf 'durable-move-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'durable-move-contract checks passed: cases=%s pwsh=%s contract=covered access-mask=pinned behaviour=NOT-covered(needs-Windows)\n' "$cases" \
-    "$("$pwsh_binary" -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()' 2>/dev/null || printf 'unknown')"
+printf 'durable-move-contract checks passed: cases=%s pwsh=%s binder=%s contract=covered access-mask=pinned behaviour=NOT-covered(needs-Windows)\n' "$cases" \
+    "$("$pwsh_binary" -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()' 2>/dev/null || printf 'unknown')" "$pwsh_binder"

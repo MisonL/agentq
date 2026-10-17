@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.15'
+agentq_client_version='0.1.16'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072); a Windows target re-encodes
 # argv onto a CreateProcess command line capped at 32767 characters, and the
@@ -47,7 +47,15 @@ stdin_script_windows_limit=20000
 platform_probe_output_limit=65536
 ssh_binary=${AGENTQ_SSH:-}
 json_parser=${AGENTQ_JQ:-}
+# Lower-cased on read: the Windows client's `switch` is case-INSENSITIVE by
+# language rule, so `AUTO` and `Unix` take their normal branches there while
+# this `case` refused them outright (measured 2026-10-21: `AGENTQ_REMOTE_PLATFORM=AUTO`
+# exited 2 here and 255 -- a normal probe-then-connect -- there).  Two spellings
+# of the same instruction must not mean different things per client.  The
+# value is normalised rather than the `case` pattern widened so everything
+# downstream (the cache comparison at 3005, the launcher probe) sees one form.
 remote_platform=${AGENTQ_REMOTE_PLATFORM:-auto}
+remote_platform=$(printf '%s' "$remote_platform" | tr '[:upper:]' '[:lower:]')
 remote_argument_file=''
 remote_input_file=''
 submit_input_file=''
@@ -1229,8 +1237,14 @@ run_wait_ssh_with_timeout() {
         wait_ssh_stderr_capture_identity=''
     else
         printf '%s: failed to remove the wait stderr capture: %s\n' "$program" "$wait_ssh_stderr_capture" >&2
+        # NOT `wait_ssh_status=$?` here: by this point `$?` is the `[` test's
+        # status (always 0), not the failed removal's -- so the assignment
+        # silently turned a cleanup failure into a success.  The intent is
+        # "report the failure only when ssh itself succeeded", and a cleanup
+        # failure has no exit code of its own in the contract, so the general
+        # failure code is what gets reported.  (shellcheck SC2319, 2026-10-18.)
         if [ "$wait_ssh_status" -eq 0 ]; then
-            wait_ssh_status=$?
+            wait_ssh_status=1
         fi
     fi
 
@@ -1299,8 +1313,24 @@ run_submit_recovery_ssh() {
     return "$recovery_ssh_status"
 }
 
+agentq_stop_background_ssh() {
+    # A signal handler that only exits leaves the backgrounded ssh child alive:
+    # the client returns 130 while the remote `wait` keeps holding the server
+    # operation lock until its own budget elapses.  Killing the local ssh closes
+    # the channel, which makes the remote sshd HUP the remote command.  Only the
+    # wait-with-timeout path backgrounds an ssh (the platform probe does too, but
+    # it runs inside a $( ) subshell, so its pid never reaches this shell -- that
+    # path is bounded by its own 30s probe timeout instead).
+    if [ -n "${agentq_operation_ssh_pid:-}" ]; then
+        kill "$agentq_operation_ssh_pid" >/dev/null 2>&1 || true
+        wait "$agentq_operation_ssh_pid" >/dev/null 2>&1 || true
+        agentq_operation_ssh_pid=''
+    fi
+}
+
 cleanup_client_runtime() {
     cleanup_client_runtime_status=0
+    agentq_stop_background_ssh
     if cleanup_config_snapshot; then
         :
     else
@@ -1809,33 +1839,46 @@ is_task_id() {
 }
 
 is_positive_integer_or_all() {
+    # Same shape the Windows twin's Test-PositiveIntegerOrAll accepts
+    # (`^[1-9][0-9]*$`, or the literal `all`).  The charset-only form here used
+    # to accept `05`/`007` while the Windows client refused them -- measured
+    # 2026-10-21 with `logs 1 --tail 05`: 255 here (the tail was forwarded and
+    # the request reached ssh) against 2 there.  Both clients now refuse a
+    # leading zero, which is the shape `--tail`'s own error message promises
+    # ("a positive integer or all").
     case "$1" in
         all) return 0 ;;
-        ''|*[!0-9]*|0) return 1 ;;
+        ''|*[!0-9]*|0*) return 1 ;;
         *) return 0 ;;
     esac
 }
 
 # A positive integer that also fits the range every consumer here can do
-# arithmetic on.  `[ "$a" -ge "$b" ]` with a value past the shell's integer
-# range does not fail the test -- dash prints "Illegal number" and the
+# arithmetic on, in EXACTLY the shape the Windows client accepts.
+#
+# The range matters because `[ "$a" -ge "$b" ]` with a value past the shell's
+# integer range does not fail the test -- dash prints "Illegal number" and the
 # comparison reads as FALSE (measured 2026-10-16: `[ 5 -ge 99999999999999999999 ]`
-# → rc=2, and every deadline check that uses this shape then never fires, so a
-# `wait --timeout` with such a value would wait forever).  Anything that feeds
-# a comparison or an arithmetic expansion must pass through here.
+# -> rc=2), so a deadline built that way never fires.  Anything that feeds a
+# comparison or an arithmetic expansion must pass through here.
+#
+# Why int32 and not the shell's own int64 limit (measured 2026-10-21:
+# `[ 9223372036854775807 -ge 1 ]` is true under sh/dash/bash, and
+# 9223372036854775808 is the first failure): the WINDOWS twin cannot represent
+# anything larger -- its Start-Sleep takes an [int], and Convert-ToPositiveInt32
+# refuses above [int]::MaxValue.  A bound that differs between the two clients
+# is the same drift class as the CACHE_TTL default, which one side refused and
+# the other silently replaced: measured 2026-10-21, `...=1000000000` and
+# `...=2147483647` were ACCEPTED by the Windows client and REFUSED here, while
+# `05` was accepted here and refused there.  Both clients now accept exactly
+# `^[1-9][0-9]*$` up to 2147483647.
 is_bounded_positive_integer() {
     case "$1" in
-        ''|*[!0-9]*|0) return 1 ;;
+        ''|*[!0-9]*|0*) return 1 ;;
     esac
-    [ "${#1}" -le 9 ] || return 1
-    return 0
-}
-
-is_positive_integer() {
-    case "$1" in
-        ''|*[!0-9]*|0) return 1 ;;
-        *) return 0 ;;
-    esac
+    [ "${#1}" -le 10 ] || return 1
+    [ "${#1}" -lt 10 ] && return 0
+    [ "$1" -le 2147483647 ]
 }
 
 is_request_id() {
@@ -2104,18 +2147,16 @@ run_platform_probe() {
     }
     platform_probe_output_file=$(mktemp "$agentq_temp_directory/agentq-platform-output.XXXXXX") || return 2
     platform_probe_output_identity=$(platform_probe_file_identity "$platform_probe_output_file") || {
-        printf '%s: cannot record platform probe output temporary identity\n' "$program" >&2
+        # Preserve, and say so: removal is identity-gated (the same rule as
+        # run_ssh_logged), so the file is deliberately left behind.  The path
+        # must appear in THIS line -- the previous shape cleared the global and
+        # then called the remover with an empty path, which printed
+        # "unsafe platform probe temporary file: " (no file name) and could
+        # never have removed anything.
+        printf '%s: cannot record platform probe output temporary identity; preserving it: %s\n' \
+            "$program" "$platform_probe_output_file" >&2
         platform_probe_output_file=''
-        platform_probe_status=2
-        if platform_probe_remove_file "$platform_probe_output_file" ''; then
-            platform_probe_output_cleanup_status=0
-        else
-            platform_probe_output_cleanup_status=$?
-            if [ "$platform_probe_status" -eq 0 ]; then
-                platform_probe_status=$platform_probe_output_cleanup_status
-            fi
-        fi
-        return "$platform_probe_status"
+        return 2
     }
     if platform_probe_require_file "$platform_probe_output_file"; then
         :
@@ -2144,7 +2185,11 @@ run_platform_probe() {
         return "$platform_probe_status"
     }
     platform_probe_log_identity=$(platform_probe_file_identity "$platform_probe_log_file") || {
-        printf '%s: cannot record platform probe log temporary identity\n' "$program" >&2
+        # Same shape as the output-file branch above: name the preserved file,
+        # remove the output file (whose identity IS known), and do not attempt
+        # an identity-gated removal of the log file with an empty path.
+        printf '%s: cannot record platform probe log temporary identity; preserving it: %s\n' \
+            "$program" "$platform_probe_log_file" >&2
         platform_probe_log_file=''
         platform_probe_status=2
         if platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity"; then
@@ -2153,14 +2198,6 @@ run_platform_probe() {
             platform_probe_output_cleanup_status=$?
             if [ "$platform_probe_status" -eq 0 ]; then
                 platform_probe_status=$platform_probe_output_cleanup_status
-            fi
-        fi
-        if platform_probe_remove_file "$platform_probe_log_file" ''; then
-            platform_probe_log_cleanup_status=0
-        else
-            platform_probe_log_cleanup_status=$?
-            if [ "$platform_probe_status" -eq 0 ]; then
-                platform_probe_status=$platform_probe_log_cleanup_status
             fi
         fi
         return "$platform_probe_status"
@@ -2494,19 +2531,15 @@ encode_windows_powershell() {
     resolve_agentq_temp_directory || return $?
     windows_encoding_input=$(mktemp "$agentq_temp_directory/agentq-windows-powershell.XXXXXX") || return 1
     windows_encoding_input_identity=$(windows_encoding_file_identity "$windows_encoding_input") || {
-        printf '%s: cannot record Windows PowerShell encoding input identity: %s\n' "$program" "$windows_encoding_input" >&2
-        # drop tracking: cleanup refuses an unattributable temporary (see run_ssh_logged)
+        # Preserve, and say so: the removal below is identity-gated, so the file
+        # is deliberately left behind.  The path must appear in THIS line -- the
+        # previous shape cleared the global and then called the remover with an
+        # empty path, which printed an "unsafe temporary" line with no file name
+        # and could never have removed anything.
+        printf '%s: cannot record Windows PowerShell encoding input identity; preserving it: %s\n' \
+            "$program" "$windows_encoding_input" >&2
         windows_encoding_input=''
-        windows_encoding_status=1
-        if windows_encoding_remove_file "$windows_encoding_input" ''; then
-            windows_encoding_input_cleanup_status=0
-        else
-            windows_encoding_input_cleanup_status=$?
-            if [ "$windows_encoding_status" -eq 0 ]; then
-                windows_encoding_status=$windows_encoding_input_cleanup_status
-            fi
-        fi
-        return "$windows_encoding_status"
+        return 1
     }
     if windows_encoding_require_file "$windows_encoding_input"; then
         :
@@ -2535,7 +2568,10 @@ encode_windows_powershell() {
         return "$windows_encoding_status"
     }
     windows_encoding_output_identity=$(windows_encoding_file_identity "$windows_encoding_output") || {
-        printf '%s: cannot record Windows PowerShell encoding output identity: %s\n' "$program" "$windows_encoding_output" >&2
+        # Same shape: name the preserved output file, remove the INPUT (whose
+        # identity is known), and skip the identity-gated removal of the output.
+        printf '%s: cannot record Windows PowerShell encoding output identity; preserving it: %s\n' \
+            "$program" "$windows_encoding_output" >&2
         windows_encoding_output=''
         windows_encoding_status=1
         if windows_encoding_remove_file "$windows_encoding_input" "$windows_encoding_input_identity"; then
@@ -2544,14 +2580,6 @@ encode_windows_powershell() {
             windows_encoding_input_cleanup_status=$?
             if [ "$windows_encoding_status" -eq 0 ]; then
                 windows_encoding_status=$windows_encoding_input_cleanup_status
-            fi
-        fi
-        if windows_encoding_remove_file "$windows_encoding_output" ''; then
-            windows_encoding_output_cleanup_status=0
-        else
-            windows_encoding_output_cleanup_status=$?
-            if [ "$windows_encoding_status" -eq 0 ]; then
-                windows_encoding_status=$windows_encoding_output_cleanup_status
             fi
         fi
         return "$windows_encoding_status"
@@ -3063,6 +3091,19 @@ initialize_remote_platform_by_probe() {
             return 0
             ;;
     esac
+    # 255 is OpenSSH's own failure code: by the time the local probe returns it,
+    # either the recovery loop has already spent its whole transport-retry budget
+    # (it re-runs only classified transport failures, and returns 255 when the
+    # budget is gone) or ssh failed for a reason the Windows probe would hit
+    # identically -- authentication, host key, name resolution.  Running the
+    # Windows probe next would spend a SECOND full budget against the same wall
+    # (~70s with the default six attempts) and could not change the diagnosis.
+    # Deliberately NOT applied to 124: a probe timeout on a slow host says
+    # nothing about the platform, and that probe is the only way to find out.
+    if [ "$local_platform_status" -eq 255 ]; then
+        printf '%s: unable to detect the remote platform: the SSH connection failed before the probe could complete\n' "$program" >&2
+        return 255
+    fi
     windows_probe_command || fail 'cannot encode the Windows PowerShell platform probe; iconv and base64 are required'
     windows_platform_command=$windows_probe_prepared_command_line
     if windows_platform_output=$(run_platform_probe_with_recovery "$windows_platform_command" "$platform_probe_stdin_file"); then
@@ -3811,10 +3852,8 @@ run_safe_operation_with_recovery() {
             # cannot read `$?` for this, because by the time the else runs, `$?`
             # is the failed `[` test's 1, not the validation's code (measured
             # 2026-10-15: a lock-rejected status 2 surfaced to the caller as 1).
-            agentq_operation_validated=0
             if operation_output_require_existing_file "$agentq_operation_output_file" &&
                 validate_json_response "$agentq_operation_output_file" "$agentq_operation_profile" "$agentq_operation_request_id" "$agentq_operation_expected_task_id"; then
-                agentq_operation_validated=1
                 if [ "$agentq_operation_name" = wait ]; then
                     if validate_wait_response "$agentq_operation_output_file" 0 "$agentq_operation_expected_task_id"; then
                         :
@@ -3842,10 +3881,14 @@ run_safe_operation_with_recovery() {
                 :
             else
                 # The response failed protocol validation (or the output file
-                # vanished).  The failure status is in agentq_operation_validated's
-                # if -- capture it here where `$?` is still the validation's rc,
-                # NOT in the gate's else below (there `$?` is the failed gate
-                # test's 1 -- measured 2026-10-15).
+                # vanished).  Capture `$?` here, where it is still the
+                # validation's rc, NOT in the gate's else below (there `$?` is
+                # the failed gate test's 1 -- measured 2026-10-15).
+                # (`agentq_operation_validated` used to be assigned in both
+                # arms of this if and was never read; removed 2026-10-18 after
+                # the linter's unused-variable rule flagged it -- a comment
+                # describing a variable that no longer exists is how a dead
+                # mechanism stays looking alive.)
                 agentq_operation_status=$?
                 if operation_output_remove_file "$agentq_operation_output_file"; then
                     :
@@ -4012,16 +4055,21 @@ run_safe_operation_with_recovery() {
     done
 }
 
-is_positive_integer "$submit_retry_attempts" || fail 'AGENTQ_SUBMIT_RETRY_ATTEMPTS must be a positive integer'
-is_positive_integer "$submit_retry_delay" || fail 'AGENTQ_SUBMIT_RETRY_DELAY must be a positive integer'
-is_positive_integer "$operation_retry_attempts" || fail 'AGENTQ_OPERATION_RETRY_ATTEMPTS must be a positive integer'
-is_positive_integer "$operation_retry_delay" || fail 'AGENTQ_OPERATION_RETRY_DELAY must be a positive integer'
-is_positive_integer "$platform_probe_timeout" || fail 'AGENTQ_PLATFORM_PROBE_TIMEOUT must be a positive integer'
+# Every one of these feeds a `[ ... -ge/-gt ... ]` comparison or a `sleep`.
+# A value past the shell's integer range does not fail that test -- dash prints
+# "Illegal number" and the comparison reads as FALSE, so the deadline never
+# fires (a hung probe waits forever) and the retry limit never fires (infinite
+# retries).  Bounded, exactly like --timeout and the cache TTL above.
+is_bounded_positive_integer "$submit_retry_attempts" || fail 'AGENTQ_SUBMIT_RETRY_ATTEMPTS must be a positive integer of at most 2147483647'
+is_bounded_positive_integer "$submit_retry_delay" || fail 'AGENTQ_SUBMIT_RETRY_DELAY must be a positive integer of at most 2147483647'
+is_bounded_positive_integer "$operation_retry_attempts" || fail 'AGENTQ_OPERATION_RETRY_ATTEMPTS must be a positive integer of at most 2147483647'
+is_bounded_positive_integer "$operation_retry_delay" || fail 'AGENTQ_OPERATION_RETRY_DELAY must be a positive integer of at most 2147483647'
+is_bounded_positive_integer "$platform_probe_timeout" || fail 'AGENTQ_PLATFORM_PROBE_TIMEOUT must be a positive integer of at most 2147483647'
 # The cache TTL feeds `[ $((now - probed_at)) -le "$ttl" ]`; an unvalidated
 # value ("abc", or one past the shell's integer range) makes that test fail
 # LOUDLY on stderr under dash and read as false, i.e. the cache silently
 # vanishes.  Validated here like every other numeric environment variable.
-is_bounded_positive_integer "$platform_probe_cache_ttl" || fail 'AGENTQ_PLATFORM_PROBE_CACHE_TTL must be a positive integer of at most nine digits'
+is_bounded_positive_integer "$platform_probe_cache_ttl" || fail 'AGENTQ_PLATFORM_PROBE_CACHE_TTL must be a positive integer of at most 2147483647'
 
 # Resolve and validate the credential source before anything reaches ssh --
 # including the platform probe, which is itself an ssh call that runs before
@@ -4317,10 +4365,10 @@ case "$operation" in
         append_arg "$1"
         if [ "$#" -eq 3 ]; then
             [ "$2" = '--timeout' ] || fail 'wait accepts only --timeout <seconds>'
-            is_bounded_positive_integer "$3" || fail '--timeout must be a positive integer of at most nine digits'
+            is_bounded_positive_integer "$3" || fail '--timeout must be a positive integer of at most 2147483647'
             wait_timeout_seconds=$3
         elif [ -n "$wait_timeout" ]; then
-            is_bounded_positive_integer "$wait_timeout" || fail 'AGENTQ_WAIT_TIMEOUT must be a positive integer of at most nine digits'
+            is_bounded_positive_integer "$wait_timeout" || fail 'AGENTQ_WAIT_TIMEOUT must be a positive integer of at most 2147483647'
             wait_timeout_seconds=$wait_timeout
         fi
         # The budget is CLIENT-side: run_wait_ssh_with_timeout kills the local
@@ -4357,6 +4405,7 @@ case "$operation" in
         mutation_output_file=$(mktemp "$agentq_temp_directory/agentq-mutation-output.XXXXXX") || fail "cannot create a temporary output file for $operation"
         mutation_output_require_file "$mutation_output_file" || exit $?
         mutation_status=2
+        mutation_body_suppressed=0
         if run_mutation_ssh "$remote_command" "$remote_input_file"; then
             if mutation_output_require_existing_file "$mutation_output_file"; then
                 if [ "$operation" = remove ] && [ "$remove_batch" -eq 1 ]; then
@@ -4380,10 +4429,25 @@ case "$operation" in
                     if validate_json_response "$mutation_output_file" cancel_pending '' "$1"; then
                         :
                     else
-                        mutation_status=$?
+                        # The exit code stays 4.  It is the server's own
+                        # contract statement ("cannot decide safely; STOP, do
+                        # not retry"), and a body that fails validation is a
+                        # reason to trust the response LESS, not to downgrade it
+                        # to 2 -- which reads as "protocol/parameter error, fix
+                        # your arguments and try again", the opposite of what a
+                        # cancellation_pending state requires.  The validation
+                        # diagnostic has already been printed by
+                        # validate_json_response.
+                        #
+                        # The unvalidated body must NOT reach stdout either
+                        # (the `-ne 2` cat guard below used to suppress it only
+                        # as a side effect of the downgrade), hence the flag.
+                        mutation_body_suppressed=1
                     fi
                 else
-                    mutation_status=$?
+                    # Same rule for an unreadable/absent body: keep 4, print
+                    # nothing that did not pass validation.
+                    mutation_body_suppressed=1
                 fi
             fi
         fi
@@ -4396,7 +4460,7 @@ case "$operation" in
         if [ "$mutation_status" -ne 0 ] && [ -n "$agentq_remote_failure_reason_value" ]; then
             printf '%s: remote failure reason: %s\n' "$program" "$agentq_remote_failure_reason_value" >&2
         fi
-        if [ "$mutation_status" -ne 2 ]; then
+        if [ "$mutation_status" -ne 2 ] && [ "$mutation_body_suppressed" -eq 0 ]; then
             if mutation_output_require_existing_file "$mutation_output_file"; then
                 cat "$mutation_output_file"
             else

@@ -74,7 +74,10 @@ SH
     chmod 700 "$work/$side/pueue" "$work/$side/pueued"
 done
 
-base="$work/base/agentq-server"
+# The baseline server lives at "$work/base/agentq-server" by construction (see
+# the loop above); only the variant is overridable.  An earlier `base=` line
+# here was a dead variable -- nothing ever read it, and the path is used
+# directly -- so it is gone rather than left looking load-bearing.
 variant=${AGENTQ_SMOKE_SERVER:-$work/variant/agentq-server}
 if [ "$variant" != "$work/variant/agentq-server" ]; then
     cp "$variant" "$work/variant/agentq-server"

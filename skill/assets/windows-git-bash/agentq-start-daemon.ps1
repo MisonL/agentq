@@ -239,7 +239,23 @@ $previousErrorActionPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 & $clientPath --config $configPath status --json *> $null
 $ErrorActionPreference = $previousErrorActionPreference
-if ($LASTEXITCODE -eq 0) {
+# StrictMode: a CreateProcess failure (AV or a policy blocking pueue.exe) is a
+# NON-terminating error and never sets $LASTEXITCODE.  A bare
+# `$LASTEXITCODE -eq 0` then throws "The variable '$LASTEXITCODE' cannot be
+# retrieved because it has not been set" and the process exits 1 with a
+# PowerShell error instead of the controlled diagnostic below (measured
+# 2026-10-17 in pwsh 7.5 under Set-StrictMode -Version Latest; the direct read
+# throws, the Get-Variable form does not).  This is the same guard the other
+# PowerShell assets use (agentq.ps1, sshp.ps1, the launcher wrapper).  In a
+# fresh -File process the probe is the first native command, so an unset
+# variable here means the probe itself never ran -- the daemon state is
+# unknown, and the caller's non-zero -> fail mapping is the correct direction.
+$probeExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
+if ($null -eq $probeExitCode) {
+    [Console]::Error.WriteLine("{0}: AgentQ Pueue client could not be executed: {1}", $script:StartDaemonProgram, $clientPath)
+    exit 2
+}
+if ([int]$probeExitCode.Value -eq 0) {
     exit 0
 }
 
@@ -264,5 +280,15 @@ if (Test-ManagedDaemonProcess -Path $daemonPath) {
     exit 2
 }
 
-Start-Process -FilePath $daemonPath -ArgumentList @("--config", $configPath) -WorkingDirectory $rootDirectory -WindowStyle Hidden | Out-Null
+# Start-Process -ArgumentList joins its elements with SPACES and adds no
+# quoting of its own: measured on pwsh 7 (macOS), a child argv dump shows
+# `--config` and `/tmp/a b/pueue.yml` arriving as THREE arguments unquoted and
+# as two once every element is quoted.  NOT measured on PowerShell 5.1 -- but
+# the joining is done by Start-Process itself, not by a native command line,
+# and no documented version quotes elements.  The install root is under the
+# user's control, so quote every element explicitly; $configPath is never empty
+# and a path cannot contain a double quote.
+Start-Process -FilePath $daemonPath `
+    -ArgumentList @('"--config"', ('"' + $configPath + '"')) `
+    -WorkingDirectory $rootDirectory -WindowStyle Hidden | Out-Null
 exit 0

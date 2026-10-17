@@ -13,6 +13,7 @@ $script:TargetHost = ""
 $script:SessionName = "ghostty"
 $script:LastInteractiveSshResult = $null
 $script:PreparationResult = $null
+$script:ResolvedZellijPath = ""
 
 function Show-Usage {
     [Console]::Out.WriteLine(@"
@@ -35,7 +36,16 @@ function Stop-Sshp {
 function Convert-ToReconnectDelay {
     param([string]$Value)
 
+    # Digits-only first, then the 32-bit bound -- the POSIX twin's contract.
+    # [int]::TryParse alone accepts `+5` and ` 5` (measured: both parse to 5),
+    # which the POSIX side refuses; the two clients must agree on what the
+    # variable accepts, and a value ssh's `sleep` could not take is a
+    # configuration error worth naming at startup rather than at the first
+    # reconnect.
     [int]$seconds = 0
+    if ($Value -notmatch '^[0-9]+$') {
+        Stop-Sshp "SSHP_RECONNECT_DELAY must be a non-negative 32-bit integer"
+    }
     if (![int]::TryParse($Value, [ref]$seconds) -or ($seconds -lt 0)) {
         Stop-Sshp "SSHP_RECONNECT_DELAY must be a non-negative 32-bit integer"
     }
@@ -316,11 +326,15 @@ function Get-FileTextOrEmpty {
 }
 
 function Get-LastExitCodeOrFailure {
-    $lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
-    if ($null -eq $lastExitCode) {
+    # Not named $lastExitCode: PowerShell identifiers are case-insensitive, so
+    # that name IS the automatic $LASTEXITCODE (safe here, inside a function,
+    # but the same idiom at script scope corrupts the automatic variable --
+    # measured 2026-10-18).  One name for both scopes removes the trap.
+    $nativeProbe = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
+    if ($null -eq $nativeProbe) {
         return 1
     }
-    return [int]$lastExitCode.Value
+    return [int]$nativeProbe.Value
 }
 
 function Join-Diagnostics {
@@ -339,15 +353,37 @@ function Join-Diagnostics {
     return $combined
 }
 
-function Convert-ToEncodedPowerShellCommand {
+function Get-WindowsScriptInvocation {
     param([string]$ScriptText)
 
+    # Hand a PowerShell script to ssh WITHOUT putting it on the command line.
+    #
+    # The previous shape was `powershell.exe ... -EncodedCommand <base64>` with
+    # the WHOLE script (the ~8.1K Zellij resolver plus the body) on the command
+    # line: measured 2026-10-17 at 23,210 chars for the probe and 23,882 for the
+    # install -- roughly three times the smallest DefaultShell limit this repo
+    # measured on a real host (powershell.exe 8,125, see smoke/14).  Over that
+    # limit sshd TRUNCATES the command instead of rejecting it, the base64 tail
+    # is cut mid-string, PowerShell dies with TerminatorExpectedAtEndOfString and
+    # the client reports "remote dependency probe failed", blaming the
+    # deployment.  agentq.ps1 solved the identical problem by moving the script
+    # to stdin (`-Command -`, smoke/14 site 4); this client had not followed.
+    #
+    # The script travels on stdin now.  `-Command -` reads it in INTERACTIVE mode,
+    # so a pending block is executed only when a blank line terminates it and at
+    # EOF it is DISCARDED SILENTLY -- the same rule agentq.ps1 documents at
+    # Add-ProbeExitToken, and the reason a blank line is appended here.  The
+    # probe and install paths are non-interactive (-T), so sshd hands stdin to
+    # PowerShell verbatim.  The SESSION path is interactive (-tt) and cannot use
+    # this channel -- its stdin belongs to the multiplexer -- so it takes the
+    # short two-stage form instead (see Get-WindowsSessionCommand).
     if ([string]::IsNullOrEmpty($ScriptText)) {
-        Stop-Sshp "cannot encode an empty Windows PowerShell command"
+        Stop-Sshp "cannot prepare an empty Windows PowerShell command"
     }
-    $effectiveScriptText = '$ProgressPreference = "SilentlyContinue"' + [Environment]::NewLine + $ScriptText
-    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($effectiveScriptText))
-    return "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
+    return [pscustomobject]@{
+        Command = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command -"
+        Input = ('$ProgressPreference = "SilentlyContinue"' + [Environment]::NewLine + $ScriptText + "`n`n")
+    }
 }
 
 function Test-SshTransportError {
@@ -382,7 +418,8 @@ function Get-SshDiagnosticClass {
 function Invoke-SshLogged {
     param(
         [bool]$Interactive,
-        [string]$RemoteCommand
+        [string]$RemoteCommand,
+        [AllowNull()][string]$InputPayload
     )
 
     $logPath = New-TemporaryPath -Prefix "sshp-log"
@@ -429,7 +466,11 @@ function Invoke-SshLogged {
             $errorPath = New-TemporaryPath -Prefix "sshp-error"
             Assert-NonReparseTemporaryFilePath -Path $outputPath
             Assert-NonReparseTemporaryFilePath -Path $errorPath
-            & $script:SshPath @sshArguments 1> $outputPath 2> $errorPath
+            if ($null -eq $InputPayload) {
+                & $script:SshPath @sshArguments 1> $outputPath 2> $errorPath
+            } else {
+                $InputPayload | & $script:SshPath @sshArguments 1> $outputPath 2> $errorPath
+            }
             $exitCode = Get-LastExitCodeOrFailure
             $transportDiagnostics = Get-FileTextOrEmpty -Path $logPath -Bounded
             $standardError = Get-FileTextOrEmpty -Path $errorPath -Bounded
@@ -696,11 +737,12 @@ function Resolve-RemoteInstaller {
 
 function Get-WindowsProbeCommand {
     $resolver = Get-WindowsZellijResolverScript
-    return Convert-ToEncodedPowerShellCommand -ScriptText ($resolver + @'
+    return Get-WindowsScriptInvocation -ScriptText ($resolver + @'
 $ErrorActionPreference = "Stop"
 $zellij = Resolve-RemoteZellij
 if ($null -ne $zellij) {
     [Console]::Out.Write("__SSHP_READY__:Windows")
+    [Console]::Out.Write("`n__SSHP_ZELLIJ__:" + $zellij)
     exit 0
 }
 $installer = Resolve-RemoteInstaller
@@ -794,7 +836,7 @@ exit 42
 
 function Get-WindowsInstallCommand {
     $resolver = Get-WindowsZellijResolverScript
-    return Convert-ToEncodedPowerShellCommand -ScriptText ($resolver + @'
+    return Get-WindowsScriptInvocation -ScriptText ($resolver + @'
 $ErrorActionPreference = "Stop"
 $zellij = Resolve-RemoteZellij
 if ($null -ne $zellij) {
@@ -819,11 +861,14 @@ switch ($installer.Kind) {
         throw "sshp: unsupported Windows installer: $($installer.Kind)"
     }
 }
-$lastExitCode = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
-if ($null -eq $lastExitCode) {
+# NOT $lastExitCode: PowerShell identifiers are case-insensitive, so that name
+# IS the automatic $LASTEXITCODE; at script scope the assignment replaces the
+# integer with a PSVariable and the .Value read throws (measured 2026-10-18).
+$installerProbe = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
+if ($null -eq $installerProbe) {
     exit 1
 }
-exit ([int]$lastExitCode.Value)
+exit ([int]$installerProbe.Value)
 '@)
 }
 
@@ -863,10 +908,30 @@ function Confirm-Install {
     return (($answer -eq "y") -or ($answer -eq "Y") -or ($answer -eq "yes") -or ($answer -eq "YES"))
 }
 
+function ConvertTo-MarkerText {
+    param([AllowNull()][string]$Text)
+
+    # Line endings are a property of how the output was captured, not of its
+    # content: a Windows redirect (PowerShell 5.1 `>` re-emits through Out-File;
+    # this suite's native recorder writes WriteLine) produces CRLF, and .NET's
+    # `(?m)^...$` does NOT match before `\r\n` -- measured 2026-10-17: the
+    # two-line READY+ZELLIJ probe output failed the READY match on CRLF and
+    # every Windows probe reported "remote dependency probe failed", while the
+    # same bytes with LF passed.  The single-line probe that preceded 0.1.16
+    # survived only because .Trim() removes a TRAILING CRLF; an internal one
+    # (the second line, or a trailing one on the first) is untouched.  Every
+    # marker match in this client funnels through here so the tolerance is
+    # defined once.
+    if ($null -eq $Text) {
+        return ""
+    }
+    return ($Text -replace "`r`n", "`n").Trim()
+}
+
 function Get-ProbeOutcome {
     param([pscustomobject]$Result)
 
-    $marker = $Result.Output.Trim()
+    $marker = ConvertTo-MarkerText $Result.Output
     if ($Result.ExitCode -eq 0) {
         if ($marker -match '(?m)^__SSHP_READY__:Windows$') {
             return [pscustomobject]@{ Platform = "windows"; Ready = $true }
@@ -892,20 +957,37 @@ function Get-ProbeOutcome {
 function Test-WindowsShellMarker {
     param([pscustomobject]$Result)
 
-    return ($Result.Output -match '(?m)^__SSHP_WINDOWS_SHELL__:(MINGW|MSYS|CYGWIN)[^\r\n]*$')
+    return ((ConvertTo-MarkerText $Result.Output) -match '(?m)^__SSHP_WINDOWS_SHELL__:(MINGW|MSYS|CYGWIN)[^\r\n]*$')
 }
 
 function Get-WindowsProbeOutcome {
     param([pscustomobject]$Result)
 
-    $marker = $Result.Output.Trim()
-    if (($Result.ExitCode -eq 0) -and ($marker -match '(?m)^__SSHP_READY__:Windows$')) {
-        return [pscustomobject]@{ Platform = "windows"; Ready = $true }
+    # Marker-first, status-second -- the POSIX twin's routing (probe success
+    # branch -> READY, failure branch -> INSTALL_REQUIRED/INSTALL_UNAVAILABLE).
+    # The first version required the exact pair (0,READY)/(42,REQUIRED)/
+    # (127,UNAVAILABLE), which an sshd whose DefaultShell is powershell.exe can
+    # never satisfy: that shell flattens a native child's exit code to 1 (A5b),
+    # so an installable host answered 1+REQUIRED and this client reported
+    # "probe failed" -- pointing at the deployment instead of the install.  The
+    # marker is written by the probe body itself and is far more specific than
+    # the exit code; the code is still recorded and still decides READY (a
+    # READY marker with a non-zero status is contradictory and is refused).
+    $marker = ConvertTo-MarkerText $Result.Output
+    if ($marker -match '(?m)^__SSHP_READY__:Windows$') {
+        if ($Result.ExitCode -ne 0) {
+            return $null
+        }
+        $resolved = ""
+        if ($marker -match '(?m)^__SSHP_ZELLIJ__:(.+)$') {
+            $resolved = $Matches[1].Trim()
+        }
+        return [pscustomobject]@{ Platform = "windows"; Ready = $true; ZellijPath = $resolved }
     }
-    if (($Result.ExitCode -eq 42) -and ($marker -match '(?m)^__SSHP_INSTALL_REQUIRED__:Windows$')) {
+    if ($marker -match '(?m)^__SSHP_INSTALL_REQUIRED__:Windows$') {
         return [pscustomobject]@{ Platform = "windows"; Ready = $false }
     }
-    if (($Result.ExitCode -eq 127) -and ($marker -match '(?m)^__SSHP_INSTALL_UNAVAILABLE__:Windows$')) {
+    if ($marker -match '(?m)^__SSHP_INSTALL_UNAVAILABLE__:Windows$') {
         return [pscustomobject]@{ Platform = "windows"; Ready = $false; InstallUnavailable = $true }
     }
     return $null
@@ -964,7 +1046,8 @@ function Prepare-Remote {
 
             # Always use native PowerShell for Windows, including Git Bash servers.
             # The SSH server process may have a stale PATH that cannot reliably find Zellij.
-            $windowsProbe = Invoke-SshLogged -Interactive $false -RemoteCommand (Get-WindowsProbeCommand)
+            $windowsProbeCommand = Get-WindowsProbeCommand
+            $windowsProbe = Invoke-SshLogged -Interactive $false -RemoteCommand $windowsProbeCommand.Command -InputPayload $windowsProbeCommand.Input
             $outcome = Get-WindowsProbeOutcome -Result $windowsProbe
             if ($null -eq $outcome) {
                 if (($windowsProbe.ExitCode -eq 255) -and (Test-SshTransportError -Diagnostics $windowsProbe.TransportDiagnostics)) {
@@ -991,7 +1074,14 @@ function Prepare-Remote {
                 Write-Diagnostics -Diagnostics $windowsProbe.Diagnostics
                 $failureDescription = if ($windowsShellDetected) { "the Windows shell" } else { "both Unix and Windows shells" }
                 [Console]::Error.WriteLine("$($script:Program): remote dependency probe failed for $failureDescription.")
-                Set-PreparationResult -ExitCode 2 -Platform ""
+                # Propagate the probe's own status, as the POSIX twin does
+                # (`return "$windows_probe_status"`): --check is a diagnostic,
+                # and collapsing every failure to 2 hides the remote's answer.
+                # 0 is impossible here (a zero exit with an unrecognised
+                # marker is still a client-side contract failure, so it stays
+                # 2 rather than masquerading as success).
+                $probeExitCode = if ($windowsProbe.ExitCode -ne 0) { $windowsProbe.ExitCode } else { 2 }
+                Set-PreparationResult -ExitCode $probeExitCode -Platform ""
                 return
             }
             Write-Diagnostics -Diagnostics $windowsProbe.Diagnostics
@@ -1000,6 +1090,9 @@ function Prepare-Remote {
         }
 
         if ($outcome.Ready) {
+            if (($outcome.PSObject.Properties.Name -contains "ZellijPath") -and ![string]::IsNullOrWhiteSpace($outcome.ZellijPath)) {
+                $script:ResolvedZellijPath = $outcome.ZellijPath
+            }
             Set-PreparationResult -ExitCode 0 -Platform $outcome.Platform
             return
         }
@@ -1029,12 +1122,16 @@ function Prepare-Remote {
             return
         }
 
-        $installCommand = if ($outcome.Platform -eq "windows") { Get-WindowsInstallCommand } else { Get-UnixInstallCommand }
         if ($outcome.Platform -eq "unix") {
+            $installCommand = Get-UnixInstallCommand
             Invoke-SshLogged -Interactive $true -RemoteCommand $installCommand
             $installResult = $script:LastInteractiveSshResult
         } else {
-            $installResult = Invoke-SshLogged -Interactive $false -RemoteCommand $installCommand
+            # Windows installs run non-interactively and take their script on
+            # stdin (Get-WindowsScriptInvocation); the unix installer keeps the
+            # -tt form because its package managers need the terminal.
+            $installCommand = Get-WindowsInstallCommand
+            $installResult = Invoke-SshLogged -Interactive $false -RemoteCommand $installCommand.Command -InputPayload $installCommand.Input
         }
         Write-Diagnostics -Diagnostics $installResult.Diagnostics
         if ($installResult.ExitCode -ne 0) {
@@ -1049,18 +1146,52 @@ function Prepare-Remote {
 }
 
 function Get-WindowsSessionCommand {
+    # DELIBERATELY short, unlike the previous EncodedCommand form.
+    # The session runs with -tt: sshd hands the pty's stdin to the multiplexer,
+    # so the script CANNOT arrive on stdin -- and the command line cannot carry
+    # the resolver either (the same 8,125-char DefaultShell truncation that
+    # moved the probe and install scripts to stdin; the old session command
+    # measured 22,274 chars).  The two-stage shape solves both at once:
+    #
+    #   1. The probe (Get-WindowsProbeCommand) already ran the full resolver on
+    #      the same host moments ago and now reports the resolved zellij path
+    #      after its marker; Prepare-Remote carries it in
+    #      $script:ResolvedZellijPath.
+    #   2. The session command is only the attach -- the path arrives as a
+    #      single-quoted literal.  A single quote inside it would break that
+    #      quoting, so the client refuses rather than emitting a script that
+    #      word-splits.
+    if ([string]::IsNullOrWhiteSpace($script:ResolvedZellijPath)) {
+        Stop-Sshp "internal error: no resolved Zellij path from the probe; refusing to start a Windows session"
+    }
+    # The path is remote-supplied text that goes into a single-quoted PowerShell
+    # literal on a command line.  Anything that could end the literal or the
+    # line -- a quote, a newline, a control character -- is refused rather than
+    # escaped: a well-formed resolved path never contains one, so a value that
+    # does is either a resolver defect or a hostile probe answer, and neither
+    # should be able to reshape the command.  The length bound is the same
+    # argument one step further: this value rides an -EncodedCommand, whose
+    # whole command line sshd TRUNCATES past the DefaultShell limit, so an
+    # unbounded path could push the session command over it.  1024 is ~4x the
+    # longest legitimate Windows path (MAX_PATH 260; a zellij.exe install path
+    # is far shorter) and keeps the command line at ~5.5K, well under budget.
+    if ($script:ResolvedZellijPath -match "['`r`n]") {
+        Stop-Sshp "the resolved Zellij path contains a quote or line break; refusing to build the session command"
+    }
+    if ($script:ResolvedZellijPath -match '[\x00-\x1f]') {
+        Stop-Sshp "the resolved Zellij path contains a control character; refusing to build the session command"
+    }
+    if ($script:ResolvedZellijPath.Length -gt 1024) {
+        Stop-Sshp "the resolved Zellij path is longer than 1024 characters; refusing to build the session command"
+    }
     $sessionLiteral = $script:SessionName.Replace("'", "''")
-    $resolver = Get-WindowsZellijResolverScript
+    $zellijLiteral = $script:ResolvedZellijPath
     $sessionScript = @"
 `$ErrorActionPreference = 'Stop'
-`$sessionName = '$sessionLiteral'
-`$zellij = Resolve-RemoteZellij
-if (`$null -eq `$zellij) {
-    throw 'sshp: native Zellij is unavailable on the remote Windows host.'
-}
-& `$zellij attach --create `$sessionName
+& '$zellijLiteral' attach --create '$sessionLiteral'
 "@
-    return Convert-ToEncodedPowerShellCommand -ScriptText ($resolver + $sessionScript)
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($sessionScript))
+    return "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
 }
 
 function Get-UnixSessionCommand {
@@ -1106,7 +1237,11 @@ if (($arguments.Count -gt 0) -and ($arguments[0] -eq "--check")) {
         $arguments = @($arguments[1..($arguments.Count - 1)])
     }
 }
-if (($arguments.Count -eq 1) -and (($arguments[0] -eq "-h") -or ($arguments[0] -eq "--help"))) {
+# Help is recognised on the FIRST token after the optional --check, whatever
+# follows it: `-h extra` is a help request, not a malformed host (the POSIX
+# twin's semantics, pinned by smoke/19's --help case), and a host that happens
+# to begin with `-h` is not a name this client can ever dial anyway.
+if (($arguments.Count -ge 1) -and (($arguments[0] -eq "-h") -or ($arguments[0] -eq "--help"))) {
     Show-Usage
     exit 0
 }
@@ -1116,6 +1251,18 @@ if (($arguments.Count -lt 1) -or ($arguments.Count -gt 2)) {
 }
 
 $script:TargetHost = $arguments[0]
+# ANY whitespace, not just a whitespace-only name -- the POSIX twin's
+# `*[[:space:]]*` guard.  IsNullOrWhiteSpace alone let `foo bar` and a
+# tab-separated name through: measured 2026-10-17, `sshp.ps1 --check 'foo bar'`
+# exited 0 (the probe ran against a name ssh has to quote its way through)
+# while the POSIX client refused with exit 2.  0.1.16 added the POSIX guard but
+# not this one, so the same input was accepted by one client and rejected by
+# the other -- the divergence class this version set out to end.  The
+# whitespace test runs BEFORE the empty test so a whitespace-only name reports
+# the same message as the POSIX side.
+if ($script:TargetHost -match '\s') {
+    Stop-Sshp "SSH host must not contain whitespace"
+}
 if ([string]::IsNullOrWhiteSpace($script:TargetHost)) {
     Stop-Sshp "SSH host must not be empty"
 }
@@ -1123,7 +1270,14 @@ if ($script:TargetHost.StartsWith("-", [System.StringComparison]::Ordinal)) {
     Stop-Sshp "SSH host must not begin with a hyphen"
 }
 if ($arguments.Count -eq 2) {
-    $script:SessionName = $arguments[1]
+    # An EMPTY session argument falls back to the default, exactly like the
+    # POSIX twin's `${2:-ghostty}` (smoke/19 pins "empty session name is
+    # accepted").  Before 2026-10-17 this assigned the empty string and the
+    # charset guard then refused it -- the same input accepted by one client
+    # and rejected by the other.
+    if (![string]::IsNullOrEmpty($arguments[1])) {
+        $script:SessionName = $arguments[1]
+    }
 }
 if ($script:SessionName -notmatch '^[A-Za-z0-9_.-]+$') {
     Stop-Sshp "session name must contain only letters, numbers, dots, underscores, or hyphens"
@@ -1138,7 +1292,7 @@ if ($checkOnly) {
     Prepare-Remote -AllowInstall:$false -CheckReconnectAttempts 3
 } else {
     # -AllowInstall is a [bool] parameter, not a switch: a bare `-AllowInstall`
-    # binds no value and the binder rejects the call (measured 2026-10-13 —
+    # binds no value and the binder rejects the call (measured 2026-10-13 --
     # this broke every non---check session). The named-colon form is required.
     Prepare-Remote -AllowInstall:$true
 }

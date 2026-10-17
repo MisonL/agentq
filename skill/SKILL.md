@@ -23,7 +23,10 @@ Git Bash 8,176），且
 （实测范围是**全部协议码**：`2/3/4/5/6/42/124` 一律变 1，只有 0/1 保留），
 使 `42-45`（launcher 契约）与客户端依赖 `3/4/5/6` 的恢复判定都失真。这两点**两条路径都已修**：
 **探针路径**不再把脚本放进命令行，改经 stdin 喂给 `powershell.exe … -Command -`（两端命令行
-固定 76 字符），退出码由 stdout 末尾的 `agentq-exit:<code>` 带外传递；**操作路径**
+固定 76 字符），退出码由 stdout 末尾的 `agentq-exit:<code>` 带外传递；`sshp.ps1` 的 Windows
+探针/安装同型（0.1.16 起，此前 23,210/23,882 字符的 `-EncodedCommand` 会被 sshd **截断**而非
+拒绝，表现为误导性的「probe failed」；它的**会话**因 `-tt` 下 stdin 归多路复用器，走的是探针
+预解析路径 + 短 attach 命令的两段式，见下文 `sshp` 一节）；**操作路径**
 （launcher wrapper）把同一个 token 写到 **stderr**——客户端本就捕获远端 stderr（服务端
 `reason=` 同路），所以无需在 stdin（被 base64 payload 占）与 stdout（是 JSON 响应本身）
 之间取舍。两份客户端各自在**仅限 windows 目标**时以该 token 覆盖 ssh 退出码；unix 目标不发它。
@@ -144,7 +147,7 @@ POSIX 客户端的探针都是单行、不受影响，所以**只有「Windows �
 - Windows 安装器 `Test-PueueConnection` 在允许缺失的路径链校验后再次强制读取 client/config；真正缺失仍返回不可连接，已观察到的 reparse 路径会显式拒绝，不会被 `Test-Path` 误判为缺失后静默跳过。
 - Windows 安装器 `Require-Path` 使用强制项读取区分真正缺失和已存在的 reparse 路径；缺失仍报告缺失，已存在但不安全的路径进入完整路径链校验并显式拒绝。
 - Windows 服务实例由执行安装的 Windows 登录用户持有：其计划任务与私有 ACL 都绑定该身份，启动时还会重新按 SID 注入该用户环境。当前 `C:\ProgramData\AgentQ` 部署一次只支持一个服务身份；另一 Windows SSH 用户不得直接重装或覆盖它。需要切换服务身份时，先确认队列为空、停止原服务并显式迁移或重新部署；这不是客户端的自动动作。
-- 人类交互会话使用 `sshp <ssh-host> [session-name]`；先用 `sshp --check <ssh-host>` 只读检查可用的会话工具。Unix 目标优先使用 `tmux`，随后是 GNU screen 或 Zellij；Windows 目标只使用原生 `zellij.exe`。首个连接发现依赖缺失时才询问是否通过受支持的包管理器安装，`--check` 永不安装，安装期间的 SSH 中断也绝不自动重放。
+- 人类交互会话使用 `sshp <ssh-host> [session-name]`；先用 `sshp --check <ssh-host>` 只读检查可用的会话工具。Unix 目标优先使用 `tmux`，随后是 GNU screen 或 Zellij；Windows 目标只使用原生 `zellij.exe`。首个连接发现依赖缺失时才询问是否通过受支持的包管理器安装，`--check` 永不安装，安装期间的 SSH 中断也绝不自动重放。Windows 目标的会话是**两段式**：`--check`/连接时的探针在 `__SSHP_READY__` 之后额外上报解析到的 `zellij.exe` 路径，会话命令只携带 `attach --create`（命令行因此很短——远端 `DefaultShell` 的截断上限见上文）。该路径来自远端应答，含引号、换行、控制字符或超过 1024 字符时客户端**拒绝启动会话**而不是转义拼接。
 
 ## 协议
 

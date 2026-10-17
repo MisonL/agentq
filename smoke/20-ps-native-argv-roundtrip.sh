@@ -41,11 +41,42 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+
+# python3 is a real dependency of this check: the extraction / parsing steps
+# below are Python.  Probe that it RUNS, not that a name resolves -- measured
+# 2026-10-20 on a zh-CN Windows 10, where `python3` is the Microsoft Store
+# alias: the check died at its first Python step with exit 49 and ZERO output,
+# which run-tests.sh can only report as a bare FAIL with no cause.  Same rule as
+# the pwsh usability probes: an interpreter that cannot execute is an
+# ENVIRONMENT fault, say so and do not claim the contract ran.
+python3_probe_status=0
+python3 -c 'import sys' >/dev/null 2>&1 || python3_probe_status=$?
+if [ "$python3_probe_status" -ne 0 ]; then
+    printf '%s\n' 'ps-native-argv NOT run: the python3 on PATH cannot execute (a Microsoft Store alias cannot run scripts).' >&2
+    printf '%s\n' 'Install a real Python 3 and put it on PATH, then re-run.' >&2
+    exit 1
+fi
 pwsh_binary=${AGENTQ_SMOKE_PWSH:-$(command -v pwsh || true)}
 
 if [ -z "$pwsh_binary" ] || ! command -v "$pwsh_binary" >/dev/null 2>&1; then
     printf 'SKIPPED: pwsh is not available; the PowerShell clients were not executed\n'
     exit 0
+fi
+
+# Present is not the same as working.  A corrupt pwsh startup cache makes
+# every launch die (measured five times in this repo, with four different
+# messages: "String cannot have zero length", "Stack overflow",
+# FileLoadException, and Abort trap: 6).  The existence tests above cannot see
+# that, so every case below would run against a pwsh that never starts and
+# report its failures as asset defects -- the misdiagnosis smoke/01 fixed for
+# itself in 2026-09-28.  Probe once: an unusable interpreter is an ENVIRONMENT
+# fault, say so with the fix, and do not claim the check ran.
+pwsh_probe_status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command 'exit 0' >/dev/null 2>&1 || pwsh_probe_status=$?
+if [ "$pwsh_probe_status" -ne 0 ]; then
+    printf '%s\n' 'Native-argv contract NOT run: the pwsh on PATH cannot execute (startup cache).' >&2
+    printf '%s\n' 'Try: mv ~/.cache/powershell/StartupProfileData-NonInteractive{,.broken}' >&2
+    exit 1
 fi
 
 work=$(mktemp -d /tmp/agentq-smoke-psargv.XXXXXX)
@@ -79,9 +110,53 @@ using System;
 using System.IO;
 using System.Text;
 
-// Stand-in for ssh.exe: records the argv it was handed (NUL-separated, like the
-// sh stub) and answers with PS_STUB_REPLY.
+// Stand-in for ssh.exe.  Several contracts share this one binary, selected by
+// PS_STUB_MODE:
+//   empty -- the legacy argv recorder the round-trip cases use (PS_ARGV_OUT +
+//   PS_STUB_REPLY);
+//   "sshp-win" / "sshp-parity" -- the routing stubs the sshp.ps1 Windows cases
+//   drive, answering per the LAST argv element's shape.  These mirror, byte for
+//   byte in behaviour, the `stub-ssh-win` / `stub-ssh-parity` sh scripts used
+//   on POSIX hosts -- a drift between the two forms is a fixture drift, not a
+//   client property.  Windows hosts need this binary because a `#!/bin/sh`
+//   file cannot be executed there and the MSYS path cannot even be resolved
+//   (measured: the first real CI run, run 37810470283).
+// The routing arms, in order (win): `printf %s` platform probe -> MINGW
+// marker/43; `-Command -` -> drain stdin (saving it when SSHP_WIN_STDIN is
+// set) then READY + the resolved path; `-EncodedCommand` -> save the session
+// command, exit 7.  The parity arm additionally appends each stdin-channel
+// command to SSHP_PARITY_CALLS and routes on STUB_PARITY_MODE (ready /
+// flattened-required / failing).
 internal static class StubSsh {
+    private static void Record(string path, string text) {
+        if (string.IsNullOrEmpty(path)) { return; }
+        System.IO.File.WriteAllText(path, text, new UTF8Encoding(false));
+    }
+
+    private static void Append(string path, string text) {
+        if (string.IsNullOrEmpty(path)) { return; }
+        System.IO.File.AppendAllText(path, text + "\n", new UTF8Encoding(false));
+    }
+
+    private static string DrainStandardInput(string savePath) {
+        string saved = "";
+        using (Stream stdin = Console.OpenStandardInput()) {
+            using (MemoryStream buffer = new MemoryStream()) {
+                byte[] chunk = new byte[65536];
+                int read;
+                while ((read = stdin.Read(chunk, 0, chunk.Length)) > 0) {
+                    buffer.Write(chunk, 0, read);
+                }
+                byte[] payload = buffer.ToArray();
+                if (!string.IsNullOrEmpty(savePath)) {
+                    System.IO.File.WriteAllBytes(savePath, payload);
+                }
+                saved = Encoding.UTF8.GetString(payload);
+            }
+        }
+        return saved;
+    }
+
     private static int Main(string[] args) {
         string argvPath = Environment.GetEnvironmentVariable("PS_ARGV_OUT");
         if (!string.IsNullOrEmpty(argvPath)) {
@@ -92,6 +167,54 @@ internal static class StubSsh {
                     stream.WriteByte(0);
                 }
             }
+        }
+        string mode = Environment.GetEnvironmentVariable("PS_STUB_MODE");
+        if (mode == "sshp-win") {
+            string last = args.Length > 0 ? args[args.Length - 1] : "";
+            Record(Environment.GetEnvironmentVariable("SSHP_WIN_LAST"), last);
+            if (last.Contains("printf %s")) {
+                Console.Out.WriteLine("__SSHP_WINDOWS_SHELL__:MINGW64_NT-10.0-19045");
+                return 43;
+            }
+            if (last.Contains("-Command -")) {
+                DrainStandardInput(Environment.GetEnvironmentVariable("SSHP_WIN_STDIN"));
+                string zellij = Environment.GetEnvironmentVariable("STUB_ZELLIJ_PATH");
+                if (zellij == null) { zellij = "C:\\Users\\me\\scoop\\apps\\zellij\\current\\zellij.exe"; }
+                Console.Out.WriteLine("__SSHP_READY__:Windows");
+                Console.Out.WriteLine("__SSHP_ZELLIJ__:" + zellij);
+                return 0;
+            }
+            string sessionPath = Environment.GetEnvironmentVariable("SSHP_WIN_SESSION");
+            if (last.Contains("-EncodedCommand") && sessionPath != null) {
+                Record(sessionPath, last);
+                return 7;
+            }
+            Console.Out.WriteLine("unexpected");
+            return 2;
+        }
+        if (mode == "sshp-parity") {
+            string last = args.Length > 0 ? args[args.Length - 1] : "";
+            if (last.Contains("printf %s")) {
+                Console.Out.WriteLine("__SSHP_WINDOWS_SHELL__:MINGW64_NT-10.0-19045");
+                return 43;
+            }
+            if (last.Contains("-Command -")) {
+                Append(Environment.GetEnvironmentVariable("SSHP_PARITY_CALLS"), last);
+                DrainStandardInput(null);
+                string parityMode = Environment.GetEnvironmentVariable("STUB_PARITY_MODE");
+                if (parityMode == "flattened-required") {
+                    Console.Out.WriteLine("__SSHP_INSTALL_REQUIRED__:Windows");
+                    return 1;
+                }
+                if (parityMode == "failing") {
+                    return 7;
+                }
+                Console.Out.WriteLine("__SSHP_READY__:Windows");
+                Console.Out.WriteLine("__SSHP_ZELLIJ__:C:\\zellij.exe");
+                return 0;
+            }
+            Console.Out.WriteLine("unexpected");
+            return 2;
         }
         string reply = Environment.GetEnvironmentVariable("PS_STUB_REPLY");
         if (reply != null) {
@@ -218,11 +341,14 @@ make_stub() {
 failures=0
 cases=0
 
-# check_roundtrip <label> <client.ps1> <argv-file> <expected-fragment>
+# check_roundtrip <label> <argv-file> <expected-fragment>
 # Asserts the LAST argv element (the remote command) survives the model:
 # exactly one argument, and byte-identical to what the client built.
+# (A <client.ps1> parameter used to sit second here and was never read --
+# shellcheck reported it SC2034; it is gone rather than left looking
+# load-bearing.)
 check_roundtrip() {
-    local label=$1 client=$2 argvfile=$3 expected=$4
+    local label=$1 argvfile=$2 expected=$3
     cases=$((cases + 1))
     if [ ! -s "$argvfile" ]; then
         printf 'ps-native-argv: %s: the client invoked ssh but recorded no argv\n' "$label" >&2
@@ -238,7 +364,7 @@ PY
     local sent
     sent=$(cat "$work/sent.txt")
     # The client really sent the script we think it did.
-    if ! printf '%s' "$sent" | grep -qF -- "$expected"; then
+    if ! grep -qF -- "$expected" <<< "$sent"; then
         printf 'ps-native-argv: %s: the recorded argv does not contain %s\n' "$label" "$expected" >&2
         failures=$((failures + 1))
         return 0
@@ -278,7 +404,393 @@ mkdir -p "$work/tmp1"
 PS_ARGV_OUT="$(win_path "$work/argv-sshp")" SSHP_SSH="$stub_ssh" PS_STUB_REPLY='__SSHP_READY__:Linux' TMPDIR="$work/tmp1" \
     "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_client_arg" --check smoke-host \
     >"$work/o1" 2>"$work/e1" || true
-check_roundtrip 'sshp.ps1 unix probe' "$sshp_client" "$work/argv-sshp" 'base64 -d | sh'
+check_roundtrip 'sshp.ps1 unix probe' "$work/argv-sshp" 'base64 -d | sh'
+
+# --- sshp.ps1: the WINDOWS probe command, which must NOT be on the line ------
+#
+# The MINGW marker in the stub's reply routes the client to the Windows probe.
+# That command used to be `powershell.exe ... -EncodedCommand <base64>` with the
+# whole ~8.1K resolver + body ON the command line (measured 23,210 chars -- the
+# P1 the 2026-10-17 audit found, since smoke/14 measured no sshp.ps1 Windows
+# site).  Fixed like agentq.ps1's protocol probe: a short `-Command -` command
+# line, the script on STDIN.  Asserted three ways:
+#   1. the LAST argv (the command) is short and carries -Command -, NOT
+#      -EncodedCommand -- the same two directions site 4 of smoke/14 pins
+#      statically, asserted behaviourally here on the real client's output;
+#   2. the payload the client piped to the stub's stdin decodes to the script
+#      with the marker the client matches on -- the command must DO something;
+#   3. the payload carries the resolved-zellij path report the session start
+#      depends on (see Get-WindowsSessionCommand's two-stage shape).
+mkdir -p "$work/tmp-w"
+cat > "$work/stub-ssh-win" <<'WINSTUB'
+#!/bin/sh
+last=''
+for a in "$@"; do last=$a; done
+printf '%s' "$last" > "$SSHP_WIN_LAST"
+case "$last" in
+  *'printf %s'*) printf '__SSHP_WINDOWS_SHELL__:MINGW64_NT-10.0-19045\n'; exit 43 ;;
+  *'-Command -'*) cat > "$SSHP_WIN_STDIN"; printf '__SSHP_READY__:Windows\n__SSHP_ZELLIJ__:%s\n' "${STUB_ZELLIJ_PATH:-C:\\Users\\me\\scoop\\apps\\zellij\\current\\zellij.exe}"; exit 0 ;;
+  *'-EncodedCommand'*) printf '%s' "$last" > "$SSHP_WIN_SESSION"; exit 7 ;;
+esac
+printf 'unexpected\n'; exit 2
+WINSTUB
+chmod 700 "$work/stub-ssh-win"
+# Windows hosts cannot execute the sh stub or even resolve its MSYS path (see
+# the recorder block above): there the pair below points at the csc-compiled
+# binary, whose PS_STUB_MODE routes the same three shapes.  POSIX hosts keep
+# the script.  Both forms are exercised by CI -- the Windows branch's first
+# execution is the windows-latest job, exactly like every other Windows branch
+# in this file.
+stub_win_ssh="$work/stub-ssh-win"
+stub_win_mode=""
+if [ "$stub_windows" = 1 ]; then
+    # The client is native on Windows: it needs the recorder's Windows path
+    # (same conversion make_stub performs) and the mode that selects the
+    # routing contract inside that binary.
+    stub_win_ssh=$(cygpath -w "$stub_exe")
+    stub_win_mode="sshp-win"
+fi
+win_status=0
+SSHP_WIN_SESSION="$(win_path "$work/win-session")" SSHP_WIN_LAST="$(win_path "$work/win-last")" SSHP_WIN_STDIN="$(win_path "$work/win-stdin")" SSHP_SSH="$stub_win_ssh" PS_STUB_MODE="$stub_win_mode" TMPDIR="$work/tmp-w" \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_client_arg" --check smoke-host \
+    >"$work/o-win" 2>"$work/e-win" || win_status=$?
+cases=$((cases + 1))
+if [ "$win_status" -ne 0 ] || ! grep -qF 'persistent remote session: Zellij (Windows)' "$work/o-win"; then
+    printf 'ps-native-argv: sshp.ps1 Windows probe: the client did not reach READY through the stdin channel (exit %s): %s\n' \
+        "$win_status" "$(head -1 "$work/e-win")" >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+win_last=$(cat "$work/win-last" 2>/dev/null || true)
+if [ -z "$win_last" ]; then
+    printf 'ps-native-argv: sshp.ps1 Windows probe: the client invoked ssh but no command was recorded\n' >&2
+    failures=$((failures + 1))
+else
+    if [ "${#win_last}" -gt 200 ]; then
+        printf 'ps-native-argv: sshp.ps1 Windows probe: the command line is %s chars -- the script went back on the command line\n' "${#win_last}" >&2
+        failures=$((failures + 1))
+    fi
+    if grep -q -- '-EncodedCommand' <<< "$win_last"; then
+        printf 'ps-native-argv: sshp.ps1 Windows probe: -EncodedCommand is back on the command line\n' >&2
+        failures=$((failures + 1))
+    fi
+    if ! grep -q -- '-Command -' <<< "$win_last"; then
+        printf 'ps-native-argv: sshp.ps1 Windows probe: does not read its script from stdin (-Command -)\n' >&2
+        failures=$((failures + 1))
+    fi
+fi
+cases=$((cases + 1))
+if ! grep -qF '__SSHP_ZELLIJ__' "$work/win-stdin" 2>/dev/null || ! grep -qF 'Resolve-RemoteZellij' "$work/win-stdin" 2>/dev/null; then
+    printf 'ps-native-argv: sshp.ps1 Windows probe: the stdin payload does not carry the resolver script and its zellij-path report\n' >&2
+    failures=$((failures + 1))
+fi
+# --check must never reach the SESSION command: the stub records any
+# -EncodedCommand invocation into win-session, and that file must not exist.
+cases=$((cases + 1))
+if [ -e "$work/win-session" ]; then
+    printf 'ps-native-argv: sshp.ps1 --check: started a session command (should be read-only)\n' >&2
+    failures=$((failures + 1))
+fi
+
+# --- sshp.ps1: CRLF-terminated probe output ---------------------------------
+#
+# The client redirects ssh's stdout to a file and reads it back.  On Windows
+# that file separates lines with CRLF -- PowerShell 5.1's `>` re-emits through
+# Out-File (platform newline), and this check's own native recorder writes
+# CRLF via WriteLine -- so on the windows-latest job (and on any real Windows
+# client) every marker line ends with `\r`.  .NET's `(?m)^...$` does NOT match
+# before `\r\n` (measured: the position before `\n` is after `\r`, and `$`
+# requires the line to end there), so the two-line READY+ZELLIJ output that
+# 0.1.16 introduced failed the READY match and every Windows probe reported
+# "remote dependency probe failed" -- measured 2026-10-17 with a CRLF stub,
+# while the LF stub stayed green (the whole reason this defect is invisible on
+# macOS).  The single-line probe that preceded 0.1.16 survived only because
+# .Trim() removes the TRAILING CRLF; an INTERNAL one is untouched.
+#
+# This case drives the CRLF stub on the POSIX path so the property is pinned
+# here too, not only on the Windows job.  The assertion is the client's own
+# verdict (READY + the session line), not an implementation detail: any fix
+# that normalizes or tolerates CRLF passes.
+mkdir -p "$work/tmp-crlf"
+cat > "$work/stub-ssh-crlf" <<'CRLFSTUB'
+#!/bin/sh
+last=''
+for a in "$@"; do last=$a; done
+printf '%s' "$last" > "$SSHP_WIN_LAST"
+case "$last" in
+  *'printf %s'*) printf '__SSHP_WINDOWS_SHELL__:MINGW64_NT-10.0-19045\r\n'; exit 43 ;;
+  *'-Command -'*) cat > "$SSHP_WIN_STDIN"; printf '__SSHP_READY__:Windows\r\n__SSHP_ZELLIJ__:C:\\zellij.exe\r\n'; exit 0 ;;
+  *'-EncodedCommand'*) printf '%s' "$last" > "$SSHP_WIN_SESSION"; exit 7 ;;
+esac
+printf 'unexpected\r\n'; exit 2
+CRLFSTUB
+chmod 700 "$work/stub-ssh-crlf"
+# Dual-platform wiring, exactly like the win block above: on Windows the csc
+# recorder's WriteLine emits Environment.NewLine, which IS CRLF there, so
+# PS_STUB_MODE=sshp-win exercises this property natively; POSIX hosts need
+# the sh stub (a `#!/bin/sh` file cannot run on Windows and its MSYS path
+# cannot even be resolved).
+stub_crlf_ssh="$work/stub-ssh-crlf"
+stub_crlf_mode=""
+if [ "$stub_windows" = 1 ]; then
+    stub_crlf_ssh="$stub_win_ssh"
+    stub_crlf_mode="$stub_win_mode"
+fi
+crlf_status=0
+SSHP_WIN_SESSION="$(win_path "$work/crlf-session-cmd")" SSHP_WIN_LAST="$(win_path "$work/crlf-last")" SSHP_WIN_STDIN="$(win_path "$work/crlf-stdin")" \
+SSHP_SSH="$stub_crlf_ssh" PS_STUB_MODE="$stub_crlf_mode" TMPDIR="$work/tmp-crlf" \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_client_arg" --check smoke-host \
+    >"$work/o-crlf" 2>"$work/e-crlf" || crlf_status=$?
+cases=$((cases + 1))
+if [ "$crlf_status" -ne 0 ] || ! grep -qF 'persistent remote session: Zellij (Windows)' "$work/o-crlf"; then
+    printf 'ps-native-argv: sshp.ps1 CRLF probe output: the client did not reach READY (exit %s): %s\n' \
+        "$crlf_status" "$(head -1 "$work/e-crlf")" >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+# And the path parsed out of the CRLF output must not carry the carriage
+# return into the session command.  Positive assertion: the full session must
+# reach the stub's -EncodedCommand arm (recorded, exit 7 propagated).  A path
+# that still carried `\r` would trip the quote/linebreak guard (exit 2, no
+# session command), and a probe that failed would never get that far.
+crlf_session_status=0
+SSHP_WIN_SESSION="$(win_path "$work/crlf-session-cmd")" SSHP_WIN_LAST="$(win_path "$work/crlf-last")" SSHP_WIN_STDIN="$(win_path "$work/crlf-stdin")" \
+SSHP_SSH="$stub_crlf_ssh" PS_STUB_MODE="$stub_crlf_mode" TMPDIR="$work/tmp-crlf" \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_client_arg" smoke-host \
+    >"$work/o-crlf2" 2>"$work/e-crlf2" || crlf_session_status=$?
+if [ "$crlf_session_status" -ne 7 ] || [ ! -e "$work/crlf-session-cmd" ]; then
+    printf 'ps-native-argv: sshp.ps1 CRLF probe output: the parsed Zellij path did not reach a session command (exit %s): %s\n' \
+        "$crlf_session_status" "$(head -1 "$work/e-crlf2")" >&2
+    failures=$((failures + 1))
+fi
+
+# --- sshp.ps1: the two-stage WINDOWS SESSION command -------------------------
+#
+# The session is the half of the P1 fix that has NO stdin channel: -tt gives the
+# pty's stdin to the multiplexer, so the session command rides the command line
+# and must stay short AND carry the path the probe resolved.  Three properties,
+# each measured on the real client against the real stub above:
+#   1. the command embeds the probe's path verbatim (and the session name);
+#      a parse that silently drops the path makes the attach meaningless and
+#      the next call refuses with "no resolved Zellij path" -- measured mutant:
+#      forcing the parse to yield '' left BOTH smoke/14 and this file green,
+#      because neither decodes the session command;
+#   2. the session's exit code reaches the caller (the stub answers 7);
+#   3. a hostile path from the probe answer is REFUSED before it can be
+#      embedded -- an apostrophe would close the single-quoted literal and put
+#      arbitrary PowerShell on the remote command line; the oversized path
+#      (>1024) would push the command line back over the truncation budget.
+#      Measured mutant: deleting the quote guard produced a 322-byte session
+#      command containing `O'Brien` while every existing check stayed green.
+for sess_case in good hostile long; do
+    mkdir -p "$work/tmp-sess-$sess_case"
+    sess_path='C:\Program Files\zellij\zellij.exe'
+    case "$sess_case" in
+        hostile) sess_path="C:\\Users\\O'Brien\\zellij.exe" ;;
+        long) sess_path=$(awk 'BEGIN{for(i=0;i<1100;i++)printf "p"}') ;;
+    esac
+    sess_status=0
+    STUB_ZELLIJ_PATH="$sess_path" SSHP_WIN_SESSION="$(win_path "$work/sess-$sess_case-cmd")" SSHP_WIN_LAST="$(win_path "$work/sess-$sess_case-last")" SSHP_WIN_STDIN="$(win_path "$work/sess-$sess_case-stdin")" SSHP_SSH="$stub_win_ssh" PS_STUB_MODE="$stub_win_mode" TMPDIR="$work/tmp-sess-$sess_case" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_client_arg" smoke-host \
+        >"$work/o-sess-$sess_case" 2>"$work/e-sess-$sess_case" || sess_status=$?
+    if [ "$sess_case" = good ]; then
+        cases=$((cases + 1))
+        if [ "$sess_status" -ne 7 ]; then
+            printf 'ps-native-argv: sshp.ps1 Windows session: expected the stub exit code 7 to propagate, got %s: %s\n' \
+                "$sess_status" "$(head -1 "$work/e-sess-good")" >&2
+            failures=$((failures + 1))
+        fi
+        cases=$((cases + 1))
+        decoded=$(python3 - "$work/sess-good-cmd" <<'PYEOF' 2>/dev/null || true
+import base64, re, sys
+raw = open(sys.argv[1]).read()
+m = re.search(r'-EncodedCommand (\S+)', raw)
+if m:
+    sys.stdout.write(base64.b64decode(m.group(1)).decode('utf-16-le'))
+PYEOF
+)
+        if [ -z "$decoded" ]; then
+            printf 'ps-native-argv: sshp.ps1 Windows session: no decodable -EncodedCommand was emitted\n' >&2
+            failures=$((failures + 1))
+        elif ! grep -qF "attach --create 'ghostty'" <<< "$decoded"; then
+            printf 'ps-native-argv: sshp.ps1 Windows session: the attach/session part is missing: %s\n' "$decoded" >&2
+            failures=$((failures + 1))
+        elif ! grep -qF "& 'C:\Program Files\zellij\zellij.exe' attach" <<< "$decoded"; then
+            printf 'ps-native-argv: sshp.ps1 Windows session: the resolved Zellij path was not embedded verbatim (dropped or rewritten): %s\n' "$decoded" >&2
+            failures=$((failures + 1))
+        fi
+    else
+        cases=$((cases + 1))
+        if [ "$sess_status" -ne 2 ]; then
+            printf 'ps-native-argv: sshp.ps1 Windows session %s-path: expected refusal exit 2, got %s\n' "$sess_case" "$sess_status" >&2
+            failures=$((failures + 1))
+        fi
+        cases=$((cases + 1))
+        if [ -e "$work/sess-$sess_case-cmd" ]; then
+            printf 'ps-native-argv: sshp.ps1 Windows session %s-path: a session command was emitted despite the guard\n' "$sess_case" >&2
+            failures=$((failures + 1))
+        fi
+    fi
+done
+cases=$((cases + 1))
+if ! grep -qF 'the resolved Zellij path contains a quote or line break' "$work/e-sess-hostile" 2>/dev/null; then
+    printf 'ps-native-argv: sshp.ps1 Windows session hostile-path: the refusal message is missing\n' >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if ! grep -qF 'the resolved Zellij path is longer than 1024 characters' "$work/e-sess-long" 2>/dev/null; then
+    printf 'ps-native-argv: sshp.ps1 Windows session long-path: the refusal message is missing\n' >&2
+    failures=$((failures + 1))
+fi
+
+# --- sshp.ps1: the five 0.1.16 parity fixes, each driven behaviourally --------
+#
+# Reverting any ONE of these fixes left every check green (measured 2026-10-17,
+# right after the release): smoke/20 exercised none of them, smoke/14 measures
+# only lengths, and no other check runs this client at all. The POSIX twin has
+# its own locks for the same properties in smoke/19, so an unlocked ps1 side is
+# exactly the silent divergence the 0.1.16 theme was supposed to end.
+#
+# Each case drives the real client through the stub defined above:
+#   1. SSHP_RECONNECT_DELAY='+5' must be refused at startup (exit 2).  The POSIX
+#      twin refuses it; [int]::TryParse alone accepts it (measured: +5 -> 5).
+#      Before 0.1.16 the two clients disagreed on the same input.
+#   2. An installable host whose exit code is FLATTENED (the A5b form: a
+#      DefaultShell=powershell.exe sshd turns a native 42 into 1) must still be
+#      read as INSTALL_REQUIRED from the marker, and --check must still refuse
+#      to install (exit 127 + the missing-dependency message).  A marker+code
+#      pair check reads 1+REQUIRED as "probe failed" and points at the wrong
+#      thing -- and after the 0.1.16 probeExitCode change a probe failure would
+#      print the FLATTENED code, making the misreport harder to spot.
+#   3. A probe that fails with its own code (7) and no marker must propagate 7,
+#      not collapse to 2 (the POSIX twin propagates; measured mutant: reverting
+#      to a flat 2 stayed green everywhere).
+#   4. `-h extra` and `--check --help` are help requests (exit 0, usage on
+#      stdout, no ssh call) -- the POSIX twin's semantics, pinned by smoke/19's
+#      --help case for the POSIX side.
+#   5. An EMPTY session-name argument falls back to the default (ghostty),
+#      exactly like the POSIX `${2:-ghostty}`; assigning '' hit the charset
+#      guard and refused, the mirror-image divergence of smoke/19's
+#      "empty session name is accepted" case.
+mkdir -p "$work/tmp-parity"
+cat > "$work/stub-ssh-parity" <<'PARITYSTUB'
+#!/bin/sh
+last=''
+for a in "$@"; do last=$a; done
+case "$last" in
+  *'printf %s'*) printf '__SSHP_WINDOWS_SHELL__:MINGW64_NT-10.0-19045\n'; exit 43 ;;
+  *'-Command -'*)
+    printf '%s\n' "$last" >> "$SSHP_PARITY_CALLS"
+    cat > /dev/null
+    case "${STUB_PARITY_MODE:-ready}" in
+      ready) printf '__SSHP_READY__:Windows\n__SSHP_ZELLIJ__:C:\\zellij.exe\n'; exit 0 ;;
+      flattened-required) printf '__SSHP_INSTALL_REQUIRED__:Windows\n'; exit 1 ;;
+      failing) printf ''; exit 7 ;;
+    esac
+    ;;
+esac
+printf 'unexpected\n'; exit 2
+PARITYSTUB
+chmod 700 "$work/stub-ssh-parity"
+stub_parity_ssh="$work/stub-ssh-parity"
+stub_parity_mode=""
+if [ "$stub_windows" = 1 ]; then
+    stub_parity_ssh=$(cygpath -w "$stub_exe")
+    stub_parity_mode="sshp-parity"
+fi
+
+parity_run() {
+    local label=$1 expected=$2 needle=$3 mode=$4 delay=$5
+    shift 5
+    local output="$work/parity-$label-out" error="$work/parity-$label-err"
+    local status=0
+    SSHP_PARITY_CALLS="$(win_path "$work/parity-$label-calls")" STUB_PARITY_MODE="$mode" \
+        SSHP_SSH="$stub_parity_ssh" PS_STUB_MODE="$stub_parity_mode" SSHP_RECONNECT_DELAY="$delay" TMPDIR="$work/tmp-parity" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_client_arg" "$@" \
+        >"$output" 2>"$error" || status=$?
+    cases=$((cases + 1))
+    if [ "$status" -ne "$expected" ]; then
+        printf 'ps-native-argv: sshp.ps1 parity (%s): expected exit %s, got %s: %s\n' \
+            "$label" "$expected" "$status" "$(head -1 "$error")" >&2
+        failures=$((failures + 1))
+    fi
+    cases=$((cases + 1))
+    if [ -n "$needle" ] && ! grep -qF "$needle" "$error" "$output" 2>/dev/null; then
+        printf 'ps-native-argv: sshp.ps1 parity (%s): expected message missing: %s\n' "$label" "$needle" >&2
+        failures=$((failures + 1))
+    fi
+}
+
+# 1. reconnect delay: `+5` refused at startup.  The delay is validated before
+#    the host arguments, so no host is needed to reach it.
+parity_run 'delay-plus' 2 'SSHP_RECONNECT_DELAY must be a non-negative 32-bit integer' ready '+5'
+# 2. flattened installable host: the marker decides, and --check never installs.
+parity_run 'flattened-required' 127 'native Zellij is required on Windows' flattened-required '' --check smoke-host
+cases=$((cases + 1))
+flattened_calls=$(wc -l < "$work/parity-flattened-required-calls" 2>/dev/null || printf '0')
+if [ "$flattened_calls" -gt 3 ]; then
+    printf 'ps-native-argv: sshp.ps1 parity (flattened-required): %s ssh calls -- the client tried to INSTALL under --check\n' "$flattened_calls" >&2
+    failures=$((failures + 1))
+fi
+# 3. probe failure propagates its own code, not a flat 2.
+parity_run 'probe-propagates' 7 'remote dependency probe failed' failing '' --check smoke-host
+# 4. help semantics: `-h extra` and `--check --help` are help requests.
+parity_run 'help-extra' 0 'Usage:' ready '' -h extra
+parity_run 'help-after-check' 0 'Usage:' ready '' --check --help
+# 5. empty session argument falls back to the default (ghostty).  The empty
+#    argument is passed as its own argv element -- quoted, so bash keeps it.
+parity_run 'empty-session' 0 'persistent remote session: Zellij (Windows)' ready '' --check smoke-host ''
+# 6. A host carrying ANY whitespace is refused at startup, like the POSIX
+#    twin's `*[[:space:]]*` guard.  IsNullOrWhiteSpace alone (the pre-fix
+#    form) only caught a whitespace-ONLY name: measured 2026-10-17,
+#    `sshp.ps1 --check 'foo bar'` exited 0 and ran the probe against a name
+#    ssh has to quote its way through, while the POSIX client refused with
+#    exit 2.  0.1.16 added the POSIX guard but not this one -- the same
+#    one-side-only divergence the version set out to end.  The tab form is
+#    asserted too: a space-only fixture cannot tell `[[:space:]]` from a
+#    literal-space test.
+parity_run 'host-whitespace' 2 'SSH host must not contain whitespace' ready '' --check 'foo bar'
+parity_run 'host-tab' 2 'SSH host must not contain whitespace' ready '' --check "$(printf 'host\ttab')"
+# 7. The install confirmation must come from a TERMINAL.  SKILL.md promises
+#    "the first connection asks before installing it; with no TTY the client
+#    refuses explicitly and never installs silently", and that had no
+#    behavioural lock on either client until 2026-10-17.  The strong form is
+#    asserted: stdin is a pipe carrying `y`, so a client that only checked
+#    whether input was available (or read the answer without a tty test) would
+#    install.  `flattened-required` is exactly the installable-host answer.
+#    Assertions: exit 1, the refusal message, and at most 2 ssh calls (the
+#    platform probe + the Windows probe) -- an install attempt is a third.
+#    DELIBERATELY without -NonInteractive: sshp.cmd and sshp.bash both invoke
+#    `powershell.exe -NoProfile -ExecutionPolicy Bypass -File` (checked in the
+#    assets), so the REAL invocation lets Read-Host consume a pipe.  With
+#    -NonInteractive, Read-Host throws instead, the catch prints the same
+#    refusal, and deleting the IsInputRedirected guard is invisible -- measured
+#    2026-10-17: mutant M6 (guard removed) stayed green under -NonInteractive
+#    and ran the installer (3 ssh calls) without it.  The lock must model the
+#    launcher's argv, not a stricter one.
+install_status=0
+printf 'y\n' > "$work/parity-yes-stdin"
+SSHP_PARITY_CALLS="$(win_path "$work/parity-install-calls")" STUB_PARITY_MODE=flattened-required \
+    SSHP_SSH="$stub_parity_ssh" PS_STUB_MODE="$stub_parity_mode" SSHP_RECONNECT_DELAY='' TMPDIR="$work/tmp-parity" \
+    "$pwsh_binary" -NoProfile -File "$sshp_client_arg" smoke-host <"$work/parity-yes-stdin" \
+    >"$work/parity-install-out" 2>"$work/parity-install-err" || install_status=$?
+cases=$((cases + 1))
+if [ "$install_status" -ne 1 ]; then
+    printf 'ps-native-argv: sshp.ps1 piped-y install: expected exit 1, got %s: %s\n' \
+        "$install_status" "$(head -1 "$work/parity-install-err")" >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if ! grep -qF 'dependency installation requires an interactive local terminal' "$work/parity-install-err"; then
+    printf 'ps-native-argv: sshp.ps1 piped-y install: the no-tty refusal message is missing\n' >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+install_calls=$(wc -l < "$work/parity-install-calls" 2>/dev/null || printf '0')
+if [ "${install_calls:-0}" -gt 1 ]; then
+    printf 'ps-native-argv: sshp.ps1 piped-y install: %s ssh call(s) -- a piped confirmation reached the installer\n' "$install_calls" >&2
+    failures=$((failures + 1))
+fi
 
 # --- sshp.ps1: the unix SESSION command, which must stay a RAW argument ------
 # This is the one argument the fix deliberately does NOT base64-wrap: it `exec`s
@@ -319,7 +831,7 @@ else
     # has not lost it -- naming the wrong defect.
     cases=$((cases + 1))
     session_wrapped=0
-    if printf '%s' "$session_cmd" | grep -qF 'base64 -d | sh'; then
+    if grep -qF 'base64 -d | sh' <<< "$session_cmd"; then
         session_wrapped=1
         printf 'ps-native-argv: sshp.ps1 session: the session command was base64-wrapped; it must stay a raw argument because the pipe channel hands tmux/screen a non-tty stdin\n' >&2
         failures=$((failures + 1))
@@ -327,7 +839,7 @@ else
     # Direction 2: it must carry the multiplexer dispatch intact.
     if [ "$session_wrapped" -eq 0 ]; then
         cases=$((cases + 1))
-        if ! printf '%s' "$session_cmd" | grep -qF 'exec tmux new-session -A -s'; then
+        if ! grep -qF 'exec tmux new-session -A -s' <<< "$session_cmd"; then
             printf 'ps-native-argv: sshp.ps1 session: the session command lost its tmux line\n' >&2
             failures=$((failures + 1))
         fi
@@ -416,7 +928,7 @@ PS_ARGV_OUT="$(win_path "$work/argv-agentq")" AGENTQ_SSH="$stub2_ssh" PS_STUB_RE
     AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix TMPDIR="$work/tmp2" \
     "$pwsh_binary" -NoProfile -NonInteractive -File "$agentq_client_arg" status \
     >"$work/o2" 2>"$work/e2" || true
-check_roundtrip 'agentq.ps1 unix operation' "$agentq_client" "$work/argv-agentq" 'base64 -d | sh'
+check_roundtrip 'agentq.ps1 unix operation' "$work/argv-agentq" 'base64 -d | sh'
 
 # ...and the channel must actually decode back to the script the client meant to
 # run.  Asserting only "the command line survived" would pass on a command that

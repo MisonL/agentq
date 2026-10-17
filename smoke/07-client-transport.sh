@@ -101,7 +101,12 @@ ssh-keygen -q -t ed25519 -N '' -f "$ssh_dir/id" -C agentq-smoke-client
 remote_home="$work/remote"
 mkdir -p "$remote_home/.local/bin"
 chmod 700 "$remote_home"
-cp "$source_home/agentq-server" "$remote_home/.local/bin/agentq"
+# The SERVER under test is the repo asset, not the runtime's snapshot (same fix
+# as smoke/04/06, 2026-10-21): "$source_home/agentq-server" is whatever
+# sandbox.sh wrote when the SANDBOX was created -- measured at 247276 bytes
+# against the repo asset's 248213 -- so server-side changes after that moment
+# were invisible here.
+cp "${AGENTQ_SMOKE_SERVER:-$repo_root/skill/assets/unix/agentq-server}" "$remote_home/.local/bin/agentq"
 cp "$source_home/pueue" "$remote_home/.local/bin/pueue"
 cp "$source_home/pueued" "$remote_home/.local/bin/pueued"
 chmod 700 "$remote_home/.local/bin/agentq" "$remote_home/.local/bin/pueue" "$remote_home/.local/bin/pueued"
@@ -434,8 +439,10 @@ jq -e '.state == "not_started"' <<<"$notstarted_out" >/dev/null || {
     exit 1
 }
 # And it must be repeatable: not_started is a state, not a one-shot verdict.
+# The second response BODY is deliberately not captured -- only the status is
+# asserted (an earlier version assigned it to a variable nothing read).
 notstarted_again_status=0
-notstarted_again=$(run_client lookup "$crash_request_id" 2>/dev/null) || notstarted_again_status=$?
+run_client lookup "$crash_request_id" >/dev/null 2>&1 || notstarted_again_status=$?
 if [ "$notstarted_again_status" -ne 3 ]; then
     printf 'a second lookup of a not_started record exited %s, expected 3\n' \
         "$notstarted_again_status" >&2
@@ -573,8 +580,9 @@ fi
 # This is the asymmetry that matters: response loss on a READ is retried, but on
 # a MUTATION it must not be, because the client cannot know whether the mutation
 # took effect.  The count of remote calls is the assertion -- a second call
-# would be the forbidden automatic retry.
-cancel_target="$workdir"
+# would be the forbidden automatic retry.  The target is identified by the id
+# the submit returns (cancel_target_id below); an earlier `cancel_target=`
+# line here named the WORKDIR as if it were the target and was never read.
 cancel_submit=$(run_client submit --workdir "$workdir" --label transport-interrupt-cancel \
     --request-id "${interrupt_request_id}-cancel" -- sleep 120 2>/dev/null) || {
     printf '%s\n' 'submit of the interruption cancel target failed' >&2

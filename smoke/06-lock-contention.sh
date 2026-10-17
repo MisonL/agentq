@@ -64,7 +64,13 @@ control="$work/control"
 
 cp "$source_home/pueue" "$home/pueue.real"
 cp "$source_home/pueued" "$home/pueued"
-cp "$source_home/agentq-server" "$home/agentq-server"
+# The SERVER under test is the repo asset, not the runtime's snapshot: the
+# runtime supplies pueue/pueued (the only thing it is needed for), and until
+# 2026-10-21 this copied "$source_home/agentq-server", which is whatever the
+# sandbox held at ITS creation time -- measured: 247276 bytes against the repo
+# asset's 248213, with every check here green either way.
+root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+cp "${AGENTQ_SMOKE_SERVER:-$root/skill/assets/unix/agentq-server}" "$home/agentq-server"
 chmod 700 "$home/pueue.real" "$home/pueued" "$home/agentq-server"
 
 cat > "$home/config/pueue.yml" <<YAML
@@ -385,7 +391,11 @@ if [ "$read_logs_status" -ne 0 ]; then
 fi
 
 read_doctor_status=0
-read_doctor_output=$("$server" doctor 2>"$work/read-doctor.err") || read_doctor_status=$?
+# doctor's stdout is discarded: the assertion is that a READ command does not
+# contend on the held lock, which the exit code carries.  (The output was
+# captured and never read -- SC2034, the same shape as the server's deleted
+# `removal_status`.)
+"$server" doctor >/dev/null 2>"$work/read-doctor.err" || read_doctor_status=$?
 if [ "$read_doctor_status" -ne 0 ]; then
     printf 'doctor contended on the held lock (exit %s): %s\n' \
         "$read_doctor_status" "$(head -1 "$work/read-doctor.err")" >&2

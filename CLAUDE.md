@@ -366,6 +366,17 @@ diff -rq /Volumes/Work/code/agentq/skill "$SKILL_DIR"   # 必须无输出
   **不参与任何协商**；`pueue=`/`pueued=` 是队列
   实现的版本、不是 AgentQ 的协议版本。部署单元就是 `skill/assets/` 那 23 个文件的同一
   版本，必须整体替换。将来若要跨版本互操作，先加协商字段。
+- **两份客户端对同一输入必须给同一答案。** `client/unix/agentq` 与
+  `client/windows/agentq.ps1` 是同一契约的两个实现（`sshp` 同理），「两个实现各写一遍」
+  意味着**任何一处校验都可能只改了一边**。实测过的不一致（2026-10-21，全部已修）：
+  六项数值环境变量的上界（POSIX ≤9 位 / Windows int32）与前导零（POSIX 收 / Windows 拒）、
+  `--tail` 的前导零、`AGENTQ_REMOTE_PLATFORM` 的大小写（PS 的 `switch` 不分大小写，
+  POSIX 的 `case` 分）、launcher 探针失败的状态码（POSIX 透传 255、Windows 折成 2——
+  这两个码对调用方的含义相反）、死传输后是否重跑平台探针。
+  **检测方法是差分，不是读代码**：同一组 argv / 同一组环境变量分别喂给两个客户端，
+  比退出码。注意**检测器本身也会骗人**——同一轮里我自己的探测脚本就因为把
+  `env "VAR="` 与 `env VAR` 混用、以及忘了给 Windows 侧设 `AGENTQ_SSH`，
+  两次报出假分歧。
 - 规划与待办的唯一权威清单是 `docs/PLAN.md`。`docs/HANDOFF.md` 只保留操作规则与边界；
   别处出现的待办（HANDOFF 的历史段落、CHANGELOG 的过程记录）都是历史，不是任务。
 
@@ -373,6 +384,13 @@ diff -rq /Volumes/Work/code/agentq/skill "$SKILL_DIR"   # 必须无输出
 历史全量扫描；完整历史 `shasum -c`；为每个旧 fixture 重建当前报告。
 
 真实远端服务、队列、TLS/shared key、生产凭证均**未被验证**，不要声称已验证。
+
+**2026-10-21 更正该句的适用范围**：上面这句写在只有本机沙箱时。现在**专用测试机**（用户点名的
+Windows 10 VM）上的真远端已实测并留证（见 `docs/PLAN.md` 第十八轮）：0.1.8 → 0.1.16 真升级
+（`updated_atomically: true`、无残留、数据保留）+ 协议端到端（`status`/`submit`/`lookup`/`wait`/
+`logs`/`remove` 全通）。**仍未验证的是「生产」那一层**：13 台生产主机一台都没碰过，生产凭证、
+生产队列数据、跨主机并发与负载、真实运维中断下的行为，全部没有证据。所以措辞改为：
+**测试机真远端已验证；生产环境仍未被验证，不要声称已验证。**
 
 
 ## 实测证据与测试覆盖

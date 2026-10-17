@@ -35,11 +35,15 @@ jobs:
         # smoke/01 parses the .yml assets (pyyaml), re-parses the shell assets
         # under zsh, and lints the plists (xmllint); 07 and 17 start their own
         # sshd on a high port, which needs the binary and its privilege
-        # separation directory.  pwsh and jq are already on the runner image.
+        # separation directory; smoke/05's shellcheck lock covers the nine
+        # shell assets and the repo's own 31 scripts, and WITHOUT the tool it
+        # degrades to `shellcheck=absent` and exits 0 -- the assertion below
+        # is what keeps that degradation from reading as green.  pwsh and jq
+        # are already on the runner image.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libxml2-utils openssh-server python3-yaml zsh
+            libxml2-utils openssh-server python3-yaml shellcheck zsh
           sudo mkdir -p /run/sshd
       - name: Run the full suite against a real runtime
         run: |
@@ -73,6 +77,13 @@ jobs:
             exit 1
           fi
           grep -qE '^PASS checks: [0-9]+ ran, [01] skipped, 0 partial, 0 failed' smoke.log
+          # smoke/05's shellcheck lock is TOOL-GATED: without shellcheck it
+          # prints `shellcheck=absent` and still exits 0, so neither the exit
+          # code nor the PASS line can tell a linted run from an unlinted one.
+          # Both enumerations must have run: the assets AND the repo scripts.
+          # A check that degrades to "not linted" must turn this job red, not
+          # read green -- the same rule smoke/01's `ps1_static=ok` follows.
+          grep -qE 'shellcheck=checked\([1-9][0-9]*\) scriptcheck=checked\([1-9][0-9]*\)' smoke.log
           # NOT-covered is platform-expected, so it is neither skipped nor
           # partial and must not disturb the line above.  But the word has to
           # be pinned somewhere: every check allowed to admit it must be in the
@@ -139,10 +150,12 @@ jobs:
             exit 1
           fi
           # ps1=7: the PowerShell parser ran over all seven .ps1 assets.
+          # ps1_static=ok: the PS AST rules ran AND self-calibrated -- a rule
+          # that had quietly stopped matching prints skipped(...) instead.
           # tool_full=6/6: no probe tool (pwsh, xmllint, zsh, pyyaml, cmp,
           # find) was missing.  A `skipped(` marker means part of 01 did not
           # run and the job must not read as green.
-          grep -qE 'ps1=7 .*tool_full=6/6' smoke.log
+          grep -qE 'ps1=7 ps1_static=ok .*tool_full=6/6' smoke.log
           if grep -q 'skipped(' smoke.log; then
             echo 'part of the quick suite did not run' >&2
             exit 1
@@ -166,7 +179,13 @@ jobs:
           # supported entry point adjusts PATH for the same reason.
           export PATH="/usr/bin:$PATH"
           fail=0
-          for check in 12-ps-client-contract 20-ps-native-argv-roundtrip 22-launcher-contract 23-durable-move-contract; do
+          # 13 and 25 join on 2026-10-20: their platform-gate cases are
+          # non-Windows-only (the gate cannot fire on Windows), and BEFORE the
+          # guard added that day a run here would have INSTALLED the client and
+          # rewritten the runner's PATH.  The windows job is exactly where they
+          # must be exercised: the guard is what keeps them safe, and a guard
+          # that is only ever exercised off Windows is a guard nobody runs.
+          for check in 12-ps-client-contract 13-ps-installer-contract 20-ps-native-argv-roundtrip 22-launcher-contract 23-durable-move-contract 25-ps-client-installer-contract; do
             log="smoke-$check.log"
             status=0
             "./smoke/$check.sh" >"$log" 2>&1 || status=$?
@@ -177,6 +196,37 @@ jobs:
               echo "$check skipped -- it must run here" >&2
               fail=1
             fi
+            # Every NOT-covered token must carry a NAMED platform reason.  On
+            # this host 13 and 25 must additionally report the gate as
+            # unverifiable (the gate cannot fire on Windows); a run that
+            # claimed `platform-gate=covered` here would be asserting a case it
+            # did not execute.
+            occurrences=$(grep -o 'NOT-covered' "$log" | wc -l | tr -d ' ')
+            named=$(grep -o 'NOT-covered([^)]*)' "$log" | wc -l | tr -d ' ')
+            if [ "$occurrences" -ne "$named" ]; then
+              echo "$check printed a NOT-covered token with no parenthesised reason" >&2
+              fail=1
+            fi
+            # The allowed reasons are the named platform boundaries this repo
+            # has measured.  `deliberately-not-exercised` is the third one: on
+            # Windows, 13/25 must never issue a valid installer invocation
+            # (measuring 2026-10-20: doing so installs and edits the user's
+            # PATH), so their staging cases are withheld BY CHOICE there rather
+            # than being unreachable -- a different fact, and a different token.
+            bad_tokens=$(grep -o 'NOT-covered([^)]*)' "$log" | grep -vE '^NOT-covered\((needs-Windows|needs-non-Windows|deliberately-not-exercised)\)$' || true)
+            if [ -n "$bad_tokens" ]; then
+              echo "$check reported NOT-covered without a named platform reason:" >&2
+              echo "$bad_tokens" >&2
+              fail=1
+            fi
+            case "$check" in
+              13-ps-installer-contract|25-ps-client-installer-contract)
+                if ! grep -q 'platform-gate=NOT-covered(needs-non-Windows)' "$log"; then
+                  echo "$check claimed platform-gate coverage on a Windows host" >&2
+                  fail=1
+                fi
+                ;;
+            esac
           done
           exit "$fail"
       - name: Assert PS 5.1 was the interpreter
@@ -192,7 +242,7 @@ jobs:
           # while this job counts it as 5.1 evidence.
           grep -q 'ps51=covered' smoke-12-ps-client-contract.log
           fail=0
-          for log in smoke-20-ps-native-argv-roundtrip.log smoke-22-launcher-contract.log smoke-23-durable-move-contract.log; do
+          for log in smoke-13-ps-installer-contract.log smoke-20-ps-native-argv-roundtrip.log smoke-22-launcher-contract.log smoke-23-durable-move-contract.log smoke-25-ps-client-installer-contract.log; do
             if ! grep -qE 'pwsh=5\.' "$log"; then
               echo "$log did not report PowerShell 5.1 as its interpreter" >&2
               fail=1

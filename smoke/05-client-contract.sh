@@ -525,6 +525,13 @@ expect_rejected '--timeout must be a positive integer' wait 1 --timeout abc
 expect_rejected 'logs requires a task id' logs
 expect_rejected 'task id must be a non-negative integer' logs abc
 expect_rejected '--tail must be a positive integer or all' logs 1 --tail x
+# A leading zero is not "a positive integer", in either client.  Measured
+# 2026-10-21: this client accepted `05` (the value was forwarded and the
+# request reached ssh) while the Windows twin refused it -- the same
+# one-shape-two-answers drift as the numeric env vars above.  `all` and a plain
+# integer must stay accepted; the accepted side is pinned by the usage cases.
+expect_rejected '--tail must be a positive integer or all' logs 1 --tail 05
+expect_rejected '--tail must be a positive integer or all' logs 1 --tail 00
 expect_rejected 'cancel requires one task id' cancel
 expect_rejected 'task id must be a non-negative integer' cancel abc
 expect_rejected 'remove requires one task id' remove
@@ -593,6 +600,57 @@ if grep -qF 'already in progress' "$work/reason.err"; then
     failures=$((failures + 1))
 fi
 
+# cancel exit 4: the CODE is the contract, the body is decoration.
+# Until 2026-10-21 the client replaced 4 with 2 whenever the body failed its
+# `cancellation_pending` validation -- i.e. it reported "protocol/parameter
+# error, fix your arguments and retry" for the one state whose documented
+# meaning is "the server cannot decide safely; STOP, do not retry".  Both
+# directions are asserted: an unvalidated body must keep 4 and must NOT reach
+# stdout, and a validated one must keep 4 and be printed.
+cases=$((cases + 1))
+cancel4_stub="$work/bin/ssh-cancel4-bad"
+cat > "$cancel4_stub" <<'STUB'
+#!/bin/sh
+printf '%s\n' '{"task_id":1,"state":"bogus_state"}'
+exit 4
+STUB
+chmod 700 "$cancel4_stub"
+cancel4_status=0
+AGENTQ_SSH="$cancel4_stub" AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    "$client" cancel 1 >"$work/cancel4.out" 2>"$work/cancel4.err" || cancel4_status=$?
+if [ "$cancel4_status" -ne 4 ]; then
+    printf 'client cancel with exit 4 and an unvalidated body exited %s, expected 4 (4 means STOP; 2 reads as "fix your arguments and retry")\n' \
+        "$cancel4_status" >&2
+    failures=$((failures + 1))
+fi
+if [ -s "$work/cancel4.out" ]; then
+    printf 'client cancel printed an unvalidated body on stdout: %s\n' \
+        "$(tr '\n' '|' < "$work/cancel4.out")" >&2
+    failures=$((failures + 1))
+fi
+
+cancel4_ok_stub="$work/bin/ssh-cancel4-ok"
+cases=$((cases + 1))
+cat > "$cancel4_ok_stub" <<'STUB'
+#!/bin/sh
+printf '%s\n' '{"task_id":1,"state":"cancellation_pending","cancellation_requested_at":"2026-10-21T00:00:00Z"}'
+exit 4
+STUB
+chmod 700 "$cancel4_ok_stub"
+cancel4_ok_status=0
+AGENTQ_SSH="$cancel4_ok_stub" AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    "$client" cancel 1 >"$work/cancel4-ok.out" 2>"$work/cancel4-ok.err" || cancel4_ok_status=$?
+if [ "$cancel4_ok_status" -ne 4 ]; then
+    printf 'client cancel with exit 4 and a valid cancellation_pending body exited %s, expected 4\n' \
+        "$cancel4_ok_status" >&2
+    failures=$((failures + 1))
+fi
+if ! grep -qF '"state":"cancellation_pending"' "$work/cancel4-ok.out"; then
+    printf 'client cancel did not forward the validated cancellation_pending body: %s\n' \
+        "$(tr '\n' '|' < "$work/cancel4-ok.out")" >&2
+    failures=$((failures + 1))
+fi
+
 # The PLATFORM PROBE runs before any operation is dispatched, and it used to be
 # the one ssh call site that did not capture stderr -- so a remote could write a
 # fully-formed forged line straight onto the caller's stderr, ahead of anything
@@ -608,9 +666,13 @@ printf '%s\n' 'agentq: remote failure reason: lock_contention' >&2
 exit 0
 STUB
 chmod 700 "$probe_stub"
-probe_status=0
+# The status is deliberately NOT captured.  These three cases assert on what
+# reaches stderr, and `|| true` is the honest form: a `probe_status=$?` here
+# would be a dead variable -- this very file's shellcheck lock (below) reports
+# SC2034 for exactly that shape, and in the assets it is how the POSIX client's
+# `wait_ssh_status=$?` defect read: like a status about to be checked.
 AGENTQ_SSH="$probe_stub" AGENTQ_HOST=smoke-host \
-    "$client" status >"$work/probe.out" 2>"$work/probe.err" || probe_status=$?
+    "$client" status >"$work/probe.out" 2>"$work/probe.err" || true
 if grep -qF 'lock_contention' "$work/probe.err"; then
     printf 'the platform probe let remote-controlled text reach the caller stderr: %s\n' \
         "$(tr '\n' '|' < "$work/probe.err")" >&2
@@ -618,6 +680,46 @@ if grep -qF 'lock_contention' "$work/probe.err"; then
 fi
 if grep -qF 'remote failure reason' "$work/probe.err"; then
     printf '%s\n' 'the platform probe forwarded a forged reason line' >&2
+    failures=$((failures + 1))
+fi
+
+# A dead transport must not be probed twice.  The local probe retries a
+# transport failure (254) a bounded number of times, then returns 255; the
+# Windows probe used to run NEXT regardless, spending a second full retry
+# budget against the same dead host -- up to ~70s more -- and could not change
+# the answer.  The stub counts invocations, so "the second probe did not run"
+# is asserted directly rather than inferred from timing.  The stub writes the
+# transport line to the -E log, exactly as real ssh does (the client classifies
+# from that file, not from stderr).
+cases=$((cases + 1))
+transport_stub="$work/bin/ssh-transport-dead"
+cat > "$transport_stub" <<'STUB'
+#!/bin/sh
+prev=''
+for argument in "$@"; do
+    if [ "$prev" = '-E' ]; then log_path=$argument; fi
+    prev=$argument
+done
+printf 'x\n' >> "$AGENTQ_TRANSPORT_COUNT_FILE"
+printf 'ssh: connect to host smoke-host port 22: Connection refused\r\n' > "${log_path:-/dev/null}"
+exit 255
+STUB
+chmod 700 "$transport_stub"
+transport_count="$work/transport-count"
+: > "$transport_count"
+transport_status=0
+AGENTQ_TRANSPORT_COUNT_FILE="$transport_count" \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$transport_stub" AGENTQ_HOST=smoke-host \
+    "$client" status >"$work/transport.out" 2>"$work/transport.err" || transport_status=$?
+transport_calls=$(wc -l < "$transport_count" | tr -d ' ')
+if [ "$transport_status" -ne 255 ]; then
+    printf 'client status against a dead transport exited %s, expected 255\n' "$transport_status" >&2
+    failures=$((failures + 1))
+fi
+if [ "$transport_calls" -ne 2 ]; then
+    printf 'client made %s probe call(s) against a dead transport, expected 2 (initial + one retry; the Windows probe must not repeat the same failing transport)\n' \
+        "$transport_calls" >&2
     failures=$((failures + 1))
 fi
 
@@ -693,9 +795,11 @@ printf 'smokeuser@smoke-host: Permission denied (publickey,password,keyboard-int
 exit 255
 STUB
 chmod 700 "$auth_stub"
-auth_status=0
+# Same as the probe-forge case above: the assertion is on the diagnostic text,
+# so the exit status is discarded with `|| true` rather than captured into a
+# variable nothing reads (SC2034).
 AGENTQ_SSH="$auth_stub" AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
-    "$client" status >"$work/auth.out" 2>"$work/auth.err" || auth_status=$?
+    "$client" status >"$work/auth.out" 2>"$work/auth.err" || true
 if ! grep -qF 'class=authentication' "$work/auth.err"; then
     printf 'ssh authentication failure was not classified as authentication: %s\n' \
         "$(tr '\n' '|' < "$work/auth.err")" >&2
@@ -723,12 +827,11 @@ fi
 credential_auth_stub="$work/bin/ssh-auth-credential"
 sed 's/^STUB$//' "$auth_stub" > "$credential_auth_stub" 2>/dev/null || cp "$auth_stub" "$credential_auth_stub"
 chmod 700 "$credential_auth_stub"
-credential_status=0
 printf '#!/bin/sh\nprintf "pw\\n"\n' > "$work/askpass-program"
 chmod 700 "$work/askpass-program"
 AGENTQ_ASKPASS="$work/askpass-program" \
     AGENTQ_SSH="$auth_stub" AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
-    "$client" status >"$work/auth2.out" 2>"$work/auth2.err" || credential_status=$?
+    "$client" status >"$work/auth2.out" 2>"$work/auth2.err" || true
 if ! grep -qF 'even though a credential source (askpass) is configured' "$work/auth2.err"; then
     printf 'an authentication failure WITH a credential source gave the wrong advice: %s\n' \
         "$(tr '\n' '|' < "$work/auth2.err")" >&2
@@ -764,18 +867,91 @@ if ! grep -qF 'class=authentication' "$work/hostkey.err"; then
 fi
 
 # The client's own environment validation runs before anything else.
+# AGENTQ_PLATFORM_PROBE_CACHE_TTL and AGENTQ_WAIT_TIMEOUT were missing from this
+# list until 2026-10-21 -- and that gap is exactly how the two clients drifted:
+# the POSIX side refused a bad TTL while the Windows side silently fell back to
+# the default 604800, i.e. `..._CACHE_TTL=abc` quietly meant "seven days".  A
+# contract shared by two implementations needs a case per variable, otherwise
+# only the implementation you happen to test is pinned.
 for variable in AGENTQ_SUBMIT_RETRY_ATTEMPTS AGENTQ_SUBMIT_RETRY_DELAY \
     AGENTQ_OPERATION_RETRY_ATTEMPTS AGENTQ_OPERATION_RETRY_DELAY \
-    AGENTQ_PLATFORM_PROBE_TIMEOUT; do
+    AGENTQ_PLATFORM_PROBE_TIMEOUT AGENTQ_PLATFORM_PROBE_CACHE_TTL; do
+    # Three shapes per variable.  `0` was the only case until 2026-10-21, and
+    # it cannot see the range defect: every one of these values feeds a
+    # `[ ... -ge/-gt ... ]` comparison or a `sleep`, and a value past the
+    # shell's integer range does not fail that test -- dash prints "Illegal
+    # number" and the comparison reads as FALSE, so the probe deadline never
+    # fires and the retry limit never fires.  The over-range case is what pins
+    # the bound; the `0` case alone stayed green on an unbounded validator.
+    #
+    # `05` pins the OTHER end of the same contract.  Measured 2026-10-21: the
+    # POSIX client accepted `05`/`007` while the Windows one refused them
+    # (`^[1-9][0-9]*$`), and the two also disagreed on 1000000000 and
+    # 2147483647 -- the POSIX side stopped at nine digits, so a value the
+    # Windows client accepted was refused here and vice versa.  Both now take
+    # exactly `^[1-9][0-9]*$` up to 2147483647, and this case is what keeps them
+    # there: a leading zero is not a positive integer in either client.
+    for env_value in 0 99999999999999999999 05; do
+        env_rejections=$((env_rejections + 1))
+        status=0
+        env "$variable=$env_value" AGENTQ_SSH="$work/bin/ssh" AGENTQ_HOST=smoke-host \
+            "$client" --help >"$work/env.out" 2>"$work/env.err" || status=$?
+        if [ "$status" -ne 2 ] || ! grep -qF "$variable must be a positive integer" "$work/env.err"; then
+            printf '%s\n' "$variable=$env_value was not rejected as a positive integer" >&2
+            failures=$((failures + 1))
+        fi
+    done
+done
+
+# AGENTQ_WAIT_TIMEOUT is validated on the WAIT path, not at startup (both
+# clients do it there, so the loop above cannot see it: `--help` never reaches
+# the check).  Driven through a stub ssh that fails immediately -- the refusal
+# happens before ssh is consulted, so the stub never has to model a session.
+wait_timeout_stub="$work/bin/ssh-wait-timeout"
+printf '%s\n' '#!/bin/sh' 'exit 255' > "$wait_timeout_stub"
+chmod 700 "$wait_timeout_stub"
+env_rejections=$((env_rejections + 1))
+status=0
+AGENTQ_WAIT_TIMEOUT=0 AGENTQ_SSH="$wait_timeout_stub" AGENTQ_HOST=smoke-host \
+    AGENTQ_REMOTE_PLATFORM=unix "$client" wait 1 >"$work/env.out" 2>"$work/env.err" || status=$?
+if [ "$status" -ne 2 ] || ! grep -qF 'AGENTQ_WAIT_TIMEOUT must be a positive integer' "$work/env.err"; then
+    printf '%s\n' 'AGENTQ_WAIT_TIMEOUT=0 was not rejected on the wait path as a positive integer' >&2
+    failures=$((failures + 1))
+fi
+
+# AGENTQ_REMOTE_PLATFORM is matched case-insensitively, like the Windows
+# client's `switch` (a language rule there, a written-out pattern here).
+# Measured 2026-10-21: `AUTO`/`Unix` were accepted by the Windows client and
+# refused by this one, so the same instruction meant "probe as usual" on one
+# platform and "argument error" on the other.  The upper-case forms must now
+# reach ssh (255 through this stub) exactly like the lower-case ones; an
+# invalid value must still be refused, which the last row pins.
+for platform_case in auto unix windows AUTO Unix WINDOWS; do
     env_rejections=$((env_rejections + 1))
-    status=0
-    env "$variable=0" AGENTQ_SSH="$work/bin/ssh" AGENTQ_HOST=smoke-host \
-        "$client" --help >"$work/env.out" 2>"$work/env.err" || status=$?
-    if [ "$status" -ne 2 ] || ! grep -qF "$variable must be a positive integer" "$work/env.err"; then
-        printf '%s\n' "$variable=0 was not rejected as a positive integer" >&2
+    platform_status=0
+    AGENTQ_REMOTE_PLATFORM="$platform_case" AGENTQ_SSH="$wait_timeout_stub" \
+        AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+        AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+        AGENTQ_PLATFORM_PROBE_CACHE=off \
+        "$client" status >"$work/env.out" 2>"$work/env.err" || platform_status=$?
+    # NOT "must be 255": `windows` also runs the launcher protocol probe, whose
+    # own failure code is legitimate.  The defect being pinned is the argument
+    # error -- 2 with the switch's message -- which is what a case-sensitive
+    # match produced for `AUTO`/`Unix`.
+    if [ "$platform_status" -eq 2 ] && grep -qF 'AGENTQ_REMOTE_PLATFORM must be auto, unix, or windows' "$work/env.err"; then
+        printf 'AGENTQ_REMOTE_PLATFORM=%s was refused as an invalid value; it is accepted case-insensitively\n' \
+            "$platform_case" >&2
         failures=$((failures + 1))
     fi
 done
+env_rejections=$((env_rejections + 1))
+platform_bad_status=0
+AGENTQ_REMOTE_PLATFORM=bogus AGENTQ_SSH="$work/bin/ssh" AGENTQ_HOST=smoke-host \
+    "$client" status >"$work/env.out" 2>"$work/env.err" || platform_bad_status=$?
+if [ "$platform_bad_status" -ne 2 ] || ! grep -qF 'AGENTQ_REMOTE_PLATFORM must be auto, unix, or windows' "$work/env.err"; then
+    printf '%s\n' 'AGENTQ_REMOTE_PLATFORM=bogus was not refused with the controlled message' >&2
+    failures=$((failures + 1))
+fi
 
 # ---------------------------------------------------------------------------
 # The Windows probe path.  This exists because a static check could not see the
@@ -931,7 +1107,7 @@ launcher_calls=$(awk '/^launcher /{n++} END{print n+0}' "$work/calls.txt" 2>/dev
 # status whose payload was empty while the submit's was fine -- a false red, and
 # a message naming the wrong operation.
 last_launcher_bytes=''
-while read -r _tag launcher_count launcher_bytes launcher_op; do
+while read -r _tag launcher_count launcher_bytes _launcher_op; do
     last_launcher_bytes=$launcher_bytes
     launcher_file="$work/launcher-stdin.$launcher_count"
     [ -e "$launcher_file" ] || continue
@@ -959,7 +1135,7 @@ else
     # vector.  The request id is the client's own, so it cannot be present by
     # accident, and the workdir is the one passed on the command line.
     for required in smokeclient00000001 /tmp; do
-        if ! printf '%s\n' "$submit_payload_vector" | grep -qxF -- "$required"; then
+        if ! grep -qxF -- "$required" <<< "$submit_payload_vector"; then
             printf 'launcher payload for a submit lacks %s: %s\n' \
                 "$required" "$(printf '%s' "$submit_payload_vector" | tr '\n' '|')" >&2
             failures=$((failures + 1))
@@ -1441,8 +1617,8 @@ else
     fn_body=$(awk -v start="$reason_fn_line" 'NR>=start{print} NR>start && /^}[[:space:]]*$/{exit}' "$client")
     # Line offset (1-based, relative to the opener) of the clear and of the
     # first early return, both measured WITHIN the function body.
-    clear_rel=$(printf '%s\n' "$fn_body" | grep -n "agentq_remote_failure_reason_value=''" | head -1 | cut -d: -f1) || true
-    return_rel=$(printf '%s\n' "$fn_body" | grep -n 'return \$?' | head -1 | cut -d: -f1) || true
+    clear_rel=$(grep -n "agentq_remote_failure_reason_value=''" <<< "$fn_body" | head -1 | cut -d: -f1) || true
+    return_rel=$(grep -n 'return \$?' <<< "$fn_body" | head -1 | cut -d: -f1) || true
     if [ -z "$clear_rel" ]; then
         printf '%s\n' 'client-contract: run_ssh_logged no longer clears the forwarded reason at all' >&2
         failures=$((failures + 1))
@@ -1483,9 +1659,83 @@ for wrapper_file in "$client" "$windows_wrapper_asset" "$launcher_asset"; do
     fi
 done
 
+# Two precise shellcheck rules, over EVERY shell asset, when the tool is
+# present.  They are the only two that found real defects here (2026-10-18):
+# SC2319 (a `$?` captured after a `[` test -- it is the TEST's status, always 0,
+# so a failed cleanup was reported as success) and SC2034 (an
+# assigned-but-never-read variable).  The first was found in the POSIX client;
+# the second in the SERVER -- `removal_status=$?` in remove_task, never read,
+# with a comment right below it explaining why pueue's code is not propagated.
+# A dead `$?` capture is worse than dead code: it reads as if the status were
+# about to be used, which is exactly what the neighbouring comment was read as.
+# Restricted with `-i` so a newer shellcheck's new rules cannot redden CI on
+# their own; the two IDs are stable.  Absent tool = skipped, like pwsh
+# elsewhere in this suite.  Dialect per file: the two canonical servers run
+# bash, everything else is `#!/bin/sh` and is checked as POSIX sh.
+shellcheck_summary=absent
+shellcheck_assets=0
+shellcheck_scripts=0
+shellcheck_bad=0
+if command -v shellcheck >/dev/null 2>&1; then
+    # $1 = path to lint, $2 = the name to print.  Runs in this shell, not a
+    # subshell, so `shellcheck_bad` accumulates.
+    lint_shell_file() {
+        local shell_file=$1 shell_label=$2 shell_dialect first
+        first=$(head -1 "$shell_file")
+        case $first in
+            *bash*) shell_dialect=bash ;;
+            *) shell_dialect=sh ;;
+        esac
+        # SC2221/SC2222 joined the lock on 2026-10-20: a duplicated case
+        # pattern (''|en|en-*|'') makes the repeated branch DEAD, and a dead
+        # branch in a check is the same defect class as a dead variable -- an
+        # assertion that silently never runs.  It was found by widening the
+        # lock in a real-host run, after three checks had shipped with it.
+        if ! shellcheck -s "$shell_dialect" -i SC2319,SC2034,SC2221,SC2222 "$shell_file" >/dev/null 2>&1; then
+            printf 'client-contract: shellcheck found SC2319/SC2034/SC2221/SC2222 in %s (a `$?` after a test, a dead variable, or a dead case branch):\n' "$shell_label" >&2
+            shellcheck -s "$shell_dialect" -i SC2319,SC2034,SC2221,SC2222 "$shell_file" >&2 || true
+            shellcheck_bad=$((shellcheck_bad + 1))
+        fi
+    }
+    while IFS= read -r shell_asset; do
+        lint_shell_file "$shell_asset" "${shell_asset#"$root"/}"
+        shellcheck_assets=$((shellcheck_assets + 1))
+    done < <(find "$root/skill/assets" -type f -exec sh -c '
+        first=$(head -1 "$1" 2>/dev/null) || exit 0
+        case "$first" in
+            "#!"*sh*) printf "%s\n" "$1" ;;
+        esac
+    ' _ {} \; | sort)
+    # ...and the repo's OWN shell scripts, because this lock's two rules have
+    # now found the same defect class in both halves.  Round eleven found SC2319
+    # in the POSIX client, round twelve widened the lock to all nine assets and
+    # immediately found SC2034 in the SERVER.  Then a 2026-10-20 sweep found
+    # TWELVE more SC2034 sites -- all of them in smoke/ itself, invisible to a
+    # lock that only looked at skill/assets: dead status captures in 05/06/07/15
+    # that read like assertions about to be made.  A check that silently stops
+    # checking is worse than an asset defect, because it hides the next one.
+    while IFS= read -r shell_script; do
+        lint_shell_file "$shell_script" "${shell_script#"$root"/}"
+        shellcheck_scripts=$((shellcheck_scripts + 1))
+    done < <({ find "$root/smoke" -type f -name '*.sh'; printf '%s\n' "$root/run-tests.sh" "$root/sandbox.sh"; } | sort)
+    # Zero in EITHER set means an enumeration failed, not that there was nothing
+    # to check -- the same reasoning as the shell enumeration in smoke/01.
+    if [ "$shellcheck_assets" -eq 0 ]; then
+        printf 'client-contract: no shell assets were enumerated for shellcheck; refusing to report a pass\n' >&2
+        shellcheck_bad=$((shellcheck_bad + 1))
+    fi
+    if [ "$shellcheck_scripts" -eq 0 ]; then
+        printf 'client-contract: no repo scripts were enumerated for shellcheck; refusing to report a pass\n' >&2
+        shellcheck_bad=$((shellcheck_bad + 1))
+    fi
+    cases=$((cases + 1))
+    failures=$((failures + shellcheck_bad))
+    shellcheck_summary="checked($shellcheck_assets) scriptcheck=checked($shellcheck_scripts)"
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'client-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
 
-printf 'client-contract checks passed: cases=%s env=%s cred=%s stub-ssh=yes reason=forwarded/injection-safe exit-token=last-wins windows-probe=stdin-fed/no-leak windows-submit=payload-delivered/args-checked/no-leak\n' "$cases" "$env_rejections" "$credential_cases"
+printf 'client-contract checks passed: cases=%s env=%s cred=%s stub-ssh=yes reason=forwarded/injection-safe exit-token=last-wins windows-probe=stdin-fed/no-leak windows-submit=payload-delivered/args-checked/no-leak shellcheck=%s\n' "$cases" "$env_rejections" "$credential_cases" "$shellcheck_summary"

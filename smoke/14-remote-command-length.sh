@@ -32,6 +32,21 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+
+# python3 is a real dependency of this check: the extraction / parsing steps
+# below are Python.  Probe that it RUNS, not that a name resolves -- measured
+# 2026-10-20 on a zh-CN Windows 10, where `python3` is the Microsoft Store
+# alias: the check died at its first Python step with exit 49 and ZERO output,
+# which run-tests.sh can only report as a bare FAIL with no cause.  Same rule as
+# the pwsh usability probes: an interpreter that cannot execute is an
+# ENVIRONMENT fault, say so and do not claim the contract ran.
+python3_probe_status=0
+python3 -c 'import sys' >/dev/null 2>&1 || python3_probe_status=$?
+if [ "$python3_probe_status" -ne 0 ]; then
+    printf '%s\n' 'remote-command-length NOT run: the python3 on PATH cannot execute (a Microsoft Store alias cannot run scripts).' >&2
+    printf '%s\n' 'Install a real Python 3 and put it on PATH, then re-run.' >&2
+    exit 1
+fi
 posix_client="$root/skill/assets/client/unix/agentq"
 windows_client="$root/skill/assets/client/windows/agentq.ps1"
 sshp_client="$root/skill/assets/client/windows/sshp.ps1"
@@ -117,11 +132,11 @@ check_site 'POSIX client: Windows protocol probe' "$(printf '%s' "$probe_cmdline
 # The script body must NOT be on that command line.  If a future edit goes back
 # to -EncodedCommand, site 1 above stays short only by accident of the extraction
 # and this assertion is what catches it.
-if printf '%s' "$probe_cmdline" | grep -q -- '-EncodedCommand'; then
+if grep -q -- '-EncodedCommand' <<< "$probe_cmdline"; then
     printf 'POSIX client: Windows protocol probe puts the script on the command line (-EncodedCommand)\n' >&2
     failures=$((failures + 1))
 fi
-if printf '%s' "$probe_cmdline" | grep -q -- '-Command -'; then
+if grep -q -- '-Command -' <<< "$probe_cmdline"; then
     :
 else
     printf 'POSIX client: Windows protocol probe does not read its script from stdin (-Command -)\n' >&2
@@ -135,19 +150,19 @@ fi
 # (which site 1 already measures) would let the platform probe regress to
 # -EncodedCommand while every length stayed green.
 platform_probe_body=$(extract_between "$posix_client" 'windows_probe_command() {' '}')
-if printf '%s' "$platform_probe_body" | grep -q 'make_windows_probe_script_file'; then
+if grep -q 'make_windows_probe_script_file' <<< "$platform_probe_body"; then
     :
 else
     printf 'POSIX client: Windows platform probe does not build a stdin script file\n' >&2
     failures=$((failures + 1))
 fi
-if printf '%s' "$platform_probe_body" | grep -q 'windows_probe_command_line'; then
+if grep -q 'windows_probe_command_line' <<< "$platform_probe_body"; then
     :
 else
     printf 'POSIX client: Windows platform probe does not use the shared command line\n' >&2
     failures=$((failures + 1))
 fi
-if printf '%s' "$platform_probe_body" | grep -q -- '-EncodedCommand'; then
+if grep -q -- '-EncodedCommand' <<< "$platform_probe_body"; then
     printf 'POSIX client: Windows platform probe puts the script on the command line (-EncodedCommand)\n' >&2
     failures=$((failures + 1))
 fi
@@ -184,11 +199,11 @@ PYEOF3
 )
 check_site 'Windows client: Windows protocol probe' \
     "$(printf '%s' "$win_probe_cmdline" | wc -c | tr -d '[:space:]')"
-if printf '%s' "$win_probe_cmdline" | grep -q -- '-EncodedCommand'; then
+if grep -q -- '-EncodedCommand' <<< "$win_probe_cmdline"; then
     printf 'Windows client: Windows protocol probe puts the script on the command line (-EncodedCommand)\n' >&2
     failures=$((failures + 1))
 fi
-if printf '%s' "$win_probe_cmdline" | grep -q -- '-Command -'; then
+if grep -q -- '-Command -' <<< "$win_probe_cmdline"; then
     :
 else
     printf 'Windows client: Windows protocol probe does not read its script from stdin (-Command -)\n' >&2
@@ -260,6 +275,110 @@ PYEOF5
 }
 check_site 'Windows client: unix probe script' "$(unix_cmdline_len Get-UnixProbeCommand)"
 check_site 'Windows client: unix install script' "$(unix_cmdline_len Get-UnixInstallCommand)"
+
+# 8. sshp.ps1: the Windows probe and install scripts.
+#
+# These sites did not exist before 2026-10-17, and their absence was the exact
+# shape of the P1 the audit found: the whole script (~8.1K Zellij resolver plus
+# the body) travelled as `-EncodedCommand <base64>` ON THE COMMAND LINE --
+# measured 23,210 / 23,882 chars, near three times the 8,125 budget -- while
+# nothing measured it.  The client's own launcher wrapper went unmeasured for
+# the same reason until 2026-09-24 (padded to 26,538 chars, still green).
+# Fixed the same way agentq.ps1 fixed its probe: the script rides STDIN
+# (`-Command -`), and the command line is the short constant.  Both commands
+# are built by Get-WindowsScriptInvocation, so the constant is extracted from
+# that function and asserted for the same two properties site 4 asserts for
+# agentq.ps1: no -EncodedCommand, and -Command - present.
+win_sshp_cmdline=$(python3 - "$sshp_client" <<'PYEOF6'
+import io, re, sys
+src = io.open(sys.argv[1], encoding="utf-8").read()
+fn = re.search(r"function Get-WindowsScriptInvocation \{\r?\n(.*?)\r?\n\}", src, re.S)
+if not fn:
+    sys.stdout.write("")
+    sys.exit(0)
+body = fn.group(1)
+m = re.search(r'Command = "([^"]*)"', body)
+sys.stdout.write(m.group(1) if m else "")
+PYEOF6
+)
+check_site 'sshp.ps1: Windows probe+install' "${#win_sshp_cmdline}"
+if grep -q -- '-EncodedCommand' <<< "$win_sshp_cmdline"; then
+    printf 'sshp.ps1 Get-WindowsScriptInvocation: the Windows script was put back on the command line (-EncodedCommand)\n' >&2
+    failures=$((failures + 1))
+fi
+if grep -q -- '-Command -' <<< "$win_sshp_cmdline"; then
+    :
+else
+    printf 'sshp.ps1 Get-WindowsScriptInvocation: does not read its script from stdin (-Command -)\n' >&2
+    failures=$((failures + 1))
+fi
+# The probe and install builders must both go through the stdin-channel helper
+# (a builder that quietly kept the old EncodedCommand shape would not be
+# measured by the constant above).  The PROBE must also still report the
+# resolved Zellij path: the session command is the two-stage form whose script
+# embeds that path, and a probe that stops reporting it makes every session
+# start refuse with "no resolved Zellij path" (measured mutation M4: dropping
+# the path line left this file green -- the length sites cannot see it).
+if ! awk '
+    $0 ~ "^function Get-WindowsProbeCommand \\{" { in_fn = 1 }
+    in_fn && /__SSHP_ZELLIJ__/ { found = 1 }
+    in_fn && /^\}/ { exit }
+    END { exit found ? 0 : 1 }
+' "$sshp_client"; then
+    printf '%s\n' 'sshp.ps1 Get-WindowsProbeCommand: no longer reports the resolved Zellij path; the session start would refuse on every Windows host' >&2
+    failures=$((failures + 1))
+fi
+for win_sshp_site in Get-WindowsProbeCommand Get-WindowsInstallCommand; do
+    if ! grep -q "return Get-WindowsScriptInvocation -ScriptText" "$sshp_client" ||
+        ! awk -v fn="$win_sshp_site" '
+            $0 ~ "^function " fn " \\{" { in_fn = 1 }
+            in_fn && /return Get-WindowsScriptInvocation -ScriptText/ { found = 1 }
+            in_fn && /^\}/ { exit }
+            END { exit found ? 0 : 1 }
+        ' "$sshp_client"; then
+        printf 'sshp.ps1 %s: no longer builds through the stdin-channel helper\n' "$win_sshp_site" >&2
+        failures=$((failures + 1))
+    fi
+done
+
+# 9. sshp.ps1: the Windows SESSION command -- the two-stage EncodedCommand form.
+# It is short because the resolver ran during the probe and only the attach
+# remains; this site exists so the property holds: a session command must stay
+# under the same budget.  The path literal the session embeds is capped at
+# 1024 chars in the client (remote-supplied text on a command line), so the
+# session's own bound is prefix + base64 of the script skeleton + 1024*4/3;
+# the measured number below uses the CAP, and any client change that lets the
+# path grow unbounded reds here without needing a hostile path to exist.
+win_sshp_session_len=$(python3 - "$sshp_client" <<'PYEOF7'
+import base64, io, re, sys
+src = io.open(sys.argv[1], encoding="utf-8").read()
+fn = re.search(r"function Get-WindowsSessionCommand \{\r?\n(.*?)\r?\n\}", src, re.S)
+if not fn:
+    sys.stdout.write("0")
+    sys.exit(0)
+body = fn.group(1)
+m = re.search(r'\$sessionScript = @"\r?\n(.*?)\r?\n"@', body, re.S)
+if not m:
+    sys.stdout.write("0")
+    sys.exit(0)
+script = m.group(1).replace("\r\n", "\n")
+# Read the cap from the client itself.  Hard-coding 1024 here (the first
+# version) made the site blind to the cap being raised: measured mutation M3,
+# `-gt 1024` -> `-gt 16384`, stayed green because the extractor still padded
+# to 1024.  The cap is the contract; the measurement must follow it.
+cap = re.search(r"\$script:ResolvedZellijPath\.Length -gt ([0-9]+)", body)
+if not cap:
+    sys.stdout.write("0")
+    sys.exit(0)
+limit = int(cap.group(1))
+script = script.replace("$zellijLiteral", "p" * limit)
+script = script.replace("$sessionLiteral", "s" * 256)
+encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+prefix = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "
+sys.stdout.write(str(len(prefix) + len(encoded)))
+PYEOF7
+)
+check_site 'sshp.ps1: Windows session (two-stage)' "$win_sshp_session_len"
 
 # The three DefaultShell limits this budget came from, restated so a reader can
 # re-derive the number instead of trusting it.

@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.15'
+agentq_version='0.1.16'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -3254,7 +3254,13 @@ archive_removed_request() {
     [ "$(jq -r '.state' <<<"$record")" = removed ] || fail "cannot archive a non-removed AgentQ request: $request_id"
     record_path=$(request_record_path "$request_id")
     tombstone_path=$(request_tombstone_path "$request_id")
-    tombstone=$(make_request_tombstone "$record")
+    # `|| return 1` is load-bearing: this function runs inside `if !` / `||`
+    # contexts where errexit is suspended, so a failing `$( )` leaves tombstone
+    # EMPTY and execution continues -- an empty tombstone would be written, the
+    # live record deleted, and the request id could then be reused (the submit
+    # path treats an unreadable tombstone as "never used").  Same fail-open
+    # class as the 2026-10-06 --workdir defect.
+    tombstone=$(make_request_tombstone "$record") || return 1
 
     if [ -e "$tombstone_path" ]; then
         existing_tombstone=$(read_request_tombstone "$request_id") || fail "invalid AgentQ request tombstone: $tombstone_path"
@@ -5652,7 +5658,13 @@ cancel_task() {
     # One status call, not two: raw_compact_task already fails for an unknown
     # id, so a separate existence probe would only duplicate the Pueue call.
     if task=$(raw_compact_task "$task_id"); then
-        created_at=$(jq -er '.created_at' <<<"$task")
+        # `|| fail`, not a bare assignment: cancel_task runs inside the lock's
+        # `if "$@"` body where errexit is suspended.  An empty created_at would
+        # be persisted into the cancellation marker, and valid_marker requires a
+        # non-empty one -- every later read of that marker would fail closed
+        # (exit 2), poisoning this task id until the file is removed by hand.
+        created_at=$(jq -er '.created_at' <<<"$task") ||
+            fail "cannot read the Pueue task creation time for cancellation: $task_id"
     else
         # $? is still raw_compact_task's status at the top of the else branch.
         raw_compact_status=$?
@@ -5822,7 +5834,6 @@ remove_tasks_by_label() {
 remove_task() {
     local task_id=$1
     local removable_task
-    local removal_status=0
     local request_id
     local record
     local removable_status=0
@@ -5843,8 +5854,6 @@ remove_task() {
         fi
         jq -cn --argjson task_id "$task_id" '{task_id: $task_id, removed: true}'
         return 0
-    else
-        removal_status=$?
     fi
 
     if request_id=$(request_id_from_task "$removable_task"); then

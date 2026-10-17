@@ -274,7 +274,7 @@ function Install-CommitSet {
             $temporaryPath = New-InstallerTemporaryFile -Directory $DestinationDirectory -Prefix "stage"
             Assert-NonReparsePathChain -Path $temporaryPath -Description "client temporary file"
             [void]$stagedTemporaryPaths.Add($temporaryPath)
-            Copy-Item -LiteralPath $SourcePath -Destination $temporaryPath -Force
+            Copy-Item -LiteralPath $sourcePath -Destination $temporaryPath -Force
             if ($item.PSObject.Properties["Prepare"] -and $null -ne $item.Prepare) {
                 & $item.Prepare $temporaryPath
             }
@@ -546,7 +546,18 @@ if ($null -ne $gitBashPath) {
                 SourcePath    = $shimSourcePath
                 DestinationPath = $shimPath
                 Description   = $client
+                # Applied TWICE on purpose.  Prepare tightens the staged file so
+                # the committed file is never briefly visible with the inherited
+                # ACL; PostCommit re-applies to the final path because
+                # File.Replace's security-descriptor semantics are not something
+                # this installer should depend on -- if the replaced file's ACL
+                # wins, the Prepare step's work would be silently undone, and
+                # the verification inside Set-ClientLauncherAcl would still have
+                # passed (it runs on the staged path, before the swap).  The
+                # function is idempotent: it drops every rule and re-adds the
+                # same four.
                 Prepare       = { param($path) Set-ClientLauncherAcl -Path $path }
+                PostCommit    = { param($path) Set-ClientLauncherAcl -Path $path }
             })
     }
 }

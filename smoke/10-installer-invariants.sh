@@ -78,6 +78,21 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+
+# python3 is a real dependency of this check: the extraction / parsing steps
+# below are Python.  Probe that it RUNS, not that a name resolves -- measured
+# 2026-10-20 on a zh-CN Windows 10, where `python3` is the Microsoft Store
+# alias: the check died at its first Python step with exit 49 and ZERO output,
+# which run-tests.sh can only report as a bare FAIL with no cause.  Same rule as
+# the pwsh usability probes: an interpreter that cannot execute is an
+# ENVIRONMENT fault, say so and do not claim the contract ran.
+python3_probe_status=0
+python3 -c 'import sys' >/dev/null 2>&1 || python3_probe_status=$?
+if [ "$python3_probe_status" -ne 0 ]; then
+    printf '%s\n' 'installer-invariants NOT run: the python3 on PATH cannot execute (a Microsoft Store alias cannot run scripts).' >&2
+    printf '%s\n' 'Install a real Python 3 and put it on PATH, then re-run.' >&2
+    exit 1
+fi
 # The installer paths can be overridden (mirrors smoke/05's AGENTQ_SMOKE_CLIENT
 # and smoke/12's AGENTQ_SMOKE_PS_CLIENT) so a mutation proof can point the rule
 # scan at a modified copy -- without the hook, red-proofing a source-level fix
@@ -121,7 +136,7 @@ if [ -z "$declarations" ]; then
     fail "$server_installer" "no [int]\$MaximumBytes parameter found at all; the reader's limit is no longer raisable by a caller"
 else
     while IFS= read -r decl; do
-        if ! printf '%s' "$decl" | grep -qE '\[int\]\$MaximumBytes = [0-9]+'; then
+        if ! grep -qE '\[int\]\$MaximumBytes = [0-9]+' <<< "$decl"; then
             fail "$server_installer" "line ${decl%%:*} declares -MaximumBytes with no default; a caller that omits it gets an unusable limit"
         fi
     done <<EOF
@@ -172,8 +187,8 @@ if [ -n "$redirect_sites" ]; then
     reader_body=$(awk '/^function Read-AgentQInstallerJsonFile/ { in_fn = 1 }
                        in_fn { print }
                        in_fn && /^}/ { exit }' "$server_installer")
-    if ! printf '%s' "$reader_body" | grep -q '0xFF' ||
-        ! printf '%s' "$reader_body" | grep -q '0xFE'; then
+    if ! grep -q '0xFF' <<< "$reader_body" ||
+        ! grep -q '0xFE' <<< "$reader_body"; then
         while IFS= read -r line; do
             fail "$server_installer" "line ${line%%:*} writes JSON by redirect, but its reader (Read-AgentQInstallerJsonFile) has no BOM detection; the UTF-16LE output would not parse"
         done <<EOF
@@ -507,7 +522,11 @@ for file in "$server_installer" "$client_installer"; do
         # `grep -vE '^[0-9]+:[[:space:]]*#'` drops comments.  A comment is not a
         # guard, and the fix for this very defect quotes the bad pattern in one
         # -- a rule that counted it would fail the corrected file.
-        while IFS=: read -r lineno text; do
+        # The line TEXT is not needed -- the rule reports the file and line
+        # number and quotes the pattern itself -- so it is `_text`, not `text`
+        # (shellcheck SC2034, and a named-but-unread variable suggests the
+        # message was meant to include it).
+        while IFS=: read -r lineno _text; do
             [ -n "$lineno" ] || continue
             fail "$file" "line $lineno guards [AllowNull()][string] \$$var with a \$null comparison; PowerShell coerces \$null to \"\" for [string], so the guard passes on the empty value"
         done <<EOF
@@ -565,7 +584,7 @@ while IFS='|' read -r template renderer guard_marker; do
     # source, i.e. named by a substitution).  A token only in the template is one
     # nothing substitutes -- exactly the drift this rule exists for.
     for token in $template_tokens; do
-        if ! printf '%s\n' "$renderer_tokens" | grep -qxF -- "$token"; then
+        if ! grep -qxF -- "$token" <<< "$renderer_tokens"; then
             fail "$template" "placeholder $token appears in the template but not in ${renderer#"$root"/}: nothing substitutes it, so it would ship literally"
         fi
     done
@@ -704,10 +723,10 @@ client_finally=$(awk '
 if [ -z "$client_finally" ]; then
     fail "$client_installer" "could not extract Install-CommitSet its finally block; rule K cannot conclude"
 else
-    cleanup_throw=$(printf '%s\n' "$client_finally" | grep -cE '^\s*throw "Client installer temporary cleanup failed"' || true)
+    cleanup_throw=$(grep -cE '^\s*throw "Client installer temporary cleanup failed"' <<< "$client_finally" || true)
     if [ "$cleanup_throw" -eq 0 ]; then
         fail "$client_installer" "Install-CommitSet no longer throws when its temporary cleanup fails; a cleanup failure would pass silently"
-    elif ! printf '%s\n' "$client_finally" | grep -qE '\$originalError'; then
+    elif ! grep -qE '\$originalError' <<< "$client_finally"; then
         fail "$client_installer" "Install-CommitSet throws on cleanup failure without testing a captured exception; the throw replaces the in-flight error and masks why the install failed"
     fi
 fi

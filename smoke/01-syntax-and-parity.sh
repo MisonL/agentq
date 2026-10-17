@@ -6,7 +6,13 @@
 #   .ps1 assets   -> PowerShell AST parse; reports 'skipped(pwsh-absent)' if pwsh
 #                    is missing and 'skipped(pwsh-unusable)' (plus a failure) if
 #                    pwsh is on PATH but cannot run -- an environment fault must
-#                    not be reported as seven broken assets
+#                    not be reported as seven broken assets.  The same AST pass
+#                    also runs the static rules (ps1_static): a name assigned
+#                    only $null must not be read, a name assigned anywhere
+#                    must be read somewhere, and no .NET API may be used that
+#                    .NET Framework 4.x lacks -- Windows PowerShell 5.1 and
+#                    PowerShell 7.x must both be able to run these assets
+#                    (see the rule comments below)
 #   .plist assets -> XML well-formedness, plus plutil -lint on macOS
 #   .yml assets   -> YAML parse (python3 + pyyaml)
 #   .service      -> structural check: required sections and keys, absolute
@@ -21,6 +27,12 @@
 #   tools         -> every probe tool is inventoried; one that is missing turns
 #                    the summary into skipped(tool-...), which run-tests.sh
 #                    routes to its PART bucket instead of a green ok
+#   repo scripts  -> no pipeline into a quiet grep (`grep -q`/`-m`): it exits
+#                    before draining stdin, so any upstream stage can take
+#                    SIGPIPE and pipefail turns a FOUND match into "absent".
+#                    Writer-agnostic on purpose -- function writers and
+#                    absolute paths both escaped the first, printf-only rule.
+#                    `grep -c` is excluded: it must read every line.
 #
 # These are syntax and shape checks, not behaviour.  A .cmd can be
 # well-formed and still wrong; a plist can parse and still be rejected by
@@ -89,6 +101,30 @@ if command -v pwsh >/dev/null 2>&1; then
     fi
 fi
 
+# Encoding rule, independent of pwsh: a .ps1 that is not pure ASCII MUST carry
+# a UTF-8 BOM.  Windows PowerShell 5.1 decodes a BOM-less script with the ANSI
+# code page, so a non-ASCII byte inside a STRING LITERAL silently becomes
+# mojibake -- measured on the windows CI job (run 37810470283): the literal
+# `任务` reached the payload as `ä»»åŠ¡`.  A non-ASCII byte in a COMMENT is
+# harmless today, but the rule is byte-level because "comment vs literal" is
+# exactly what a later edit can change.  The launcher carries a BOM already;
+# the other six assets are ASCII, which is the simplest state to keep.
+ps1_encoding_failures=0
+while IFS= read -r file; do
+    bom=$(head -c 3 "$file" | od -An -tx1 | tr -d ' \n')
+    if [ "$bom" = "efbbbf" ]; then
+        continue
+    fi
+    if LC_ALL=C grep -q '[^[:print:][:space:]]' "$file"; then
+        printf 'non-ASCII in a BOM-less .ps1: %s (PowerShell 5.1 decodes it with the ANSI code page; add a UTF-8 BOM or keep the file ASCII)\n' "${file#"$root"/}" >&2
+        ps1_encoding_failures=$((ps1_encoding_failures + 1))
+    fi
+done < <(find "$root/skill/assets" -type f -name '*.ps1' | sort)
+if [ "$ps1_encoding_failures" -ne 0 ]; then
+    failures=$((failures + ps1_encoding_failures))
+fi
+ps1_encoding_summary=checked
+
 if [ "$pwsh_state" = usable ]; then
     parse_ps1=$(mktemp "${TMPDIR:-/tmp}/agentq-parse-ps1.XXXXXX.ps1")
     trap 'rm -f -- "$parse_ps1"' EXIT
@@ -111,6 +147,347 @@ PSEOF
         ps_count=$((ps_count + 1))
     done < <(find "$root/skill/assets" -type f -name '*.ps1' | sort)
     ps_summary=$ps_count
+
+    # --- PowerShell variable rules ------------------------------------------
+    # Two defects found by reading the assets, both invisible to the parse above
+    # and to every behavioural check (the installers only run on a Windows host):
+    #
+    #  1. `2> $smokeLogErrorPath` in Assert-PueueSmokeLogContainsToken, where
+    #     that name was assigned ONLY `$null`, and only in the CALLING function.
+    #     PowerShell's dynamic scope resolves the name from the caller, so the
+    #     redirect quietly became `2> $null` -- and the cleanup branch guarding
+    #     it could never run.  Measured on this host: `2> $null` and `2> <a
+    #     variable holding $null>` both discard the child's stderr and create no
+    #     file.  The defect is not the discard; it is that the code SAYS it is
+    #     capturing stderr to a file it will clean up, and does neither.
+    #  2. `$health = Get-PueueHealthFromTemporaryFile ...` where the value is
+    #     never read.  The call must stay -- it is the validation -- but the
+    #     bare `$name =` reads as "the result matters" and, more importantly,
+    #     invites a future edit to drop the assignment: the installer's success
+    #     stream IS its JSON response, so an unconsumed return would land in
+    #     front of it.
+    #
+    # Rule 1: a variable assigned only $null must not be read.  A `[ref]`
+    # parameter is exempt -- the callee writes it, which is why it starts $null.
+    # Rule 2: a variable assigned somewhere must be read SOMEWHERE in the file.
+    # File-wide, not function-scoped, on purpose: dynamic scope lets a callee
+    # read the caller's variable, so a function-scoped read set would report
+    # false positives.  That makes rule 2 blind to a name that is written in one
+    # function and read in another -- the direction that is safe here, since a
+    # missed read only means a missed warning, never a false alarm.
+    #
+    # Neither rule is `PSUseDeclaredVarsMoreThanAssignments`: it misses rule 1
+    # entirely (the name IS read), and it flags the `[ref]` out-parameters.
+    rules_ps1=$(mktemp "${TMPDIR:-/tmp}/agentq-ps-static-rules.XXXXXX.ps1")
+    trap 'rm -f -- "$parse_ps1" "$rules_ps1"' EXIT
+    cat > "$rules_ps1" <<'PSEOF'
+param([string]$Root, [switch]$Calibrate)
+
+$errors = $null; $tokens = $null
+
+# Preference and automatic variables are read by the RUNTIME, not by any
+# expression in the file, so a static read-collector cannot see their reads.
+$runtimeRead = @('erroractionpreference','progresspreference','warningpreference',
+    'verbosepreference','debugpreference','informationpreference','confirmpreference',
+    'whatifpreference','outputencoding','ofs')
+
+# Static members that exist on .NET Core (PowerShell 7.x) but NOT on .NET
+# Framework 4.x (Windows PowerShell 5.1).  Each entry carries the portable
+# alternative, because the point of the rule is that the FIX is mechanical.
+# Measured 2026-10-19 on pwsh 7.5.4: [System.IO.File].GetMethods() lists
+# Move(String, String) and Move(String, String, Boolean).
+#
+# The list must stay SHORT and true.  The first version of this rule also
+# carried Directory.Move and File.Move arity 2 -- the opposite mistake, with
+# the same effect on the reader: a rule that flags portable code.
+# Directory.Move is BCL since 2.0 and File.Move(a, b) likewise; they belong on
+# the allowed side.  Both are gone, and the calibration fixture now calls the
+# two-argument File.Move so the always-correct form is refused if it returns.
+$coreOnlyTraps = @(
+    @{ Type = 'System.IO.File';      Member = 'Move';     Arity = 3;
+       Why = 'File.Move(a, b, overwrite) is .NET Core 3.0+ only; when the destination exists use [System.IO.File]::Replace (2.0+), otherwise the 2-arg File.Move' },
+    @{ Type = 'System.IO.Path';      Member = 'Join';     Arity = -1;
+       Why = 'Path.Join is .NET Core 2.0+ only; use [System.IO.Path]::Combine' },
+    @{ Type = 'System.IO.File';      Member = 'ReadAllTextAsync';  Arity = -1; Why = 'the async file APIs are Core-only' },
+    @{ Type = 'System.IO.File';      Member = 'WriteAllTextAsync'; Arity = -1; Why = 'the async file APIs are Core-only' },
+    @{ Type = 'System.IO.File';      Member = 'AppendAllTextAsync'; Arity = -1; Why = 'the async file APIs are Core-only' }
+)
+
+# Two traps that take an INSTANCE receiver, so the static-member loop below
+# cannot see them.  [string]::Contains does not exist on any runtime (measured
+# 2026-10-19 on pwsh 7.5.4: "[System.String] does not contain a method named
+# 'Contains'"), and String.Contains(String, StringComparison) is .NET Core 2.1+
+# only with no 5.1 form at all.  The calibration fixture exercises both.
+#
+# Type names both entries so the STATIC form is caught too: `[string]::Contains`
+# is the same nonexistent member written as a static call, and the first version
+# of this table only looked at instance receivers, so that spelling escaped.
+# Instance receivers carry no type, so the member/arity match stands alone there.
+$instanceOnlyTraps = @(
+    @{ Type = 'System.String'; Member = 'Contains'; Arity = 2;
+       Why = 'String.Contains(String, StringComparison) is .NET Core 2.1+ only (and String has no static Contains on any runtime); use IndexOf(...) -ge 0' }
+)
+
+function Get-PsStaticViolations {
+    param([string]$Path)
+
+    $out = New-Object System.Collections.ArrayList
+    $err = $null; $tok = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tok, [ref]$err)
+    if ($err.Count) { return $out }   # the parse pass owns syntax failures
+    $name = Split-Path -Leaf $Path
+
+    # --- rule 1: a variable whose only value is $null must not be read --------
+    # A name is DECLARED by an assignment, a foreach loop variable, or a
+    # parameter.  The foreach case cost a false positive: `$e = $null` followed
+    # by `foreach ($e in ...)` assigns a REAL value every iteration, but a
+    # ForEachStatementAst is not an AssignmentStatementAst, so the null-only map
+    # saw a variable that is null forever and flagged legal code.
+    $nullOnly = @{}
+    $record = {
+        param($varAst, $isNull, $line)
+        $n = $varAst.VariablePath.UserPath
+        if ($n -eq 'null' -or $n.Contains(':')) { return }
+        $k = $n.ToLower()
+        if (-not $nullOnly.ContainsKey($k)) { $nullOnly[$k] = @{ Real = $false; Line = $line; Name = $n } }
+        if (-not $isNull) { $nullOnly[$k].Real = $true }
+    }
+    foreach ($a in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
+        $l = $a.Left
+        if ($l -is [System.Management.Automation.Language.ConvertExpressionAst]) { $l = $l.Child }
+        if (-not ($l -is [System.Management.Automation.Language.VariableExpressionAst])) { continue }
+        $rhs = $a.Right
+        if ($rhs -is [System.Management.Automation.Language.PipelineAst] -and $rhs.PipelineElements.Count -eq 1) { $rhs = $rhs.PipelineElements[0] }
+        if ($rhs -is [System.Management.Automation.Language.CommandExpressionAst]) { $rhs = $rhs.Expression }
+        if ($rhs -is [System.Management.Automation.Language.ParenExpressionAst]) { $rhs = $rhs.Pipeline }
+        if ($rhs -is [System.Management.Automation.Language.PipelineAst] -and $rhs.PipelineElements.Count -eq 1) { $rhs = $rhs.PipelineElements[0] }
+        if ($rhs -is [System.Management.Automation.Language.CommandExpressionAst]) { $rhs = $rhs.Expression }
+        $isNull = ($rhs -is [System.Management.Automation.Language.VariableExpressionAst] -and $rhs.VariablePath.UserPath -eq 'null')
+        & $record $l $isNull $a.Extent.StartLineNumber
+    }
+    foreach ($fe in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ForEachStatementAst] }, $true)) {
+        & $record $fe.Variable $false $fe.Extent.StartLineNumber
+    }
+    $refUsed = @{}
+    foreach ($c in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ConvertExpressionAst] }, $true)) {
+        if ($c.Type.TypeName.Name -eq 'ref' -and $c.Child -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            $refUsed[$c.Child.VariablePath.UserPath.ToLower()] = $true
+        }
+    }
+    foreach ($v in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) {
+        $k = $v.VariablePath.UserPath.ToLower()
+        if (-not $nullOnly.ContainsKey($k) -or $nullOnly[$k].Real -or $refUsed.ContainsKey($k)) { continue }
+        $p = $v.Parent
+        if ($p -is [System.Management.Automation.Language.AssignmentStatementAst] -and $p.Left -eq $v) { continue }
+        if ($p -is [System.Management.Automation.Language.ConvertExpressionAst] -and $p.Parent -is [System.Management.Automation.Language.AssignmentStatementAst] -and $p.Parent.Left -eq $p) { continue }
+        if ($p -is [System.Management.Automation.Language.ParameterAst]) { continue }
+        if ($p -is [System.Management.Automation.Language.ForEachStatementAst]) { continue }
+        [void]$out.Add(("{0}:{1}: `${2} is assigned only `$null (line {3}) but read here; the read can never see anything else" -f $name, $v.Extent.StartLineNumber, $nullOnly[$k].Name, $nullOnly[$k].Line))
+    }
+
+    # --- rule 2: a name assigned somewhere must be read somewhere -------------
+    # File-wide, not function-scoped, on purpose: dynamic scope lets a callee
+    # read the caller's variable, so a function-scoped read set would report
+    # false positives.  The cost is blindness to write-here/read-there, which
+    # can only MISS a warning, never raise a false one.
+    $assigned = @{}
+    foreach ($a in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
+        $l = $a.Left
+        if ($l -is [System.Management.Automation.Language.ConvertExpressionAst]) { $l = $l.Child }
+        if (-not ($l -is [System.Management.Automation.Language.VariableExpressionAst])) { continue }
+        $raw = $l.VariablePath.UserPath
+        if ($raw -match '^env:') { continue }   # an environment write IS the side effect
+        if ($raw.Contains(':')) { $raw = $raw.Substring($raw.LastIndexOf(':') + 1) }
+        $k = $raw.ToLower()
+        if ($raw -eq 'null' -or $runtimeRead -contains $k -or $k.StartsWith('_')) { continue }
+        if (-not $assigned.ContainsKey($k)) { $assigned[$k] = @($raw, $a.Extent.StartLineNumber) }
+    }
+    $read = @{}
+    foreach ($v in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) {
+        $p = $v.Parent
+        if ($p -is [System.Management.Automation.Language.AssignmentStatementAst] -and $p.Left -eq $v) { continue }
+        if ($p -is [System.Management.Automation.Language.ConvertExpressionAst] -and $p.Parent -is [System.Management.Automation.Language.AssignmentStatementAst] -and $p.Parent.Left -eq $p) { continue }
+        $raw = $v.VariablePath.UserPath
+        if ($raw.Contains(':')) { $raw = $raw.Substring($raw.LastIndexOf(':') + 1) }
+        $read[$raw.ToLower()] = $true
+    }
+    foreach ($k in ($assigned.Keys | Sort-Object)) {
+        if ($read.ContainsKey($k)) { continue }
+        [void]$out.Add(("{0}:{1}: `${2} is assigned and never read anywhere in the file; the call is for its side effect, so say so (`$null = ... or [void](...))" -f $name, $assigned[$k][1], $assigned[$k][0]))
+    }
+
+    # --- rule 3: only .NET APIs that exist on BOTH runtimes -------------------
+    # The deployment unit has to run under Windows PowerShell 5.1 (.NET
+    # Framework) and PowerShell 7.x (.NET Core); a Core-only member is not a
+    # parse error and not a lint hit -- it is a RUNTIME binding failure on 5.1,
+    # and 5.1 is what the .cmd/.bash launchers use.  This is the check that the
+    # local suite could not otherwise perform, because pwsh 7 is the only
+    # engine the suite runs on here.
+    #
+    # The type name is RESOLVED before it is compared.  Originally the
+    # comparison was ieq against the table's long form, so `[IO.File]::Move(a,
+    # b, $true)` -- legal PowerShell, same .NET type -- matched nothing and the
+    # rule was blind to it (measured: the written name is `IO.File`, and
+    # `[IO.File]::Move` is what a short-form edit produces).  A profile-blind
+    # rule is worse than none when its whole purpose is a second engine the
+    # development host does not have.  GetReflectionType() is the resolver
+    # PowerShell itself uses for `[IO.File]`, so `[IO.File]` and
+    # `[System.IO.File]` both arrive as System.IO.File and `[File]` -- which
+    # resolves only with a `using namespace` this repo does not use -- arrives
+    # empty and falls back to the written name, i.e. matches the table only
+    # when the table itself is written that way.
+    foreach ($n in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true)) {
+        $member = $n.Member.Extent.Text
+        $arity = @($n.Arguments).Count
+        if ($n.Static) {
+            if (-not ($n.Expression -is [System.Management.Automation.Language.TypeExpressionAst])) { continue }
+            $written = $n.Expression.TypeName.FullName
+            $resolved = ''
+            try { $resolved = $n.Expression.TypeName.GetReflectionType().FullName } catch { }
+            if ([string]::IsNullOrEmpty($resolved)) { $resolved = $written }
+            # Both tables: the instance table carries a Type precisely so its
+            # static spelling (`[string]::Contains`, nonexistent on every
+            # runtime) is caught here as well.
+            foreach ($t in @($coreOnlyTraps) + @($instanceOnlyTraps)) {
+                if (($resolved -ieq $t.Type -or $written -ieq $t.Type) -and $member -ieq $t.Member -and ($t.Arity -eq -1 -or $arity -eq $t.Arity)) {
+                    [void]$out.Add(("{0}:{1}: [{2}]::{3} with {4} argument(s) -- {5}" -f $name, $n.Extent.StartLineNumber, $resolved, $member, $arity, $t.Why))
+                }
+            }
+        } else {
+            # An instance receiver can be any object, and its type is not
+            # recoverable by static analysis here (the assets always call
+            # $variable.Contains(...)).  Member + arity alone is therefore NOT
+            # enough: HashSet<T>.Contains(item, comparer) has the same shape as
+            # the defect and is portable -- an earlier version of this rule
+            # reported it, which is the false-positive class that gets a rule
+            # switched off.  The second argument is the discriminator (see
+            # below).  The STATIC spelling of the same trap is caught by the
+            # static arm above, which is why the entry carries a Type.
+            foreach ($t in $instanceOnlyTraps) {
+                if (-not ($member -ieq $t.Member -and $arity -eq $t.Arity)) { continue }
+                # Member+arity alone is not the defect: HashSet<T>.Contains(x,
+                # comparer) takes two arguments, is portable, and this repo
+                # constructs eight Generic.List[string] collections already --
+                # a rule that cries wolf on that gets switched off.  The
+                # discriminator is the SECOND ARGUMENT: only the String overload
+                # takes a StringComparison, and that overload is the Core-only
+                # one.  So require the second argument to be a member access on
+                # System.StringComparison (`[System.StringComparison]::Ordinal`).
+                # A StringComparison held in a VARIABLE is not resolved here --
+                # recorded as a blind spot rather than guessed at; the shape the
+                # assets would actually write is the inline member.
+                $second = @($n.Arguments)[$arity - 1]
+                $comparisonType = ''
+                if ($second -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                    $second.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) {
+                    try { $comparisonType = $second.Expression.TypeName.GetReflectionType().FullName } catch { }
+                }
+                if ($comparisonType -ine 'System.StringComparison') { continue }
+                [void]$out.Add(("{0}:{1}: .{2} with {3} argument(s) and a StringComparison -- {4}" -f $name, $n.Extent.StartLineNumber, $member, $arity, $t.Why))
+            }
+        }
+    }
+
+    return $out
+}
+
+if ($Calibrate) {
+    # A rule that has never been shown to accept legal code is a rule that gets
+    # switched off the first time it cries wolf; a rule that has never been
+    # shown to reject the defect is a rule that may match nothing at all.  Both
+    # fixtures travel with the rule.
+    $calibration = Join-Path ([System.IO.Path]::GetTempPath()) ("agentq-psstatic-" + $PID)
+    $null = New-Item -ItemType Directory -Path $calibration -Force
+    try {
+        $legal = Join-Path $calibration 'legal.ps1'
+        Set-Content -LiteralPath $legal -Value @'
+Set-StrictMode -Version Latest
+function Get-Legal {
+    param([string]$Path)
+    $literal = $null
+    $parsed = [int]::TryParse("5", [ref]$literal)
+    Write-Host "parsed=$parsed literal=$literal"
+    foreach ($item in @(1, 2)) { Write-Host "in loop: $item" }
+    $entry = $null
+    foreach ($entry in @(1, 2)) { Write-Host "released after: $entry" }
+    $table = @{ LiteralPath = $Path }
+    Get-Item @table | Out-Null
+    $env:AGENTQ_CALIBRATION = "1"
+    [System.IO.File]::Move($Path, "$Path.moved")
+    if ([System.IO.File]::Exists($Path)) { [System.IO.File]::Replace("$Path.new", $Path, "$Path.bak", $true) }
+    [System.IO.Directory]::Move("$Path.a", "$Path.b")
+    Write-Host ("contains: " + ([string]::Join(",", @("a", "b"))))
+    if ($Path.IndexOf("x", [System.StringComparison]::Ordinal) -ge 0) { Write-Host "found" }
+    if ($Path.Contains("x")) { Write-Host "plain contains is fine" }
+    # A two-argument Contains on a COLLECTION is portable and must stay legal:
+    # HashSet<T>.Contains(item, comparer) takes two arguments, and this repo
+    # constructs Generic.List/HashSet collections in eight places.  The rule
+    # keys on the StringComparison argument, not on member+arity, so this
+    # fixture turns red if that discrimination is ever lost.
+    $set = [System.Collections.Generic.HashSet[string]]::new()
+    if ($set.Contains("x", [System.StringComparer]::OrdinalIgnoreCase)) { Write-Host "collection contains is fine" }
+}
+function Use-Legal { Get-Legal -Path "/tmp" }
+Use-Legal
+'@
+        $defect = Join-Path $calibration 'defect.ps1'
+        Set-Content -LiteralPath $defect -Value @'
+Set-StrictMode -Version Latest
+function Invoke-Outer {
+    $errorPath = $null
+    Invoke-Inner
+    $health = Get-Item -LiteralPath "/tmp"
+    [System.IO.File]::Move("/tmp/a", "/tmp/b", $true)
+    [IO.File]::Move("/tmp/c", "/tmp/d", $true)
+    $text = "abc"
+    if ($text.Contains("b", [System.StringComparison]::Ordinal)) { Write-Host "hit" }
+}
+function Invoke-Inner {
+    & sh -c 'true' 2> $errorPath
+}
+Invoke-Outer
+'@
+        $legalOut = Get-PsStaticViolations -Path $legal
+        if ($legalOut.Count -ne 0) {
+            Write-Host "calibration FAILED: the rules reject legal code ($($legalOut.Count) violations)"
+            $legalOut | ForEach-Object { Write-Host "  $_" }
+            exit 2
+        }
+        $defectOut = Get-PsStaticViolations -Path $defect
+        if ($defectOut.Count -ne 5) {
+            Write-Host "calibration FAILED: the rules found $($defectOut.Count) violations in the defect fixture, expected 5"
+            $defectOut | ForEach-Object { Write-Host "  $_" }
+            exit 2
+        }
+        Write-Host "ps-static rules calibrated (legal=0 defects=5)"
+    } finally {
+        Remove-Item -LiteralPath $calibration -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+$violations = 0
+$files = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Filter *.ps1 | Sort-Object FullName)
+if ($files.Count -eq 0) { Write-Host "no .ps1 assets were enumerated under $Root"; exit 2 }
+foreach ($file in $files) {
+    $found = Get-PsStaticViolations -Path $file.FullName
+    foreach ($line in $found) { Write-Host $line; $violations++ }
+}
+if ($violations -gt 0) { exit 1 }
+if (-not $Calibrate) { Write-Host ("ps-static rules ok (NOT calibrated): files={0}" -f $files.Count) }
+exit 0
+PSEOF
+    # -Calibrate is not optional.  It runs the rule over a LEGAL fixture and a
+    # DEFECT fixture built inside the script, and refuses to report on the
+    # assets unless the rule accepts the first and flags the second.  Without
+    # it, a rule that has quietly stopped matching anything reads exactly like
+    # a clean tree -- the failure mode this repo has already paid for twice
+    # (smoke/01's own config-pattern extraction, smoke/10's rule A).
+    if ! pwsh -NoProfile -NonInteractive -File "$rules_ps1" -Root "$root/skill/assets" -Calibrate >/dev/null; then
+        printf '%s\n' 'PowerShell static rules FAILED (a $null-only variable that is read, an assignment nobody reads, or a .NET API that is missing on Windows PowerShell 5.1):' >&2
+        pwsh -NoProfile -NonInteractive -File "$rules_ps1" -Root "$root/skill/assets" -Calibrate >&2 || true
+        failures=$((failures + 1))
+    fi
+    ps_static_rules=ok
 else
     # Do not let a missing OR broken parser read as "the .ps1 assets were
     # checked".  These are distinct states: absent means the check could not run
@@ -121,6 +498,7 @@ else
         absent) ps_summary='skipped(tool-absent)' ;;
         *) ps_summary="skipped(pwsh-$pwsh_state)" ;;
     esac
+    ps_static_rules='skipped(pwsh-'"$pwsh_state"')'
 fi
 
 # --- tool inventory ----------------------------------------------------------
@@ -265,10 +643,35 @@ while IFS= read -r file; do
     # break the very thing it exists for.  Requiring the flag everywhere is
     # wrong, and so is omitting it everywhere -- the invariant is agreement.
     cmd_has_flag=true
-    grep -q -- '-NonInteractive' "$file" || cmd_has_flag=false
+    # Comments are excluded before matching.  Without this, deleting the real
+    # `-NonInteractive` from the command line and leaving a `rem -NonInteractive`
+    # behind kept the flag test true (measured 2026-10-21) -- the same
+    # "explanation satisfies the rule" hole smoke/12's stdin-guard lock closes
+    # by stripping comment lines.
+    # awk, NOT a printf-to-grep pipeline.  Under `set -o pipefail` a `grep -q`
+    # exits on its FIRST match and closes the pipe; printf then dies with
+    # SIGPIPE (141), and the pipeline reports failure even though the match was
+    # found -- a rule that was meant to say PRESENT says ABSENT.  Measured
+    # 2026-10-21 in a full suite run: this rule reported sshp.cmd as
+    # "delegates to a non-interactive script but omits -NonInteractive" with
+    # `printf: write error: Broken pipe` on stderr.  sshp.cmd omits the flag on
+    # purpose, so the wrong half is the TARGET predicate: sshp.ps1 does call
+    # Read-Host (line 903) and that pipeline still reported no match.  The
+    # trigger was not isolatable: the same pipeline over the same bytes passed
+    # 500 times standalone, 200 more under CPU load; a forced >64 KiB payload
+    # is the only reproducible form (rc=141).  Mechanism measured, rate not.
+    # One process, no pipe, no race.  [Rr][Ee][Mm]: BSD awk has no IGNORECASE.
+    if awk '!/^[[:space:]]*(@?[Rr][Ee][Mm]([[:space:]]|$)|::)/ && /-NonInteractive/ { found = 1; exit } END { exit !found }' "$file"; then
+        cmd_has_flag=true
+    else
+        cmd_has_flag=false
+    fi
     target_has_interactive=false
     if [ -n "$target" ] && [ -f "${file%/*}/$target" ]; then
-        if grep -qE 'Read-Host|ShouldContinue|ReadKey' "${file%/*}/$target"; then
+        # Same exclusion on the target: a `# Read-Host` comment must not make a
+        # non-interactive script look interactive (which would invert the rule
+        # and REQUIRE the flag to be dropped).
+        if awk '!/^[[:space:]]*#/ && /Read-Host|ShouldContinue|ReadKey/ { found = 1; exit } END { exit !found }' "${file%/*}/$target"; then
             target_has_interactive=true
         fi
     fi
@@ -315,6 +718,20 @@ version_server_line=$(grep -m1 '^agentq_version=' "$root/skill/assets/unix/agent
 version_server=${version_server_line#agentq_version=}
 version_server=${version_server#\'}
 version_server=${version_server%\'}
+# The two CLIENT constants belong in this comparison too.  Measured 2026-10-21:
+# bumping only `agentq_client_version` in the POSIX client (or only
+# $script:ClientVersion in the Windows one) left every check green -- the
+# single-deployment-unit rule (CLAUDE.md) exists precisely because clients and
+# server are upgraded together, and the one file that carries a client version
+# was the one file nothing compared.
+version_unix_client_line=$(grep -m1 '^agentq_client_version=' "$root/skill/assets/client/unix/agentq" || true)
+version_unix_client=${version_unix_client_line#agentq_client_version=}
+version_unix_client=${version_unix_client#\'}
+version_unix_client=${version_unix_client%\'}
+version_windows_client_line=$(grep -m1 '^\$script:ClientVersion = ' "$root/skill/assets/client/windows/agentq.ps1" || true)
+version_windows_client=${version_windows_client_line#* = }
+version_windows_client=${version_windows_client#\"}
+version_windows_client=${version_windows_client%\"}
 version_readme_line=$(grep -m1 '^\*\*Version:\*\* ' "$root/README.md" || true)
 version_readme=${version_readme_line#\*\*Version:\*\* }
 version_readme=${version_readme%% *}
@@ -327,7 +744,7 @@ version_check_record() {
         failures=$((failures + 1))
         return
     fi
-    if ! printf '%s' "$2" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    if ! grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' <<< "$2"; then
         printf 'version FAILED: the %s records "%s", which is not X.Y.Z\n' "$1" "$2" >&2
         failures=$((failures + 1))
         return
@@ -338,17 +755,19 @@ version_check_record 'POSIX installer' "$version_posix"
 version_check_record 'Windows installer' "$version_windows"
 version_check_record 'server' "$version_server"
 version_check_record 'README' "$version_readme"
+version_check_record 'POSIX client' "$version_unix_client"
+version_check_record 'Windows client' "$version_windows_client"
 
 version_unique_count=0
 if [ -n "$version_recorded" ]; then
     version_unique_count=$(printf '%s\n' $version_recorded | sort -u | grep -c . || true)
 fi
 if [ -z "$version_recorded" ]; then
-    printf '%s\n' 'version FAILED: no version was extracted from any of the four files; refusing to report a pass' >&2
+    printf '%s\n' 'version FAILED: no version was extracted from any of the six files; refusing to report a pass' >&2
     failures=$((failures + 1))
 elif [ "$version_unique_count" -ne 1 ]; then
-    printf 'version FAILED: the four records disagree -- POSIX installer "%s", Windows installer "%s", server "%s", README "%s"\n' \
-        "$version_posix" "$version_windows" "$version_server" "$version_readme" >&2
+    printf 'version FAILED: the six records disagree -- POSIX installer "%s", Windows installer "%s", server "%s", README "%s", POSIX client "%s", Windows client "%s"\n' \
+        "$version_posix" "$version_windows" "$version_server" "$version_readme" "$version_unix_client" "$version_windows_client" >&2
     failures=$((failures + 1))
 else
     version_summary=$version_posix
@@ -504,11 +923,54 @@ if [ "$shell_count" -eq 0 ]; then
     failures=$((failures + 1))
 fi
 
+# --- repo scripts: no pipeline into a quiet grep -----------------------------
+# The hazard is described in the .cmd rule above and in the header.  Every site
+# found on 2026-10-21 was converted, most to `grep ... <<< "$VAR"`; this lock
+# keeps the shape from returning.  Comment lines are skipped, so the rules'
+# own explanations may keep naming the pattern.  The diagnostic text is
+# deliberately worded WITHOUT the literal pipe, so this rule cannot flag its
+# own file.
+repo_pipe_count=0
+repo_script_count=0
+# The invariant is on the CONSUMER, not the writer: `grep -q` (and `-m`) exit
+# before draining stdin, so ANY upstream stage can take SIGPIPE, and under
+# pipefail that makes the pipeline non-zero even when the pattern matched --
+# `if !` then reads a found match as absent.  So the rule bans every pipeline
+# whose last stage is a quiet grep, whatever writes into it and however the
+# command is spelled (absolute paths like /usr/bin/grep escaped the first
+# version, which expected whitespace before the token).  `grep -c` is NOT
+# matched: it must read every line to count, so it cannot cause the race.
+# `(^|[^|])` keeps `a || grep -q file` from matching -- that is a fallback,
+# not a pipeline.
+repo_pipe_re='(^|[^|])[|][^|;&]*grep[^|;&]*-[a-zA-Z]*q'
+while IFS= read -r repo_script; do
+    repo_script_count=$((repo_script_count + 1))
+    repo_hits=$(grep -nE "$repo_pipe_re" "$repo_script" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#' || true)
+    if [ -n "$repo_hits" ]; then
+        while IFS= read -r repo_hit; do
+            printf 'repo script FAILED (a pipeline into a quiet grep reads a FOUND match as absent under pipefail): %s: %s\n' \
+                "${repo_script#"$root"/}" "$repo_hit" >&2
+            repo_pipe_count=$((repo_pipe_count + 1))
+        done <<EOF
+$repo_hits
+EOF
+        failures=$((failures + 1))
+    fi
+done <<EOF
+$(find "$root/smoke" -type f -name '*.sh' | sort)
+$root/run-tests.sh
+$root/sandbox.sh
+EOF
+if [ "$repo_script_count" -eq 0 ]; then
+    printf '%s\n' 'no repo scripts were enumerated for the pipe-lock; refusing to report a pass' >&2
+    failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s' \
-    "$shell_count" "$ps_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 printf '%s\n' "$summary"

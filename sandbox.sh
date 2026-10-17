@@ -127,6 +127,16 @@ fetch_verified() {
 
 cmd_up() {
     if daemon_responds; then
+        # Refresh the server copy even on the idempotent path: the sandbox is
+        # reused across days, so this file would otherwise stay at whatever the
+        # repo held the day the sandbox was BUILT (measured 2026-10-21: 247276
+        # bytes against the repo's 248213).  smoke/03 stages the repo asset
+        # itself and no longer depends on this, but a human poking at the
+        # sandbox with `$AGENTQ_SMOKE_HOME/agentq-server status` would be
+        # running a different build than the one under test.  Nothing else is
+        # touched -- the daemon keeps running untouched.
+        cp "$root/skill/assets/unix/agentq-server" "$agentq_home/agentq-server"
+        chmod 700 "$agentq_home/agentq-server"
         printf 'sandbox already running.\n\n  AGENTQ_SMOKE_HOME=%s ./run-tests.sh\n\n' "$agentq_home"
         return 0
     fi
