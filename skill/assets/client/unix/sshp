@@ -228,8 +228,14 @@ ssh_transport_error() {
     fi
     [ -s "$ssh_log_file" ] || return 1
     require_existing_runtime_file "$ssh_log_file" || return $?
-    LC_ALL=C tr -d '\r' < "$ssh_log_file" | LC_ALL=C grep -E -q \
-        '^(ssh: connect to host [^[:space:]]+ port [0-9]+: (Connection (refused|timed out|reset by peer|aborted)|Operation timed out|No route to host|Network is unreachable|Host is down)|Connection reset by [^[:space:]]+ port [0-9]+\.?|Connection to [^[:space:]]+ closed by remote host\.?|Connection timed out during banner exchange|banner exchange: Connection to [^[:space:]]+ port [0-9]+: (Connection (timed out|reset by peer)|No route to host|Network is unreachable|Host is down)|kex_exchange_identification: (read: )?(Connection (reset by peer|timed out|refused)|No route to host|Network is unreachable|Host is down)|client_loop: .* (Broken pipe|Connection reset by peer)|packet_write_wait: Connection to [^:]+: Broken pipe|Write failed: Broken pipe|Read from remote host [^:]+: Connection reset by peer|Timeout, server [^[:space:]]+ not responding\.|sshp: interactive SSH transport lost; child (terminated by [[:alnum:]_-]+|state unavailable after interact)|sshp: interactive SSH session ended unexpectedly: .*)$'
+    # No pipe into a quiet grep; see the twin (client/unix/agentq
+    # ssh_transport_error).  Here an inverted verdict would decide whether a
+    # dead transport is retried at all.  grep reads ssh's own `-E` file
+    # directly: it is written by the local OpenSSH (LF), and a here-string is
+    # not available under this file's #!/bin/sh on dash.
+    transport_matches=$(LC_ALL=C tr -d '\r' < "$ssh_log_file" | LC_ALL=C grep -E -c \
+        '^(ssh: connect to host [^[:space:]]+ port [0-9]+: (Connection (refused|timed out|reset by peer|aborted)|Operation timed out|No route to host|Network is unreachable|Host is down)|Connection reset by [^[:space:]]+ port [0-9]+\.?|Connection to [^[:space:]]+ closed by remote host\.?|Connection timed out during banner exchange|banner exchange: Connection to [^[:space:]]+ port [0-9]+: (Connection (timed out|reset by peer)|No route to host|Network is unreachable|Host is down)|kex_exchange_identification: (read: )?(Connection (reset by peer|timed out|refused)|No route to host|Network is unreachable|Host is down)|client_loop: .* (Broken pipe|Connection reset by peer)|packet_write_wait: Connection to [^:]+: Broken pipe|Write failed: Broken pipe|Read from remote host [^:]+: Connection reset by peer|Timeout, server [^[:space:]]+ not responding\.|sshp: interactive SSH transport lost; child (terminated by [[:alnum:]_-]+|state unavailable after interact)|sshp: interactive SSH session ended unexpectedly: .*)$') || transport_matches=0
+    [ "${transport_matches:-0}" -gt 0 ]
 }
 
 write_ssh_diagnostic_metadata() {
@@ -244,8 +250,12 @@ write_ssh_diagnostic_metadata() {
         ssh_metadata_class=transport
     else
         require_existing_runtime_file "$ssh_metadata_file" || return $?
-        if LC_ALL=C tr -d '\r' < "$ssh_metadata_file" | LC_ALL=C grep -E -q \
-            '^([^:]*: )?(Permission denied|Host key verification failed|Could not resolve hostname|No supported authentication methods available)'; then
+        # `grep -c` + arithmetic, not `grep -q`: a quiet grep under pipefail
+        # would read a FOUND match as absent and drop the authentication hint.
+        # The `tr -d '\r'` is required (see ssh_transport_error).
+        auth_matches=$(LC_ALL=C tr -d '\r' < "$ssh_metadata_file" | LC_ALL=C grep -E -c \
+            '^([^:]*: )?(Permission denied|Host key verification failed|Could not resolve hostname|No supported authentication methods available)') || auth_matches=0
+        if [ "${auth_matches:-0}" -gt 0 ]; then
             ssh_metadata_class=authentication
         else
             ssh_metadata_class=ssh
@@ -364,7 +374,14 @@ run_ssh_logged_bounded() {
 }
 
 check_only=false
-case "${1:-}" in
+# The token is folded to lower case before matching, never the host: the
+# Windows twin's `-eq` is case-INSENSITIVE by language rule, so `--CHECK`,
+# `-H` and `--HELP` were accepted there and refused here (measured 2026-10-21;
+# same class as AGENTQ_REMOTE_PLATFORM, and the same fix -- normalise the
+# value rather than widen every pattern).  A hostname is passed through
+# untouched, and folding happens only for these two flag positions.
+sshp_first_token=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+case "$sshp_first_token" in
     --check)
         check_only=true
         shift
@@ -376,7 +393,8 @@ case "${1:-}" in
         # with a hyphen" (exit 2) while `sshp.ps1 --check --help` printed
         # usage and exited 0 -- measured 2026-10-17, the same input accepted
         # by one client and rejected by the other.  smoke/19 pins both forms.
-        case "${1:-}" in
+        sshp_second_token=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+        case "$sshp_second_token" in
             -h|--help)
                 usage
                 exit 0
@@ -803,7 +821,14 @@ run_windows_remote_command() {
     windows_script_file=$(mktemp "$ssh_runtime_directory/windows-powershell.XXXXXX") || fail 'cannot create a temporary Windows PowerShell script'
     require_runtime_file "$windows_script_file"
     # shellcheck disable=SC2016
-    if ! printf '%s\n%s\n%s\n' \
+    # Trailing BLANK line, i.e. two newlines: `-Command -` reads stdin in
+    # interactive mode, where a pending block runs only when a blank line
+    # terminates it and is DISCARDED SILENTLY at EOF.  The Windows twin appends
+    # "`n`n" for exactly this reason (sshp.ps1 Get-WindowsProbeCommand); this
+    # side wrote a single terminating newline, so the last statement of every
+    # probe/install script was dropped without an error.  Measured 2026-10-21
+    # by comparing the two implementations.
+    if ! printf '%s\n%s\n%s\n\n' \
         '$ProgressPreference = "SilentlyContinue"' \
         '$env:MSYS_NO_PATHCONV = "1"' \
         "$windows_script" > "$windows_script_file"; then
@@ -1068,7 +1093,15 @@ probe_reports_marker() {
     # `$`-anchored pattern a trailing CR would silently break every match.
     # grep -E is already a local dependency (ssh_transport_error uses it);
     # a `while read` pipeline would run in a subshell and lose the result.
-    printf '%s\n' "$1" | LC_ALL=C tr -d '\r' | LC_ALL=C grep -E -q "$2"
+    #
+    # `grep -c` and an arithmetic test, NOT `grep -q`: under `set -o pipefail`
+    # a quiet grep exits at its first match, `tr` takes SIGPIPE, and a FOUND
+    # marker reads as ABSENT -- a real protocol answer dropped.  `-c` must read
+    # every line to count, so the writer can never be killed early; the count
+    # is what makes "found" mean found.  (A here-string would also avoid the
+    # pipe, but this file is #!/bin/sh and dash has none.)
+    marker_matches=$(printf '%s\n' "$1" | LC_ALL=C tr -d '\r' | LC_ALL=C grep -E -c "$2") || marker_matches=0
+    [ "${marker_matches:-0}" -gt 0 ]
 }
 
 prepare_remote() {

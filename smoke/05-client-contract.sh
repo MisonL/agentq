@@ -1731,6 +1731,12 @@ if command -v shellcheck >/dev/null 2>&1; then
     cases=$((cases + 1))
     failures=$((failures + shellcheck_bad))
     shellcheck_summary="checked($shellcheck_assets) scriptcheck=checked($shellcheck_scripts)"
+else
+    # `skipped(...)`, not a bare `absent`: run-tests.sh buckets a check into
+    # PART on the word "skipped", so the old token read as a full pass on a
+    # machine without shellcheck -- "9 assets and 38 scripts were never linted"
+    # printed as green.  Same vocabulary as smoke/01's skipped(pwsh-absent).
+    shellcheck_summary="skipped(shellcheck-absent)"
 fi
 
 if [ "$failures" -ne 0 ]; then

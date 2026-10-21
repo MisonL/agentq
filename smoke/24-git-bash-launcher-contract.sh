@@ -65,6 +65,7 @@ cat > "$work/bin/powershell.exe" <<'STUB'
     printf 'MSYS2_ARG_CONV_EXCL=%s\n' "${MSYS2_ARG_CONV_EXCL-<unset>}"
     printf 'AGENTQ_SSH=%s\n' "${AGENTQ_SSH-<unset>}"
     printf 'AGENTQ_CONFIG=%s\n' "${AGENTQ_CONFIG-<unset>}"
+    printf 'AGENTQ_ASKPASS=%s\n' "${AGENTQ_ASKPASS-<unset>}"
     printf 'SSHP_SSH=%s\n' "${SSHP_SSH-<unset>}"
 } > "${PS_OUT:?}"
 exit "${PS_EXIT:-0}"
@@ -159,11 +160,25 @@ run_launcher agentq >/dev/null
 expect_line 'agentq AGENTQ_SSH unset -> unset' "$work/ps.out" 'AGENTQ_SSH=<unset>'
 expect_line 'agentq AGENTQ_CONFIG unset -> unset' "$work/ps.out" 'AGENTQ_CONFIG=<unset>'
 
+# AGENTQ_ASKPASS is the THIRD conditional conversion in agentq.bash and had no
+# case at all, although it carries a credential path: converting it wrongly
+# hands the PowerShell client a posix-shaped path to the program that prints the
+# password.  All three directions, like the two variables above.
+run_launcher agentq AGENTQ_ASKPASS=/c/ask/pass >/dev/null
+expect_line 'agentq AGENTQ_ASKPASS absolute -> converted' "$work/ps.out" 'AGENTQ_ASKPASS=WIN(/c/ask/pass)'
+run_launcher agentq AGENTQ_ASKPASS=relative/askpass >/dev/null
+expect_line 'agentq AGENTQ_ASKPASS relative -> unchanged' "$work/ps.out" 'AGENTQ_ASKPASS=relative/askpass'
+run_launcher agentq >/dev/null
+expect_line 'agentq AGENTQ_ASKPASS unset -> unset' "$work/ps.out" 'AGENTQ_ASKPASS=<unset>'
+
 run_launcher sshp SSHP_SSH=/c/keys/id >/dev/null
 expect_line 'sshp SSHP_SSH absolute -> converted' "$work/ps.out" 'SSHP_SSH=WIN(/c/keys/id)'
 
 run_launcher sshp SSHP_SSH=relative/key >/dev/null
 expect_line 'sshp SSHP_SSH relative -> unchanged' "$work/ps.out" 'SSHP_SSH=relative/key'
+
+run_launcher sshp >/dev/null
+expect_line 'sshp SSHP_SSH unset -> unset' "$work/ps.out" 'SSHP_SSH=<unset>'
 
 # --- 3. the child's exit status must reach the caller -------------------------
 # The .cmd shims end with `exit /b %ERRORLEVEL%` for the same reason: a launcher

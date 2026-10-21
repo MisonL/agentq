@@ -75,13 +75,31 @@ cat > "$work/ssh" <<EOF
 #!/bin/sh
 # Record that we were reached, then interrupt the client mid-call.
 : > "$work/ssh-invoked"
-kill -TERM "\$(ps -o ppid= -p \$\$ | tr -d ' ')" 2>/dev/null || true
+# The signal comes from the caller.  It used to be a hard-coded TERM, which
+# made all three "per-signal" cases the same case run three times while the
+# summary reported signals=TERM/INT/HUP.
+kill -\${SMOKE_SIGNAL:-TERM} "\$(ps -o ppid= -p \$\$ | tr -d ' ')" 2>/dev/null || true
 # Give the client a moment to run its handler, then exit normally so the client
 # is not left waiting on a live child.
 sleep 2
 exit 255
 EOF
 chmod 700 "$work/ssh"
+
+# A background job started by a non-interactive shell has SIGINT IGNORED (POSIX:
+# an asynchronous command without job control begins with SIGINT/SIGQUIT
+# ignored), and an IGNORED disposition cannot be trapped -- so plain `... &`
+# made the INT case structurally untestable: the client survived and the old
+# assertion passed for the wrong reason.  This wrapper is exec'd AFTER
+# restoring SIG_DFL, so the client really can receive INT.
+cat > "$work/int-launcher.pl" <<'EOF'
+$SIG{INT} = 'DEFAULT';
+exec @ARGV or exit 127;
+EOF
+int_launcher=''
+if command -v perl >/dev/null 2>&1; then
+    int_launcher="perl $work/int-launcher.pl"
+fi
 
 # One run per signal.  All three are asserted separately: a fix that covered only
 # INT (the common one) would pass a single-case check and is exactly the shape of
@@ -91,16 +109,35 @@ for signal_name in TERM INT HUP; do
     : > "$work/ssh-invoked"
     before=$(find "$client_tmp" -mindepth 1 | wc -l | tr -d ' ')
 
+    if [ "$signal_name" = INT ] && [ -z "$int_launcher" ]; then
+        printf 'client-interrupt: SIGINT case NOT-covered (perl is required to restore SIG_DFL in a background job)\n' >&2
+        continue
+    fi
+
     status=0
-    env -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD_PROMPT \
-        TMPDIR="$client_tmp" \
-        AGENTQ_SSH="$work/ssh" \
-        AGENTQ_HOST=127.0.0.1 \
-        AGENTQ_REMOTE_PLATFORM=unix \
-        AGENTQ_CONFIG="$work/absent-config" \
-        AGENTQ_PASSWORD='agentq-smoke-interrupt-secret' \
-        "$client" status >"$work/out.$signal_name" 2>"$work/err.$signal_name" &
+    if [ "$signal_name" = INT ]; then
+        env -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD_PROMPT \
+            SMOKE_SIGNAL="$signal_name" \
+            TMPDIR="$client_tmp" \
+            AGENTQ_SSH="$work/ssh" \
+            AGENTQ_HOST=127.0.0.1 \
+            AGENTQ_REMOTE_PLATFORM=unix \
+            AGENTQ_CONFIG="$work/absent-config" \
+            AGENTQ_PASSWORD='agentq-smoke-interrupt-secret' \
+            perl "$work/int-launcher.pl" "$client" status >"$work/out.$signal_name" 2>"$work/err.$signal_name" &
         client_pid=$!
+    else
+        env -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD_PROMPT \
+            SMOKE_SIGNAL="$signal_name" \
+            TMPDIR="$client_tmp" \
+            AGENTQ_SSH="$work/ssh" \
+            AGENTQ_HOST=127.0.0.1 \
+            AGENTQ_REMOTE_PLATFORM=unix \
+            AGENTQ_CONFIG="$work/absent-config" \
+            AGENTQ_PASSWORD='agentq-smoke-interrupt-secret' \
+            "$client" status >"$work/out.$signal_name" 2>"$work/err.$signal_name" &
+        client_pid=$!
+    fi
 
     # Wait for the stub to prove the client reached an SSH call, then let the
     # signal land.  Bounded so a client that never calls ssh fails instead of

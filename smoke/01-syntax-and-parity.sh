@@ -942,7 +942,13 @@ repo_script_count=0
 # matched: it must read every line to count, so it cannot cause the race.
 # `(^|[^|])` keeps `a || grep -q file` from matching -- that is a fallback,
 # not a pipeline.
-repo_pipe_re='(^|[^|])[|][^|;&]*grep[^|;&]*-[a-zA-Z]*q'
+#
+# `-[a-zA-Z]*[qm]` -- the `m` arm was MISSING until 2026-10-22 even though the
+# comment above always said `-q` (and `-m`): the old pattern ended in `q`, so
+# `| grep -m1` (same SIGPIPE mechanism, `-m` also exits at its match limit)
+# passed the lock.  A flag cluster ending in either letter is now caught;
+# `-c` still is not, and `-q`/`-m` inside a longer cluster (`-Eq`, `-m1`) is.
+repo_pipe_re='(^|[^|])[|][^|;&]*grep[^|;&]*(-[a-zA-Z]*[qm]|[[:space:]]--(quiet|max-count|silent))'
 while IFS= read -r repo_script; do
     repo_script_count=$((repo_script_count + 1))
     repo_hits=$(grep -nE "$repo_pipe_re" "$repo_script" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#' || true)
@@ -960,6 +966,7 @@ done <<EOF
 $(find "$root/smoke" -type f -name '*.sh' | sort)
 $root/run-tests.sh
 $root/sandbox.sh
+$(find "$root/skill/assets" -type f \( -name '*.sh' -o -name 'agentq' -o -name 'agentq-server' -o -name 'sshp' -o -name 'durable-move' -o -name 'start-daemon' \) | sort)
 EOF
 if [ "$repo_script_count" -eq 0 ]; then
     printf '%s\n' 'no repo scripts were enumerated for the pipe-lock; refusing to report a pass' >&2

@@ -68,7 +68,10 @@ while IFS= read -r check <&3; do
 
     output=$(mktemp)
     status=0
-    if "$check" >"$output" 2>&1; then
+    # 3<&- : fd 3 is this loop's own list of checks.  Leaving it open meant a
+    # check that read fd 3 drained the list, and the only symptom was a later
+    # "only N of M smoke checks ran" with no idea which one did it.
+    if "$check" 3<&- >"$output" 2>&1; then
         status=0
     else
         status=$?
@@ -92,6 +95,16 @@ while IFS= read -r check <&3; do
         # check was not verified.
         printf 'PART  %-28s %s\n' "$name" "$(grep -i skipped "$output" | head -1)"
         partial=$((partial + 1))
+        # Double-report: a check that BOTH skipped an inner sub-part AND declared
+        # a NOT-covered platform item belongs in PART (it is genuinely partial)
+        # and in the known-set gate (the NOT-covered name must be recognised).
+        # Testing NOT-covered only in the arm below meant the PART arm swallowed
+        # it, so a NEW platform gap inside such a check never reached ci.yml.
+        if grep -q 'NOT-covered\|not-covered' "$output"; then
+            printf 'NCOV  %-28s %s\n' "$name" "$(grep -E 'NOT-covered|not-covered' "$output" | head -1)"
+            notcovered=$((notcovered + 1))
+            notcovered_list="$notcovered_list$name "
+        fi
     elif grep -q 'NOT-covered\|not-covered' "$output"; then
         # A THIRD bucket, distinct from PART.  A check whose summary says
         # `staging=NOT-covered(needs-Windows)` has admitted a named sub-part it

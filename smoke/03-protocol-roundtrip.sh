@@ -13,16 +13,18 @@ set -euo pipefail
 
 runtime_home=${AGENTQ_SMOKE_HOME:-}
 
+# NO fallback to $HOME/.agentq.  This check submits, cancels and removes tasks
+# and swaps the repo's agentq-server into place, so pointing it at a real local
+# AgentQ is a mutation of a queue nobody authorized this suite to touch.  It used
+# to fall back there when AGENTQ_SMOKE_HOME was unset -- unlike every other
+# runtime check (04/06/07/15/17) -- so on a developer machine that had AgentQ
+# installed, "just run the tests" wrote to the real queue.
 if [ -z "$runtime_home" ]; then
-    for candidate in "$HOME/.agentq" "$HOME/.local/share/agentq"; do
-        if [ -x "$candidate/pueue" ] && [ -x "$candidate/agentq-server" ]; then
-            runtime_home=$candidate
-            break
-        fi
-    done
+    printf '%s\n' 'protocol-roundtrip: SKIPPED (set AGENTQ_SMOKE_HOME to a throwaway runtime; this check mutates the queue and never falls back to the real one)'
+    exit 0
 fi
 
-if [ -z "$runtime_home" ] || [ ! -x "$runtime_home/pueue" ]; then
+if [ ! -x "$runtime_home/pueue" ]; then
     printf '%s\n' 'protocol-roundtrip: SKIPPED (no installed runtime; set AGENTQ_SMOKE_HOME to enable)'
     exit 0
 fi

@@ -146,6 +146,23 @@ if [ -n "$(find "$empty_destination" -mindepth 1 -print -quit)" ]; then
     failures=$((failures + 1))
 fi
 
+# --check with the destination directory ABSENT (not merely empty): SKILL.md
+# documents 0 match / 1 missing or drift / 2 unsafe, and the Windows twin's
+# Invoke-CanonicalClientCheck reports each client as missing and returns 1.  The
+# POSIX path ran assert_regular_directory_path first, which fail()ed with 2, so
+# one state answered 2 on POSIX and 1 on Windows.  Nothing may be created.
+absent_destination="$work/absent-dest"
+cases=$((cases + 1))
+absent_status=$(run_installer --check --bin-dir "$absent_destination")
+if [ "$absent_status" -ne 1 ]; then
+    printf 'install-client --check (absent directory): expected 1, got %s\n' "$absent_status" >&2
+    failures=$((failures + 1))
+fi
+if [ -e "$absent_destination" ]; then
+    printf 'install-client --check (absent directory): --check created the destination\n' >&2
+    failures=$((failures + 1))
+fi
+
 # --- the success path ---------------------------------------------------------
 # The ONLY installer happy path testable here: it copies two files into a sandbox
 # directory, no network, no service manager.  Covered on purpose -- a contract

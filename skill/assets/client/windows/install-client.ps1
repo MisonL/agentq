@@ -301,6 +301,12 @@ function Install-CommitSet {
             if ($entry.DestinationExisted) {
                 $backupPath = New-InstallerTemporaryFile -Directory $DestinationDirectory -Prefix "backup"
                 Assert-NonReparsePathChain -Path $backupPath -Description "client backup file"
+                # Registered before the Replace: if Replace or the PostCommit ACL
+                # step throws, the finally block below is the only thing that
+                # would ever remove this copy of the PREVIOUS client -- it is not
+                # in $stagedTemporaryPaths any other way, so it used to survive
+                # every failed install (measured by inspection 2026-10-21).
+                [void]$stagedTemporaryPaths.Add($backupPath)
                 [System.IO.File]::Replace($entry.TemporaryPath, $entry.DestinationPath, $backupPath)
                 if (!(Remove-InstallerTemporaryFile -Path $backupPath -Description "client backup file")) {
                     throw "Client installer temporary cleanup failed"
