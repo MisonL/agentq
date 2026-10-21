@@ -165,7 +165,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PL
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.16"
+$script:ClientVersion = "0.1.17"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's argv limit, not this machine's platform: a unix
 # target takes up to 100000 base64 characters (the POSIX twin's MAX_ARG_STRLEN
@@ -588,6 +588,10 @@ function Resolve-SshPath {
         # The probe is a real launch with an argument ssh rejects immediately,
         # so it costs no connection and touches no remote host.
         $probeError = $null
+        # Declared before the try: the catch block inspects it, and under
+        # StrictMode reading an unassigned variable throws -- which would turn
+        # a controlled refusal into an uncaught throw.
+        $probe = $null
         try {
             $probeInfo = [System.Diagnostics.ProcessStartInfo]::new()
             $probeInfo.FileName = [System.IO.Path]::GetFullPath($env:AGENTQ_SSH)
@@ -596,11 +600,35 @@ function Resolve-SshPath {
             $probeInfo.CreateNoWindow = $true
             $probeInfo.RedirectStandardOutput = $true
             $probeInfo.RedirectStandardError = $true
+            # stdin must be a CLOSED pipe, not this process's stdin.  A wrapper
+            # that reads stdin to EOF before doing anything (a common shape for
+            # ssh shims: `cat > /dev/null`) otherwise blocks forever, because a
+            # redirected-from console stdin never reaches EOF -- the 10s budget
+            # then fires and a perfectly launchable AGENTQ_SSH is refused.
+            # Measured 2026-10-21 against this repo's own smoke/12 stub.
+            $probeInfo.RedirectStandardInput = $true
             $probe = [System.Diagnostics.Process]::Start($probeInfo)
-            [void]$probe.StandardOutput.ReadToEnd()
-            [void]$probe.StandardError.ReadToEnd()
-            $probe.WaitForExit(10000) | Out-Null
+            # Asynchronous reads, THEN a bounded wait.  The first version read
+            # both streams with ReadToEnd() before WaitForExit(10000), so a
+            # file that ignores -V and never exits (a GUI program, a wrapper
+            # waiting on input) hung the client forever and the 10s budget
+            # never applied.  The tasks themselves are never awaited: the
+            # probe only asks "does this launch and answer", and GetResult()
+            # after Kill() could throw on a dead pipe.
+            [void]$probe.StandardOutput.ReadToEndAsync()
+            [void]$probe.StandardError.ReadToEndAsync()
+            # Closing the write end gives the child EOF on stdin.
+            $probe.StandardInput.Close()
+            if (!$probe.WaitForExit(10000)) {
+                try { $probe.Kill() } catch { }
+                throw [System.TimeoutException]::new("did not exit within 10s of -V")
+            }
         } catch {
+            # A process that was started but overran its budget must not be
+            # left running behind us.
+            if (($null -ne $probe) -and (!$probe.HasExited)) {
+                try { $probe.Kill() } catch { }
+            }
             $probeError = $_.Exception.Message
         }
         if ($null -ne $probeError) {
@@ -1712,6 +1740,13 @@ function Write-PlatformProbeCache {
     if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLATFORM_PROBE_CACHE) -and ($env:AGENTQ_PLATFORM_PROBE_CACHE -eq "off")) {
         return
     }
+    # Declared before the try: the catch block below reads $temporary, and an
+    # exception thrown before its assignment (Join-Path on an invalid
+    # AGENTQ_PLATFORM_CACHE_DIR, New-Item refused) made the CATCH itself throw
+    # "The variable '$temporary' cannot be retrieved because it has not been
+    # set" under StrictMode -- an uncaught throw that killed an otherwise
+    # successful command, against this function's "never fatal" contract.
+    $temporary = $null
     try {
         $path = Get-PlatformProbeCachePath
         $dir = Split-Path -Parent $path
@@ -2684,10 +2719,18 @@ function Confirm-NativeWindowsPlatform {
     if ($windowsProbe.ExitCode -eq 124) {
         exit 124
     }
-    if (($windowsProbe.ExitCode -eq 255) -and (Test-SshTransportError -Diagnostics $windowsProbe.TransportDiagnostics)) {
-        Stop-AgentQ "SSH transport failed while confirming the remote Windows platform"
+    if (($windowsProbe.ExitCode -eq 0)) {
+        # Zero status with an unrecognised payload is a client-side contract
+        # failure, not a remote answer -- 2 like any other protocol error.
+        Stop-AgentQ "native Windows platform probe returned an unexpected response"
     }
-    Stop-AgentQ "native Windows platform probe failed after a Windows shell was detected"
+    # Propagate the probe's own status, as the POSIX twin does
+    # (`return "$windows_platform_status"`).  This used to collapse every
+    # failure to 2, so a dead transport exited 2 ("fix your arguments") here
+    # and 255 ("retry") there.  Measured 2026-10-21; the 255/2 collapse had
+    # already been fixed in Confirm-WindowsAgentQProtocol, not here.
+    [Console]::Error.WriteLine("$($script:Program): native Windows platform probe failed after a Windows shell was detected")
+    exit $windowsProbe.ExitCode
 }
 
 function Initialize-RemoteInvocation {
@@ -2739,8 +2782,14 @@ function Initialize-RemoteInvocation {
                 [Console]::Error.WriteLine("$($script:Program): SSH transport failed while detecting the remote platform")
                 exit 255
             } elseif ($unixProbe.ExitCode -eq 124) {
+                # Deliberately does NOT exit: the POSIX twin keeps going here,
+                # because a probe timeout on a slow host says nothing about the
+                # platform, and the Windows probe is the only way to find out.
+                # It used to exit 124 here, so a slow-but-Windows host failed a
+                # command the POSIX client completed.  Measured divergence
+                # 2026-10-21 (this file's own comment below already said the
+                # 255 rule was "deliberately NOT applied to 124").
                 Write-Diagnostics -Diagnostics $unixProbe.Diagnostics
-                exit 124
             }
 
             $windowsProbe = Invoke-PlatformProbeWithRecovery -Probe (Get-WindowsProbeCommand)
@@ -2753,11 +2802,23 @@ function Initialize-RemoteInvocation {
                 return
             }
             Write-Diagnostics -Diagnostics $windowsProbe.Diagnostics
-            if ($windowsProbe.ExitCode -eq 124) {
-                exit 124
-            }
+            # No exit 124 here either: with the unix probe timed out and the
+            # Windows probe timed out too, the POSIX twin takes its "both
+            # failed" arm, which prints the unsupported-platform line and
+            # returns the LOCAL probe's status (2 only when that status is 0,
+            # which cannot happen in this arm).  Exiting 124 here instead made
+            # the same input mean "timeout" on Windows and "unsupported
+            # platform" on POSIX.  The both-failed arm below now owns it and
+            # propagates the unix probe's status.
             if (($unixProbe.ExitCode -ne 0) -and ($windowsProbe.ExitCode -ne 0)) {
-                Stop-AgentQ "unable to detect the remote platform; set AGENTQ_REMOTE_PLATFORM to unix or windows only when the target is known"
+                # Twin of `return "$local_platform_status"`: the local (unix)
+                # probe's own status is the answer -- 255 stays 255, 124 stays
+                # 124, and only a zero status (impossible here) would become 2.
+                # Stop-AgentQ is fixed at 2, so this writes the same message and
+                # exits with the propagated code itself.
+                $localProbeExitCode = if ($unixProbe.ExitCode -ne 0) { $unixProbe.ExitCode } else { 2 }
+                [Console]::Error.WriteLine("$($script:Program): unable to detect the remote platform; set AGENTQ_REMOTE_PLATFORM to unix or windows only when the target is known")
+                exit $localProbeExitCode
             }
             # The probe output is remote-controlled.  Print it as a single
             # charset-limited token -- first line, ASCII word characters only,

@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.16'
+agentq_version='0.1.17'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -1571,7 +1571,10 @@ ensure_not_in_maintenance() {
         recover_stale_maintenance_lock
     fi
     if [ -e "$maintenance_lock_directory" ]; then
-        fail "AgentQ maintenance is in progress; retry after the installer completes"
+        # lock_contention, not the default protocol_error: the message already
+        # tells the caller to retry, and an installer window is exactly the
+        # "retryable, nothing you passed is wrong" case that class names.
+        fail "AgentQ maintenance is in progress; retry after the installer completes" lock_contention
     fi
 }
 
@@ -1993,8 +1996,14 @@ managed_daemon_is_active() {
                 Darwin*)
                     command -v launchctl >/dev/null 2>&1 || return 1
                     macos_launch_service_target
-                    launchctl print "$macos_launch_service" 2>/dev/null \
-                        | grep -q 'state = running'
+                    # No pipe: under `set -o pipefail` a quiet grep that exits
+                    # on its first match can make launchctl take SIGPIPE, turn
+                    # the pipeline non-zero, and report a RUNNING service as
+                    # inactive -- start_managed_daemon then kickstarts it.
+                    # Here-strings have no second writer, so the same predicate
+                    # cannot be inverted by a race.
+                    launch_output=$(launchctl print "$macos_launch_service" 2>/dev/null) || return 1
+                    grep -q 'state = running' <<<"$launch_output"
                     ;;
                 *)
                     return 1
@@ -5034,7 +5043,16 @@ submit() {
             ensure_daemon
             if record=$(read_request_record "$request_id"); then
                 [ "$(jq -r '.state' <<<"$record")" = removing ] || fail "unexpected AgentQ request state after removal recovery: $request_id"
-                fail "request id has a pending removal; use lookup or retry remove before submitting again: $request_id"
+                # The contract table files `removing` under exit 4 alongside
+                # ambiguous: the removal intent is durable but unfinished, so
+                # the caller must stop rather than resubmit.  lookup answers
+                # this same state with 4 and a JSON body; a bare exit 2 here
+                # told callers to fix their arguments instead.
+                task_id=$(jq -r '.task_id' <<<"$record")
+                validate_task_id_precision "$task_id"
+                jq -cn --arg request_id "$request_id" --argjson task_id "$task_id" '{request_id: $request_id, task_id: $task_id, state: "removing"}'
+                printf '%s: request id has a pending removal; retry remove to finish it: %s\n' "$program" "$request_id" >&2
+                return 4
             elif read_request_tombstone "$request_id" >/dev/null; then
                 fail "request id was already consumed by a task that has been removed: $request_id"
             else
@@ -5464,9 +5482,13 @@ doctor() {
     printf 'agentq=' >&2
     printf '%s\n' "$agentq_version" >&2
     printf 'pueue=' >&2
-    "$pueue_bin" --version >&2
+    # `|| printf`: a binary that exists but cannot execute (corrupt, wrong ABI)
+    # must not leak its own status as the server's exit code -- doctor is the
+    # documented first call on a new host, and the contract says this program
+    # only ever exits 0-6.  require_executable checks -x, not runnability.
+    "$pueue_bin" --version >&2 || printf '%s\n' 'unavailable' >&2
     printf 'pueued=' >&2
-    "$pueued_bin" --version >&2
+    "$pueued_bin" --version >&2 || printf '%s\n' 'unavailable' >&2
 
     case "$platform_kind" in
         windows)
@@ -5556,6 +5578,12 @@ doctor_with_operation_lock() {
 task_instance_created_at_is_recorded() {
     local task_id=$1
     local expected_created_at=$2
+    # Evidence grade.  "any" (default) accepts a request record or a tombstone;
+    # "tombstone" accepts ONLY a tombstone.  A tombstone proves AgentQ already
+    # removed the task, so it stands on its own while Pueue is unreadable; an
+    # accepted record only proves that SOME instance of this (recyclable) id was
+    # tracked, which an earlier instance satisfies just as well as the live one.
+    local evidence_grade=${3:-any}
     local path request_id created_at
     local records=()
     local tombstones=()
@@ -5572,7 +5600,9 @@ task_instance_created_at_is_recorded() {
     # separately (as the loop did) so a hit in the records is reported without
     # ever reading a tombstone.
     local combined=()
-    if [ "${#records[@]}" -gt 0 ]; then combined+=("${records[@]}"); fi
+    if [ "$evidence_grade" != tombstone ]; then
+        if [ "${#records[@]}" -gt 0 ]; then combined+=("${records[@]}"); fi
+    fi
     if [ "${#tombstones[@]}" -gt 0 ]; then combined+=("${tombstones[@]}"); fi
     if [ "${#combined[@]}" -gt 0 ]; then
         if probe=$( {
@@ -5588,8 +5618,8 @@ task_instance_created_at_is_recorded() {
             return 1
         fi
     fi
-    # Fallback: the original per-file scan, unchanged.
-    if [ "${#records[@]}" -gt 0 ]; then
+    # Fallback: the original per-file scan, unchanged apart from the grade.
+    if [ "$evidence_grade" != tombstone ] && [ "${#records[@]}" -gt 0 ]; then
         for path in "${records[@]}"; do
             request_id=${path##*/}
             request_id=${request_id%.json}
@@ -5618,6 +5648,7 @@ task_instance_created_at_is_recorded() {
 
 cancelled_task_replay() {
     local task_id=$1
+    local evidence_grade=${2:-any}
     local marker
 
     # Quiet exploratory read: a corrupt marker must not emit the machine
@@ -5638,7 +5669,7 @@ cancelled_task_replay() {
     # tombstone.  Without this, a marker left behind by an earlier task that
     # reused the id would make an unrelated task look like a replay.
     marker_created_at=$(jq -r '.created_at' <<<"$marker")
-    task_instance_created_at_is_recorded "$task_id" "$marker_created_at" || return 1
+    task_instance_created_at_is_recorded "$task_id" "$marker_created_at" "$evidence_grade" || return 1
     jq -cn --argjson task_id "$task_id" \
         --arg requested_at "$(jq -r '.requested_at' <<<"$marker")" \
         '{task_id: $task_id, action: "cancel_requested", cancellation_requested_at: $requested_at, reused: true}'
@@ -5668,13 +5699,25 @@ cancel_task() {
     else
         # $? is still raw_compact_task's status at the top of the else branch.
         raw_compact_status=$?
-        # The replay check reads only local marker/record files, so a confirmed
-        # cancel can still be replayed while Pueue is unreadable.
-        cancelled_task_replay "$task_id" && return 0
-        # Only rc=4 proves the task is gone (Pueue answered, id not visible).
-        # On a read failure (1/2/5) we do NOT know that, so the pending-marker
-        # branch below must not claim it -- it would print "the task is gone"
-        # about a task we merely could not look up (2026-10-07).
+        # Two GRADES of replay evidence, because the two kinds do not say the
+        # same thing:
+        #   - a TOMBSTONE means AgentQ already removed the task; it cannot come
+        #     back, so a replay is safe even while Pueue is unreadable;
+        #   - an ACCEPTED RECORD only means some instance of this id was
+        #     tracked.  Pueue recycles ids, so a record left by an EARLIER
+        #     instance satisfies the instance binding exactly, and on a read
+        #     failure (rc 1/2/5) the task this call is about may be a different,
+        #     still-running one.  The binding has no discriminating power there
+        #     and a replay would answer "cancelled" (exit 0) about a live task.
+        # So rc=4 (Pueue answered "not visible") accepts either grade;
+        # an unreadable Pueue accepts tombstones only.  smoke/15 pins the
+        # tombstone half, smoke/03 the rc=4 half.
+        if [ "$raw_compact_status" -eq 4 ]; then
+            replay_evidence=any
+        else
+            replay_evidence=tombstone
+        fi
+        cancelled_task_replay "$task_id" "$replay_evidence" && return 0
         if [ "$raw_compact_status" -eq 4 ]; then
             # The task is gone, but a marker may still record that the
             # cancellation outcome was never confirmed.  "unknown AgentQ task
@@ -5692,6 +5735,11 @@ cancel_task() {
                 fi
             fi
         fi
+        # Pueue could not be read (rc 1/2/5): nothing was mutated.  This stays
+        # in the default protocol_error class, deliberately and in agreement
+        # with logs/remove, which answer the same condition the same way --
+        # smoke/15 asserts one reason for all three.  A distinct class here
+        # would make three commands describe one state in two vocabularies.
         report_compact_task_failure "$raw_compact_status" "$task_id"
     fi
 

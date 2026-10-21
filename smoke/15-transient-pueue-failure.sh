@@ -358,6 +358,37 @@ if [ "$(jq -r '.reused' <<<"$replay_output" 2>/dev/null)" != true ]; then
     failures=$((failures + 1))
 fi
 
+# The OTHER direction, and the reason the two grades exist: the same marker with
+# only an ACCEPTED RECORD behind it must NOT replay while Pueue is unreadable.
+# Pueue recycles ids, so a record from an earlier instance satisfies the
+# instance binding exactly, and the live task this call is about may be a
+# different, still-running one -- answering "cancelled" there is a false success
+# about a running task.  Same marker, same creation time, record instead of
+# tombstone, and the answer must be a failure, not reused:true.
+record_task_id=991178
+record_request_id="smoke-replay-record-$$-$(date -u '+%Y%m%dT%H%M%SZ')"
+record_request_id=${record_request_id:0:120}
+cat > "$home/data/agentq-requests/$record_request_id.json" <<RECORD
+{"version":1,"request_id":"$record_request_id","task_id":$record_task_id,"task_created_at":"2026-09-29T00:00:00Z","task_label":"agentq:$record_request_id","state":"accepted","created_at":"2026-09-29T00:00:00Z","payload":{"workdir":"/tmp","label":"command","argv":["sleep","300"]}}
+RECORD
+printf '{"version":1,"task_id":%s,"created_at":"2026-09-29T00:00:00Z","requested_at":"2026-09-29T00:05:00Z","reason":"kill_confirmed","state":"requested"}\n' \
+    "$record_task_id" > "$home/data/agentq-cancellations/$record_task_id.json"
+printf '2\n' > "$control/status.target"
+printf '0\n' > "$control/status.count"
+record_status=0
+record_output=$("$server" cancel "$record_task_id" 2>"$work/record.stderr") || record_status=$?
+printf '0\n' > "$control/status.target"
+rm -f "$home/data/agentq-cancellations/$record_task_id.json" \
+    "$home/data/agentq-requests/$record_request_id.json"
+if [ "$(jq -r '.reused' <<<"$record_output" 2>/dev/null)" = true ]; then
+    note "a record-only marker replayed as reused:true while Pueue was unreadable; the instance binding cannot distinguish a live reused id from the recorded one"
+    failures=$((failures + 1))
+fi
+if [ "$record_status" -eq 0 ]; then
+    note "a record-only marker exited 0 while Pueue was unreadable; only a tombstone proves the task is gone"
+    failures=$((failures + 1))
+fi
+
 # The probe task must have survived all three, and logs must work again.
 if ! probe_state=$("$server" status 2>/dev/null | jq -r --argjson id "$probe_task_id" \
         '.tasks[($id|tostring)].status | keys[0]'); then

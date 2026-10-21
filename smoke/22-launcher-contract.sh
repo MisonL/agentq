@@ -776,6 +776,10 @@ assert_last_exitcode_guard "$launcher" 'launcher Git Bash spawn' 'exit 2'
 assert_last_exitcode_guard "$installer" 'installer native calls' 'return 1'
 assert_last_exitcode_guard "$ps_client" 'Windows client' 'return 1|exit 1'
 assert_last_exitcode_guard "$sshp_client" 'Windows sshp' 'return 1|exit 1'
+# Counted from the call sites above, not typed: the summary used to claim
+# `lastexitcode-guards=5/5` as a literal, so deleting a call left the coverage
+# claim intact (the same dead-count class this repo fixed elsewhere).
+lastexitcode_guards=$(( $(grep -c '^assert_last_exitcode_alias ' "$0") + $(grep -c '^assert_last_exitcode_guard ' "$0") ))
 
 # Behavioural half for the installer's helper: it is a pure function, so it can
 # be extracted from the REAL asset and driven in a real child pwsh.  The static
@@ -974,5 +978,7 @@ if [ "$failures" -ne 0 ]; then
     printf 'launcher-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'launcher-contract checks passed: cases=%s pwsh=%s decoder=covered pathguards=covered roundtrip=covered lastexitcode-guards=5/5 windows-api=NOT-covered(needs-Windows) malformed-payload=exit2\n' "$cases" \
-    "$("$pwsh_binary" -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()' 2>/dev/null || printf 'unknown')"
+printf 'launcher-contract checks passed: cases=%s pwsh=%s decoder=covered pathguards=covered roundtrip=covered lastexitcode-guards=%s windows-api=NOT-covered(needs-Windows) malformed-payload=exit2\n' \
+    "$cases" \
+    "$("$pwsh_binary" -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()' 2>/dev/null || printf 'unknown')" \
+    "$lastexitcode_guards"

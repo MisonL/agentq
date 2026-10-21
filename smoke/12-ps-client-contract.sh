@@ -313,6 +313,48 @@ for platform_case in auto unix windows AUTO Unix WINDOWS bogus; do
 done
 
 # --tail's shape must be the same on both clients.  Measured 2026-10-21: the
+# The MINGW arm's own status must reach the caller.  `uname -s` answers MINGW
+# (so the client takes its "a Windows shell was detected" path) and every other
+# call fails like a dead transport (255).  The client used to collapse that to 2
+# via Stop-AgentQ, while the POSIX twin returns the probe's status unchanged --
+# the same "2 means fix your arguments, 255 means retry" inversion that was
+# already fixed in Confirm-WindowsAgentQProtocol, one function away.
+# NOT asserting `exit 255` outright: the launcher-protocol probe runs next and
+# its own code is legitimate here too.  What must NOT happen is 2.
+mingw_stub_dir="$work/mingw-ssh"
+mkdir -p "$mingw_stub_dir"
+if [ "$client_arg" != "$client" ]; then
+    mingw_stub="$mingw_stub_dir/ssh.cmd"
+    # .cmd cannot inspect argv positionally without %~N, so the stub branches on
+    # whether a second argument arrived: the client's `uname -s` probe passes
+    # one, the PowerShell probe command passes several.
+    printf '%s\r\n' '@echo off' \
+        'if "%~2"=="" (' \
+        '  echo MINGW64_NT-10.0' \
+        '  exit /b 0' \
+        ')' \
+        'exit /b 255' > "$mingw_stub"
+    mingw_stub_arg=$(cygpath -w "$mingw_stub")
+else
+    mingw_stub="$mingw_stub_dir/ssh"
+    printf '#!/bin/sh\ncase "$*" in *"uname -s"*) echo MINGW64_NT-10.0; exit 0 ;; esac\nexit 255\n' > "$mingw_stub"
+    chmod 700 "$mingw_stub"
+    mingw_stub_arg="$mingw_stub"
+fi
+cases=$((cases + 1))
+mingw_status=0
+AGENTQ_REMOTE_PLATFORM=auto AGENTQ_SSH="$mingw_stub_arg" \
+    AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_PLATFORM_PROBE_CACHE=off \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
+    >"$work/mingw.out" 2>"$work/mingw.err" || mingw_status=$?
+if [ "$mingw_status" -eq 2 ]; then
+    printf 'ps-client: a failed Windows platform probe after MINGW was detected exited 2 (the argument-error code) instead of the probe status; the POSIX twin propagates it\n' >&2
+    head -3 "$work/mingw.err" >&2 || true
+    failures=$((failures + 1))
+fi
+
 # POSIX client accepted `05` (forwarded it to the server, which canonicalizes
 # leading zeros) while this one refused it, so the same command line meant
 # different things depending on which client the caller happened to run.  Both

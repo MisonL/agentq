@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.16'
+agentq_client_version='0.1.17'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072); a Windows target re-encodes
 # argv onto a CreateProcess command line capped at 32767 characters, and the
@@ -1631,8 +1631,25 @@ write_ssh_diagnostic_metadata() {
         ssh_metadata_class=transport
     else
         agentq_ssh_log_require_existing_file "$ssh_metadata_file" || return $?
-        if LC_ALL=C tr -d '\r' < "$ssh_metadata_file" | LC_ALL=C grep -E -q \
-            '^([^:]*: )?(Permission denied|Host key verification failed|Could not resolve hostname|No supported authentication methods available)'; then
+        # No pipe into a quiet grep: under `set -o pipefail` grep exits on its
+        # first match, `tr` takes SIGPIPE, and a FOUND match reads as absent --
+        # which here would downgrade an authentication failure to class=ssh and
+        # drop the "install a key or start ssh-agent" hint.  grep reads the file
+        # DIRECTLY (no writer, nothing to race).  The `tr -d '\r'` this
+        # replaces existed for CRLF; this file is ssh's OWN `-E` diagnostic,
+        # written by the local OpenSSH, which uses LF -- the CRLF concern
+        # belongs to the marker path in sshp, where the text comes from a
+        # PowerShell answer.  A here-string is not an option either: this file
+        # is #!/bin/sh and dash has none.
+        # `grep -c` + arithmetic, not `grep -q`: under `set -o pipefail` a quiet
+        # grep exits at its first match, `tr` takes SIGPIPE, and a FOUND match
+        # reads as ABSENT -- which here downgrades an authentication failure to
+        # class=ssh and drops the "install a key or start ssh-agent" hint.  The
+        # `tr -d '\r'` is required: these lines can carry CR (see
+        # ssh_transport_error).
+        auth_matches=$(LC_ALL=C tr -d '\r' < "$ssh_metadata_file" | LC_ALL=C grep -E -c \
+            '^([^:]*: )?(Permission denied|Host key verification failed|Could not resolve hostname|No supported authentication methods available)') || auth_matches=0
+        if [ "${auth_matches:-0}" -gt 0 ]; then
             ssh_metadata_class=authentication
         else
             ssh_metadata_class=ssh
@@ -1914,8 +1931,18 @@ ssh_transport_error() {
     fi
     [ -s "$ssh_log_file" ] || return 1
     agentq_ssh_log_require_existing_file "$ssh_log_file" || return $?
-    LC_ALL=C tr -d '\r' < "$ssh_log_file" | LC_ALL=C grep -E -q \
-        '^(ssh: connect to host [^[:space:]]+ port [0-9]+: (Connection (refused|timed out|reset by peer|aborted)|Operation timed out|No route to host|Network is unreachable|Host is down)|Connection reset by [^[:space:]]+ port [0-9]+\.?|Connection to [^[:space:]]+ closed by remote host\.?|Connection timed out during banner exchange|banner exchange: Connection to [^[:space:]]+ port [0-9]+: (Connection (timed out|reset by peer)|No route to host|Network is unreachable|Host is down)|kex_exchange_identification: (read: )?(Connection (reset by peer|timed out|refused)|No route to host|Network is unreachable|Host is down)|client_loop: .* (Broken pipe|Connection reset by peer)|packet_write_wait: Connection to [^:]+: Broken pipe|Write failed: Broken pipe|Read from remote host [^:]+: Connection reset by peer|Timeout, server [^[:space:]]+ not responding\.)$'
+    # `grep -c` + an arithmetic test, NOT `grep -q`: under `set -o pipefail` a
+    # quiet grep exits at its first match, `tr` takes SIGPIPE, and a FOUND match
+    # reads as ABSENT -- which here would stop the client from retrying a dead
+    # transport.  `-c` must read every line to count, so the writer is never
+    # killed early.  The `tr -d '\r'` is REQUIRED: these lines can carry CR (the
+    # Windows side writes them, and this repo's stubs copy that), and every
+    # pattern is `$`-anchored, so an unstripped CR silently breaks the match --
+    # measured 2026-10-21, when dropping the `tr` reclassified every transport
+    # failure as class=ssh and killed the retry.
+    transport_matches=$(LC_ALL=C tr -d '\r' < "$ssh_log_file" | LC_ALL=C grep -E -c \
+        '^(ssh: connect to host [^[:space:]]+ port [0-9]+: (Connection (refused|timed out|reset by peer|aborted)|Operation timed out|No route to host|Network is unreachable|Host is down)|Connection reset by [^[:space:]]+ port [0-9]+\.?|Connection to [^[:space:]]+ closed by remote host\.?|Connection timed out during banner exchange|banner exchange: Connection to [^[:space:]]+ port [0-9]+: (Connection (timed out|reset by peer)|No route to host|Network is unreachable|Host is down)|kex_exchange_identification: (read: )?(Connection (reset by peer|timed out|refused)|No route to host|Network is unreachable|Host is down)|client_loop: .* (Broken pipe|Connection reset by peer)|packet_write_wait: Connection to [^:]+: Broken pipe|Write failed: Broken pipe|Read from remote host [^:]+: Connection reset by peer|Timeout, server [^[:space:]]+ not responding\.)$') || transport_matches=0
+    [ "${transport_matches:-0}" -gt 0 ]
 }
 
 platform_probe_file_is_safe() {
@@ -2965,17 +2992,28 @@ probe_windows_agentq_protocol() {
 # resolve to last time auto-detection succeeded?  Stored at
 # $HOME/.config/agentq/platform-cache/<safe-host>.json as
 # {"platform":"unix"|"windows","probed_at":<epoch>,"probe_ms":<n>}.
-# A cache hit replaces BOTH probes (platform + launcher protocol): the entry
-# is only written after a full successful resolution, so its verdict already
-# includes the launcher check.  Bypasses: AGENTQ_REMOTE_PLATFORM set
+# A cache hit replaces the PLATFORM probe only.  The launcher-protocol probe
+# still runs on every windows invocation: initialize_remote_invocation calls
+# probe_windows_agentq_protocol unconditionally once the platform is known,
+# and platform_cache_write fires before it -- so an entry is not proof that
+# the launcher answered.  That is deliberate (fail-closed): a host whose
+# launcher broke after the cache was written must be re-checked, not trusted.
+# (An earlier comment here claimed the entry already included the launcher
+# verdict; the code never did.  Corrected 2026-10-22.)  Bypasses: AGENTQ_REMOTE_PLATFORM set
 # explicitly (never reaches auto), AGENTQ_PLATFORM_PROBE_CACHE=off, an
 # unparsable/expired entry (falls through to probing), and any filesystem
 # hiccup (cache problems must never break a working command -- a cache that
 # cannot be read is indistinguishable from an empty one).
 platform_probe_cache_ttl=${AGENTQ_PLATFORM_PROBE_CACHE_TTL:-604800}
 platform_cache_enabled() {
-    case "${AGENTQ_PLATFORM_PROBE_CACHE:-on}" in
-        off|OFF|Off|oFF|OFf|oFf|ofF) return 1 ;;
+    # Normalised like AGENTQ_REMOTE_PLATFORM, not enumerated: PS `-eq "off"` is
+    # case-insensitive by language rule, so the Windows twin disables the cache
+    # for every case shape of "off" -- a hand-written list of the 8 spellings
+    # was one short (OfF enabled here, disabled there).  One canonical form
+    # cannot drift again.
+    platform_cache_switch=$(printf '%s' "${AGENTQ_PLATFORM_PROBE_CACHE:-on}" | tr '[:upper:]' '[:lower:]')
+    case "$platform_cache_switch" in
+        off) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -3022,9 +3060,14 @@ platform_cache_read() {
         *) return 1 ;;
     esac
     platform_cache_age=$(LC_ALL=C sed -n 's/.*"probed_at":\([0-9]*\).*/\1/p' "$platform_cache_file" | tail -n 1)
-    case "$platform_cache_age" in
-        ''|*[!0-9]*) return 1 ;;
-    esac
+    # is_bounded_positive_integer, not a bare charset test: a leading-zero
+    # value passes `[ !0-9 ]` and `[ -le ]` (test parses decimal), then dies
+    # INSIDE `$((now - age))` -- dash parses `0…` as octal, "Illegal number:
+    # 0179…" is fatal, and the whole client exits 2 with a syntax-error-looking
+    # message on EVERY command until the file is removed (measured 2026-10-21).
+    # The bound (2147483647) also rejects absurd future timestamps into a
+    # graceful cache miss.  Same validator the cache TTL env var uses.
+    is_bounded_positive_integer "$platform_cache_age" || return 1
     platform_cache_now=$(date +%s) || return 1
     case "$platform_cache_now" in
         ''|*[!0-9]*) return 1 ;;
@@ -3120,10 +3163,10 @@ initialize_remote_platform_by_probe() {
     windows_platform_output=$windows_probe_token_output
     if [ "$windows_platform_status" -eq 0 ] && [ "$windows_platform_output" = agentq-windows ]; then
         remote_platform=windows
-        # The launcher-protocol verdict is part of the cached answer, so the
-        # cache is written only AFTER probe_windows_agentq_protocol passes
-        # (initialize_remote_invocation runs it next and its failure returns
-        # before any cache write below).
+        # Written here, BEFORE the launcher-protocol probe that
+        # initialize_remote_invocation runs next: the entry caches only the
+        # platform verdict, and the launcher probe re-runs on every windows
+        # invocation (see the platform_cache_read header).
         platform_cache_write
         return 0
     elif [ "$local_platform_status" -ne 0 ] && [ "$windows_platform_status" -ne 0 ]; then
@@ -4133,10 +4176,22 @@ done
 
 resolve_ssh_binary
 resolve_json_parser
-initialize_remote_invocation
+
+# Each operation branch below calls initialize_remote_invocation itself, AFTER
+# its arguments are fully validated.  Order is the Windows twin's contract: a
+# local typo must exit 2 without an SSH round trip, and on an unreachable host
+# it must not read as a transport failure (255) or pay the probe/retry budget.
+# The parser is the single validator -- no shape is checked twice.
 
 operation=$1
 shift
+# Normalised like AGENTQ_REMOTE_PLATFORM above: the Windows twin's switch is
+# case-INSENSITIVE by language rule, so `STATUS` and `--WORKDIR` dispatch there
+# while this `case` refused them (the twin-parity rule: same input, same
+# answer).  Only the tokens the local parser matches are folded -- values
+# (workdir, label, the command after --) and what goes on the remote command
+# (branch bodies emit literal lowercase words) are untouched.
+operation=$(printf '%s' "$operation" | tr '[:upper:]' '[:lower:]')
 
 case "$operation" in
     submit)
@@ -4145,7 +4200,9 @@ case "$operation" in
         request_id=''
         stdin_script=false
         while [ "$#" -gt 0 ]; do
-            case "$1" in
+            # Fold only the option token; the value is read from $2 verbatim.
+            submit_option=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+            case "$submit_option" in
                 --workdir)
                     [ "$#" -ge 2 ] || fail '--workdir requires a directory'
                     workdir=$2
@@ -4185,6 +4242,7 @@ case "$operation" in
         fi
         is_request_id "$request_id" || fail '--request-id must be 16-128 ASCII letters, numbers, dots, underscores, or hyphens and start with a letter or number'
 
+        initialize_remote_invocation
         append_arg submit
         append_arg --workdir
         append_arg "$workdir"
@@ -4280,6 +4338,7 @@ case "$operation" in
         [ "$#" -eq 1 ] || fail 'lookup requires one request id'
         is_request_id "$1" || fail 'request id must be 16-128 ASCII letters, numbers, dots, underscores, or hyphens and start with a letter or number'
         lookup_request_id=$1
+        initialize_remote_invocation
         append_arg lookup
         append_arg "$1"
         ;;
@@ -4288,17 +4347,27 @@ case "$operation" in
         # compact summary, and the single decorated task (wrapped in {"task":
         # ...} like logs and wait).  A bare numeric id is the local hint the
         # user probably wanted `logs` -- the server has no positional status.
+        # Shape is validated BEFORE the probe; the if-chain below re-checks the
+        # same shapes (unreachable fails then) and owns the values.
+        status_option_1=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+        case "$#" in
+            0) ;;
+            1) [ "$status_option_1" = '--summary' ] || fail 'status accepts --summary or --task <task-id>; for one task log, use logs <task-id>' ;;
+            2) { [ "$status_option_1" = '--task' ] && is_task_id "$2"; } || fail 'status accepts --summary or --task <task-id>' ;;
+            *) fail 'status accepts --summary or --task <task-id>' ;;
+        esac
+        initialize_remote_invocation
         agentq_operation_profile=$operation
         if [ "$#" -eq 0 ]; then
             append_arg status
-        elif [ "$#" -eq 2 ] && [ "$1" = '--task' ]; then
+        elif [ "$#" -eq 2 ] && [ "$status_option_1" = '--task' ]; then
             is_task_id "$2" || fail 'task id must be a non-negative integer'
             append_arg status
             append_arg --task
             append_arg "$2"
             agentq_operation_profile=status_task
             status_expected_task_id=$2
-        elif [ "$#" -eq 1 ] && [ "$1" = '--summary' ]; then
+        elif [ "$#" -eq 1 ] && [ "$status_option_1" = '--summary' ]; then
             append_arg status
             append_arg --summary
             agentq_operation_profile=status_summary
@@ -4312,10 +4381,12 @@ case "$operation" in
         # Default queue section is the compact summary; --full restores the
         # historical decorated dump.  doctor itself is NOT read-only (it starts
         # the pueued service); that warning lives in the usage text.
+        [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" = '--full' ]; } || fail 'doctor accepts --full or no arguments'
+        initialize_remote_invocation
         agentq_operation_profile=$operation
         if [ "$#" -eq 0 ]; then
             append_arg doctor
-        elif [ "$#" -eq 1 ] && [ "$1" = '--full' ]; then
+        elif [ "$#" -eq 1 ] && [ "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" = '--full' ]; then
             append_arg doctor
             append_arg --full
         else
@@ -4325,11 +4396,14 @@ case "$operation" in
     logs)
         [ "$#" -eq 1 ] || [ "$#" -eq 3 ] || fail 'logs requires a task id and optional --tail <lines>'
         is_task_id "$1" || fail 'task id must be a non-negative integer'
+        if [ "$#" -eq 3 ]; then
+            [ "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" = '--tail' ] || fail 'logs accepts only --tail <lines>'
+            is_positive_integer_or_all "$3" || fail '--tail must be a positive integer or all'
+        fi
+        initialize_remote_invocation
         append_arg logs
         append_arg "$1"
         if [ "$#" -eq 3 ]; then
-            [ "$2" = '--tail' ] || fail 'logs accepts only --tail <lines>'
-            is_positive_integer_or_all "$3" || fail '--tail must be a positive integer or all'
             append_arg --tail
             append_arg "$3"
         fi
@@ -4337,23 +4411,30 @@ case "$operation" in
     cancel)
         [ "$#" -eq 1 ] || fail 'cancel requires one task id'
         is_task_id "$1" || fail 'task id must be a non-negative integer'
+        initialize_remote_invocation
         append_arg cancel
         append_arg "$1"
         ;;
     remove)
-        if [ "$#" -eq 3 ] && [ "$1" = '--label' ]; then
-            [ "$3" = '--confirm' ] || fail 'remove --label requires --confirm: a batch removal must be explicitly acknowledged'
+        remove_option_1=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+        remove_option_3=$(printf '%s' "${3:-}" | tr '[:upper:]' '[:lower:]')
+        if [ "$#" -eq 3 ] && [ "$remove_option_1" = '--label' ]; then
+            [ "$remove_option_3" = '--confirm' ] || fail 'remove --label requires --confirm: a batch removal must be explicitly acknowledged'
             [ -n "$2" ] || fail 'remove --label requires a non-empty label'
+        elif [ "$#" -eq 2 ] && [ "$remove_option_1" = '--label' ]; then
+            fail 'remove --label requires --confirm: a batch removal must be explicitly acknowledged'
+        else
+            [ "$#" -eq 1 ] || fail 'remove requires one task id, or --label <label> --confirm'
+            is_task_id "$1" || fail 'task id must be a non-negative integer'
+        fi
+        initialize_remote_invocation
+        if [ "$#" -eq 3 ] && [ "$remove_option_1" = '--label' ]; then
             append_arg remove
             append_arg --label
             append_arg "$2"
             append_arg --confirm
             remove_batch=1
-        elif [ "$#" -eq 2 ] && [ "$1" = '--label' ]; then
-            fail 'remove --label requires --confirm: a batch removal must be explicitly acknowledged'
         else
-            [ "$#" -eq 1 ] || fail 'remove requires one task id, or --label <label> --confirm'
-            is_task_id "$1" || fail 'task id must be a non-negative integer'
             append_arg remove
             append_arg "$1"
         fi
@@ -4361,16 +4442,17 @@ case "$operation" in
     wait)
         [ "$#" -eq 1 ] || [ "$#" -eq 3 ] || fail 'wait requires a task id and optional --timeout <seconds>'
         is_task_id "$1" || fail 'task id must be a non-negative integer'
-        append_arg wait
-        append_arg "$1"
         if [ "$#" -eq 3 ]; then
-            [ "$2" = '--timeout' ] || fail 'wait accepts only --timeout <seconds>'
+            [ "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" = '--timeout' ] || fail 'wait accepts only --timeout <seconds>'
             is_bounded_positive_integer "$3" || fail '--timeout must be a positive integer of at most 2147483647'
             wait_timeout_seconds=$3
         elif [ -n "$wait_timeout" ]; then
             is_bounded_positive_integer "$wait_timeout" || fail 'AGENTQ_WAIT_TIMEOUT must be a positive integer of at most 2147483647'
             wait_timeout_seconds=$wait_timeout
         fi
+        initialize_remote_invocation
+        append_arg wait
+        append_arg "$1"
         # The budget is CLIENT-side: run_wait_ssh_with_timeout kills the local
         # ssh at the deadline and bounds the remote wait with `timeout <N>s`.
         # The server's `wait` arm takes exactly one task id, so forwarding

@@ -211,6 +211,15 @@ for client in agentq sshp; do
 done
 
 if [ "$check_only" = true ]; then
+    # A MISSING destination directory is drift, not a protocol error: SKILL.md
+    # documents `--check` as 0 match / 1 missing or drift / 2 unsafe or bad
+    # arguments, and the Windows twin's Invoke-CanonicalClientCheck reports each
+    # client as missing and returns 1.  assert_regular_directory_path would
+    # fail(2) here, so the same state answered 2 on POSIX and 1 on Windows.
+    if [ ! -d "$destination_directory" ]; then
+        printf '%s: client directory is missing: %s\n' "$program" "$destination_directory" >&2
+        exit 1
+    fi
     assert_regular_directory_path "$destination_directory" 'destination directory'
     client_drift_found=false
     for client in agentq sshp; do

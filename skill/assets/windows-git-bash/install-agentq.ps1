@@ -18,7 +18,7 @@ $expectedClientHash = "28b0756d54ec16ce13d78b251d086aa62e0057089cb27f793cd649f97
 $expectedDaemonHash = "aafa05e2f26cda9aff3eeb9be261e8f9f67752d1e9bb7fbcb47318e35c52ab1d"
 $releaseVersion = "4.0.4"
 $releaseBaseUrl = "https://github.com/Nukesor/pueue/releases/download/v$releaseVersion"
-$agentqVersion = "0.1.16"
+$agentqVersion = "0.1.17"
 $clientAssetName = "pueue-x86_64-pc-windows-msvc.exe"
 $daemonAssetName = "pueued-x86_64-pc-windows-msvc.exe"
 $gitBashPath = $null
@@ -2616,6 +2616,29 @@ function Remove-StaleMaintenanceLock {
         return $false
     }
 
+    # Re-confirm immediately before removing: between the staleness decision
+    # above and the removal below another process may have removed and
+    # recreated the lock with a LIVE holder, and without the re-read this
+    # ms-wide window deletes that live lock -- both holders then believe they
+    # own it.  The POSIX installer (recover_stale_maintenance_lock) and the
+    # server (recover_stale_maintenance_lock) have re-confirmed since
+    # 2026-09-24 and 2026-10-06; this third copy went straight to removal.
+    # Re-read the SAME metadata and require it unchanged, then judge death
+    # again -- a path-only re-check cannot see a recreated lock.
+    $recheckMetadata = Read-LockMetadata -Path $maintenanceLockDirectory
+    if ($null -eq $recheckMetadata) {
+        return $false
+    }
+    if (($recheckMetadata.Pid -ne $lockMetadata.Pid) -or ($recheckMetadata.Identity -ne $lockMetadata.Identity)) {
+        return $false
+    }
+    if (!(Test-ProcessIsConfirmedDead -ProcessId $recheckMetadata.Pid -ExpectedIdentity $recheckMetadata.Identity)) {
+        return $false
+    }
+    if (!(Test-NonReparseLockPath -Path $maintenanceLockDirectory)) {
+        return $false
+    }
+
     return (Remove-AgentQInstallerTemporaryFile -Path $maintenanceLockDirectory -Description "stale AgentQ maintenance lock")
 }
 
@@ -3115,6 +3138,11 @@ try {
         pueued_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $newDaemonPath).Hash.ToLowerInvariant()
         scheduled_task = $taskName
         legacy_backup = $legacyBackupDirectory
+        # Reaching this line means no rollback ran: the root swap completed.
+        # It does NOT claim the whole install is transactional -- ACL work and
+        # the scheduled task are separate steps with their own handling.  The
+        # key keeps its historical name so earlier CHANGELOG/PLAN records still
+        # line up; read it as "the root swap was not rolled back".
         updated_atomically = $true
     } | ConvertTo-Json -Compress
 } catch {
