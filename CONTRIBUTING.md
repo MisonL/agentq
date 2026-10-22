@@ -107,9 +107,13 @@ process note — is history, not a task. `docs/PLAN.md` is the list.
 ## Versioning and releases
 
 AgentQ carries its own version, separate from Pueue's. The value is recorded in
-the two installers, in the server (which `doctor` reports as `agentq=`) and in
-`README.md`; check `01` asserts those copies agree and that both installers'
-success messages print the AgentQ version rather than Pueue's.
+**six** places — the two installers, the server (which `doctor` reports as
+`agentq=`), the two clients, and `README.md`; check `01` asserts all six copies
+agree and that both installers' success messages print the AgentQ version rather
+than Pueue's. The two client constants joined that comparison on 2026-10-21,
+after a one-sided client bump left every check green — the deployment unit is
+all 23 assets, so a version recorded in only some of them is not a version at
+all.
 
 - The version denotes **the deployment unit**: any change to the bytes under
   `skill/assets/` bumps it; documentation-only changes do not.

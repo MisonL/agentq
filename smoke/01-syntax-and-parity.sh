@@ -695,16 +695,17 @@ if ! cmp -s "$root/skill/assets/unix/agentq-server" "$root/skill/assets/windows-
     failures=$((failures + 1))
 fi
 
-# --- AgentQ's own version: one value, four records ---------------------------
+# --- AgentQ's own version: one value, six records ---------------------------
 # The 2026-10-08 defect this replaces: both installers printed Pueue's
 # release_version (the value that builds the download URL) as AgentQ's own, and
-# nothing noticed because nothing read either value.  The four records -- the
-# two installers, the server (doctor reports it as agentq=) and README.md --
-# must agree and be X.Y.Z.  The success lines must interpolate the AgentQ value:
-# a revert to release_version leaves all four definitions agreeing, so the
-# values alone cannot catch that shape.  Same lesson as rule E for the launcher
-# protocol: one mechanism copied into several files stays consistent only if a
-# check compares the copies.
+# nothing noticed because nothing read either value.  The six records -- the two
+# installers, the server (doctor reports it as agentq=), README.md, and the two
+# CLIENTS (whose constants were added to this comparison 2026-10-21 after a
+# one-sided bump went unnoticed) -- must agree and be X.Y.Z.  The success lines
+# must interpolate the AgentQ value: a revert to release_version leaves every
+# definition agreeing, so the values alone cannot catch that shape.  Same lesson
+# as rule E for the launcher protocol: one mechanism copied into several files
+# stays consistent only if a check compares the copies.
 version_summary=0
 version_posix_line=$(grep -m1 '^agentq_version=' "$root/skill/assets/unix/install-agentq.sh" || true)
 version_posix=${version_posix_line#agentq_version=}
@@ -948,10 +949,34 @@ repo_script_count=0
 # `| grep -m1` (same SIGPIPE mechanism, `-m` also exits at its match limit)
 # passed the lock.  A flag cluster ending in either letter is now caught;
 # `-c` still is not, and `-q`/`-m` inside a longer cluster (`-Eq`, `-m1`) is.
+# A pipeline SPLIT ACROSS LINES escapes the regex above, and that is not
+# hypothetical: `cat file | \` on one line and `grep -q pattern` on the next is
+# an ordinary way to format a long pipeline, and the per-line match sees neither
+# a `|` followed by grep nor a grep preceded by `|`.  Measured 2026-10-22: the
+# two-line form matched NOTHING while the one-line form was caught.  So logical
+# lines are joined first, on BOTH continuations the shell honours: a trailing
+# backslash, and a trailing `|` (which continues the command just as surely --
+# `cat x |` / newline / `grep -q y` is one pipeline).  This is the same join
+# smoke/02's rules 1 and 2 already do.
+repo_pipe_scan() {
+    awk '
+        {
+            line = $0
+            if (pending != "") { line = pending " " line; pending = "" }
+            if (line ~ /\\[[:space:]]*$/ || line ~ /[|][[:space:]]*$/) {
+                sub(/\\[[:space:]]*$/, "", line)
+                pending = line
+                next
+            }
+            printf "%d:%s\n", NR, line
+        }
+        END { if (pending != "") printf "%d:%s\n", NR, pending }
+    ' "$1"
+}
 repo_pipe_re='(^|[^|])[|][^|;&]*grep[^|;&]*(-[a-zA-Z]*[qm]|[[:space:]]--(quiet|max-count|silent))'
 while IFS= read -r repo_script; do
     repo_script_count=$((repo_script_count + 1))
-    repo_hits=$(grep -nE "$repo_pipe_re" "$repo_script" 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*#' || true)
+    repo_hits=$(repo_pipe_scan "$repo_script" 2>/dev/null | grep -E "$repo_pipe_re" | grep -vE '^[0-9]+:[[:space:]]*#' || true)
     if [ -n "$repo_hits" ]; then
         while IFS= read -r repo_hit; do
             printf 'repo script FAILED (a pipeline into a quiet grep reads a FOUND match as absent under pipefail): %s: %s\n' \

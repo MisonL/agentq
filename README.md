@@ -2,7 +2,7 @@
 
 Remote task queue over SSH, backed by [Pueue](https://github.com/Nukesor/pueue) 4.0.4.
 
-**Version:** 0.1.17 — the deployment unit (`skill/assets/`, 23 files) ships as one
+**Version:** 0.1.18 — the deployment unit (`skill/assets/`, 23 files) ships as one
 version; releases are tagged in git, indexed at the top of [`CHANGELOG.md`](CHANGELOG.md),
 and verified by the [`release.yml`](.github/workflows/release.yml) tag/version gate.
 
@@ -141,8 +141,12 @@ proven and what is not. In particular:
 
 - The smoke suite proves that the assets parse, that the two canonical copies
   agree, that bad arguments are rejected, and that the command surface has not
-  drifted. **It does not prove that any branch behaves correctly.**
-  `agentq-server` is untyped shell with no compiler and no type system.
+  drifted. It *does* also exercise real behaviour, but only where a check says
+  so: `docs/verification-status.md` lists, per check, which branches run against
+  a real runtime and which are only parsed or pattern-matched. Read that column
+  rather than assuming either way — `agentq-server` is untyped shell with no
+  compiler and no type system, so "it parsed" and "it works" are different
+  claims, and the table keeps them apart.
 - Real remote services, TLS/shared-key setups, and production credentials are
   **not** verified. Do not claim otherwise.
 - `doctor` is **not** read-only: it starts the daemon if it is not running, which

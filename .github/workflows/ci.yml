@@ -77,6 +77,40 @@ jobs:
             exit 1
           fi
           grep -qE '^PASS checks: [0-9]+ ran, [01] skipped, 0 partial, 0 failed' smoke.log
+          # The check COUNT must be pinned independently of the filesystem.
+          # `run-tests.sh` already compares `ran` against the number of files it
+          # FOUND, which is not a gate: delete a smoke file and both numbers
+          # shrink together, so every assertion above stays green while the
+          # suite silently covers less.  This list is the independent record --
+          # adding a check means adding it here, and deleting one without
+          # striking it here turns the job red.  Order and spelling are pinned
+          # too: a renamed check is a different check, and the NOT-covered gate
+          # below matches by name.
+          expected_checks='01-syntax-and-parity 02-error-contract 03-protocol-roundtrip 04-degraded-contracts 05-client-contract 06-lock-contention 07-client-transport 08-jq-path-arguments 09-native-argument-quoting 10-installer-invariants 11-installer-contract 12-ps-client-contract 13-ps-installer-contract 14-remote-command-length 15-transient-pueue-failure 16-no-host-identifiers 17-askpass-credential 18-record-metadata-contract 19-sshp-contract 20-ps-native-argv-roundtrip 21-install-client-contract 22-launcher-contract 23-durable-move-contract 24-git-bash-launcher-contract 25-ps-client-installer-contract 26-record-read-paths 27-record-write-paths 28-client-interrupt 29-jq-reserved-identifiers'
+          actual_checks=$(grep -E '^(ok|SKIP|PART|NCOV|FAIL) +[0-9]{2}-' smoke.log \
+            | sed -E 's/^(ok|SKIP|PART|NCOV|FAIL) +([0-9]{2}-[a-z0-9-]+) .*/\2/' \
+            | sort -u | tr '\n' ' ' | sed 's/ $//')
+          expected_sorted=$(printf '%s\n' $expected_checks | sort | tr '\n' ' ' | sed 's/ $//')
+          if [ "$actual_checks" != "$expected_sorted" ]; then
+            echo 'the set of checks that reported does not match the pinned list' >&2
+            echo "pinned:  $expected_sorted" >&2
+            echo "reported: $actual_checks" >&2
+            echo 'missing:' >&2
+            for c in $expected_sorted; do
+              case " $actual_checks " in *" $c "*) : ;; *) echo "  $c" >&2 ;; esac
+            done
+            echo 'unexpected:' >&2
+            for c in $actual_checks; do
+              case " $expected_sorted " in *" $c "*) : ;; *) echo "  $c" >&2 ;; esac
+            done
+            exit 1
+          fi
+          expected_count=$(printf '%s\n' $expected_checks | grep -c .)
+          reported_count=$(grep -cE '^(ok|SKIP|PART|NCOV|FAIL) +[0-9]{2}-' smoke.log || true)
+          if [ "$reported_count" != "$expected_count" ]; then
+            echo "reported $reported_count check lines, pinned list has $expected_count" >&2
+            exit 1
+          fi
           # smoke/05's shellcheck lock is TOOL-GATED: without shellcheck it
           # prints `shellcheck=absent` and still exits 0, so neither the exit
           # code nor the PASS line can tell a linted run from an unlinted one.

@@ -432,6 +432,145 @@ assert_rc w7record 5
 assert_json w7record '.state == "removed" and .task_id == 1001'
 assert_err_has w7record 'was removed before wait'
 
+# ---------------------------------------------- V: the vanish window (A-F2)
+#
+# `load_request_records` runs on the LOCK-FREE read paths, so an archiver can
+# delete a record after the guard accepted it and before the read.  That is a
+# RACE, not a guard violation, and the producer must emit the `null` placeholder
+# for it -- anything else turns an unrelated `status` into exit 2 while a
+# concurrent remove is in flight.
+#
+# The window is a few microseconds per record and could not be hit from a
+# synthetic runtime (40 + 25 timing trials: 0 hits).  So this case does NOT
+# race.  It asserts the two END STATES the producer must discriminate, which is
+# where a regression would show up:
+#
+#   * ABSENT  -> tolerated (placeholder, command succeeds)
+#   * PRESENT but unsafe (here: a directory) -> still fatal
+#
+# Together they pin the guard's shape: a fix that swallowed everything would
+# fail the second, and a fix that swallowed nothing would fail the first.
+# The A/B evidence that the new failure-path checks are what produce the first
+# row is the mutation proof in docs/PLAN.md (same `rm` injected into both the
+# 0.1.17 and 0.1.18 servers: 0.1.17 exit 2, 0.1.18 exit 0).
+
+# V1. A record path that has become a DIRECTORY must stay fatal.  It exists, so
+#     it is not a vanish; `request_metadata_file_is_safe` rejects it.
+clear_runtime
+mkdir -p "$work/data/agentq-requests/AQREAD-VDIR-00000001.json"
+run_case v1 status
+assert_rc v1 2
+assert_err_has v1 'invalid AgentQ request record path'
+assert_reason v1
+rmdir "$work/data/agentq-requests/AQREAD-VDIR-00000001.json"
+
+# V2. A DANGLING SYMLINK at the record path is NOT a vanish: `[ -L ]` is true,
+#     so the path still exists as an object even though its target does not.
+#     It must stay fatal -- the distinction the fix rests on is "gone" vs
+#     "present but unsafe", and a symlink is the latter.  (V1 asserted the
+#     directory shape of the same verdict; this pins the other one, so a fix
+#     that widened `request_record_vanished` to "unreadable" fails here.)
+clear_runtime
+ln -s /nonexistent/agentq-vanish-target \
+    "$work/data/agentq-requests/AQREAD-VDANGLE-0000001.json"
+run_case v2 status
+assert_rc v2 2
+assert_err_has v2 'invalid AgentQ request record path'
+assert_reason v2
+find "$work/data/agentq-requests" -maxdepth 1 -name '*.json' -type l -delete
+
+# V3. The source of the vanish arm is visible in the asset: the checks exist at
+#     both readers that can race an archiver -- load_request_records (3 sites:
+#     guard, guard, read) and the shared request_record_path_guards_or_fail
+#     used by the repair pass (2 sites).  A copy on a SUCCESS path would restore
+#     the 4-guard cost that loop was trimmed for, so the count is also the
+#     shape.
+cases=$((cases + 1))
+vanish_sites=$(grep -c 'request_record_vanished ' "$work/agentq-server" || true)
+if [ "$vanish_sites" != 5 ]; then
+    printf 'read-paths v3: expected 5 request_record_vanished sites, got %s\n' \
+        "$vanish_sites" >&2
+    failures=$((failures + 1))
+fi
+
+# V4. The positive half: a record that DOES vanish must be tolerated.  The
+#     window is microseconds and could not be hit by timing (40 + 25 trials:
+#     0 hits, recorded in docs/PLAN.md), so this case FORCES it -- it copies the
+#     server, injects one `rm` between the accepted guard and the precision
+#     probe inside load_request_records, and requires the command to succeed.
+#     An injected `rm` is not a substitute for the real race, but it is the same
+#     failure the fix targets, and it is the only way to assert the arm at all.
+#     A regression that dropped the vanish checks fails here with exit 2 and
+#     `invalid AgentQ request record path`.
+clear_runtime
+put_record AQREAD-VFORCE-0000001 accepted 1001 '"2026-09-29T00:00:00Z"'
+python3 - "$work/agentq-server" "$work/agentq-server-forced" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+lines = open(src).read().split('\n')
+start = next(i for i, l in enumerate(lines) if l.startswith('load_request_records() {'))
+end = next(i for i in range(start + 1, len(lines)) if lines[i] == '}')
+target = next(i for i in range(start, end)
+              if 'validate_task_id_precision_in_file "$record_path"' in lines[i])
+indent = ' ' * (len(lines[target]) - len(lines[target].lstrip()))
+lines.insert(target, indent + 'rm -f "$record_path"  # SMOKE: forced vanish')
+open(dst, 'w').write('\n'.join(lines))
+PY
+chmod 700 "$work/agentq-server-forced"
+run_forced() {
+    local label=$1
+    shift
+    local rc=0
+    ( cd "$work" && "$work/agentq-server-forced" "$@" ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+run_forced v4 status
+assert_rc v4 0
+assert_json v4 '.group.status == "Running"'
+cases=$((cases + 1))
+if grep -qF 'invalid AgentQ request record' "$work/v4.err"; then
+    printf 'read-paths v4: forced vanish still reported as a record error\n' >&2
+    sed -n '1,3p' "$work/v4.err" >&2
+    failures=$((failures + 1))
+fi
+
+# V5. And the same forced vanish through the OTHER reader (the repair pass that
+#     runs from the migrator) -- the second copy of this defect, found by V2's
+#     first draft.  Its rm goes into the shared guard helper.
+clear_runtime
+put_record AQREAD-VREPAIR-000001 accepted 1001 '"2026-09-29T00:00:00Z"'
+python3 - "$work/agentq-server" "$work/agentq-server-forced2" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+lines = open(src).read().split('\n')
+start = next(i for i, l in enumerate(lines)
+             if l.startswith('request_record_path_guards_or_fail() {'))
+end = next(i for i in range(start + 1, len(lines)) if lines[i] == '}')
+target = next(i for i in range(start, end)
+              if 'validate_task_id_precision_in_file "$record_path"' in lines[i])
+indent = ' ' * (len(lines[target]) - len(lines[target].lstrip()))
+lines.insert(target, indent + 'rm -f "$record_path"  # SMOKE: forced vanish')
+open(dst, 'w').write('\n'.join(lines))
+PY
+chmod 700 "$work/agentq-server-forced2"
+run_forced2() {
+    local label=$1
+    shift
+    local rc=0
+    ( cd "$work" && "$work/agentq-server-forced2" "$@" ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+run_forced2 v5 status
+assert_rc v5 0
+cases=$((cases + 1))
+if grep -qF 'failed to recover removing AgentQ requests' "$work/v5.err"; then
+    printf 'read-paths v5: forced vanish in the repair pass still aborted recovery\n' >&2
+    sed -n '1,3p' "$work/v5.err" >&2
+    failures=$((failures + 1))
+fi
+
 # --------------------------------------------------------------- summary
 if [ "$failures" -ne 0 ]; then
     printf 'read-paths checks FAILED: cases=%s failures=%s\n' "$cases" "$failures" >&2

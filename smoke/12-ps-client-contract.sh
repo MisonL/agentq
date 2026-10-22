@@ -1552,6 +1552,52 @@ grep -q -- '--full' "$client" || { printf '%s\n' 'ps-client: missing doctor --fu
 grep -q -- '--summary' "$client" || { printf '%s\n' 'ps-client: missing status --summary' >&2; mode_static_failures=$((mode_static_failures + 1)); }
 failures=$((failures + mode_static_failures))
 
+# The LOCAL command-line budget.  The unix-target payload is base64'd twice
+# (submit arm + New-UnixRemoteInvocation) and both copies ride ONE argv
+# element of the local ssh.exe, so the platform's command-line limit applies:
+# CreateProcess caps a Windows command line at 32767 characters.  The declared
+# unix limit was 100000 base64 characters -- 4.2x more than Windows can
+# transmit -- so scripts between 13.5 KB and 75 KB were accepted here and then
+# failed at the local process launch (an unclassified exit 1 with the
+# diagnostic redacted).  Measured 2026-10-22 with this repo's stub ssh: an
+# 8-byte script produced a 750-character local argv, so the fixed overhead is
+# about 734 and the usable budget on Windows is about 24000 base64 chars.
+#
+# The static lock pins the WINDOWS value: the platform branch is chosen at
+# runtime, so a case run under pwsh on macOS exercises the POSIX limit, and
+# only the constant can carry the Windows one.
+grep -q 'LocalCommandLineLimit' "$client" ||
+    { printf '%s\n' 'ps-client: no local command-line budget for the ssh payload' >&2; mode_static_failures=$((mode_static_failures + 1)); }
+grep -q '32767' "$client" ||
+    { printf '%s\n' 'ps-client: the local command-line budget does not carry the Windows CreateProcess limit (32767)' >&2; mode_static_failures=$((mode_static_failures + 1)); }
+grep -q 'LocalCommandLineFixedOverhead' "$client" ||
+    { printf '%s\n' 'ps-client: the local command-line budget has no measured fixed overhead' >&2; mode_static_failures=$((mode_static_failures + 1)); }
+failures=$((failures + mode_static_failures))
+
+# The behavioural half: a payload beyond the local budget must be REFUSED with
+# the controlled message, before any ssh launch -- not accepted and then failed
+# at the process launch.  The budget is read from the asset's own constants so
+# the case does not restate them (a second copy would drift).
+cases=$((cases + 1))
+oversize_probe='
+$ErrorActionPreference = "Stop"
+. "'"$client_arg"'" 2>$null
+$limit = [int](($script:LocalCommandLineLimit - $script:LocalCommandLineFixedOverhead) * 3 / 4)
+$payload = "x" * ($limit + 4096)
+$scriptBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload))
+Write-Output ("limit=" + $limit + " b64=" + $scriptBase64.Length)
+'
+oversize_out=$("$pwsh_binary" -NoProfile -NonInteractive -Command "$oversize_probe" 2>/dev/null | tr -d '\r')
+oversize_limit=$(printf '%s\n' "$oversize_out" | sed -n 's/^limit=\([0-9]*\) .*/\1/p')
+oversize_b64=$(printf '%s\n' "$oversize_out" | sed -n 's/.*b64=\([0-9]*\)$/\1/p')
+if [ -z "$oversize_limit" ] || [ -z "$oversize_b64" ]; then
+    printf 'ps-client: could not read the local command-line budget from the asset: %s\n' "$oversize_out" >&2
+    failures=$((failures + 1))
+elif [ "$oversize_b64" -le "$oversize_limit" ]; then
+    printf 'ps-client: the local command-line budget did not shrink the usable payload (%s > %s is false)\n' "$oversize_b64" "$oversize_limit" >&2
+    failures=$((failures + 1))
+fi
+
 # --version must be byte-identical to the POSIX twin's line.  Measured
 # 2026-10-21: this client printed `agentq.ps1 0.1.16` while the POSIX client
 # printed `agentq 0.1.16` -- the program name came from $script:Program, which
