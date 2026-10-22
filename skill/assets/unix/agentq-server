@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.18'
+agentq_version='0.1.19'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -880,7 +880,7 @@ atomic_destination_parent_identity_matches() {
 # neither a regular file nor a symlink -- i.e. it is GONE, not merely
 # unreadable.  A record that still EXISTS but fails a safety guard is a
 # different thing entirely and must stay fatal.
-request_record_vanished() {
+tracked_path_vanished() {
     local record_path=$1
 
     [ ! -e "$record_path" ] && [ ! -L "$record_path" ]
@@ -2281,6 +2281,7 @@ load_cancellation_markers() {
     local marker_parent
     local marker_task_id
     local marker
+    local marker_status=0
 
     shopt -s nullglob
     marker_files=("$cancellation_directory"/*.json)
@@ -2307,13 +2308,43 @@ load_cancellation_markers() {
                 fail "invalid AgentQ cancellation marker path: $marker_path"
             [ -f "$marker_path" ] && [ ! -L "$marker_path" ] ||
                 fail "invalid AgentQ cancellation marker path: $marker_path"
-            request_metadata_file_is_safe "$marker_path" ||
+            # Same race as load_request_records: a lock-free reader
+            # (status/logs) can interleave with remove_cancellation_marker_for_task,
+            # which runs under the operation lock.  A marker that VANISHED is
+            # skipped -- and skipping is safe here because markers are NOT
+            # positionally bound to ids (the aggregate filter validates each one
+            # on its own).  Measured 2026-10-22: without this, a vanished marker
+            # made the pipeline fail and the whole command exited 1 -- a code the
+            # contract does not define for this, printed together with
+            # reason=protocol_error, i.e. an exit code that contradicted its own
+            # machine-readable line.
+            request_metadata_file_is_safe "$marker_path" || {
+                tracked_path_vanished "$marker_path" && continue
                 fail "invalid AgentQ cancellation marker path: $marker_path"
-            request_metadata_file_is_safe "$marker_path" ||
+            }
+            request_metadata_file_is_safe "$marker_path" || {
+                tracked_path_vanished "$marker_path" && continue
                 fail "invalid AgentQ cancellation marker path: $marker_path"
+            }
             validate_task_id_precision "$marker_task_id"
+            # rc=1 is the vanished verdict; `|| marker_status=$?` (not a bare
+            # assignment) because under `set -e` a failing `$( )` assignment
+            # kills the server before the next line -- the fourth time this
+            # repo has hit that trap.  Anything else non-zero (jq rejects the
+            # marker body with 5) keeps the ORIGINAL loud failure: without the
+            # `fail` below the loop would print an EMPTY marker line instead,
+            # the aggregate would silently accept it, and `status` would exit 0
+            # on a corrupt marker -- measured 2026-10-22 by reverting the branch.
             marker=$(cancellation_marker_is_valid "$marker_path" "$marker_task_id") ||
+                marker_status=$?
+            if [ "${marker_status:-0}" -eq 1 ]; then
+                marker_status=0
+                continue
+            fi
+            if [ "${marker_status:-0}" -ne 0 ]; then
+                marker_status=0
                 fail "invalid AgentQ cancellation marker: $marker_path"
+            fi
             printf '%s\n' "$marker"
         done
     } | jq -cse '
@@ -2493,28 +2524,36 @@ request_instance_probe_filter='
 | length > 0
 '
 
-request_record_is_valid() {
-    local record_path=$1
-    local request_id=$2
-
-    request_metadata_file_is_safe "$record_path" ||
-        fail "invalid AgentQ request record path: $record_path"
-    validate_task_id_precision_in_file "$record_path"
-    request_metadata_file_is_safe "$record_path" ||
-        fail "invalid AgentQ request record path: $record_path"
-    jq -ce --arg request_id "$request_id" "$request_record_filter" < "$record_path"
-}
+# request_record_is_valid was folded into read_request_record + the shared
+# request_record_path_guards_or_fail: it was a THIRD copy of the guard sequence
+# (rule E), and its two consecutive identical guards bought nothing --
+# path_chain_is_safe walks every component with `[ -L ]`, so the copy in the
+# caller and the copy in the callee were the same walk on the same path with
+# nothing between them (the same measurement that trimmed load_request_records
+# from 4 guards to 2).  Its one caller was read_request_record.
 
 request_tombstone_is_valid() {
     local tombstone_path=$1
     local request_id=$2
 
-    request_metadata_file_is_safe "$tombstone_path" ||
-        fail "invalid AgentQ request tombstone path: $tombstone_path"
-    validate_task_id_precision_in_file "$tombstone_path"
-    request_metadata_file_is_safe "$tombstone_path" ||
-        fail "invalid AgentQ request tombstone path: $tombstone_path"
-    jq -ce --arg request_id "$request_id" "$request_tombstone_filter" < "$tombstone_path"
+    # Same vanish verdict as its record twin: 1 means the tombstone is GONE.
+    # Its delete sites are prune_request_tombstones (lock only) and nothing
+    # else, so this arm is a defensive consistency measure rather than a
+    # measured race -- but a reader that calls a vanished tombstone "invalid
+    # path" is the same wrong verdict in either file, and the two readers must
+    # not disagree about what "gone" means.
+    request_tombstone_path_guards_or_fail "$tombstone_path" || return 1
+    # Silent read first, for the same reason as the record twin above: a bare
+    # `jq < "$path"` prints bash's redirection error on a vanished file, and the
+    # clients forward the remote stderr.
+    tombstone_read_status=0
+    tombstone_body=$(cat -- "$tombstone_path" 2>/dev/null) || tombstone_read_status=$?
+    if [ "$tombstone_read_status" -ne 0 ]; then
+        tracked_path_vanished "$tombstone_path" && return 1
+        fail "invalid AgentQ request tombstone: $tombstone_path"
+    fi
+    jq -ce --arg request_id "$request_id" "$request_tombstone_filter" <<<"$tombstone_body" ||
+        fail "invalid AgentQ request tombstone: $tombstone_path"
 }
 
 # The tombstone-path guard sequence, in ONE place so the per-file reader above
@@ -2691,16 +2730,16 @@ load_request_records() {
         # for exactly that reason (4 guards 1040ms -> 1 guard 263ms, measured
         # on 272 records).
         request_metadata_file_is_safe "$record_path" || {
-            if request_record_vanished "$record_path"; then printf 'null\n'; continue; fi
+            if tracked_path_vanished "$record_path"; then printf 'null\n'; continue; fi
             fail "invalid AgentQ request record path: $record_path"
         }
         validate_task_id_precision_in_file "$record_path"
         request_metadata_file_is_safe "$record_path" || {
-            if request_record_vanished "$record_path"; then printf 'null\n'; continue; fi
+            if tracked_path_vanished "$record_path"; then printf 'null\n'; continue; fi
             fail "invalid AgentQ request record path: $record_path"
         }
         record=$(<"$record_path") || {
-            if request_record_vanished "$record_path"; then printf 'null\n'; continue; fi
+            if tracked_path_vanished "$record_path"; then printf 'null\n'; continue; fi
             fail "invalid AgentQ request record: $record_path"
         }
         printf '%s\n' "$record"
@@ -2817,20 +2856,37 @@ prepare_request_metadata_files() {
 read_request_record_state_and_body() {
     local request_id=$1
     local record_path
+    local record_body
 
     is_request_id "$request_id" || fail "invalid AgentQ request record id: $request_id"
     record_path=$(request_record_path "$request_id")
     if [ ! -e "$record_path" ] && [ ! -L "$record_path" ]; then
         return 1
     fi
-    # `fail` exits the SUBSHELL with status 2 (the protocol-error code), so the
-    # guard's failure must NOT be folded into the "vanished" verdict of 1: the
-    # caller distinguishes them.  `|| return 2` keeps the distinction; the
-    # guard's own stderr was already printed by `fail` inside the subshell.
-    request_record_path_guards_or_fail "$record_path" || return 2
+    # `fail` never RETURNS -- it exits the subshell with status 2, so by the
+    # time this `||` runs, the helper can only have returned 1, the VANISHED
+    # verdict.  The first version of this line was `|| return 2`, written
+    # against the opposite intuition: it therefore converted every vanish in
+    # this fallback into the failure code, and the caller's `fail "missing...
+    # during recovery"` fired on a concurrent archiver.  Measured 2026-10-22
+    # with a forced vanish inside the helper on the 2nd (fallback) call:
+    # exit 2 `missing AgentQ request record during recovery`.  `|| return 1`
+    # carries the vanish verdict through; a real guard violation cannot be
+    # folded here because `fail` already ended the subshell.
+    request_record_path_guards_or_fail "$record_path" || return 1
+    # Silent read, then jq from the string: the guard-to-open gap is the last
+    # window a concurrent archiver can slip into, and a bare `jq < "$path"`
+    # would turn it into bash's redirection error plus the caller's "missing
+    # record during recovery" -- the exact 0.1.18 symptom the guard's vanish
+    # arm exists to remove, just narrower.  rc=1 (gone) is the skip verdict the
+    # callers already read; anything else is a real failure and still speaks.
+    record_body=$(cat -- "$record_path" 2>/dev/null) || {
+        tracked_path_vanished "$record_path" && return 1
+        fail "invalid AgentQ request record: $record_path"
+    }
 
     jq -re --arg request_id "$request_id" \
-        "$request_record_filter | .state, (.task_id // \"\" | tostring), tojson" < "$record_path" ||
+        "$request_record_filter | .state, (.task_id // \"\" | tostring), tojson" <<<"$record_body" ||
         fail "invalid AgentQ request record: $record_path"
 }
 
@@ -2852,12 +2908,12 @@ request_record_path_guards_or_fail() {
     local record_path=$1
 
     request_metadata_file_is_safe "$record_path" || {
-        request_record_vanished "$record_path" && return 1
+        tracked_path_vanished "$record_path" && return 1
         fail "invalid AgentQ request record path: $record_path"
     }
     validate_task_id_precision_in_file "$record_path"
     request_metadata_file_is_safe "$record_path" || {
-        request_record_vanished "$record_path" && return 1
+        tracked_path_vanished "$record_path" && return 1
         fail "invalid AgentQ request record path: $record_path"
     }
 }
@@ -2865,31 +2921,73 @@ request_record_path_guards_or_fail() {
 read_request_record() {
     local request_id=$1
     local record_path
+    local record_body
+    local record_read_status
 
     is_request_id "$request_id" || fail "invalid AgentQ request record id: $request_id"
     record_path=$(request_record_path "$request_id")
     if [ ! -e "$record_path" ] && [ ! -L "$record_path" ]; then
         return 1
     fi
-    request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
-    request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
-
-    request_record_is_valid "$record_path" "$request_id" || fail "invalid AgentQ request record: $record_path"
+    # rc=1 is the VANISHED verdict, the same one the bare existence check above
+    # returns: every caller already reads 1 as "no record" (lookup falls through
+    # to the tombstone, submit to "already consumed", wait to its own scan).
+    #
+    # This path DOES race an archiver even though it runs under the operation
+    # lock: the archiver (repair_removed_request_records) also runs from
+    # migrate_removed_request_records on the LOCK-FREE read paths (status, logs,
+    # doctor), so a lock holder is not shielded from it.  The window is exactly
+    # "the record is already in state removed and a concurrent status archives
+    # it" -- an id in accepted/removing is never deleted, because archiving is
+    # the only delete site and it requires the removed state.
+    #
+    # Reported as `invalid AgentQ request record path` before this arm existed
+    # (same class as load_request_records, A-F2): a caller told to fix its
+    # arguments when the right answer was "it is gone, read the tombstone".
+    request_record_path_guards_or_fail "$record_path" || return 1
+    # The read is SILENT on failure (`cat` into a substitution, stderr dropped)
+    # rather than `jq ... < "$record_path"`: bash's own redirection error would
+    # otherwise print `<path>: No such file or directory` on stderr, and the
+    # clients capture the remote stderr to look for `reason=`, so a benign race
+    # would still surface as unexplained noise on a successful call.  A failed
+    # read is classified below, where "gone" and "unreadable" can be told apart.
+    record_read_status=0
+    record_body=$(cat -- "$record_path" 2>/dev/null) || record_read_status=$?
+    if [ "$record_read_status" -ne 0 ]; then
+        tracked_path_vanished "$record_path" && return 1
+        fail "invalid AgentQ request record: $record_path"
+    fi
+    jq -ce --arg request_id "$request_id" "$request_record_filter" <<<"$record_body" ||
+        fail "invalid AgentQ request record: $record_path"
 }
 
 read_request_tombstone() {
     local request_id=$1
     local tombstone_path
+    local tombstone_body
+    local tombstone_read_status
+    local tombstone_status
 
     is_request_id "$request_id" || fail "invalid AgentQ request tombstone id: $request_id"
     tombstone_path=$(request_tombstone_path "$request_id")
     if [ ! -e "$tombstone_path" ] && [ ! -L "$tombstone_path" ]; then
         return 1
     fi
-    request_metadata_file_is_safe "$tombstone_path" || fail "invalid AgentQ request tombstone path: $tombstone_path"
-    request_metadata_file_is_safe "$tombstone_path" || fail "invalid AgentQ request tombstone path: $tombstone_path"
-
-    request_tombstone_is_valid "$tombstone_path" "$request_id" || fail "invalid AgentQ request tombstone: $tombstone_path"
+    # rc=1 = GONE, matching the existence check above and its record twin.
+    # No guard call here: request_tombstone_is_valid runs the SAME shared
+    # helper as its first step, and a second identical walk on an unchanged
+    # path buys nothing (the measurement that trimmed load_request_records
+    # and the record reader).  The status is captured explicitly:
+    # `[ $? -eq 1 ]` inside a `||` block would test the block's own first
+    # command, not the reader.
+    tombstone_status=0
+    request_tombstone_is_valid "$tombstone_path" "$request_id" || tombstone_status=$?
+    if [ "$tombstone_status" -eq 1 ]; then
+        return 1
+    elif [ "$tombstone_status" -ne 0 ]; then
+        fail "invalid AgentQ request tombstone: $tombstone_path"
+    fi
+    return 0
 }
 
 prune_request_temporary_files_in_directory() {
@@ -4332,6 +4430,7 @@ wait_reconcile_missing_task() {
     local tombstone_task_id
     local tombstone_created_at
     local output
+    local wait_read_status=0
     local matched_request_id=''
     local matched_record=''
     local matched_tombstone_request_id=''
@@ -4387,8 +4486,22 @@ wait_reconcile_missing_task() {
                 request_id=${path##*/}
                 request_id=${request_id%.json}
                 is_request_id "$request_id" || fail "invalid AgentQ request record filename: $path"
+                # rc=1 is the vanished verdict (the reader returns it when the
+                # record is gone rather than unsafe); every other failure keeps
+                # the original loud `fail`.  Same reader, same rule -- the
+                # repair fallback and this one must not disagree about what
+                # "gone" means.
+                wait_read_status=0
                 output=$(read_request_record_state_and_body "$request_id") ||
+                    wait_read_status=$?
+                if [ "${wait_read_status:-0}" -eq 1 ]; then
+                    wait_read_status=0
+                    continue
+                fi
+                if [ "${wait_read_status:-0}" -ne 0 ]; then
+                    wait_read_status=0
                     fail "missing AgentQ request record during wait recovery: $path"
+                fi
                 record_state=${output%%$'\n'*}
                 output=${output#*$'\n'}
                 record_task_id=${output%%$'\n'*}
@@ -4623,11 +4736,17 @@ cancellation_marker_is_valid() {
     # used by read_cancellation_marker(), so relying only on
     # load_cancellation_markers() would let a low-precision jq round an
     # unsafe persisted id on the single-marker path.
-    request_metadata_file_is_safe "$marker_path" ||
+    # Returns 1 when the marker VANISHED (a concurrent archiver), so both
+    # callers can skip it; `fail` still ends the process on a real violation.
+    request_metadata_file_is_safe "$marker_path" || {
+        tracked_path_vanished "$marker_path" && return 1
         fail "invalid AgentQ cancellation marker path: $marker_path"
+    }
     validate_task_id_precision_in_file "$marker_path"
-    request_metadata_file_is_safe "$marker_path" ||
+    request_metadata_file_is_safe "$marker_path" || {
+        tracked_path_vanished "$marker_path" && return 1
         fail "invalid AgentQ cancellation marker path: $marker_path"
+    }
     jq -ce --arg task_id "$task_id" '
         def valid_task_id:
             if type != "number" then
@@ -4666,7 +4785,11 @@ read_cancellation_marker() {
     request_metadata_file_is_safe "$marker_path" || fail "invalid AgentQ cancellation marker path: $marker_path"
     request_metadata_file_is_safe "$marker_path" || fail "invalid AgentQ cancellation marker path: $marker_path"
 
-    cancellation_marker_is_valid "$marker_path" "$task_id" || fail "invalid AgentQ cancellation marker: $marker_path"
+    # A vanished marker is "no marker" for every caller of this function.
+    cancellation_marker_is_valid "$marker_path" "$task_id" || {
+        [ $? -eq 1 ] && return 1
+        fail "invalid AgentQ cancellation marker: $marker_path"
+    }
 }
 
 # compact_task/raw_compact_task exit 4 only when Pueue ANSWERED and this id is
