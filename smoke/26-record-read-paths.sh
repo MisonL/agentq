@@ -469,7 +469,7 @@ rmdir "$work/data/agentq-requests/AQREAD-VDIR-00000001.json"
 #     It must stay fatal -- the distinction the fix rests on is "gone" vs
 #     "present but unsafe", and a symlink is the latter.  (V1 asserted the
 #     directory shape of the same verdict; this pins the other one, so a fix
-#     that widened `request_record_vanished` to "unreadable" fails here.)
+#     that widened `tracked_path_vanished` (born `request_record_vanished`) to "unreadable" fails here.)
 clear_runtime
 ln -s /nonexistent/agentq-vanish-target \
     "$work/data/agentq-requests/AQREAD-VDANGLE-0000001.json"
@@ -479,16 +479,24 @@ assert_err_has v2 'invalid AgentQ request record path'
 assert_reason v2
 find "$work/data/agentq-requests" -maxdepth 1 -name '*.json' -type l -delete
 
-# V3. The source of the vanish arm is visible in the asset: the checks exist at
-#     both readers that can race an archiver -- load_request_records (3 sites:
-#     guard, guard, read) and the shared request_record_path_guards_or_fail
-#     used by the repair pass (2 sites).  A copy on a SUCCESS path would restore
-#     the 4-guard cost that loop was trimmed for, so the count is also the
-#     shape.
+# V3. The source of the vanish arm is visible in the asset: every reader that
+#     can race an archiver carries it -- load_request_records (3 sites: guard,
+#     guard, read), the shared request_record_path_guards_or_fail used by the
+#     repair pass and both single-record readers (2), load_cancellation_markers
+#     (2), cancellation_marker_is_valid (2) and the single-file readers'
+#     read arms (3: read_request_record, read_request_tombstone and
+#     read_request_record_state_and_body, the repair/wait fallback reader).
+#     A copy on a SUCCESS path would restore the 4-guard cost
+#     those loops were trimmed for, so the count is also the shape.  The
+#     cancellation-marker pair was added 2026-10-22 after the same race was
+#     measured there (it exited 1 -- a code the contract does not define for
+#     it -- while printing reason=protocol_error); the two read arms were added
+#     the same day when read_request_record turned out to have the same defect
+#     (V10/V11).
 cases=$((cases + 1))
-vanish_sites=$(grep -c 'request_record_vanished ' "$work/agentq-server" || true)
-if [ "$vanish_sites" != 5 ]; then
-    printf 'read-paths v3: expected 5 request_record_vanished sites, got %s\n' \
+vanish_sites=$(grep -c 'tracked_path_vanished ' "$work/agentq-server" || true)
+if [ "$vanish_sites" != 12 ]; then
+    printf 'read-paths v3: expected 12 tracked_path_vanished sites, got %s\n' \
         "$vanish_sites" >&2
     failures=$((failures + 1))
 fi
@@ -570,6 +578,290 @@ if grep -qF 'failed to recover removing AgentQ requests' "$work/v5.err"; then
     sed -n '1,3p' "$work/v5.err" >&2
     failures=$((failures + 1))
 fi
+
+# V6. The repair FALLBACK loop (reached only when the batch fast path failed)
+#     had the same defect in a second form, found 2026-10-22 AFTER 0.1.18 was
+#     cut: read_request_record_state_and_body folded the vanished verdict into
+#     the failure code (`|| return 2`, written against the opposite intuition --
+#     `fail` never returns, so that `||` only ever sees 1).  The result was
+#     `missing AgentQ request record during recovery` on a record a concurrent
+#     archiver had deleted.
+#
+#     The vanish must happen ONLY in the fallback, so the injected rm is
+#     count-gated: the fast path's call leaves the file alone, the fallback's
+#     call deletes it.  A directory record forces the fast path to fail, which
+#     is what makes the fallback run at all.  Assertion: the vanished record
+#     must NOT be the one named by the recovery failure -- the failure must be
+#     the directory's, which is the genuinely unsafe one.
+clear_runtime
+put_record AQREAD-VFALLBACK-0001 accepted 1001 '"2026-09-29T00:00:00Z"'
+mkdir -p "$work/data/agentq-requests/AQREAD-VFBDIR-00000002.json"
+python3 - "$work/agentq-server" "$work/agentq-server-forced3" "$work/.v6cnt" <<'PYV6'
+import sys
+src, dst, counter = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = open(src).read().split('\n')
+start = next(i for i, l in enumerate(lines)
+             if l.startswith('request_record_path_guards_or_fail() {'))
+end = next(i for i in range(start + 1, len(lines)) if lines[i] == '}')
+target = next(i for i in range(start, end)
+              if 'validate_task_id_precision_in_file "$record_path"' in lines[i])
+indent = ' ' * (len(lines[target]) - len(lines[target].lstrip()))
+inj = (indent + 'case $record_path in *VFALLBACK*) '
+       + 'c=$(cat "' + counter + '" 2>/dev/null || echo 0); c=$((c+1)); '
+       + 'printf %s "$c" > "' + counter + '"; '
+       + '[ "$c" -ge 2 ] && rm -f "$record_path" ;; esac')
+lines.insert(target, inj)
+open(dst, 'w').write('\n'.join(lines))
+PYV6
+chmod 700 "$work/agentq-server-forced3"
+rm -f "$work/.v6cnt"
+run_forced3() {
+    local label=$1
+    shift
+    local rc=0
+    ( cd "$work" && "$work/agentq-server-forced3" "$@" ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+run_forced3 v6 status
+assert_rc v6 2
+cases=$((cases + 1))
+if grep -qF 'AQREAD-VFALLBACK-0001' "$work/v6.err"; then
+    printf 'read-paths v6: the fallback blamed the VANISHED record instead of skipping it\n' >&2
+    sed -n '1,3p' "$work/v6.err" >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if ! grep -qF 'AQREAD-VFBDIR-00000002' "$work/v6.err"; then
+    printf 'read-paths v6: the genuinely unsafe record was not the one reported\n' >&2
+    sed -n '1,3p' "$work/v6.err" >&2
+    failures=$((failures + 1))
+fi
+rmdir "$work/data/agentq-requests/AQREAD-VFBDIR-00000002.json"
+
+# V7. The cancellation-marker reader is the third copy of the same race, and
+#     its symptom was worse: the marker loop's `fail` made the pipeline fail,
+#     so a TRANSIENT concurrent deletion surfaced as a hard failure (exit 1)
+#     carrying `reason=protocol_error` -- and the documented rule is to read
+#     `reason=` rather than the message, so a caller would classify a benign
+#     race as a bad argument.  Markers are NOT positionally bound to ids, so
+#     skipping one is safe (unlike a record, which needs the `null` placeholder
+#     to keep the binding aligned).
+clear_runtime
+printf '{"version":1,"task_id":1,"task_created_at":"2026-09-29T00:00:00Z","state":"requested","requested_at":"2026-09-29T00:00:00Z"}\n' \
+    > "$work/data/agentq-cancellations/1.json"
+# A fixture that cannot be applied is a FAILURE of this case, never a crash:
+# running this check against an older asset must report "the marker guard is
+# not the shape this case injects into", not die with a traceback (a crash and
+# an assertion-red are different verdicts -- recorded lesson from smoke/10).
+cases=$((cases + 1))
+if ! python3 - "$work/agentq-server" "$work/agentq-server-forced4" <<'PYV7'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+needle = '            request_metadata_file_is_safe "$marker_path" || {'
+if s.count(needle) != 2:
+    sys.stderr.write('fixture: expected 2 vanish-tolerant marker guards, found %d\n'
+                     % s.count(needle))
+    sys.exit(3)
+s = s.replace(needle, '            rm -f "$marker_path"  # SMOKE: forced vanish\n' + needle, 1)
+open(dst, 'w').write(s)
+PYV7
+then
+    printf 'read-paths v7: could not inject the forced vanish (see fixture message above)\n' >&2
+    failures=$((failures + 1))
+fi
+# When the injection failed the fixture already counted one failure; running
+# against a file that was never produced would only add a `chmod: No such file`
+# cascade of NOISE, which reads like two more failures than there are.
+if [ ! -f "$work/agentq-server-forced4" ]; then
+    clear_runtime
+    : # fall through to the summary with the one failure the fixture recorded
+else
+chmod 700 "$work/agentq-server-forced4"
+run_forced4() {
+    local label=$1
+    shift
+    local rc=0
+    ( cd "$work" && "$work/agentq-server-forced4" "$@" ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+run_forced4 v7 status
+assert_rc v7 0
+cases=$((cases + 1))
+if grep -qF 'invalid AgentQ cancellation marker' "$work/v7.err"; then
+    printf 'read-paths v7: a vanished cancellation marker was reported as invalid\n' >&2
+    sed -n '1,3p' "$work/v7.err" >&2
+    failures=$((failures + 1))
+fi
+fi
+clear_runtime
+
+# V8. The WAIT reconcile fallback is the fourth reader with the same defect
+#     (found 2026-10-22 in the same self-check as V6/V7).  Its fast path runs
+#     inside `with_operation_lock`, whose acquire pass calls the same guard
+#     helper from the repair scan, so an injected rm count-gated to the 2nd call
+#     fires in the WAIT fast path -- and it is the FALLBACK that then sees the
+#     file gone.  Released 0.1.18 answered `missing AgentQ request record during
+#     wait recovery`; the vanished record must instead be SKIPPED, and the
+#     scanner converges on "nothing tracks this id".
+#
+#     Both directions are asserted: the vanished record must NOT be named, and
+#     the verdict must be the converged one (`unknown AgentQ task id`), not a
+#     record error.
+clear_runtime
+put_record AQREAD-VWAIT-000001 accepted 1001 '"2026-09-29T00:00:00Z"'
+python3 - "$work/agentq-server" "$work/agentq-server-forced5" "$work/.v8cnt" <<'PYV8'
+import sys
+src, dst, counter = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = open(src).read().split('\n')
+start = next(i for i, l in enumerate(lines)
+             if l.startswith('request_record_path_guards_or_fail() {'))
+end = next(i for i in range(start + 1, len(lines)) if lines[i] == '}')
+target = next(i for i in range(start, end)
+              if 'validate_task_id_precision_in_file "$record_path"' in lines[i])
+indent = ' ' * (len(lines[target]) - len(lines[target].lstrip()))
+inj = (indent + 'c=$(cat "' + counter + '" 2>/dev/null || echo 0); c=$((c+1)); '
+       + 'printf %s "$c" > "' + counter + '"; [ "$c" -ge 2 ] && rm -f "$record_path"')
+lines.insert(target, inj)
+open(dst, 'w').write('\n'.join(lines))
+PYV8
+chmod 700 "$work/agentq-server-forced5"
+rm -f "$work/.v8cnt"
+run_forced5() {
+    local label=$1
+    shift
+    local rc=0
+    ( cd "$work" && "$work/agentq-server-forced5" "$@" ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+run_forced5 v8 wait 1001
+assert_rc v8 2
+assert_err_has v8 'unknown AgentQ task id'
+cases=$((cases + 1))
+if grep -qF 'missing AgentQ request record during wait recovery' "$work/v8.err"; then
+    printf 'read-paths v8: the wait fallback blamed the VANISHED record instead of skipping it\n' >&2
+    sed -n '1,3p' "$work/v8.err" >&2
+    failures=$((failures + 1))
+fi
+
+# V9. The other direction on the same path: a record that is PRESENT but
+#     UNSAFE (here a directory) must still fail loudly.  Without this, "skip
+#     everything the reader refuses" would pass V8.
+clear_runtime
+mkdir -p "$work/data/agentq-requests/AQREAD-VWAITDIR-0002.json"
+run_case v9 wait 1001
+assert_rc v9 2
+assert_err_has v9 'invalid AgentQ request record path'
+assert_reason v9
+rmdir "$work/data/agentq-requests/AQREAD-VWAITDIR-0002.json"
+clear_runtime
+
+# V10. read_request_record is the FIFTH copy of the same defect, found
+#      2026-10-22 after V6-V9 were fixed.  It runs under the operation lock, but
+#      the archiver it races does NOT: repair_removed_request_records is called
+#      from migrate_removed_request_records on the lock-free read paths
+#      (status/logs/doctor), so a lock holder is not shielded from it.  The
+#      window is exactly "the record is already `removed` and a concurrent
+#      status archives it" -- nothing else deletes a record.
+#
+#      Released 0.1.18 answered a vanished record with
+#      `invalid AgentQ request record path` + exit 2: a caller told to fix its
+#      arguments when the truth was "it is gone".  Measured A/B with the rm
+#      injected before the guard call: 0.1.18 exit 2 with that message, the
+#      fixed tree exit 3 (not_found, the converged answer) and NO stderr line
+#      at all -- the read is deliberately silent so a benign race cannot put
+#      unexplained text on a successful call's stderr (the clients scan that
+#      stream for `reason=`).
+clear_runtime
+put_record AQREAD-VREADER-00001 accepted 1001 '"2026-09-29T00:00:00Z"'
+cases=$((cases + 1))
+# The injection point is STRUCTURAL, not a string that only exists in the
+# fixed shape: it goes immediately after the existence check inside
+# read_request_record, which every version of this reader has.  Anchoring on
+# the fix's own variable made the case un-injectable against the pre-fix
+# reader, so the mutation test reported "fixture could not inject" instead of
+# "the reader answered wrongly" -- a fixture miss masquerading as coverage.
+if ! python3 - "$work/agentq-server" "$work/agentq-server-forced6" <<'PYV10'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+lines = open(src).read().split('\n')
+try:
+    start = next(i for i, l in enumerate(lines) if l.startswith('read_request_record() {'))
+except StopIteration:
+    sys.stderr.write('fixture: read_request_record is not defined\n')
+    sys.exit(3)
+end = next(i for i in range(start + 1, len(lines)) if lines[i] == '}')
+# Anchor on the EXISTENCE CHECK itself (`[ ! -e ... ] && [ ! -L ... ]`), which
+# every version of this reader has, and insert right after the `fi` that closes
+# it.  Two earlier anchors were wrong and both showed up as fixture misses
+# rather than vermin: `return 1` matched the `is_request_id` refusal first
+# (where `$record_path` is still unset, so the injected rm does nothing and the
+# case passed for the wrong reason), and a count guard then rejected the
+# pre-fix reader, whose shape has only one such line.  A fixture that cannot
+# inject against the OLD code cannot prove anything about the new.
+guard = next(i for i in range(start, end) if '[ ! -e "$record_path" ]' in lines[i])
+fi = next(i for i in range(guard, end) if lines[i].strip() == 'fi')
+check = fi
+indent = ' ' * (len(lines[check]) - len(lines[check].lstrip()))
+lines.insert(check + 1, indent + 'rm -f "$record_path"  # SMOKE: forced vanish')
+open(dst, 'w').write('\n'.join(lines))
+PYV10
+then
+    printf 'read-paths v10: could not inject the forced vanish (see fixture message above)\n' >&2
+    failures=$((failures + 1))
+fi
+if [ -f "$work/agentq-server-forced6" ]; then
+chmod 700 "$work/agentq-server-forced6"
+run_forced6() {
+    local label=$1
+    shift
+    local rc=0
+    ( cd "$work" && "$work/agentq-server-forced6" "$@" ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+run_forced6 v10 lookup AQREAD-VREADER-00001
+assert_rc v10 3
+assert_json v10 '.state == "not_found"'
+cases=$((cases + 1))
+if grep -qF 'invalid AgentQ request record' "$work/v10.err"; then
+    printf 'read-paths v10: a vanished record was reported as an invalid record\n' >&2
+    sed -n '1,3p' "$work/v10.err" >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if [ -s "$work/v10.err" ]; then
+    printf 'read-paths v10: a benign vanish put text on stderr (clients scan it for reason=)\n' >&2
+    sed -n '1,3p' "$work/v10.err" >&2
+    failures=$((failures + 1))
+fi
+fi
+
+# V11. The other direction on the same reader: PRESENT but UNSAFE must still
+#      fail loudly, with the path message and the reason line.  Without this,
+#      "treat every read failure as gone" would pass V10 -- and that is the
+#      fail-open shape this project has fixed four times already.
+clear_runtime
+mkdir -p "$work/data/agentq-requests/AQREAD-VREADERDIR-01.json"
+run_case v11 lookup AQREAD-VREADERDIR-01
+assert_rc v11 2
+assert_err_has v11 'invalid AgentQ request record path'
+assert_reason v11
+rmdir "$work/data/agentq-requests/AQREAD-VREADERDIR-01.json"
+
+# V12. And a record that is present but MALFORMED keeps its own message: the
+#      vanish arm must not swallow a real integrity failure into "not found".
+#      (V10's "no stderr" assertion is only safe because THIS direction still
+#      speaks.)
+clear_runtime
+printf '{ this is not json\n' > "$work/data/agentq-requests/AQREAD-VREADERBAD-01.json"
+run_case v12 lookup AQREAD-VREADERBAD-01
+assert_rc v12 2
+assert_err_has v12 'invalid AgentQ request record'
+assert_reason v12
 
 # --------------------------------------------------------------- summary
 if [ "$failures" -ne 0 ]; then

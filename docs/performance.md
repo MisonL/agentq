@@ -49,8 +49,9 @@ shell，在命令替换内部设置的全局变量传不回来——缓存会静
 
 代码路径（读代码得出，未逐项单独测量）：`prepare_request_metadata_files` →
 `load_request_records` / `load_cancellation_markers` 各自遍历目录下**每个** `*.json`，
-每个文件经 `request_record_is_valid` 调 jq（另有 `validate_task_id_precision_in_file`
-一次）。这些校验是完整性防御，不是可省的冗余——**所以这里不要为了提速而顺手改**：
+每文件走一遍路径守卫 + `validate_task_id_precision_in_file`，再由**一次**聚合 jq
+处理全部记录（逐条 jq 的形态在 2026-09-30 已折叠；此处原先写的是
+`request_record_is_valid`——那个函数只被单条读调用、2026-10-22 已并入共享守卫并删除）。这些校验是完整性防御，不是可省的冗余——**所以这里不要为了提速而顺手改**：
 `agentq-server` 是无类型 shell，本仓的 smoke 抓不到行为回归，而这条路径正好是安全
 相关的。要优化就得先把行为钉死（针对该函数写针对性测试或真机验证），再动。
 
@@ -260,8 +261,8 @@ marker 实测 0–3 个（本机沙箱 0 个），即使折叠也只有毫秒级
 fork+exec 约 15ms。
 
 **但这条路径不要为了提速而顺手改**：`prepare_request_metadata_files` →
-`load_request_records` / `load_cancellation_markers` 会遍历每个 `*.json`，每个文件
-经 `request_record_is_valid` 调 jq。这些校验是**完整性防御**，不是可省的冗余。
+`load_request_records` / `load_cancellation_markers` 会遍历每个 `*.json`，每文件走
+路径守卫与精度探针，再交给一次聚合 jq。这些校验是**完整性防御**，不是可省的冗余。
 `agentq-server` 是无类型 shell，本仓 smoke 抓不到行为回归，而这条路径正好是
 安全相关的。要优化就得**先把行为钉死**（写针对性测试或真机验证），再动。
 
