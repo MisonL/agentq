@@ -481,22 +481,28 @@ find "$work/data/agentq-requests" -maxdepth 1 -name '*.json' -type l -delete
 
 # V3. The source of the vanish arm is visible in the asset: every reader that
 #     can race an archiver carries it -- load_request_records (3 sites: guard,
-#     guard, read), the shared request_record_path_guards_or_fail used by the
-#     repair pass and both single-record readers (2), load_cancellation_markers
-#     (2), cancellation_marker_is_valid (2) and the single-file readers'
-#     read arms (3: read_request_record, read_request_tombstone and
-#     read_request_record_state_and_body, the repair/wait fallback reader).
+#     guard, read), the shared request_record_path_guards_or_fail (2), its
+#     tombstone twin request_tombstone_path_guards_or_fail (2), the single-file
+#     readers' read arms (3: read_request_record, read_request_tombstone,
+#     read_request_record_state_and_body), request_tombstone_is_valid (1),
+#     load_cancellation_markers (2) and cancellation_marker_is_valid (3: two
+#     guards plus the guard-to-read gap), and the non-UTF-8 log branch in
+#     compact_log (1).  Note the OTHER readers that carry no
+#     site because their whole read is wrapped in a `{ ... } 2>/dev/null`
+#     group (wait's two batch scans, task_instance_created_at_is_recorded's
+#     fast path): those are safe by construction, not by a vanish arm.
 #     A copy on a SUCCESS path would restore the 4-guard cost
 #     those loops were trimmed for, so the count is also the shape.  The
 #     cancellation-marker pair was added 2026-10-22 after the same race was
 #     measured there (it exited 1 -- a code the contract does not define for
 #     it -- while printing reason=protocol_error); the two read arms were added
 #     the same day when read_request_record turned out to have the same defect
-#     (V10/V11).
+#     (V10/V11); the tombstone twin's two arms and read_request_tombstone's
+#     read arm followed in the same session (V13/V14).
 cases=$((cases + 1))
 vanish_sites=$(grep -c 'tracked_path_vanished ' "$work/agentq-server" || true)
-if [ "$vanish_sites" != 12 ]; then
-    printf 'read-paths v3: expected 12 tracked_path_vanished sites, got %s\n' \
+if [ "$vanish_sites" != 16 ]; then
+    printf 'read-paths v3: expected 16 tracked_path_vanished sites, got %s\n' \
         "$vanish_sites" >&2
     failures=$((failures + 1))
 fi
@@ -862,6 +868,443 @@ run_case v12 lookup AQREAD-VREADERBAD-01
 assert_rc v12 2
 assert_err_has v12 'invalid AgentQ request record'
 assert_reason v12
+
+# V13. The TOMBSTONE readers were the sixth and seventh copies (2026-10-23).
+#      Two distinct holes, and the second is the interesting one:
+#        * read_request_tombstone had a read arm but the shared guard it calls
+#          (request_tombstone_path_guards_or_fail) began with a BARE `fail` for
+#          "not present", so a vanish never reached the arm.  That also made the
+#          `null` placeholder in wait's batch scan dead code.
+#        * read_cancellation_marker had two direct guards in front of the
+#          vanish-tolerant validator, so its own comment ("a vanished marker is
+#          no marker") was false: the guards failed first.
+#      Both are measured here with the same structural injection as V10.
+clear_runtime
+put_tombstone AQREAD-VTOMB-00000001 1001
+cases=$((cases + 1))
+if ! python3 - "$work/agentq-server" "$work/agentq-server-forced7" <<'PYV13'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+lines = open(src).read().split('\n')
+start = next(i for i, l in enumerate(lines) if l.startswith('read_request_tombstone() {'))
+end = next(i for i in range(start + 1, len(lines)) if lines[i] == '}')
+guard = next(i for i in range(start, end) if '[ ! -e "$tombstone_path" ]' in lines[i])
+fi = next(i for i in range(guard, end) if lines[i].strip() == 'fi')
+indent = ' ' * (len(lines[fi]) - len(lines[fi].lstrip()))
+lines.insert(fi + 1, indent + 'rm -f "$tombstone_path"  # SMOKE: forced vanish')
+open(dst, 'w').write('\n'.join(lines))
+PYV13
+then
+    printf 'read-paths v13: could not inject the forced vanish (see fixture message above)\n' >&2
+    failures=$((failures + 1))
+fi
+if [ -f "$work/agentq-server-forced7" ]; then
+chmod 700 "$work/agentq-server-forced7"
+run_forced7() {
+    local label=$1
+    shift
+    local rc=0
+    ( cd "$work" && "$work/agentq-server-forced7" "$@" ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+run_forced7 v13 lookup AQREAD-VTOMB-00000001
+assert_rc v13 3
+assert_json v13 '.state == "not_found"'
+cases=$((cases + 1))
+if grep -qF 'invalid AgentQ request tombstone' "$work/v13.err"; then
+    printf 'read-paths v13: a vanished tombstone was reported as invalid\n' >&2
+    sed -n '1,3p' "$work/v13.err" >&2
+    failures=$((failures + 1))
+fi
+fi
+rm -f "$work/data/agentq-requests/.tombstones/AQREAD-VTOMB-00000001.json"
+
+# V14. The marker reader.  This one runs through the LOCK-FREE repair path:
+#      a `removed` record plus its marker makes repair archive the record, and
+#      archiving removes the marker via remove_cancellation_marker_for_task ->
+#      read_cancellation_marker.  Injecting the vanish inside that reader must
+#      leave `status` succeeding (the marker is simply gone), not exit 2.
+clear_runtime
+put_record AQREAD-VMARK-00000001 removed 1001 '"2026-09-29T00:00:00Z"'
+printf '{"version":1,"task_id":1001,"task_created_at":"2026-09-29T00:00:00Z","state":"requested","requested_at":"2026-09-29T00:00:00Z","created_at":"2026-09-29T00:00:00Z","reason":"smoke"}\n' \
+    > "$work/data/agentq-cancellations/1001.json"
+cases=$((cases + 1))
+if ! python3 - "$work/agentq-server" "$work/agentq-server-forced8" <<'PYV14'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+lines = open(src).read().split('\n')
+try:
+    start = next(i for i, l in enumerate(lines) if l.startswith('read_cancellation_marker() {'))
+except StopIteration:
+    sys.stderr.write('fixture: read_cancellation_marker is not defined\n')
+    sys.exit(3)
+end = next(i for i in range(start + 1, len(lines)) if lines[i] == '}')
+# STRUCTURAL anchor (same lesson as V10): insert right after the existence
+# check's `fi`, which every version of this reader has -- 0.1.18, 0.1.19 and
+# the fixed tree.  Anchoring on the fix's own `marker_status` lines made the
+# case un-injectable against the pre-fix reader, so the mutation test reported
+# "fixture could not inject" instead of "the reader answered wrongly".
+guard = next((i for i in range(start, end) if '[ ! -e "$marker_path" ]' in lines[i]), None)
+if guard is None:
+    sys.stderr.write('fixture: read_cancellation_marker has no existence check\n')
+    sys.exit(3)
+fi = next((i for i in range(guard, end) if lines[i].strip() == 'fi'), None)
+if fi is None:
+    sys.stderr.write('fixture: existence check is not an if/fi block\n')
+    sys.exit(3)
+indent = ' ' * (len(lines[fi]) - len(lines[fi].lstrip()))
+lines.insert(fi + 1, indent + 'rm -f "$marker_path"  # SMOKE: forced vanish')
+open(dst, 'w').write('\n'.join(lines))
+PYV14
+then
+    printf 'read-paths v14: could not inject the forced vanish (see fixture message above)\n' >&2
+    failures=$((failures + 1))
+fi
+if [ -f "$work/agentq-server-forced8" ]; then
+chmod 700 "$work/agentq-server-forced8"
+run_forced8() {
+    local label=$1
+    shift
+    local rc=0
+    ( cd "$work" && "$work/agentq-server-forced8" "$@" ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+run_forced8 v14 status
+assert_rc v14 0
+cases=$((cases + 1))
+if grep -qF 'invalid AgentQ cancellation marker' "$work/v14.err"; then
+    printf 'read-paths v14: a vanished marker was reported as invalid\n' >&2
+    sed -n '1,3p' "$work/v14.err" >&2
+    failures=$((failures + 1))
+fi
+fi
+clear_runtime
+
+# V15/V16. The reverse direction for both new arms: PRESENT but UNSAFE must
+#          still fail loudly.  Without these, "call every read failure gone"
+#          would pass V13/V14 -- the fail-open shape this project has fixed
+#          repeatedly.
+mkdir -p "$work/data/agentq-requests/.tombstones/AQREAD-VTOMBAD-0001.json"
+run_case v15 lookup AQREAD-VTOMBAD-0001
+assert_rc v15 2
+assert_err_has v15 'invalid AgentQ request tombstone path'
+assert_reason v15
+rmdir "$work/data/agentq-requests/.tombstones/AQREAD-VTOMBAD-0001.json"
+mkdir -p "$work/data/agentq-cancellations/1001.json"
+put_record AQREAD-VMARKBAD-00001 removed 1001 '"2026-09-29T00:00:00Z"'
+run_case v16 status
+assert_rc v16 2
+assert_err_has v16 'invalid AgentQ cancellation marker path'
+assert_reason v16
+rmdir "$work/data/agentq-cancellations/1001.json"
+clear_runtime
+
+# V17. The marker validator's OWN guard-to-read gap.  read_cancellation_marker
+#      and cancellation_marker_is_valid each read the file; fixing only the
+#      first leaves the second printing bash's redirection error (measured:
+#      `status` exited 0 with `<path>: No such file or directory` on stderr,
+#      which the clients scan for `reason=`).  The injection goes between the
+#      second guard and the read inside the VALIDATOR.
+clear_runtime
+mkdir -p "$work/data/agentq-cancellations"
+printf '{"version":1,"task_id":1001,"task_created_at":"2026-09-29T00:00:00Z","state":"requested","requested_at":"2026-09-29T00:00:00Z","created_at":"2026-09-29T00:00:00Z","reason":"smoke"}\n' \
+    > "$work/data/agentq-cancellations/1001.json"
+cases=$((cases + 1))
+if ! python3 - "$work/agentq-server" "$work/agentq-server-forced9" <<'PYV17'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+anchor = '    marker_read_status=0\n    marker_body=$(cat -- "$marker_path" 2>/dev/null)'
+if s.count(anchor) != 1:
+    sys.stderr.write('fixture: expected 1 validation read site, found %d\n' % s.count(anchor))
+    sys.exit(3)
+s = s.replace(anchor, '    rm -f "$marker_path"  # SMOKE: forced vanish\n' + anchor, 1)
+open(dst, 'w').write(s)
+PYV17
+then
+    printf 'read-paths v17: could not inject the forced vanish (see fixture message above)\n' >&2
+    failures=$((failures + 1))
+fi
+if [ -f "$work/agentq-server-forced9" ]; then
+chmod 700 "$work/agentq-server-forced9"
+run_forced9() {
+    local label=$1
+    shift
+    local rc=0
+    ( cd "$work" && "$work/agentq-server-forced9" "$@" ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+run_forced9 v17 status
+assert_rc v17 0
+cases=$((cases + 1))
+if [ -s "$work/v17.err" ]; then
+    printf 'read-paths v17: the marker validator leaked text on a vanished file\n' >&2
+    sed -n '1,3p' "$work/v17.err" >&2
+    failures=$((failures + 1))
+fi
+fi
+clear_runtime
+
+# V18. The precision probe is the one reader that only runs on a LOW-PRECISION
+#      jq (jq <= 1.6 returns early on anything newer), so this case forces that
+#      branch and then vanishes the file between the guard and the `grep`.
+#      Without the change, `grep` prints `<path>: No such file or directory` on
+#      a call that otherwise succeeds -- measured on a copy, stderr carried that
+#      line while `status` exited 0.
+mkdir -p "$work/data/agentq-cancellations"
+printf '{"version":1,"task_id":1001,"task_created_at":"2026-09-29T00:00:00Z","state":"requested","requested_at":"2026-09-29T00:00:00Z","created_at":"2026-09-29T00:00:00Z","reason":"smoke"}\n' \
+    > "$work/data/agentq-cancellations/1001.json"
+cases=$((cases + 1))
+if ! python3 - "$work/agentq-server" "$work/agentq-server-forced10" <<'PYV18'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+lowp = 'jq_preserves_integer_digits() {'
+if s.count(lowp) != 1:
+    sys.stderr.write('fixture: jq_preserves_integer_digits is not defined\n')
+    sys.exit(3)
+s = s.replace(lowp, lowp + '\n    return 1  # SMOKE: pretend jq 1.6', 1)
+needle = ('        fail "invalid AgentQ cancellation marker path: $marker_path"\n'
+          '    }\n'
+          '    validate_task_id_precision_in_file "$marker_path"')
+if s.count(needle) != 1:
+    sys.stderr.write('fixture: expected 1 marker precision-probe site, found %d\n' % s.count(needle))
+    sys.exit(3)
+s = s.replace(needle, needle.replace(
+    '    validate_task_id_precision_in_file "$marker_path"',
+    '    rm -f "$marker_path"  # SMOKE: forced vanish\n'
+    '    validate_task_id_precision_in_file "$marker_path"'), 1)
+open(dst, 'w').write(s)
+PYV18
+then
+    printf 'read-paths v18: could not inject the forced vanish (see fixture message above)\n' >&2
+    failures=$((failures + 1))
+fi
+if [ -f "$work/agentq-server-forced10" ]; then
+chmod 700 "$work/agentq-server-forced10"
+run_forced10() {
+    local label=$1
+    shift
+    local rc=0
+    ( cd "$work" && "$work/agentq-server-forced10" "$@" ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+run_forced10 v18 status
+assert_rc v18 0
+cases=$((cases + 1))
+if [ -s "$work/v18.err" ]; then
+    printf 'read-paths v18: the precision probe leaked grep text on a vanished file\n' >&2
+    sed -n '1,3p' "$work/v18.err" >&2
+    failures=$((failures + 1))
+fi
+fi
+clear_runtime
+
+# V19. The last reader with the same shape, and the only one that needs a
+#      FALLBACK to reach: task_instance_created_at_is_recorded scans records in
+#      a fast aggregate path and falls back to a per-file loop.  The fallback
+#      read was `... < "$path" 2>/dev/null`, which LOOKS suppressed but is not:
+#      a redirection error is the shell's own write and happens before the
+#      redirect applies (measured 2026-10-23: bash printed the path anyway).
+#      A malformed TOMBSTONE forces the fast path to fail without touching the
+#      record scan, so the fallback is the code that runs.
+#
+#      The verdict is unchanged between versions (`unknown AgentQ task id`/2);
+#      what differs is the noise on stderr, which the clients scan for
+#      `reason=`.  A/B measured: 0.1.18 emits `bash: <path>: No such file or
+#      directory`, the fixed tree emits nothing.
+clear_runtime
+put_record AQREAD-VSCAN-00000001 accepted 1001 '"2026-09-29T00:00:00Z"'
+printf '{ not json\n' > "$work/data/agentq-requests/.tombstones/AQREAD-VPOISON-01.json"
+printf '{"version":1,"task_id":1001,"task_created_at":"2026-09-29T00:00:00Z","state":"requested","requested_at":"2026-09-29T00:00:00Z","created_at":"2026-09-29T00:00:00Z","reason":"smoke"}\n' \
+    > "$work/data/agentq-cancellations/1001.json"
+cases=$((cases + 1))
+if ! python3 - "$work/agentq-server" "$work/agentq-server-forced11" <<'PYV19'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+start = s.index('task_instance_created_at_is_recorded() {')
+end = s.index('\n}\n', start)
+body = s[start:end]
+# Anchored on the READ ITSELF in either shape: the silent-cat form or the
+# pre-fix `created_at=$(jq ... < "$path"` form.  A fixture that only fits the
+# fixed shape reports a fixture miss against the old code instead of a verdict.
+needle = '            file_body=$(cat -- "$path" 2>/dev/null) || continue'
+if body.count(needle) != 2:
+    needle = '            created_at=$(jq -r --argjson id "$task_id" \\'
+if body.count(needle) != 2:
+    sys.stderr.write('fixture: fallback read shape not recognised (%d)\n' % body.count(needle))
+    sys.exit(3)
+s = s[:start] + body.replace(needle, '            rm -f "$path"  # SMOKE: forced vanish\n' + needle, 1) + s[end:]
+open(dst, 'w').write(s)
+PYV19
+then
+    printf 'read-paths v19: could not inject the forced vanish (see fixture message above)\n' >&2
+    failures=$((failures + 1))
+fi
+if [ -f "$work/agentq-server-forced11" ]; then
+chmod 700 "$work/agentq-server-forced11"
+run_forced11() {
+    local label=$1
+    shift
+    local rc=0
+    ( cd "$work" && "$work/agentq-server-forced11" "$@" ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+run_forced11 v19 cancel 1001
+assert_rc v19 2
+assert_err_has v19 'unknown AgentQ task id'
+cases=$((cases + 1))
+if grep -qF 'No such file or directory' "$work/v19.err"; then
+    printf 'read-paths v19: a vanished record left bash noise on stderr\n' >&2
+    sed -n '1,3p' "$work/v19.err" >&2
+    failures=$((failures + 1))
+fi
+fi
+clear_runtime
+
+# V20. load_request_records' own read, the FIRST site fixed (0.1.18) and the
+#      one whose `null` placeholder already had coverage -- but only for the
+#      GUARD half.  The read itself was still `record=$(<"$record_path")`,
+#      whose bash redirection error is written to the top-level stderr even
+#      though the substitution fails "correctly" and the vanish arm then skips
+#      the record.  Measured 2026-10-23: `status` exit 0, record correctly
+#      skipped, and `<path>: No such file or directory` on stderr -- which the
+#      clients scan for `reason=`.
+clear_runtime
+put_record AQREAD-VREC-000000001 accepted 1001 '"2026-09-29T00:00:00Z"'
+cases=$((cases + 1))
+if ! python3 - "$work/agentq-server" "$work/agentq-server-forced12" <<'PYV20'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+start = s.index('load_request_records() {')
+end = s.index('\n}\n', start)
+body = s[start:end]
+# Either shape: the silent-cat read or the pre-fix $(<...) read.
+needle = '        record=$(cat -- "$record_path" 2>/dev/null) || {'
+if body.count(needle) != 1:
+    needle = '        record=$(<"$record_path") || {'
+if body.count(needle) != 1:
+    sys.stderr.write('fixture: record read shape not recognised (%d)\n' % body.count(needle))
+    sys.exit(3)
+s = s[:start] + body.replace(
+    needle, '        rm -f "$record_path"  # SMOKE: forced vanish\n' + needle, 1) + s[end:]
+open(dst, 'w').write(s)
+PYV20
+then
+    printf 'read-paths v20: could not inject the forced vanish (see fixture message above)\n' >&2
+    failures=$((failures + 1))
+fi
+if [ -f "$work/agentq-server-forced12" ]; then
+chmod 700 "$work/agentq-server-forced12"
+run_forced12() {
+    local label=$1
+    shift
+    local rc=0
+    ( cd "$work" && "$work/agentq-server-forced12" "$@" ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+run_forced12 v20 status
+assert_rc v20 0
+cases=$((cases + 1))
+if grep -qF 'No such file or directory' "$work/v20.err"; then
+    printf 'read-paths v20: the record load leaked bash noise on stderr\n' >&2
+    sed -n '1,3p' "$work/v20.err" >&2
+    failures=$((failures + 1))
+fi
+fi
+clear_runtime
+
+# V21. The non-UTF-8 log branch of compact_log.  `logs` is NOT a request-record
+#      reader, but it is one of the few places that opens a file by its own path
+#      and hands it to another process.  Two defects lived there:
+#        * `base64 < "$log_path"` -- a redirection, so a vanished log printed
+#          bash's own message (the clients scan stderr for `reason=`);
+#        * `tail ... | base64` -- under `set -o pipefail` the pipeline failed and
+#          the ONLY message was `cannot encode non-UTF-8 task log`, a wrong cause
+#          for a file that was simply gone.
+#      A/B measured (0.1.18 and the pre-change tree both): exit 2, `tail: <path>:
+#      No such file or directory` on stderr, then the encode message.  The
+#      branch now captures base64's status, tells "gone" from "encode failed",
+#      and emits exactly one controlled message.
+clear_runtime
+printf '\xff\xfe binary\n' > "$work/data/task_logs/1.log"
+cases=$((cases + 1))
+if ! python3 - "$work/agentq-server" "$work/agentq-server-forced13" <<'PYV21'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+# STRUCTURAL anchor: the branch that turns the raw log into base64, in either
+# shape -- the fixed `log_encoded=$(tail ...)` or the pre-fix
+# `tail ... "$log_path" | base64`.  Anchoring on the fix's own variable name
+# made the case un-injectable against the old code, which reports a FIXTURE
+# miss instead of a wrong verdict (the same trap V10 and V14 hit).
+anchor = '            log_encoded=$(tail -n "$tail_lines" "$log_path"'
+if s.count(anchor) != 1:
+    anchor = '                tail -n "$tail_lines" "$log_path" | base64'
+if s.count(anchor) != 1:
+    sys.stderr.write('fixture: log-encode site not recognised (%d)\n' % s.count(anchor))
+    sys.exit(3)
+indent = anchor[:len(anchor) - len(anchor.lstrip())]
+s = s.replace(anchor, indent + 'rm -f "$log_path"  # SMOKE: forced vanish\n' + anchor, 1)
+open(dst, 'w').write(s)
+PYV21
+then
+    printf 'read-paths v21: could not inject the forced vanish (see fixture message above)\n' >&2
+    failures=$((failures + 1))
+fi
+if [ -f "$work/agentq-server-forced13" ]; then
+chmod 700 "$work/agentq-server-forced13"
+cat > "$work/pueue.binary" <<'SH'
+#!/bin/sh
+case "$*" in
+  *"status --json"*) printf '%s\n' '{"tasks":{"1":{"id":1,"group":"agentq","label":"agentq:AQREAD-VLOG-0000001","created_at":"2026-09-29T00:00:00Z","status":{"Done":{"result":"Success","start":"2026-09-29T00:00:00Z","end":"2026-09-29T00:00:01Z"},"enqueued_at":"2026-09-29T00:00:00Z"}}},"groups":{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}}' ;;
+  *"group --json"*) printf '%s\n' '{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}' ;;
+  *"log --json"*) printf '%s\n' '{"1":{"task":{"id":1,"created_at":"2026-09-29T00:00:00Z"},"output":"(Pueue error) Failed to read local log output file: stream did not contain valid UTF-8"}}' ;;
+  *) printf '%s 4.0.4\n' pueue ;;
+esac
+SH
+chmod 700 "$work/pueue.binary"
+mv "$work/pueue" "$work/pueue.plain"
+cp "$work/pueue.binary" "$work/pueue"
+run_forced13() {
+    local label=$1
+    shift
+    local rc=0
+    ( cd "$work" && "$work/agentq-server-forced13" "$@" ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+run_forced13 v21 logs 1
+mv "$work/pueue.plain" "$work/pueue"
+assert_rc v21 2
+assert_err_has v21 'the task log disappeared while it was being read'
+# `reason=`, not assert_reason: the mutant runs as agentq-server-forced13, and
+# the server derives the message prefix from $0, so the machine line reads
+# `agentq-server-forced13: reason=protocol_error`.  V6/V8 hit the same shape.
+assert_err_has v21 'reason=protocol_error'
+cases=$((cases + 1))
+if grep -qF 'No such file or directory' "$work/v21.err"; then
+    printf 'read-paths v21: the log read leaked the tool own path error\n' >&2
+    sed -n '1,3p' "$work/v21.err" >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if grep -qF 'cannot encode non-UTF-8' "$work/v21.err"; then
+    printf 'read-paths v21: a vanished log was blamed on encoding\n' >&2
+    sed -n '1,3p' "$work/v21.err" >&2
+    failures=$((failures + 1))
+fi
+fi
+find "$work/data/task_logs" -maxdepth 1 -name '*.log' -delete
+clear_runtime
 
 # --------------------------------------------------------------- summary
 if [ "$failures" -ne 0 ]; then

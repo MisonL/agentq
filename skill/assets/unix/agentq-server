@@ -464,17 +464,31 @@ validate_task_id_precision() {
 validate_task_id_precision_in_file() {
     local json_path=$1
     local task_id
+    local json_text
 
     if jq_preserves_integer_digits; then
         return 0
     fi
+    # Read ONCE, silently, and feed grep from the string.  `grep ... "$path"`
+    # prints its own `<path>: No such file or directory` when a concurrent
+    # archiver removed the file after the caller's guard, and the clients scan
+    # the remote stderr for `reason=` -- so a benign race put unexplained text
+    # on a call that otherwise succeeded.  Measured 2026-10-23 on a copy forced
+    # into the low-precision branch (this is the only branch that reads at all;
+    # on jq >= 1.6.3 the function returns above and never opens the file).
+    #
+    # A file that cannot be read is NOT a precision violation: return 0 and let
+    # the caller's own read report the file's fate with its own verdict
+    # (vanished -> skip, present-but-unsafe -> fail).
+    json_text=$(cat -- "$json_path" 2>/dev/null) || return 0
     while IFS= read -r task_id; do
         [ -n "$task_id" ] || continue
         if task_id_exceeds_jq_safe_integer "$task_id"; then
             fail "task id exceeds the exact-integer range of the configured jq: $task_id"
         fi
     done < <(
-        grep -Eo '"task_id"[[:space:]]*:[[:space:]]*[0-9]+' "$json_path" |
+        printf '%s\n' "$json_text" |
+            grep -Eo '"task_id"[[:space:]]*:[[:space:]]*[0-9]+' |
             sed -E 's/.*:[[:space:]]*//'
     )
 }
@@ -482,17 +496,22 @@ validate_task_id_precision_in_file() {
 validate_pueue_task_id_precision_in_file() {
     local json_path=$1
     local task_id
+    local json_text
 
     if jq_preserves_integer_digits; then
         return 0
     fi
+    # Silent single read; see validate_task_id_precision_in_file for why a bare
+    # `grep ... "$path"` must not be used here.
+    json_text=$(cat -- "$json_path" 2>/dev/null) || return 0
     while IFS= read -r task_id; do
         [ -n "$task_id" ] || continue
         if task_id_exceeds_jq_safe_integer "$task_id"; then
             fail "Pueue task id exceeds the exact-integer range of the configured jq: $task_id"
         fi
     done < <(
-        grep -Eo '"id"[[:space:]]*:[[:space:]]*[0-9]+' "$json_path" |
+        printf '%s\n' "$json_text" |
+            grep -Eo '"id"[[:space:]]*:[[:space:]]*[0-9]+' |
             sed -E 's/.*:[[:space:]]*//'
     )
 }
@@ -2507,9 +2526,20 @@ $request_tombstone_filter
 | if ((\$tombstones | length) != (\$ids | length)) then
     error(\"invalid AgentQ request tombstone\")
   else . end
+# null is the placeholder the producer emits for a tombstone that vanished
+# between the glob and the read (the same contract as
+# request_removed_records_filter on the record side).  It is dropped AFTER the
+# positional binding, so a skip cannot shift a later tombstone onto the id
+# before it; null can never be a real tombstone, which is what made a bare
+# continue in the producer fatal.  (No backticks in this comment: the filter is
+# a DOUBLE-quoted shell string, so they would run as command substitution --
+# measured 2026-10-23, the shell tried to execute the commands "null" and
+# "continue".)
 | range(0; length) as \$i
-| (\$tombstones[\$i] | valid(\$ids[\$i]))
-| (\$ids[\$i], (.task_id | tostring), .task_created_at)
+| if \$tombstones[\$i] == null then empty
+  else (\$tombstones[\$i] | valid(\$ids[\$i]))
+  | (\$ids[\$i], (.task_id | tostring), .task_created_at)
+  end
 "
 
 # The batch form of the `select(.task_id == $id) | .task_created_at // empty`
@@ -2535,6 +2565,7 @@ request_instance_probe_filter='
 request_tombstone_is_valid() {
     local tombstone_path=$1
     local request_id=$2
+    local tombstone_read_status
 
     # Same vanish verdict as its record twin: 1 means the tombstone is GONE.
     # Its delete sites are prune_request_tombstones (lock only) and nothing
@@ -2570,11 +2601,30 @@ request_tombstone_is_valid() {
 # fall back gets the same verdict as the per-file path.
 request_tombstone_path_guards_or_fail() {
     local tombstone_path=$1
-    [ -e "$tombstone_path" ] || [ -L "$tombstone_path" ] ||
+
+    # rc=1 is the VANISHED verdict, exactly as in the record twin
+    # request_record_path_guards_or_fail.  Without these arms the bare `fail`
+    # below exited before any caller could see that the file was simply GONE,
+    # which made two things dead: the `null` placeholder the wait batch scan
+    # emits for a vanished tombstone, and the vanish arm of
+    # read_request_tombstone.  Measured 2026-10-23 by injecting the rm right
+    # after the existence check in read_request_tombstone: `lookup` answered
+    # `invalid AgentQ request tombstone path` + exit 2 instead of converging to
+    # not_found, on both 0.1.18 and the tree that was supposed to have fixed it.
+    #
+    # "Present but unsafe" still fails loudly -- only "neither a file nor a
+    # symlink" is treated as gone (a dangling symlink is an object whose TARGET
+    # is missing, so it stays fatal).
+    [ -e "$tombstone_path" ] || [ -L "$tombstone_path" ] || return 1
+    request_metadata_file_is_safe "$tombstone_path" || {
+        tracked_path_vanished "$tombstone_path" && return 1
         fail "invalid AgentQ request tombstone path: $tombstone_path"
-    request_metadata_file_is_safe "$tombstone_path" || fail "invalid AgentQ request tombstone path: $tombstone_path"
+    }
     validate_task_id_precision_in_file "$tombstone_path"
-    request_metadata_file_is_safe "$tombstone_path" || fail "invalid AgentQ request tombstone path: $tombstone_path"
+    request_metadata_file_is_safe "$tombstone_path" || {
+        tracked_path_vanished "$tombstone_path" && return 1
+        fail "invalid AgentQ request tombstone path: $tombstone_path"
+    }
 }
 
 request_records_filter='
@@ -2738,7 +2788,15 @@ load_request_records() {
             if tracked_path_vanished "$record_path"; then printf 'null\n'; continue; fi
             fail "invalid AgentQ request record path: $record_path"
         }
-        record=$(<"$record_path") || {
+        # Silent read: `record=$(<"$record_path")` fails the right way when the
+        # archiver wins the race -- but bash prints its OWN redirection error
+        # first, and that error is written to the top-level stderr no matter
+        # what wraps the loop (measured 2026-10-23: `status` exited 0, skipped
+        # correctly, and still carried `<path>: No such file or directory`; the
+        # clients scan the remote stderr for `reason=`, so noise on a successful
+        # call is a defect by itself).  `cat`'s error IS its own stderr and IS
+        # suppressed by the redirect.
+        record=$(cat -- "$record_path" 2>/dev/null) || {
             if tracked_path_vanished "$record_path"; then printf 'null\n'; continue; fi
             fail "invalid AgentQ request record: $record_path"
         }
@@ -4431,6 +4489,7 @@ wait_reconcile_missing_task() {
     local tombstone_created_at
     local output
     local wait_read_status=0
+    local wait_tombstone_status=0
     local matched_request_id=''
     local matched_record=''
     local matched_tombstone_request_id=''
@@ -4537,7 +4596,15 @@ wait_reconcile_missing_task() {
             if output=$(
                 {
                     for path in "${tombstone_files[@]}"; do
-                        request_tombstone_path_guards_or_fail "$path"
+                        # Same `null` placeholder as the record scan above: a
+                        # tombstone removed between the glob and the read must
+                        # not abort the whole scan, and a bare `continue` would
+                        # drop a line while the positional binding still carries
+                        # its id.
+                        if ! request_tombstone_path_guards_or_fail "$path"; then
+                            printf 'null\n'
+                            continue
+                        fi
                         printf '%s\n' "$(<"$path")"
                     done | jq -rs --args "$request_tombstones_states_filter" -- "${tombstone_ids[@]}"
                 } 2>/dev/null
@@ -4560,8 +4627,23 @@ wait_reconcile_missing_task() {
                     # race (2026-10-13): skip, the scanner converges on the
                     # next invocation instead of exiting 2 with a misleading
                     # "missing tombstone" on a file that never belonged to us.
-                    [ -e "$request_tombstone_directory/$request_id.json" ] || continue
-                    tombstone=$(read_request_tombstone "$request_id") || fail "missing AgentQ request tombstone during wait recovery: $path"
+                    #
+                    # The status is captured rather than folded with `|| fail`:
+                    # read_request_tombstone returns 1 for GONE (the skip
+                    # verdict this loop wants) and 2 via `fail` for a real
+                    # violation, so the two must not be collapsed -- the exact
+                    # mistake this file records for the record-side fallback.
+                    wait_tombstone_status=0
+                    tombstone=$(read_request_tombstone "$request_id") ||
+                        wait_tombstone_status=$?
+                    if [ "${wait_tombstone_status:-0}" -eq 1 ]; then
+                        wait_tombstone_status=0
+                        continue
+                    fi
+                    if [ "${wait_tombstone_status:-0}" -ne 0 ]; then
+                        wait_tombstone_status=0
+                        fail "missing AgentQ request tombstone during wait recovery: $path"
+                    fi
                     validate_task_id_precision "$(jq -r '.task_id' <<<"$tombstone")"
                     if [ "$(canonical_task_id "$(jq -r '.task_id' <<<"$tombstone")")" = "$(canonical_task_id "$task_id")" ]; then
                         matched_tombstone_request_id=$request_id
@@ -4731,6 +4813,8 @@ cancellation_marker_path() {
 cancellation_marker_is_valid() {
     local marker_path=$1
     local task_id=$2
+    local marker_read_status
+    local marker_body
 
     # Validate the decimal text before jq parses it.  This direct helper is
     # used by read_cancellation_marker(), so relying only on
@@ -4747,6 +4831,19 @@ cancellation_marker_is_valid() {
         tracked_path_vanished "$marker_path" && return 1
         fail "invalid AgentQ cancellation marker path: $marker_path"
     }
+    # Silent read, then jq from the string.  The guard above and the open below
+    # are separated by a window in which an archiver can remove the marker;
+    # `jq < "$marker_path"` then prints bash's OWN redirection error on stderr,
+    # and the clients capture the remote stderr to look for `reason=` -- so a
+    # benign race left unexplained text on a call that succeeded.  Measured
+    # 2026-10-23: `status` exited 0 with `<path>: No such file or directory` on
+    # stderr.  Same shape as the record and tombstone readers.
+    marker_read_status=0
+    marker_body=$(cat -- "$marker_path" 2>/dev/null) || marker_read_status=$?
+    if [ "$marker_read_status" -ne 0 ]; then
+        tracked_path_vanished "$marker_path" && return 1
+        fail "invalid AgentQ cancellation marker path: $marker_path"
+    fi
     jq -ce --arg task_id "$task_id" '
         def valid_task_id:
             if type != "number" then
@@ -4771,25 +4868,37 @@ cancellation_marker_is_valid() {
         ) then
             if .state? == null then . + {state: "requested"} else . end
         else error("invalid AgentQ cancellation marker") end
-    ' < "$marker_path"
+    ' <<<"$marker_body"
 }
 
 read_cancellation_marker() {
     local task_id=$1
     local marker_path
+    local marker_status
 
     marker_path=$(cancellation_marker_path "$task_id")
     if [ ! -e "$marker_path" ] && [ ! -L "$marker_path" ]; then
         return 1
     fi
-    request_metadata_file_is_safe "$marker_path" || fail "invalid AgentQ cancellation marker path: $marker_path"
-    request_metadata_file_is_safe "$marker_path" || fail "invalid AgentQ cancellation marker path: $marker_path"
-
+    # NO direct guards here: cancellation_marker_is_valid runs the same
+    # identity checks as its first step, and a second walk of an unchanged
+    # path buys nothing (the measurement that trimmed load_request_records and
+    # the record/tombstone readers).  More importantly, these two lines used to
+    # `fail` BEFORE the vanish-tolerant validator could see the file, so the
+    # comment below ("a vanished marker is no marker") was not true of this
+    # function: an archiver removing the marker between the existence check and
+    # here turned a lock-free `status` into exit 2 + `invalid ... path`.
+    # Measured 2026-10-22 by injecting the rm at exactly that point.
+    #
     # A vanished marker is "no marker" for every caller of this function.
-    cancellation_marker_is_valid "$marker_path" "$task_id" || {
-        [ $? -eq 1 ] && return 1
+    marker_status=0
+    cancellation_marker_is_valid "$marker_path" "$task_id" || marker_status=$?
+    if [ "$marker_status" -eq 1 ]; then
+        return 1
+    elif [ "$marker_status" -ne 0 ]; then
         fail "invalid AgentQ cancellation marker: $marker_path"
-    }
+    fi
+    return 0
 }
 
 # compact_task/raw_compact_task exit 4 only when Pueue ANSWERED and this id is
@@ -5066,13 +5175,41 @@ compact_log() {
         fi
         require_task_log_file "$log_path"
 
-        if {
-            if [ "$tail_lines" = all ]; then
-                base64 < "$log_path"
-            else
-                tail -n "$tail_lines" "$log_path" | base64
+        # The log is read by a TOOL, not by a shell redirect, and the tool's own
+        # stderr is dropped: `base64 < "$log_path"` fails with the SHELL's
+        # "<path>: No such file or directory" (a redirection error is written
+        # before the redirect applies, so no `2>/dev/null` on it can help), and
+        # `tail ... | base64` under `set -o pipefail` turns a vanished log into a
+        # non-zero pipeline whose only message would be "cannot encode" -- the
+        # wrong cause, for a file that was simply gone.  Measured 2026-10-23 by
+        # deleting the log between require_task_log_file and the read: exit 2,
+        # `tail: <path>: No such file or directory` on stderr (which the clients
+        # scan for `reason=`), and `cannot encode non-UTF-8 task log`.
+        #
+        # The base64 text is captured first so the two failures can be told
+        # apart below.  An empty log legitimately yields an empty string, so
+        # emptiness is NOT the failure signal -- the status is.
+        log_encoded=''
+        log_encode_status=0
+        if [ "$tail_lines" = all ]; then
+            log_encoded=$(cat -- "$log_path" 2>/dev/null | base64) ||
+                log_encode_status=$?
+        else
+            log_encoded=$(tail -n "$tail_lines" "$log_path" 2>/dev/null | base64) ||
+                log_encode_status=$?
+        fi
+        if [ "$log_encode_status" -ne 0 ]; then
+            # Exit 2 for BOTH arms, matching the adjacent pre-existing condition
+            # above (`Pueue reported a non-UTF-8 task log, but the raw log is
+            # unavailable`), which is the same situation one line earlier: the
+            # log content cannot be delivered.  A distinct code here would make
+            # two neighbouring branches describe one state in two vocabularies.
+            if tracked_path_vanished "$log_path"; then
+                fail "the task log disappeared while it was being read: $task_id"
             fi
-        } | tr -d '\r\n' | jq -Rsc --argjson task "$task" '
+            fail "cannot encode non-UTF-8 task log for AgentQ task: $task_id"
+        fi
+        if printf '%s' "$log_encoded" | tr -d '\r\n' | jq -Rsc --argjson task "$task" '
                 {
                     task: $task,
                     output: null,
@@ -5795,6 +5932,7 @@ task_instance_created_at_is_recorded() {
     # tracked, which an earlier instance satisfies just as well as the live one.
     local evidence_grade=${3:-any}
     local path request_id created_at
+    local file_body
     local records=()
     local tombstones=()
 
@@ -5834,8 +5972,16 @@ task_instance_created_at_is_recorded() {
             request_id=${path##*/}
             request_id=${request_id%.json}
             is_request_id "$request_id" || continue
+            # Silent read before the jq: `... < "$path" 2>/dev/null` looks like
+            # it suppresses everything, but a REDIRECTION error is the shell's
+            # own write and happens before the redirect applies -- bash prints
+            # `<path>: No such file or directory` regardless (measured
+            # 2026-10-23).  The clients scan the remote stderr for `reason=`,
+            # so a record vanishing mid-scan must not leave that line behind.
+            # `cat`'s error, by contrast, IS cat's own write and is suppressed.
+            file_body=$(cat -- "$path" 2>/dev/null) || continue
             created_at=$(jq -r --argjson id "$task_id" \
-                'select(.task_id == $id) | .task_created_at // empty' < "$path" 2>/dev/null) || continue
+                'select(.task_id == $id) | .task_created_at // empty' <<<"$file_body" 2>/dev/null) || continue
             if [ "$created_at" = "$expected_created_at" ]; then
                 return 0
             fi
@@ -5846,8 +5992,16 @@ task_instance_created_at_is_recorded() {
             request_id=${path##*/}
             request_id=${request_id%.json}
             is_request_id "$request_id" || continue
+            # Silent read before the jq: `... < "$path" 2>/dev/null` looks like
+            # it suppresses everything, but a REDIRECTION error is the shell's
+            # own write and happens before the redirect applies -- bash prints
+            # `<path>: No such file or directory` regardless (measured
+            # 2026-10-23).  The clients scan the remote stderr for `reason=`,
+            # so a record vanishing mid-scan must not leave that line behind.
+            # `cat`'s error, by contrast, IS cat's own write and is suppressed.
+            file_body=$(cat -- "$path" 2>/dev/null) || continue
             created_at=$(jq -r --argjson id "$task_id" \
-                'select(.task_id == $id) | .task_created_at // empty' < "$path" 2>/dev/null) || continue
+                'select(.task_id == $id) | .task_created_at // empty' <<<"$file_body" 2>/dev/null) || continue
             if [ "$created_at" = "$expected_created_at" ]; then
                 return 0
             fi

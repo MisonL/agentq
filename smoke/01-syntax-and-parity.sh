@@ -998,11 +998,55 @@ if [ "$repo_script_count" -eq 0 ]; then
     failures=$((failures + 1))
 fi
 
+# A `2>/dev/null` written ON a redirection does not suppress the shell's own
+# open error: `cmd < "$f" 2>/dev/null` still prints `bash: <f>: No such file or
+# directory`, because that message is written BEFORE the redirect applies.
+# Measured 2026-10-23: the same command inside `{ ...; } 2>/dev/null` is silent,
+# so the two spellings differ in meaning and only the grouped one is a
+# suppression.  This matters because the clients capture the remote stderr to
+# look for `reason=`: a benign concurrent delete then leaves unexplained text on
+# a call that succeeded.  Rule: no asset may rely on the no-op spelling.
+#
+# The rule is about the CONSTRUCT, not about a file being deleted: it fires on
+# the spelling alone, so it keeps working on code paths nobody has raced yet.
+#
+# `(^|[^<])` before the `<` excludes a HERE-STRING (`<<<"$body" 2>/dev/null`),
+# which is not a file redirect at all and cannot fail to open: the first draft
+# of this rule flagged `... <<<"$file_body" 2>/dev/null` in the server, a false
+# positive caught by running the rule before trusting it.
+redir_noop_count=0
+# Collected into a variable and tested for emptiness, exactly like the pipe lock
+# above.  A `while read` over an empty heredoc runs ONCE with an empty string
+# (the substitution yields one blank line), so the first version reported a
+# violation with no file and no line -- a false red on a clean tree, caught by
+# running the rule before trusting it.
+redir_noop_hits=$(
+    while IFS= read -r repo_script; do
+        repo_pipe_scan "$repo_script" 2>/dev/null |
+            grep -E '(^|[^<])<[[:space:]]*"\$[^"]*"[[:space:]]+2>/dev/null' |
+            grep -vE '^[0-9]+:[[:space:]]*#' |
+            sed "s|^|${repo_script#"$root"/}:|" || true
+    done <<SCRIPTS
+$(find "$root/skill/assets" -type f \( -name '*.sh' -o -name 'agentq' -o -name 'agentq-server' -o -name 'sshp' -o -name 'durable-move' -o -name 'start-daemon' \) | sort)
+SCRIPTS
+)
+if [ -n "$redir_noop_hits" ]; then
+    while IFS= read -r redir_hit; do
+        [ -n "$redir_hit" ] || continue
+        printf 'repo script FAILED (2>/dev/null on a redirect does not suppress the shell open error; wrap the command in { ...; } instead): %s\n' \
+            "$redir_hit" >&2
+        redir_noop_count=$((redir_noop_count + 1))
+    done <<EOF
+$redir_noop_hits
+EOF
+    failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 printf '%s\n' "$summary"
