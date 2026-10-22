@@ -232,9 +232,18 @@ fi
 # comment above).  The rule is structural, not a name list: renaming the
 # function, adding a call site, or dropping the reason line all go red.
 # Functions are tracked by scanning for `name() {` definitions; a site is
-# "bare" when some line consists of (optional leading whitespace +) the name
-# alone.  Calls guarded by if/||/&&/&& or inside $( ) are fine -- their return
-# value is folded by the caller, which must then carry the reason itself.
+# "bare" when a line IS that name, alone OR followed by arguments.  Calls
+# guarded by if/||/&& or inside $( ) are fine -- their return value is folded by
+# the caller, which must then carry the reason itself.
+#
+# ARGUMENTS ARE INCLUDED, and that was a measured hole (2026-10-20): the first
+# version matched only `^[[:space:]]*[a-z_]+[[:space:]]*$`, i.e. a zero-argument
+# call.  Injected proof: a function that prints to stderr and `return 2`s, called
+# bare as `mutant_check jq` from ensure_runtime_dependencies, was NOT reported by
+# this rule (26 other failures fired, all from the runtime half) -- the shape the
+# rule exists for was reachable simply by passing an argument.  A fourth form was
+# added 2026-10-20 after the same exercise on the REPAIR path: a call joined by
+# a semicolon on one physical line.
 return2_gap_sites=$(
     awk '
         {
@@ -250,9 +259,39 @@ return2_gap_sites=$(
         END {
             if (pending != "") joined[++n] = pending
             for (i = 1; i <= n; i++) {
-                if (joined[i] ~ /^[[:space:]]*[a-z_]+[[:space:]]*$/) {
-                    f = joined[i]; sub(/^[[:space:]]*/, "", f); sub(/[[:space:]]*$/, "", f)
-                    bare[f] = 1
+                # a call is bare when the whole line is the name, optionally
+                # followed by arguments -- but never when it is part of a
+                # pipeline, an `if`/`while` head, an assignment, or a
+                # substitution, all of which fold the status instead.
+                if (joined[i] !~ /^[[:space:]]*[a-z_]+([[:space:]]|$)/) continue
+                if (joined[i] ~ /[|&;]/ || joined[i] ~ /\$\(/ || joined[i] ~ /\\x60/) continue
+                if (joined[i] ~ /(^|[[:space:]])[<>]/) continue
+                f = joined[i]; sub(/^[[:space:]]*/, "", f); sub(/[[:space:]].*$/, "", f)
+                bare[f] = 1
+                # `name arg` joined after a guard keyword on the SAME line was
+                # never bare either (the keyword is the first token), so it is
+                # skipped by the regex above rather than here.
+                # A call whose very next statement is `return $?` is FOLDING the
+                # status, not letting it escape -- `set -e` never sees the
+                # failure.  That is exactly the shape in
+                # cleanup_temporary_file_after_make_failure, where the call to
+                # remove_runtime_temporary_file is followed by `return $?`,
+                # which the first draft of this widening reported as a gap; the
+                # callers up the chain fold again (`|| return 1`).  Counting it
+                # would be a false positive of the same kind the widening was
+                # meant to remove, so the fold is subtracted before the site is
+                # judged.  (No apostrophes in this block: it is inside a single-
+                # quoted awk program and one would close it -- the exact crash
+                # recorded for smoke/10 rule J.)
+                if (joined[i] !~ /^[[:space:]]*[a-z_]+\(\) \{[[:space:]]*$/) {
+                    f = joined[i]; sub(/^[[:space:]]*/, "", f)
+                    if (f ~ /^[a-z_]+([[:space:]]|$)/ && f !~ /[|&;]/ && f !~ /\$\(/ && f !~ /\\x60/ &&
+                        f !~ /(^|[[:space:]])[<>]/) {
+                        sub(/[[:space:]].*$/, "", f)
+                        k = i + 1
+                        while (k <= n && (joined[k] ~ /^[[:space:]]*$/ || joined[k] ~ /^[[:space:]]*#/)) k++
+                        if (k <= n && joined[k] ~ /^[[:space:]]*return \$[?][[:space:]]*$/) folded[f] = 1
+                    }
                 }
             }
             cur = ""
@@ -263,7 +302,7 @@ return2_gap_sites=$(
                 if (joined[i] !~ /printf/ || joined[i] ~ /reason=/ || joined[i] !~ />&2/) continue
                 j = i + 1
                 while (j <= n && (joined[j] ~ /^[[:space:]]*$/ || joined[j] ~ /^[[:space:]]*#/)) j++
-                if (j <= n && joined[j] ~ /^[[:space:]]*return 2[[:space:]]*$/ && cur != "" && bare[cur]) printf "%d [%s]: %s\n", i, cur, joined[i]
+                if (j <= n && joined[j] ~ /^[[:space:]]*return 2[[:space:]]*$/ && cur != "" && bare[cur] && !(cur in folded)) printf "%d [%s]: %s\n", i, cur, joined[i]
             }
         }' "$server"
 )

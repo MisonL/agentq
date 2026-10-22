@@ -3,6 +3,27 @@ $ErrorActionPreference = "Stop"
 
 $script:Program = Split-Path -Leaf $PSCommandPath
 
+# Top-level trap, the same shape the launcher got in 0.1.15.  A `throw` that
+# escapes a -File script exits 1 with a CLIXML stack trace on stderr, which is
+# indistinguishable from "the task failed" to a caller and is NOT the contract's
+# 2 for a client-side configuration problem -- the POSIX twin answers the same
+# conditions with 2 and an `agentq:` line.  Reachable surfaces, all before any
+# exit-2 site runs: Resolve-CurrentWindowsUserProfile (5 throws: missing SID,
+# unreadable ProfileList key, empty/missing profile directory, reparse profile,
+# ACL read failure) is called at script scope a few lines below; New-FileTree /
+# New-TemporaryPath throw on UnauthorizedAccessException and on an identity that
+# cannot be recorded, and Invoke-SshLogged re-throws by design "so its caller can
+# decide" -- no caller decided.
+#
+# A trap does NOT intercept `exit`: the deliberate exit sites (Stop-AgentQ,
+# every `exit <probe code>`) keep their exact codes -- measured for the launcher
+# on real PS 5.1.  Setting $script:Program first keeps the prefix right even
+# when the throw predates the later assignments.
+trap {
+    [Console]::Error.WriteLine("$($script:Program): $($_.Exception.Message)")
+    exit 2
+}
+
 function Test-NonReparseWindowsProfilePath {
     param([string]$Path)
 
@@ -165,7 +186,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PL
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.17"
+$script:ClientVersion = "0.1.18"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's argv limit, not this machine's platform: a unix
 # target takes up to 100000 base64 characters (the POSIX twin's MAX_ARG_STRLEN
@@ -177,6 +198,39 @@ $script:ClientVersion = "0.1.17"
 # script to a unix host with a message that blamed the wrong limit.
 $script:StdinScriptLimitUnix = 100000
 $script:StdinScriptLimitWindows = 20000
+# The LOCAL limit, which is the one that actually bites.
+#
+# The unix-target payload is base64 TWICE before it reaches ssh: once by the
+# submit arm (the script itself) and once by New-UnixRemoteInvocation (the
+# whole remote command, to survive PowerShell 5.1's argument quoting).  Both
+# copies ride ONE argv element of the LOCAL ssh.exe, and the platform's own
+# command-line limit then applies:
+#
+#   Windows  -- CreateProcess caps the WHOLE command line at 32767 characters
+#   Linux    -- one argv element is capped at MAX_ARG_STRLEN = 131072
+#   macOS    -- one argv element is capped at kern.argmax = 262144
+#
+# The outer base64 already costs 4/3 of the inner one, so a payload of N base64
+# characters needs about 1.78*N on the local command line.
+#
+# Measured 2026-10-22 with this repo's own stub ssh: an 8-byte script produced
+# a 750-character local argv (17 elements), of which the two base64 layers
+# were 16 -- so the fixed overhead is about 734 characters.  On Windows that
+# leaves 32767 - 734 = 32033 characters, i.e. about 24000 inner base64
+# characters (13.5 KB of raw script).  The declared unix limit was 100000 --
+# 4.2x more than Windows can transmit -- so scripts between 13.5 KB and 75 KB
+# were ACCEPTED here and then failed at the local process launch, which
+# surfaces as an unclassified exit 1 with the diagnostic redacted.
+#
+# The non-Windows value is the CONSERVATIVE of the two POSIX limits (Linux's
+# 131072), so the same payload is accepted or refused identically wherever this
+# client runs.
+$script:LocalCommandLineLimit = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    32767
+} else {
+    131072
+}
+$script:LocalCommandLineFixedOverhead = 734
 $script:RemotePlatform = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_REMOTE_PLATFORM)) {
     $env:AGENTQ_REMOTE_PLATFORM
 } else {
@@ -2347,8 +2401,22 @@ function New-UnixRemoteInvocation {
     # PowerShell does to it; `sh` is last in the pipeline, so the script's exit
     # status is still what ssh returns.
     $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($script))
+    $command = "printf %s $encoded | base64 -d | sh"
+    # The LOCAL command line, measured, not assumed: CreateProcess caps a
+    # Windows command line at 32767 characters, and this payload rides ONE argv
+    # element of the local ssh.exe.  Exceeding it is not a clean failure -- the
+    # launch itself fails, the client dies with an unclassified exit 1, and
+    # the diagnostic is redacted, so the operator is told nothing about the
+    # real cause.  Refuse here instead, with the same "stage it as a file"
+    # instruction the size guard gives.
+    $localCommandLineLength = $script:LocalCommandLineFixedOverhead + $command.Length
+    if ($localCommandLineLength -gt $script:LocalCommandLineLimit) {
+        Stop-AgentQ ("the remote command is too long for this platform's local ssh command line (" +
+            $localCommandLineLength + " characters, limit " + $script:LocalCommandLineLimit +
+            "); stage the script as a file and submit a command that reads it")
+    }
     return [pscustomobject]@{
-        Command = "printf %s $encoded | base64 -d | sh"
+        Command = $command
         Input = $null
     }
 }
@@ -3187,7 +3255,28 @@ switch ($operation) {
             # Fixed 2026-10-16: it used to apply the Windows cap to every
             # target, so a 60K-character script to a unix host was refused
             # with a message that blamed the wrong limit.
-            $stdinScriptLimit = if ($script:RemotePlatform -eq "windows") { $script:StdinScriptLimitWindows } else { $script:StdinScriptLimitUnix }
+            #
+            # On THIS client a unix target has a LOCAL cap as well: the payload
+            # is base64'd twice (here and in New-UnixRemoteInvocation) and both
+            # copies ride one argv element of the local ssh.exe, whose command
+            # line CreateProcess caps at 32767 characters.  Measured 2026-10-22:
+            # with a 734-character fixed overhead the usable budget is about
+            # 18000 base64 characters, not the 100000 the target would allow.
+            # Without the tighter cap a 13.5 KB-75 KB script passed this check
+            # and then failed at the local process launch instead.
+            $stdinScriptLimit = if ($script:RemotePlatform -eq "windows") {
+                $script:StdinScriptLimitWindows
+            } else {
+                $script:StdinScriptLimitUnix
+            }
+            if ($script:RemotePlatform -ne "windows") {
+                # 4/3 for the outer base64 plus the fixed local overhead, in
+                # the same units the check compares (base64 characters).
+                $localBudget = [int](($script:LocalCommandLineLimit - $script:LocalCommandLineFixedOverhead) * 3 / 4)
+                if ($localBudget -lt $stdinScriptLimit) {
+                    $stdinScriptLimit = $localBudget
+                }
+            }
             if ($scriptBase64.Length -gt $stdinScriptLimit) {
                 Stop-AgentQ ("the script is too large for --stdin-script (base64 length " + $scriptBase64.Length +
                     " exceeds $stdinScriptLimit on this target); stage it as a file and submit a command that reads it")

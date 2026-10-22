@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.17'
+agentq_version='0.1.18'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -873,6 +873,17 @@ atomic_destination_parent_identity_matches() {
     [ -n "$expected_identity" ] || return 1
     observed_identity=$(atomic_destination_parent_identity "$destination_parent") || return 1
     [ "$observed_identity" = "$expected_identity" ]
+}
+
+
+# Did this request record disappear under us?  True only when the path is
+# neither a regular file nor a symlink -- i.e. it is GONE, not merely
+# unreadable.  A record that still EXISTS but fails a safety guard is a
+# different thing entirely and must stay fatal.
+request_record_vanished() {
+    local record_path=$1
+
+    [ ! -e "$record_path" ] && [ ! -L "$record_path" ]
 }
 
 request_metadata_file_is_safe() {
@@ -2399,7 +2410,11 @@ $request_record_filter
 | if ((\$records | length) != (\$ids | length)) then
     error(\"invalid AgentQ request record\")
   else . end
-| [ range(0; length) as \$i | (\$records[\$i] | valid(\$ids[\$i])) ]
+| [ range(0; length) as \$i
+    | (\$records[\$i]
+       | if . == null then empty
+         else valid(\$ids[\$i])
+         end) ]
 | .[]
 | select(.state == \"removed\")
 | (.request_id, tojson)
@@ -2663,12 +2678,31 @@ load_request_records() {
         # for every record on every command.  Measured (272 records, macOS):
         # 4 guards 1040ms -> 1 guard 263ms; the whole producer loop 1696ms ->
         # 1083ms, with byte-identical stdout/stderr and exit code.
-        request_metadata_file_is_safe "$record_path" ||
+        # A record that vanishes between the existence check above and the
+        # read below (a concurrent archiver: remove recovery, wait reconcile)
+        # breaks any guard in this block.  "Gone" gets the SAME placeholder as
+        # the top guard; "present but unsafe" stays fatal.  The read paths run
+        # lock-free, so nothing serialises them against the archiver, and a
+        # single concurrent removal could otherwise turn an unrelated
+        # status/doctor into protocol_error (exit 2).
+        #
+        # The vanished check runs ONLY on a guard failure, so the normal path
+        # costs no extra stat -- this loop already had its guard count reduced
+        # for exactly that reason (4 guards 1040ms -> 1 guard 263ms, measured
+        # on 272 records).
+        request_metadata_file_is_safe "$record_path" || {
+            if request_record_vanished "$record_path"; then printf 'null\n'; continue; fi
             fail "invalid AgentQ request record path: $record_path"
+        }
         validate_task_id_precision_in_file "$record_path"
-        request_metadata_file_is_safe "$record_path" ||
+        request_metadata_file_is_safe "$record_path" || {
+            if request_record_vanished "$record_path"; then printf 'null\n'; continue; fi
             fail "invalid AgentQ request record path: $record_path"
-        record=$(<"$record_path") || fail "invalid AgentQ request record: $record_path"
+        }
+        record=$(<"$record_path") || {
+            if request_record_vanished "$record_path"; then printf 'null\n'; continue; fi
+            fail "invalid AgentQ request record: $record_path"
+        }
         printf '%s\n' "$record"
         done
     } | jq -cse --args "$request_records_filter" -- "${record_ids[@]}"
@@ -2789,7 +2823,11 @@ read_request_record_state_and_body() {
     if [ ! -e "$record_path" ] && [ ! -L "$record_path" ]; then
         return 1
     fi
-    request_record_path_guards_or_fail "$record_path"
+    # `fail` exits the SUBSHELL with status 2 (the protocol-error code), so the
+    # guard's failure must NOT be folded into the "vanished" verdict of 1: the
+    # caller distinguishes them.  `|| return 2` keeps the distinction; the
+    # guard's own stderr was already printed by `fail` inside the subshell.
+    request_record_path_guards_or_fail "$record_path" || return 2
 
     jq -re --arg request_id "$request_id" \
         "$request_record_filter | .state, (.task_id // \"\" | tostring), tojson" < "$record_path" ||
@@ -2802,11 +2840,26 @@ read_request_record_state_and_body() {
 # `fail`, so a caller that needs the two-message recovery contract must run it
 # inside a subshell -- exactly as read_request_record_state_and_body's caller
 # does -- while a caller that discards stderr to fall back gets the same verdict.
+#
+# A record that VANISHED is not a guard violation.  Both callers run on paths
+# that a concurrent archiver can interleave with (the repair pass runs from the
+# migrator; the batch reader runs lock-free behind it), so "gone" returns 1 --
+# the caller's own "skip this one" verdict -- while "present but unsafe" keeps
+# failing.  Without this the batch reader turned one concurrent removal into
+# exit 2 on an unrelated `status` (A-F2; same class as the load_request_records
+# fix, which is why both now share this helper).
 request_record_path_guards_or_fail() {
     local record_path=$1
-    request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
+
+    request_metadata_file_is_safe "$record_path" || {
+        request_record_vanished "$record_path" && return 1
+        fail "invalid AgentQ request record path: $record_path"
+    }
     validate_task_id_precision_in_file "$record_path"
-    request_metadata_file_is_safe "$record_path" || fail "invalid AgentQ request record path: $record_path"
+    request_metadata_file_is_safe "$record_path" || {
+        request_record_vanished "$record_path" && return 1
+        fail "invalid AgentQ request record path: $record_path"
+    }
 }
 
 read_request_record() {
@@ -3313,6 +3366,8 @@ repair_removed_request_records() {
     local record_state
     local record_ids=()
     local output
+    local read_status=0
+    local repair_guard_stderr=''
 
     shopt -s nullglob
     record_files=("$request_directory"/*.json)
@@ -3345,7 +3400,16 @@ repair_removed_request_records() {
     if output=$(
         {
             for record_path in "${record_files[@]}"; do
-                request_record_path_guards_or_fail "$record_path"
+                # A vanished record emits the `null` placeholder, exactly as
+                # load_request_records does.  A bare `continue` would drop one
+                # line while the positional binding still carries its id, and
+                # the length check above would then reject the whole batch --
+                # turning one concurrent removal back into the failure this
+                # whole arm exists to avoid.
+                if ! request_record_path_guards_or_fail "$record_path"; then
+                    printf 'null\n'
+                    continue
+                fi
                 printf '%s\n' "$(<"$record_path")"
             done | jq -rs --args "$request_removed_records_filter" -- "${record_ids[@]}"
         } 2>/dev/null
@@ -3361,21 +3425,44 @@ repair_removed_request_records() {
 
     # Fallback: the original loop, unchanged.  record_task_id is not read here
     # (repair only branches on the state), so it is not decoded.
+    repair_guard_stderr=$(mktemp "${TMPDIR:-/tmp}/agentq-repair-guard.XXXXXX") || return 1
     for record_path in "${record_files[@]}"; do
         request_id=${record_path##*/}
         request_id=${request_id%.json}
         is_request_id "$request_id" || fail "invalid AgentQ request record filename: $record_path"
-        output=$(read_request_record_state_and_body "$request_id") ||
+        # rc=1 is the vanished verdict (neither `-e` nor `-L`); every other
+        # failure still takes the original `|| fail` path below, because the
+        # reader prints its own guard message before `fail` exits the subshell.
+        # The status is captured IMMEDIATELY: `[ $? -eq 1 ]` in the elif
+        # branch would test the status of the `if` condition's own evaluation.
+        #
+        # `|| read_status=$?` is load-bearing, not decoration: under `set -e` a
+        # bare `output=$( )` whose command substitution exits non-zero kills the
+        # SERVER before the next line runs, so without it the vanished verdict
+        # was unreachable and this loop died silently with rc=2 and no message.
+        # Measured while adding the vanish arm (A-F2).  This is the record's
+        # fourth `$( )` trap.
+        output=$(read_request_record_state_and_body "$request_id" 2>"$repair_guard_stderr") ||
+            read_status=$?
+        read_status=${read_status:-0}
+        if [ "$read_status" -eq 1 ]; then
+            continue
+        elif [ "$read_status" -ne 0 ]; then
+            cat "$repair_guard_stderr" >&2
+            rm -f -- "$repair_guard_stderr"
             fail "missing AgentQ request record during recovery: $record_path"
+        fi
         record_state=${output%%$'\n'*}
         output=${output#*$'\n'}
         record=${output#*$'\n'}
         if [ "$record_state" = removed ]; then
             if ! archive_removed_request "$request_id" "$record" >/dev/null; then
+                rm -f -- "$repair_guard_stderr"
                 fail "cannot archive removed AgentQ request during repair: $request_id"
             fi
         fi
     done
+    rm -f -- "$repair_guard_stderr"
 }
 
 migrate_removed_request_records() {
