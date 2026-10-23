@@ -1314,6 +1314,14 @@ process_is_confirmed_dead() {
     esac
 }
 
+# OUT-PARAMETERS, deliberately NOT `local`: lock_pid and lock_identity are set
+# here for the CALLER to read (every call site reads them right after).  This is
+# the ONLY sanctioned unlocalized assignment in this file -- smoke/01's rule 4
+# allowlists exactly this function and these two names, and reports every other
+# case.  The rule exists because the failure mode is silent: bash resolves an
+# unqualified assignment through the DYNAMIC scope, so an unlocalized write in a
+# callee lands in its CALLER's local of the same name (measured 2026-10-23), and
+# a later reader in that caller sees the callee's value as if it were its own.
 read_lock_metadata() {
     local lock_path=$1
     local LC_ALL=C
@@ -1534,6 +1542,7 @@ maintenance_lock_is_stale() {
 recover_stale_maintenance_lock() {
     local lock_pid=''
     local lock_identity=''
+    local maintenance_lock_pid_path
 
     if ! path_chain_is_safe "$maintenance_lock_directory"; then
         printf '%s: refusing to recover an unsafe AgentQ maintenance lock: %s\n' "$program" "$maintenance_lock_directory" >&2
@@ -1767,6 +1776,11 @@ acquire_operation_lock() {
     local attempt=0
     local lock_pid=''
     local lock_identity=''
+    local lock_mtime
+    local current_epoch
+    local lock_holder_age
+    local operation_lock_holder
+    local operation_lock_message
 
     case "$candidate" in
         */*)
@@ -1997,6 +2011,7 @@ run_pueue() {
 }
 
 managed_daemon_is_active() {
+    local launch_output
     case "$platform_kind" in
         windows)
             command -v powershell.exe >/dev/null 2>&1 || return 1
@@ -2565,6 +2580,7 @@ request_instance_probe_filter='
 request_tombstone_is_valid() {
     local tombstone_path=$1
     local request_id=$2
+    local tombstone_body
     local tombstone_read_status
 
     # Same vanish verdict as its record twin: 1 means the tombstone is GONE.
@@ -3736,6 +3752,8 @@ acquire_request_lock() {
     local attempt=0
     local lock_pid=''
     local lock_identity=''
+    local request_lock_holder
+    local request_lock_message
 
     case "$candidate" in
         */*)
@@ -5104,6 +5122,8 @@ compact_log() {
     local log_args=(log --json "$task_id")
     local log_path
     local command_status
+    local log_encoded
+    local log_encode_status
 
     log_path=$(task_log_path "$task_id")
     if [ "$tail_lines" = all ]; then
@@ -6014,6 +6034,7 @@ cancelled_task_replay() {
     local task_id=$1
     local evidence_grade=${2:-any}
     local marker
+    local marker_created_at
 
     # Quiet exploratory read: a corrupt marker must not emit the machine
     # reason line on a call that goes on to succeed -- `fail` inside the
@@ -6048,6 +6069,7 @@ cancel_task() {
     local marker_state=''
     local marker_created_at=''
     local raw_compact_status=0
+    local replay_evidence
 
     ensure_daemon
     # One status call, not two: raw_compact_task already fails for an unknown
@@ -6289,6 +6311,18 @@ remove_task() {
 }
 
 main() {
+    # Declared here so this dispatcher cannot write into a same-named local of
+    # whatever it calls (bash resolves an unqualified assignment through the
+    # DYNAMIC scope: an unlocalized write inside a callee lands in its CALLER's
+    # local).  `status_mode`, `doctor_mode` and `task_id` are locals in the
+    # functions below; without these three lines every `task_id=` here was a
+    # write into whatever frame happened to be on top.  Measured 2026-10-23 with
+    # a two-function probe: an unlocalized write in the callee is visible to a
+    # caller that declared `local` for the same name.
+    local status_mode=''
+    local doctor_mode=''
+    local task_id
+
     [ "$#" -ge 1 ] || {
         usage >&2
         printf '%s: reason=protocol_error\n' "$program" >&2

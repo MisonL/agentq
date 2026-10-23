@@ -1015,6 +1015,7 @@ fi
 # of this rule flagged `... <<<"$file_body" 2>/dev/null` in the server, a false
 # positive caught by running the rule before trusting it.
 redir_noop_count=0
+local_hazard_count=0
 # Collected into a variable and tested for emptiness, exactly like the pipe lock
 # above.  A `while read` over an empty heredoc runs ONCE with an empty string
 # (the substitution yields one blank line), so the first version reported a
@@ -1042,11 +1043,120 @@ EOF
     failures=$((failures + 1))
 fi
 
+# --- server: unlocalized writes into a caller's local ------------------------
+# bash resolves an unqualified assignment through the DYNAMIC scope: a write to
+# a name the callee did not declare `local` lands in whichever frame up the
+# stack declared it -- or in the global scope.  Measured 2026-10-23 with a
+# two-function probe: the callee's bare write is visible to a caller that
+# declared `local` for the same name.  The failure mode is silent and the value
+# looks like the caller's own.
+#
+# The rule: inside a function, an assignment to a name that some OTHER function
+# declares `local` must itself be declared `local` in the assigning function.
+# The ONE sanctioned exception is read_lock_metadata's out-parameters
+# (lock_pid, lock_identity): that function's contract is to publish them for the
+# caller, and its header says so.  Any other hit is a real hazard, not a style
+# nit -- the two this rule was built from (tombstone_body, and main's
+# task_id/status_mode/doctor_mode) were both introduced by the same author in
+# the same session as the code they broke.
+#
+# A name never declared `local` anywhere is NOT flagged: it is a deliberate
+# global (the cleanup trap's file variables, the exported env, IFS).  Disabling
+# the allowlist line below makes the rule print exactly the two sanctioned
+# out-parameters and nothing else (measured 2026-10-23), which is how the
+# allowlist's width was checked -- the same measurement also confirms nothing
+# in the tree needs a THIRD exception.
+local_hazard_prog=$(
+    cat <<'AWK'
+FNR == 1 { infn = 0 }
+/^[a-zA-Z_][a-zA-Z0-9_]*\(\) \{/ {
+    fn = $0; sub(/\(\).*/, "", fn); infn = 1; next
+}
+infn && /^\}/ { infn = 0; next }
+!infn { next }
+{
+    line = $0
+    if (line ~ /^[[:space:]]*#/) next
+    if (line ~ /^[[:space:]]*local[[:space:]]/) {
+        # Peel the `local` keyword off FIRST, then split what is left.  The
+        # first version split the whole indented line and skipped the fields
+        # that were "" or "local" -- which worked only because this awk happens
+        # to emit an empty leading field for a whitespace separator.  Peeling
+        # first removes the reliance on that field-counting rule, so the rule
+        # reads the same names on every awk (mawk and gawk disagree with BWK
+        # awk about the leading empty field; that difference is the one thing
+        # here that would silently change the rule's verdict between hosts).
+        decl = line
+        sub(/^[[:space:]]*local[[:space:]]+/, "", decl)
+        n = split(decl, parts, /[[:space:]]+/)
+        for (i = 1; i <= n; i++) {
+            v = parts[i]; sub(/=.*/, "", v)
+            gsub(/[^A-Za-z0-9_]/, "", v)
+            if (v != "") { local[fn, v] = 1; declared[v] = 1 }
+        }
+    }
+    while (match(line, /(^|[;&|]|then|do|else)[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=/)) {
+        seg = substr(line, RSTART, RLENGTH)
+        # The match ends with '=', and a greedy `.*[^A-Za-z0-9_]` would consume
+        # the whole name along with it (measured: the first version returned ""
+        # for every assignment and the rule was silently green on a violation).
+        sub(/=.*$/, "", seg)
+        sub(/.*[^A-Za-z0-9_]/, "", seg)
+        if (seg != "") { assigned[fn, seg] = 1; fns[fn] = 1; names[seg] = 1 }
+        line = substr(line, RSTART + RLENGTH)
+    }
+}
+END {
+    for (f in fns) for (v in names) {
+        if (!((f, v) in assigned)) continue
+        if ((f, v) in local) continue
+        if (!(v in declared)) continue
+        if (f == "read_lock_metadata" && (v == "lock_pid" || v == "lock_identity")) continue
+        printf "%s: %s\n", f, v
+    }
+}
+AWK
+)
+local_hazard_hits=$(awk "$local_hazard_prog" "$root/skill/assets/unix/agentq-server" | sort)
+if [ -n "$local_hazard_hits" ]; then
+    while IFS= read -r hazard; do
+        [ -n "$hazard" ] || continue
+        printf 'server FAILED (an unlocalized write into a caller local: declare it local, or document it as an out-parameter): %s\n' \
+            "$hazard" >&2
+        local_hazard_count=$((local_hazard_count + 1))
+    done <<EOF
+$local_hazard_hits
+EOF
+    failures=$((failures + 1))
+fi
+
+# Self-check: a construct-level rule that silently never fires reports the same
+# green as a clean tree.  This rule died TWICE while being written -- an empty
+# first field from split(), then a greedy sub() that ate the whole name -- and
+# both times it printed zero hits on an input that contained the violation.  So
+# run it against a planted copy and require it to shout.  The anchor is the
+# function header: present in every version of the asset, unlike any statement
+# the fixes added.
+local_hazard_selftest=$(mktemp)
+sed '/^acquire_request_lock() {$/a\
+    maintenance_lock_pid_path=/tmp/planted' \
+    "$root/skill/assets/unix/agentq-server" >"$local_hazard_selftest"
+if ! grep -q '^[[:space:]]*maintenance_lock_pid_path=/tmp/planted$' "$local_hazard_selftest"; then
+    printf '%s\n' 'server FAILED (the local-hazard self-check could not plant its violation: the anchor moved)' >&2
+    failures=$((failures + 1))
+    local_hazard_count=$((local_hazard_count + 1))
+elif [ -z "$(awk "$local_hazard_prog" "$local_hazard_selftest")" ]; then
+    printf '%s\n' 'server FAILED (the local-hazard rule is silent on a planted violation: the detector itself is broken)' >&2
+    failures=$((failures + 1))
+    local_hazard_count=$((local_hazard_count + 1))
+fi
+rm -f "$local_hazard_selftest"
+
 if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s local_hazards=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$local_hazard_count")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 printf '%s\n' "$summary"
