@@ -516,25 +516,6 @@ validate_pueue_task_id_precision_in_file() {
     )
 }
 
-validate_pueue_task_id_precision_in_text() {
-    local json_text=$1
-    local task_id
-
-    if jq_preserves_integer_digits; then
-        return 0
-    fi
-    while IFS= read -r task_id; do
-        [ -n "$task_id" ] || continue
-        if task_id_exceeds_jq_safe_integer "$task_id"; then
-            fail "Pueue task id exceeds the exact-integer range of the configured jq: $task_id"
-        fi
-    done < <(
-        printf '%s\n' "$json_text" |
-            grep -Eo '"id"[[:space:]]*:[[:space:]]*[0-9]+' |
-            sed -E 's/.*:[[:space:]]*//'
-    )
-}
-
 pueue_task_shape_filter='
 def canonical_integer_string:
     tostring
@@ -572,14 +553,6 @@ validate_pueue_task_shape_in_file() {
     fi
 }
 
-validate_pueue_task_shape_in_text() {
-    local json_text=$1
-
-    if ! jq -e "$pueue_task_shape_filter" <<<"$json_text" >/dev/null; then
-        fail 'Pueue returned an invalid task identity in status'
-    fi
-}
-
 pueue_log_shape_filter='
 def canonical_integer_string:
     tostring
@@ -605,14 +578,6 @@ else
     (to_entries | all(.[]; valid_log))
 end
 '
-
-validate_pueue_log_shape_in_text() {
-    local json_text=$1
-
-    if ! jq -e "$pueue_log_shape_filter" <<<"$json_text" >/dev/null; then
-        fail 'Pueue returned an invalid task identity in logs'
-    fi
-}
 
 validate_pueue_log_shape_in_file() {
     local json_path=$1
@@ -4938,14 +4903,6 @@ report_compact_task_failure() {
     fail "cannot inspect Pueue while reading AgentQ task: $task_id"
 }
 
-require_agentq_task() {
-    local task_id=$1
-    local compact_status=0
-
-    compact_task "$task_id" >/dev/null || compact_status=$?
-    report_compact_task_failure "$compact_status" "$task_id"
-}
-
 write_cancellation_marker() {
     local task_id=$1
     local created_at=$2
@@ -5781,10 +5738,6 @@ logs_with_read_lock() {
     logs "$@"
 }
 
-logs_with_operation_lock() {
-    with_operation_lock logs "$@"
-}
-
 status() {
     # $1 (optional): "summary" or a task id.  An empty value keeps the
     # historical full-queue output.  --summary emits the compact JSON summary
@@ -5832,10 +5785,6 @@ status_with_read_lock() {
     recover_stale_operation_lock_for_read
     migrate_removed_request_records
     status "$@"
-}
-
-status_with_operation_lock() {
-    with_operation_lock status "$@"
 }
 
 doctor() {
@@ -5902,17 +5851,6 @@ doctor_with_read_lock() {
     recover_stale_operation_lock_for_read
     migrate_removed_request_records
     doctor "$@"
-}
-
-doctor_with_operation_lock() {
-    # The locked twin of doctor_with_read_lock.  `"$@"` is forwarded for the
-    # same reason the read-lock twin does it: doctor takes `--full`, and a
-    # wrapper that swallowed it would silently answer the DEFAULT (summary)
-    # shape to a caller that asked for the full one -- a wrong-shaped success,
-    # which is exactly the class of defect this round fixed in the dispatch
-    # arm.  No caller today, but the omission was a live trap for the first
-    # one.
-    with_operation_lock doctor "$@"
 }
 
 # Replaying a cancel whose task has already left Pueue.

@@ -1292,11 +1292,124 @@ else
 fi
 rm -f "$local_hazard_selftest"
 
+# --- shell assets: a defined function nobody calls ---------------------------
+# A function with zero call sites is not automatically a defect -- an API surface
+# kept for a future caller is a legitimate choice.  What is NOT legitimate is a
+# SECOND IMPLEMENTATION of a validator the live code already has: the copy that
+# runs gets the fixes and the copy that does not run silently keeps the bugs.
+# Measured 2026-10-23: three `validate_pueue_*_in_text` validators were
+# line-for-line twins of the `_in_file` versions, had never been called in any
+# commit (git log -S on the call spelling returns nothing), and had already
+# diverged -- the live twins got the vanish-race fixes the dead ones did not.
+# Four more (`require_agentq_task` and three `*_with_operation_lock`) were plain
+# leftovers from the read-lock refactor.  All seven were removed.
+#
+# The rule: report every function with no call site, so the choice is made in
+# the open.  A deliberate keep must be named in the allowlist below WITH a
+# reason -- not silently tolerated.  Allowlist is empty today.
+#
+# HOW it counts, stated because a detector's shape is its verdict: one pass
+# splits every non-comment line into identifier tokens (`split` on
+# `[^A-Za-z0-9_]+`) and tallies them; function-definition lines are skipped, so
+# a name's own declaration does not count as a use of itself.  Function names
+# only contain [A-Za-z0-9_], so a token boundary and the rule's former
+# `(^|[^A-Za-z0-9_])NAME([^A-Za-z0-9_]|$)` are the same set.  The first draft
+# re-ran a dynamic regex per (function, line) pair -- 176x6400 -- which the
+# token tally replaces with a single pass.  Do not attribute the check's total
+# wall clock to this rule: removing it entirely measured 62s and keeping it
+# measured 53s, i.e. the 50-90s spread belongs to the pwsh AST pass.
+#
+# Limits, stated rather than implied: a function invoked ONLY through a
+# variable (`$cmd`) or from another file is a false positive waiting to happen.
+# None exist in these assets today (every `$name` reference scan came back
+# empty and each asset is self-contained), which is why the allowlist can be
+# empty.  `command jq` suppresses function lookup, but `jq` has real direct
+# callers all over the file, so it is not a case the rule has to get right.
+unused_fn_prog=$(
+    cat <<'AWK'
+/^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*\(\) \{/ {
+    name = $0
+    sub(/^[[:space:]]*/, "", name)
+    sub(/\(\).*/, "", name)
+    nfn++
+    fname[nfn] = name
+    next
+}
+/^[[:space:]]*#/ { next }
+{
+    n = split($0, words, /[^A-Za-z0-9_]+/)
+    for (i = 1; i <= n; i++) if (words[i] != "") seen[words[i]]++
+}
+END {
+    for (i = 1; i <= nfn; i++) {
+        if (!(fname[i] in seen)) printf "%s\n", fname[i]
+    }
+}
+AWK
+)
+# A deliberate keep goes here as `function: reason`.  Empty today: nothing in
+# the tree is intentionally uncalled.
+unused_fn_allow=$(cat <<'ALLOW'
+ALLOW
+)
+unused_fn_count=0
+while IFS= read -r unused_asset; do
+    [ -n "$unused_asset" ] || continue
+    while IFS= read -r unused_fn; do
+        [ -n "$unused_fn" ] || continue
+        grep -qE "^${unused_fn}:" <<<"$unused_fn_allow" && continue
+        printf 'shell asset FAILED (a function with no call site -- delete it, or name it in the allowlist with a reason): %s: %s\n' \
+            "${unused_asset#"$root"/}" "$unused_fn" >&2
+        unused_fn_count=$((unused_fn_count + 1))
+    done <<FN
+$(awk "$unused_fn_prog" "$unused_asset")
+FN
+done <<ASSETS
+$shell_assets
+ASSETS
+if [ "$unused_fn_count" -gt 0 ]; then
+    failures=$((failures + 1))
+fi
+# Sanity: the rule must have been ABLE to see functions at all.  A parse that
+# finds zero definitions in seven assets (one of them 6000+ lines) cannot
+# distinguish "all called" from "never looked".
+unused_fn_defs=0
+while IFS= read -r unused_asset; do
+    [ -n "$unused_asset" ] || continue
+    n=$(grep -cE '^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*\(\) \{' "$unused_asset" || true)
+    unused_fn_defs=$((unused_fn_defs + n))
+done <<ASSETS
+$shell_assets
+ASSETS
+if [ "$unused_fn_defs" -lt 50 ]; then
+    printf 'shell asset FAILED (the no-call-site rule could only see %s function definitions across the scanned assets; refusing to report a pass)\n' \
+        "$unused_fn_defs" >&2
+    unused_fn_count=$((unused_fn_count + 1))
+    failures=$((failures + 1))
+fi
+
+# Self-check, for the reason spelled out above the local-hazard rule: a
+# construct-level detector that quietly stops matching reads exactly like a
+# clean tree.  Measured 2026-10-23: setting the comparison to an impossible
+# value made this rule report nothing and the whole check went green -- the
+# failure mode this very rule exists to catch, in the rule itself.  Plant an
+# uncalled function in a copy and require it to be named BY NAME.
+unused_fn_selftest=$(mktemp)
+{ cat "$root/skill/assets/unix/agentq-server"
+  printf 'zz_planted_uncalled_helper() {\n    :\n}\n'
+} >"$unused_fn_selftest"
+if ! grep -qx 'zz_planted_uncalled_helper' <<<"$(awk "$unused_fn_prog" "$unused_fn_selftest")"; then
+    printf '%s\n' 'shell asset FAILED (the no-call-site rule is silent on a planted uncalled function: the detector itself is broken)' >&2
+    unused_fn_count=$((unused_fn_count + 1))
+    failures=$((failures + 1))
+fi
+rm -f "$unused_fn_selftest"
+
 if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s local_hazards=%s local_hazard_files=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$local_hazard_count" "$local_hazard_file_count")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s local_hazards=%s local_hazard_files=%s uncalled=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 printf '%s\n' "$summary"

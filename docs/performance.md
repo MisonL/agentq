@@ -147,6 +147,24 @@ fail-closed 的记录过滤器，那会把「跳过畸形文件」变成「拒�
 是它把扫描排成了队。（我一度把顺序写反并据此怀疑锁没起作用，已更正；
 `doctor` 同形。）
 
+> **2026-10-23 更正：上面这一条是 2026-09-24 的实现，已经不成立。** 0.1.11 的
+> 「读免锁」把 `status`/`logs`/`doctor` 的派发从 `*_with_operation_lock` 改到了
+> `*_with_read_lock`（`agentq-server` 的 dispatch；`status_with_read_lock` 的函数体
+> 依次是 `ensure_not_in_maintenance` → `recover_stale_operation_lock_for_read` →
+> `migrate_removed_request_records` → `status "$@"`，**全程不取操作锁**）。所以：
+> ① 那句「调用链是 `status_with_operation_lock`」现在对 `status` 不成立——那个函数
+> 已无调用者（2026-10-23 作为死代码删除）；② 「N 个并发 `status` 在锁内串行做
+> N 次全量扫描」**方向反了**：现在并发 `status` 不排队，是**同时**各跑一次全量
+> 扫描；③ 「锁把扫描排成了队」这个结论对 `status`/`doctor` 不再适用（对 `submit`/
+> `lookup`/`cancel`/`wait`/`remove` 这些写路径仍然成立，它们仍走
+> `with_operation_lock`）。**原条目保留**，因为它记录的「取锁发生在 `status()` 之前」
+> 这个读码结论对当时代码是对的，且是那次排查的转折点。
+>
+> **这一段的代价没有被重新测量过**：免锁之后并发读是并行还是互相拖慢、N 次全量
+> 扫描在同一台慢机上会不会互相争 IO，都**没有实测数据**。上面「分钟级」的规模因子
+> 仍然有效（它来自元数据条数），但「并发时被锁串行化」这层保护没有了，**不要**
+> 据此推断并发读现在是安全的或更快的。
+
 **实测补充三（2026-09-24，同上）：Windows 上每次嵌套 `powershell.exe` 约 12 秒，
 而锁恢复路径每次重试都要起一个。** `process_identity_state` 的 windows 分支
 **每次调用都 spawn 一个嵌套 `powershell.exe`** 去查进程身份；`acquire_operation_lock`
