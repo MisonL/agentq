@@ -33,6 +33,16 @@
 #                    Writer-agnostic on purpose -- function writers and
 #                    absolute paths both escaped the first, printf-only rule.
 #                    `grep -c` is excluded: it must read every line.
+#   redirects     -> no `cmd < "$f" 2>/dev/null`: the `2>` is applied AFTER the
+#                    open, so the shell's own error escapes it
+#   local hazards -> no assignment inside a function to a name another function
+#                    declares `local`: bash resolves it through the DYNAMIC
+#                    scope and writes into the caller's frame
+#
+# The shell-asset list is computed ONCE (shell_assets below) and used by every
+# rule that scans them.  It used to be spelled out at each rule; three copies of
+# one file list is the shape this repo has been bitten by repeatedly (fix one,
+# miss two).
 #
 # These are syntax and shape checks, not behaviour.  A .cmd can be
 # well-formed and still wrong; a plist can parse and still be rejected by
@@ -43,6 +53,24 @@ set -euo pipefail
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 failures=0
 shell_count=0
+
+# Every shell asset, in one place: the file set the pipe lock, the redirect lock
+# and the local-hazard lock all scan.  A single source for the list means adding
+# an asset cannot silently leave one rule behind.
+shell_assets=$(
+    find "$root/skill/assets" -type f \
+        \( -name '*.sh' -o -name 'agentq' -o -name 'agentq-server' -o -name 'sshp' \
+        -o -name 'durable-move' -o -name 'start-daemon' \) | sort
+)
+# The gate belongs HERE, not on any one consumer: an empty list makes every
+# rule that scans it pass vacuously, and measuring it per-rule is how one of
+# them (the redirect lock) ended up with no check at all.  The pipe lock's own
+# count is a different number -- it also counts the smoke scripts -- so it
+# could never have caught an empty ASSET list.
+if [ -z "$shell_assets" ]; then
+    printf '%s\n' 'no shell assets were enumerated for the static shell rules; refusing to report a pass' >&2
+    failures=$((failures + 1))
+fi
 
 check_shell() {
     local file=$1
@@ -991,7 +1019,7 @@ done <<EOF
 $(find "$root/smoke" -type f -name '*.sh' | sort)
 $root/run-tests.sh
 $root/sandbox.sh
-$(find "$root/skill/assets" -type f \( -name '*.sh' -o -name 'agentq' -o -name 'agentq-server' -o -name 'sshp' -o -name 'durable-move' -o -name 'start-daemon' \) | sort)
+$shell_assets
 EOF
 if [ "$repo_script_count" -eq 0 ]; then
     printf '%s\n' 'no repo scripts were enumerated for the pipe-lock; refusing to report a pass' >&2
@@ -1028,7 +1056,7 @@ redir_noop_hits=$(
             grep -vE '^[0-9]+:[[:space:]]*#' |
             sed "s|^|${repo_script#"$root"/}:|" || true
     done <<SCRIPTS
-$(find "$root/skill/assets" -type f \( -name '*.sh' -o -name 'agentq' -o -name 'agentq-server' -o -name 'sshp' -o -name 'durable-move' -o -name 'start-daemon' \) | sort)
+$shell_assets
 SCRIPTS
 )
 if [ -n "$redir_noop_hits" ]; then
@@ -1120,15 +1148,51 @@ infn && $0 == stacklead[depth] "}" {
             if (v != "") { local[fn, v] = 1; declared[v] = 1 }
         }
     }
-    while (match(line, /(^|[;&|]|then|do|else)[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=/)) {
+    while (match(line, /(^|[;&|]|then|do|else)[[:space:]]*[A-Za-z_][A-Za-z0-9_]*([+]=|=)/)) {
         seg = substr(line, RSTART, RLENGTH)
         # The match ends with '=', and a greedy `.*[^A-Za-z0-9_]` would consume
         # the whole name along with it (measured: the first version returned ""
         # for every assignment and the rule was silently green on a violation).
         sub(/=.*$/, "", seg)
+        sub(/[+]$/, "", seg)
         sub(/.*[^A-Za-z0-9_]/, "", seg)
         if (seg != "") { assigned[fn, seg] = 1; fns[fn] = 1; names[seg] = 1 }
         line = substr(line, RSTART + RLENGTH)
+    }
+    # `if NAME=...` / `elif` / `while` / `until` are assignment statements too,
+    # and the loop above cannot see them: none of its preceders is a member of
+    # that set.  This is not a hypothetical gap -- it hid a real site in the
+    # server (`if probe=$( {...} | jq ... )` in
+    # task_instance_created_at_is_recorded, where another function declares
+    # `local probe`).  A second pass, deliberately kept separate: the keyword
+    # must stand ALONE (the preceding character is not a word character), so
+    # `otherwise_x=` and `verify_x=` are not read as `else`/`if`.  Without that
+    # boundary the name extraction would strip the keyword's tail and report a
+    # variable that does not exist.
+    # A `#` starts a comment (this ignores quoting: a `#` inside a string is
+    # read as one too).  That direction is deliberate -- a quoted `#` can only
+    # make the pass MISS a real site, never invent one, and inventing one would
+    # redden a correct tree.  Measured 2026-10-23: without this, a trailing
+    # comment carrying `# if zzz=2` was reported as a violation in a function
+    # that assigns nothing of the sort.
+    hashpos = index($0, "#")
+    if (hashpos == 0) hashpos = length($0) + 1
+    p = 1
+    while (p <= length($0)) {
+        if (!match(substr($0, p), /(then|do|else|if|elif|while|until)[[:space:]]+[A-Za-z_][A-Za-z0-9_]*([+]=|=)/)) break
+        kwpos = p + RSTART - 1
+        if (kwpos >= hashpos) break
+        pre = (kwpos == 1) ? "" : substr($0, kwpos - 1, 1)
+        if (pre == "" || pre !~ /[A-Za-z0-9_]/) {
+            v = substr($0, kwpos, RLENGTH)
+            sub(/=.*/, "", v)
+            sub(/[+]$/, "", v)
+            sub(/^.*[[:space:]]/, "", v)
+            if (v ~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
+                assigned[fn, v] = 1; fns[fn] = 1; names[v] = 1
+            }
+        }
+        p = kwpos + RLENGTH
     }
 }
 END {
@@ -1142,8 +1206,7 @@ END {
 }
 AWK
 )
-local_hazard_files=$(find "$root/skill/assets" -type f \
-    \( -name '*.sh' -o -name 'agentq' -o -name 'agentq-server' -o -name 'sshp' -o -name 'durable-move' -o -name 'start-daemon' \) | sort)
+local_hazard_files=$shell_assets
 local_hazard_file_count=$(printf '%s\n' "$local_hazard_files" | grep -c . || true)
 local_hazard_hits=$(
     while IFS= read -r hazard_asset; do
@@ -1175,23 +1238,56 @@ fi
 # function header: present in every version of the asset, unlike any statement
 # the fixes added.
 local_hazard_selftest=$(mktemp)
+# Three plants with DISTINCT names -- one per arm of the rule (plain `NAME=`,
+# `if NAME=`, `NAME+=`) -- each inserted with its own single-line sed append:
+# BSD sed ends an `a` command at the first line that is not backslash-continued,
+# so a two-line body in one append silently truncates (measured here).  A plant
+# per arm is what makes deleting an arm visible; a single plant only exercises
+# whichever arm happens to see it.
 sed '/^acquire_request_lock() {$/a\
-    maintenance_lock_pid_path=/tmp/planted' \
-    "$root/skill/assets/unix/agentq-server" >"$local_hazard_selftest"
-if ! grep -q '^[[:space:]]*maintenance_lock_pid_path=/tmp/planted$' "$local_hazard_selftest"; then
-    printf '%s\n' 'server FAILED (the local-hazard self-check could not plant its violation: the anchor moved)' >&2
+    maintenance_lock_pid_path=/tmp/planted
+' "$root/skill/assets/unix/agentq-server" |
+    sed '/^[[:space:]]*maintenance_lock_pid_path=\/tmp\/planted$/a\
+    if lock_holder_age=$(true); then :; fi
+' | sed '/^[[:space:]]*if lock_holder_age=/a\
+    log_encoded+=("appended")
+' >"$local_hazard_selftest"
+if ! grep -q '^[[:space:]]*maintenance_lock_pid_path=/tmp/planted$' "$local_hazard_selftest" ||
+    ! grep -q '^[[:space:]]*if lock_holder_age=' "$local_hazard_selftest"; then
+    printf '%s\n' 'server FAILED (the local-hazard self-check could not plant its violations: the anchor moved)' >&2
     failures=$((failures + 1))
     local_hazard_count=$((local_hazard_count + 1))
 else
     local_hazard_selftest_report=$(awk "$local_hazard_prog" "$local_hazard_selftest")
+    # ONE planted violation per ARM of the rule, with distinct names, so
+    # dropping any arm reddens this self-check.  A single plant would only ever
+    # exercise whichever arm happens to see it -- and that is not hypothetical:
+    # the keyword arm (`if NAME=`) and the append arm (`NAME+=`) were each added
+    # because the previous arms could not see that form, and a self-check that
+    # could not tell the difference would have reported the removal as green.
     if [ -z "$local_hazard_selftest_report" ]; then
         printf '%s\n' 'server FAILED (the local-hazard rule is silent on a planted violation: the detector itself is broken)' >&2
         failures=$((failures + 1))
         local_hazard_count=$((local_hazard_count + 1))
-    elif ! grep -q '^acquire_request_lock: maintenance_lock_pid_path$' <<<"$local_hazard_selftest_report"; then
-        printf '%s\n' 'server FAILED (the local-hazard rule blamed the wrong function on a planted violation)' >&2
-        failures=$((failures + 1))
-        local_hazard_count=$((local_hazard_count + 1))
+    else
+        if ! grep -q '^acquire_request_lock: maintenance_lock_pid_path$' <<<"$local_hazard_selftest_report"; then
+            printf '%s\n' 'server FAILED (the local-hazard rule missed the plain NAME= plant, or blamed the wrong function)' >&2
+            failures=$((failures + 1))
+            local_hazard_count=$((local_hazard_count + 1))
+        fi
+        if ! grep -q '^acquire_request_lock: lock_holder_age$' <<<"$local_hazard_selftest_report"; then
+            printf '%s\n' 'server FAILED (the local-hazard rule missed the `if NAME=` plant: that pass is not running)' >&2
+            failures=$((failures + 1))
+            local_hazard_count=$((local_hazard_count + 1))
+        fi
+        # A THIRD plant for the append form: `NAME+=` is the same hazard, and
+        # it is the one that appends to a caller's local instead of replacing
+        # it -- a silent widening rather than a silent overwrite.
+        if ! grep -q '^acquire_request_lock: log_encoded$' <<<"$local_hazard_selftest_report"; then
+            printf '%s\n' 'server FAILED (the local-hazard rule missed the `NAME+=` plant: the append arm is not matching)' >&2
+            failures=$((failures + 1))
+            local_hazard_count=$((local_hazard_count + 1))
+        fi
     fi
 fi
 rm -f "$local_hazard_selftest"

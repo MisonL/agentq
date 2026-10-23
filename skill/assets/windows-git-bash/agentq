@@ -5968,6 +5968,12 @@ task_instance_created_at_is_recorded() {
     # separately (as the loop did) so a hit in the records is reported without
     # ever reading a tombstone.
     local combined=()
+    # `probe` is declared local here rather than left as a bare write: bash
+    # resolves an unlocalized assignment through the DYNAMIC scope, and
+    # install_jq_line_ending_shim declares its own `local probe`.  The two
+    # functions do not sit on one stack today, which is exactly the argument
+    # that stops being true the next time someone adds a call.
+    local probe
     if [ "$evidence_grade" != tombstone ]; then
         if [ "${#records[@]}" -gt 0 ]; then combined+=("${records[@]}"); fi
     fi
