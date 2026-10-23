@@ -1043,7 +1043,7 @@ EOF
     failures=$((failures + 1))
 fi
 
-# --- server: unlocalized writes into a caller's local ------------------------
+# --- shell assets: unlocalized writes into a caller's local ------------------
 # bash resolves an unqualified assignment through the DYNAMIC scope: a write to
 # a name the callee did not declare `local` lands in whichever frame up the
 # stack declared it -- or in the global scope.  Measured 2026-10-23 with a
@@ -1060,6 +1060,15 @@ fi
 # task_id/status_mode/doctor_mode) were both introduced by the same author in
 # the same session as the code they broke.
 #
+# Every shell asset under skill/assets is scanned (the quiet-grep lock next to
+# this one taught the same lesson: a lock scoped to the file it was found in has
+# a one-file hole).  Honest limit, recorded rather than papered over: the POSIX
+# client, sshp and both installers never use `local` at all, so this rule cannot
+# fire on them -- they pass through their state as deliberate globals.  Today
+# the only assets that can trip it are the server's two canonical copies; the
+# wider root means any future shell asset that DOES use `local` is covered
+# without anyone having to remember to widen the lock again.
+#
 # A name never declared `local` anywhere is NOT flagged: it is a deliberate
 # global (the cleanup trap's file variables, the exported env, IFS).  Disabling
 # the allowlist line below makes the rule print exactly the two sanctioned
@@ -1068,11 +1077,27 @@ fi
 # in the tree needs a THIRD exception.
 local_hazard_prog=$(
     cat <<'AWK'
-FNR == 1 { infn = 0 }
-/^[a-zA-Z_][a-zA-Z0-9_]*\(\) \{/ {
-    fn = $0; sub(/\(\).*/, "", fn); infn = 1; next
+FNR == 1 { depth = 0; infn = 0 }
+function leading(s,   i) {
+    i = 1
+    while (i <= length(s) && (substr(s, i, 1) == " " || substr(s, i, 1) == "\t")) i++
+    return substr(s, 1, i - 1)
 }
-infn && /^\}/ { infn = 0; next }
+/^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*\(\) \{/ {
+    # Functions may be NESTED (the server defines a jq() wrapper inside
+    # install_jq_line_ending_shim).  A parser that only sees a column-0
+    # definition treats the nested body as part of its parent, so a write
+    # inside the nested function is blamed on the parent -- a false negative
+    # exactly where the parent happens to declare the same name local.  Track
+    # a stack keyed by the definition's own indentation: the matching close is
+    # the first line that is exactly that indentation followed by "}".
+    depth++
+    fn = $0; sub(/^[[:space:]]*/, "", fn); sub(/\(\).*/, "", fn)
+    stackfn[depth] = fn; stacklead[depth] = leading($0); infn = 1; next
+}
+infn && $0 == stacklead[depth] "}" {
+    depth--; infn = (depth > 0); next
+}
 !infn { next }
 {
     line = $0
@@ -1117,7 +1142,19 @@ END {
 }
 AWK
 )
-local_hazard_hits=$(awk "$local_hazard_prog" "$root/skill/assets/unix/agentq-server" | sort)
+local_hazard_files=$(find "$root/skill/assets" -type f \
+    \( -name '*.sh' -o -name 'agentq' -o -name 'agentq-server' -o -name 'sshp' -o -name 'durable-move' -o -name 'start-daemon' \) | sort)
+local_hazard_file_count=$(printf '%s\n' "$local_hazard_files" | grep -c . || true)
+local_hazard_hits=$(
+    while IFS= read -r hazard_asset; do
+        [ -n "$hazard_asset" ] || continue
+        awk "$local_hazard_prog" "$hazard_asset" |
+            sed "s|^|${hazard_asset#"$root"/}: |"
+    done <<ASSETS
+$local_hazard_files
+ASSETS
+)
+local_hazard_hits=$(printf '%s\n' "$local_hazard_hits" | grep . | sort || true)
 if [ -n "$local_hazard_hits" ]; then
     while IFS= read -r hazard; do
         [ -n "$hazard" ] || continue
@@ -1145,10 +1182,17 @@ if ! grep -q '^[[:space:]]*maintenance_lock_pid_path=/tmp/planted$' "$local_haza
     printf '%s\n' 'server FAILED (the local-hazard self-check could not plant its violation: the anchor moved)' >&2
     failures=$((failures + 1))
     local_hazard_count=$((local_hazard_count + 1))
-elif [ -z "$(awk "$local_hazard_prog" "$local_hazard_selftest")" ]; then
-    printf '%s\n' 'server FAILED (the local-hazard rule is silent on a planted violation: the detector itself is broken)' >&2
-    failures=$((failures + 1))
-    local_hazard_count=$((local_hazard_count + 1))
+else
+    local_hazard_selftest_report=$(awk "$local_hazard_prog" "$local_hazard_selftest")
+    if [ -z "$local_hazard_selftest_report" ]; then
+        printf '%s\n' 'server FAILED (the local-hazard rule is silent on a planted violation: the detector itself is broken)' >&2
+        failures=$((failures + 1))
+        local_hazard_count=$((local_hazard_count + 1))
+    elif ! grep -q '^acquire_request_lock: maintenance_lock_pid_path$' <<<"$local_hazard_selftest_report"; then
+        printf '%s\n' 'server FAILED (the local-hazard rule blamed the wrong function on a planted violation)' >&2
+        failures=$((failures + 1))
+        local_hazard_count=$((local_hazard_count + 1))
+    fi
 fi
 rm -f "$local_hazard_selftest"
 
@@ -1156,7 +1200,7 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s local_hazards=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$local_hazard_count")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s local_hazards=%s local_hazard_files=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$local_hazard_count" "$local_hazard_file_count")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 printf '%s\n' "$summary"
