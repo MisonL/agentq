@@ -1739,9 +1739,91 @@ else
     shellcheck_summary="skipped(shellcheck-absent)"
 fi
 
+# POSIX-dialect parse lock (2026-10-24).  Five assets declare `#!/bin/sh`,
+# which on Debian/Ubuntu is dash -- the interpreter whose startup crash on
+# three bashisms started this whole POSIX-contract work (0.1.4).  bash -n and
+# zsh -n in smoke/01 validate the WRONG grammar for them: measured by planting
+# `arr=(x y)` inside an uncalled function at EOF of client/unix/agentq --
+# bash -n exit 0, zsh -n exit 0, `shellcheck -s sh -i SC2319,SC2034,SC2221,
+# SC2222` exit 0, this check's own behavioral dash run cases=45 all GREEN,
+# `dash -n` exit 2 "Syntax error: "(" unexpected".  A behavioral dash run
+# cannot be the lock: dash parses lazily, so a bashism in a function
+# definition past the line a given command exits at never executes -- the
+# client's `--version` path exits long before EOF (measured: the planted file
+# still answered `--version` under dash, exit 0).  `dash -n` reads the whole
+# file.  Dialect per file: the canonical twins declare bash, so dash -n would
+# reject their legitimate bash syntax; they stay under bash -n/zsh -n.
+# Boundary: dash -n catches PARSE-level bashisms only.  Constructs that parse
+# in dash but behave differently there are a different class and stay with
+# the behavioral Linux-CI coverage.
+posix_parse_state=absent
+posix_bad=0
+if command -v dash >/dev/null 2>&1; then
+    posix_parsed=0
+    # $1 = path to parse.  Runs in this shell, not a subshell, so posix_bad
+    # and posix_parsed accumulate.
+    parse_posix_file() {
+        local posix_file=$1 posix_first posix_err
+        posix_first=$(head -1 "$posix_file")
+        case $posix_first in
+            *bash*) return 0 ;;
+        esac
+        posix_parsed=$((posix_parsed + 1))
+        if ! posix_err=$(dash -n "$posix_file" 2>&1); then
+            printf 'client-contract: dash -n rejected %s (a bashism the shebang interpreter cannot parse): %s\n' \
+                "${posix_file#"$root"/}" "$posix_err" >&2
+            posix_bad=$((posix_bad + 1))
+        fi
+    }
+    while IFS= read -r shell_asset; do
+        parse_posix_file "$shell_asset"
+    done < <(find "$root/skill/assets" -type f -exec sh -c '
+        first=$(head -1 "$1" 2>/dev/null) || exit 0
+        case "$first" in
+            "#!"*sh*) printf "%s\n" "$1" ;;
+        esac
+    ' _ {} \; | sort)
+    # Zero-or-few means the enumeration broke, not that there was nothing to
+    # parse -- five `#!/bin/sh` assets exist today (agentq, sshp, both
+    # installers, the unix wrapper); a count below that is a silent scan.
+    if [ "$posix_parsed" -lt 5 ]; then
+        printf 'client-contract: the POSIX parse arm could only see %s #!/bin/sh assets (expected 5); refusing to report a pass\n' "$posix_parsed" >&2
+        posix_bad=$((posix_bad + 1))
+    fi
+    # Self-check, same reason as every other planted-fixture check here: a
+    # detector that quietly stops matching reads exactly like a clean tree.
+    # Both directions run against a SELF-CONTAINED fixture, never against an
+    # asset -- the first version used client/unix/agentq as the "must still
+    # parse" half, and when a bashism was planted in that same asset to prove
+    # the rejection half worked, the acceptance half fired too and reported a
+    # SECOND, wrong cause ("the detector is over-matching") alongside the real
+    # one.  A self-check must stay independent of the thing it guards.
+    posix_ok_fixture=$(mktemp)
+    printf '#!/bin/sh\nzz_valid() {\n  local a\n  a=1\n  printf "%%s\\n" "$a"\n}\nzz_valid\n' > "$posix_ok_fixture"
+    if ! dash -n "$posix_ok_fixture" >/dev/null 2>&1; then
+        printf '%s\n' 'client-contract: the POSIX parse arm rejects a minimal valid POSIX fixture (the detector is broken)' >&2
+        posix_bad=$((posix_bad + 1))
+    fi
+    posix_bad_fixture=$(mktemp)
+    { cat "$posix_ok_fixture"
+      printf 'zz_planted_posix_bashism() {\n  arr=(x y)\n}\n'
+    } > "$posix_bad_fixture"
+    if dash -n "$posix_bad_fixture" >/dev/null 2>&1; then
+        printf '%s\n' 'client-contract: the POSIX parse arm is silent on a planted bashism (the detector itself is broken)' >&2
+        posix_bad=$((posix_bad + 1))
+    fi
+    rm -f "$posix_ok_fixture" "$posix_bad_fixture"
+    posix_parse_state="checked($posix_parsed)"
+else
+    # `skipped(...)`, so run-tests.sh buckets this as PART rather than reading
+    # "5 assets were never parsed under the grammar they ship with" as green.
+    posix_parse_state="skipped(dash-absent)"
+fi
+failures=$((failures + posix_bad))
+
 if [ "$failures" -ne 0 ]; then
     printf 'client-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
 
-printf 'client-contract checks passed: cases=%s env=%s cred=%s stub-ssh=yes reason=forwarded/injection-safe exit-token=last-wins windows-probe=stdin-fed/no-leak windows-submit=payload-delivered/args-checked/no-leak shellcheck=%s\n' "$cases" "$env_rejections" "$credential_cases" "$shellcheck_summary"
+printf 'client-contract checks passed: cases=%s env=%s cred=%s stub-ssh=yes reason=forwarded/injection-safe exit-token=last-wins windows-probe=stdin-fed/no-leak windows-submit=payload-delivered/args-checked/no-leak shellcheck=%s posix=%s\n' "$cases" "$env_rejections" "$credential_cases" "$shellcheck_summary" "$posix_parse_state"

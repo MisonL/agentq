@@ -117,7 +117,12 @@ jobs:
           # Both enumerations must have run: the assets AND the repo scripts.
           # A check that degrades to "not linted" must turn this job red, not
           # read green -- the same rule smoke/01's `ps1_static=ok` follows.
-          grep -qE 'shellcheck=checked\([1-9][0-9]*\) scriptcheck=checked\([1-9][0-9]*\)' smoke.log
+          # The POSIX parse arm (dash -n over the five `#!/bin/sh` assets) is
+          # gated the same way and must not degrade either: it is the ONLY
+          # layer that parses those assets under the grammar they actually
+          # ship with, since bash -n and zsh -n both accept bashisms dash
+          # rejects (measured 2026-10-24).  ubuntu-latest always has dash.
+          grep -qE 'shellcheck=checked\([1-9][0-9]*\) scriptcheck=checked\([1-9][0-9]*\) posix=checked\([1-9][0-9]*\)' smoke.log
           # NOT-covered is platform-expected, so it is neither skipped nor
           # partial and must not disturb the line above.  But the word has to
           # be pinned somewhere: every check allowed to admit it must be in the
