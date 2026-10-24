@@ -512,7 +512,7 @@ function Get-PsStaticViolations {
         # legitimate identifier ends in `?`.
         $ps7Variable = ($t.Kind -eq 'Variable' -and $t.Text.Length -gt 1 -and $t.Text.EndsWith('?'))
         if ($ps7TokenKinds -ccontains ([string]$t.Kind) -or $ps7Variable) {
-            [void]$out.Add(("{0}:{1}: PowerShell 7-only syntax `{2}` -- the .cmd and .bash launchers invoke Windows PowerShell 5.1, which cannot PARSE this (parse error before the first statement, for every user)" -f $name, $t.Extent.StartLineNumber, $t.Extent.Text))
+            [void]$out.Add(("{0}:{1}: PowerShell 7-only syntax `{2}` -- this payload reaches Windows PowerShell 5.1 (via .cmd/.bash launchers or sshd), which cannot PARSE it (parse error before the first statement)" -f $name, (& $LineOf $t), $t.Extent.Text))
         }
     }
 
@@ -580,6 +580,48 @@ function Get-ShellPayloadViolations {
             continue
         }
         foreach ($v in (Get-PsStaticViolations -Text $body -DisplayName $where -LineOffset ($openingLine - 1) -ParseErrorsAreViolations)) {
+            [void]$found.Add($v)
+        }
+    }
+    return $found
+}
+
+# --- the same rules over PowerShell HERE-STRINGS INSIDE .PS1 ASSETS -----------
+# The .ps1 clients build remote PowerShell payloads as here-strings and hand
+# them to `powershell.exe -EncodedCommand` or `-Command -` (agentq.ps1: the
+# launcher wrapper and the protocol probe; sshp.ps1: the Zellij resolver and
+# the two invocation bodies, plus the session script).  Those payloads are
+# shipped PowerShell that NO check parsed before 2026-10-24 -- the same blind
+# spot one level deeper than the shell-embedded payloads above: a rule over
+# the .ps1 FILE sees the here-string as one String token, never its contents.
+# Measured today: 14 here-strings in the 7 .ps1 assets; 6 parse cleanly as
+# PowerShell (the payloads), 4 are shell bodies (skip by content marker --
+# `set -eu`, `cygpath`, `#!/`, `command -v`: their `||`/`&&` are shell
+# operators, and reporting PS7-only syntax on them would be the false-red the
+# repo keeps hitting), and 4 fail to parse at all (the usage text, a C#
+# Add-Type body, two shell snippets) -- non-PS, skipped by the parse gate.
+# The count gate below pins "6 scanned" so a NEW payload, or a shell body that
+# starts looking PS-clean, cannot slip through silently.
+$hereShellPattern = '(?m)^\s*(set -[a-z]|cygpath |#!/|command -v )'
+function Get-Ps1HereStringViolations {
+    param([string]$Path)
+    $found = New-Object System.Collections.ArrayList
+    $tok = $null; $err = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tok, [ref]$err)
+    if ($err.Count) { return $found }   # the parse pass owns a broken .ps1
+    $leaf = Split-Path -Leaf $Path
+    foreach ($h in $tok) {
+        if ($h.Kind -ne 'HereStringLiteral' -and $h.Kind -ne 'HereStringExpandable') { continue }
+        # Text = opening marker (2) + newline + body + newline + closing marker (2).
+        $body = $h.Text.Substring(2).TrimStart([char]13, [char]10)
+        $body = $body.Substring(0, $body.Length - 2)
+        if ($body -match $hereShellPattern) { continue }
+        $it = $null; $ie = $null
+        [void][System.Management.Automation.Language.Parser]::ParseInput($body, 'here-classify', [ref]$it, [ref]$ie)
+        if (@($ie).Count -gt 0) { continue }   # not PowerShell (C#, usage prose, shell without those markers)
+        $base = $h.Extent.StartLineNumber
+        $where = "{0}(here-string line {1})" -f $leaf, $base
+        foreach ($v in (Get-PsStaticViolations -Text $body -DisplayName $where -LineOffset ($base - 1) -ParseErrorsAreViolations)) {
             [void]$found.Add($v)
         }
     }
@@ -722,7 +764,42 @@ expanded=$(powershell.exe -NoProfile -Command "Write-Output $profile")
             $doubleOut | ForEach-Object { Write-Host "  $_" }
             exit 2
         }
-        Write-Host "ps-static rules calibrated (legal=0 defects=13 payloads=1 double=1)"
+        # The here-string arm, both directions: a legal PS payload in a .ps1
+        # file must pass (it carries $userProfile, the POST-rename name), and a
+        # here-string carrying an automatic-variable write must be named at the
+        # right line.  The fixture file must itself parse cleanly -- the arm
+        # returns early on a broken file, which would otherwise read as a pass.
+        $hereFixture = Join-Path $calibration 'here-fixture.ps1'
+        Set-Content -LiteralPath $hereFixture -Value @'
+$clean = @"
+$ProgressPreference = "SilentlyContinue"
+$userProfile = "C:\Users\x"
+Write-Output $userProfile
+"@
+Write-Output $clean
+'@
+        $hereOut = @(Get-Ps1HereStringViolations -Path $hereFixture)
+        if ($hereOut.Count -ne 0) {
+            Write-Host "calibration FAILED: the here-string arm rejected the legal fixture ($($hereOut.Count) violations)"
+            $hereOut | ForEach-Object { Write-Host "  $_" }
+            exit 2
+        }
+        $hereBad = Join-Path $calibration 'here-bad.ps1'
+        Set-Content -LiteralPath $hereBad -Value @'
+$payload = @"
+$ProgressPreference = "SilentlyContinue"
+$profile = "C:\Users\x"
+Write-Output $profile
+"@
+Write-Output $payload
+'@
+        $hereBadOut = @(Get-Ps1HereStringViolations -Path $hereBad)
+        if ($hereBadOut.Count -ne 1 -or $hereBadOut[0] -notmatch 'here-bad\.ps1\(here-string line 1\):2: assignment to automatic variable \$profile') {
+            Write-Host "calibration FAILED: the here-string arm found $($hereBadOut.Count) violations in its defect fixture, expected exactly 1 naming `$profile at here-string line 1:2"
+            $hereBadOut | ForEach-Object { Write-Host "  $_" }
+            exit 2
+        }
+        Write-Host "ps-static rules calibrated (legal=0 defects=13 payloads=1 double=1 here=1)"
     } finally {
         Remove-Item -LiteralPath $calibration -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -731,9 +808,30 @@ expanded=$(powershell.exe -NoProfile -Command "Write-Output $profile")
 $violations = 0
 $files = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Filter *.ps1 | Sort-Object FullName)
 if ($files.Count -eq 0) { Write-Host "no .ps1 assets were enumerated under $Root"; exit 2 }
+$hereScanned = 0
 foreach ($file in $files) {
     $found = Get-PsStaticViolations -Path $file.FullName
     foreach ($line in $found) { Write-Host $line; $violations++ }
+    # Count the PowerShell here-string payloads this file contributes, so the
+    # gate below can tell "6 payloads checked" from "the extractor broke and
+    # silently skipped them all".
+    $tokProbe = $null; $errProbe = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokProbe, [ref]$errProbe)
+    foreach ($h in $tokProbe) {
+        if ($h.Kind -ne 'HereStringLiteral' -and $h.Kind -ne 'HereStringExpandable') { continue }
+        $body = $h.Text.Substring(2).TrimStart([char]13, [char]10)
+        $body = $body.Substring(0, $body.Length - 2)
+        if ($body -match $hereShellPattern) { continue }
+        $it = $null; $ie = $null
+        [void][System.Management.Automation.Language.Parser]::ParseInput($body, 'here-classify', [ref]$it, [ref]$ie)
+        if (@($ie).Count -gt 0) { continue }
+        $hereScanned++
+    }
+    foreach ($line in (Get-Ps1HereStringViolations -Path $file.FullName)) { Write-Host $line; $violations++ }
+}
+if ($hereScanned -ne 6) {
+    Write-Host ("PowerShell here-string payload count is {0}, expected 6 -- the extractor no longer sees them, so a pass here would mean nothing" -f $hereScanned)
+    exit 2
 }
 
 # --- the same rules over PowerShell EMBEDDED IN SHELL ASSETS ------------------
@@ -758,7 +856,7 @@ if ($payloadCount -ne 9 -or $doubleQuotedCount -ne 2) {
     exit 2
 }
 if ($violations -gt 0) { exit 1 }
-if (-not $Calibrate) { Write-Host ("ps-static rules ok (NOT calibrated): files={0} payloads={1}" -f $files.Count, $payloadCount) }
+if (-not $Calibrate) { Write-Host ("ps-static rules ok (NOT calibrated): files={0} payloads={1} here={2}" -f $files.Count, $payloadCount, $hereScanned) }
 exit 0
 PSEOF
     # -Calibrate is not optional.  It runs the rule over a LEGAL fixture and a
