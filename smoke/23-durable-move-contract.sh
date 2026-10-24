@@ -276,15 +276,25 @@ fi
 # C# 6 constructs are rejected by name.
 cases=$((cases + 1))
 cs_body_file="$work/addtype-body.cs"
-python3 - "$asset" > "$cs_body_file" <<'PY'
-import io, re, sys
-src = io.open(sys.argv[1], encoding="utf-8").read()
-m = re.search(r'Add-Type -TypeDefinition @"\n(.*?)\n"@', src, re.S)
-if not m:
-    sys.exit("could not extract the C# body from the Add-Type here-string")
-sys.stdout.write(m.group(1))
-PY
-if [ ! -s "$cs_body_file" ]; then
+# Extracted with awk, not python3.  Every other check in this repo that leans on
+# python3 (12, 20, 22, 29) probes that it RUNS before claiming anything, because
+# measured 2026-10-20 on a zh-CN Windows 10 `python3` is the Microsoft Store
+# alias: exit 49, zero output.  This file has no other python3 dependency and
+# does not need one -- the extractor is four awk rules, and awk is already used
+# here (line ~156).  A missing interpreter would have made this case report an
+# EMPTY body, i.e. an environment fault dressed as a check failure.
+cs_extract_status=0
+awk '
+    /Add-Type -TypeDefinition @"/ { started = 1; next }
+    started && /^"@[[:space:]]*$/ { done = 1; exit }
+    started { sub(/\r$/, ""); print }
+    END { if (!started) exit 2; if (!done) exit 3 }
+' "$asset" > "$cs_body_file" || cs_extract_status=$?
+if [ "$cs_extract_status" -ne 0 ]; then
+    printf 'durable-move: could not extract the C# body from the Add-Type here-string (awk exit %s) -- the extractor, not the asset, is broken\n' \
+        "$cs_extract_status" >&2
+    failures=$((failures + 1))
+elif [ ! -s "$cs_body_file" ]; then
     printf 'durable-move: extracted an EMPTY C# body -- the extractor, not the asset, is broken\n' >&2
     failures=$((failures + 1))
 else

@@ -42,11 +42,16 @@
 #   local hazards -> no assignment inside a function to a name another function
 #                    declares `local`: bash resolves it through the DYNAMIC
 #                    scope and writes into the caller's frame
+#   uncalled      -> no function with a definition and no call site
+#   asset kinds   -> every file in skill/assets belongs to a kind some rule
+#                    above parses (extension, or a shebang naming a shell)
 #
 # The shell-asset list is computed ONCE (shell_assets below) and used by every
-# rule that scans them.  It used to be spelled out at each rule; three copies of
-# one file list is the shape this repo has been bitten by repeatedly (fix one,
-# miss two).
+# rule that scans them -- including the parse arm, whose `shell=` count is
+# compared against it.  Until 2026-10-25 the parse arm walked its own
+# shebang-based list while the static rules walked a filename list, so the two
+# `.bash` assets were parsed by one and invisible to the other, and both numbers
+# printed side by side in the summary line.
 #
 # These are syntax and shape checks, not behaviour.  A .cmd can be
 # well-formed and still wrong; a plist can parse and still be rejected by
@@ -58,13 +63,32 @@ root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 failures=0
 shell_count=0
 
-# Every shell asset, in one place: the file set the pipe lock, the redirect lock
-# and the local-hazard lock all scan.  A single source for the list means adding
+# Every shell asset, in one place: the file set the parse arm, the pipe lock,
+# the redirect lock, the mktemp lock, the local-hazard lock and the
+# uncalled-function lock all scan.  A single source for the list means adding
 # an asset cannot silently leave one rule behind.
+#
+# The enumeration is BY SHEBANG, not by filename.  Until 2026-10-24 it was a
+# name list (`*.sh`, `agentq`, `agentq-server`, `sshp`, ...), and
+# `client/windows/agentq.bash` / `sshp.bash` -- two real shell assets whose
+# extension is `.bash` -- matched none of those names.  The parse arm was
+# already shebang-based (9 files, the `shell=` count) and checked them, while
+# every static rule below scanned 7.  Both numbers were printed side by side in
+# one summary line and nothing compared them.  A shebang scan cannot develop
+# that hole: an asset whose first line names a shell IS a shell asset.
 shell_assets=$(
-    find "$root/skill/assets" -type f \
-        \( -name '*.sh' -o -name 'agentq' -o -name 'agentq-server' -o -name 'sshp' \
-        -o -name 'durable-move' -o -name 'start-daemon' \) | sort
+    find "$root/skill/assets" -type f -exec sh -c '
+    first=$(head -1 "$1" 2>/dev/null) || exit 0
+    case "$first" in
+        "#!"*) ;;
+        *) exit 0 ;;
+    esac
+    interpreter=${first#\#!}
+    interpreter=${interpreter##* }
+    case "$interpreter" in
+        *sh) printf "%s\n" "$1" ;;
+    esac
+' _ {} \; | sort
 )
 # The gate belongs HERE, not on any one consumer: an empty list makes every
 # rule that scans it pass vacuously, and measuring it per-rule is how one of
@@ -90,23 +114,16 @@ check_shell() {
     fi
 }
 
-# Every file whose shebang names a shell interpreter, so a newly added asset
-# cannot escape parsing just because its name has an unexpected extension.
+# The parse arm walks the same list the static rules scan.  It used to walk a
+# SECOND, shebang-based enumeration while the rules used the name list above --
+# two lists, one summary line, and the two `.bash` assets fell in the gap.
 while IFS= read -r file; do
+    [ -n "$file" ] || continue
     check_shell "$file"
     shell_count=$((shell_count + 1))
-done < <(find "$root/skill/assets" -type f -exec sh -c '
-    first=$(head -1 "$1" 2>/dev/null) || exit 0
-    case "$first" in
-        "#!"*) ;;
-        *) exit 0 ;;
-    esac
-    interpreter=${first#\#!}
-    interpreter=${interpreter##* }
-    case "$interpreter" in
-        *sh) printf "%s\n" "$1" ;;
-    esac
-' _ {} \; | sort)
+done <<SHELL_ASSETS
+$shell_assets
+SHELL_ASSETS
 
 ps_count=0
 # `command -v pwsh` only proves the binary is on PATH, not that it RUNS.  A
@@ -950,23 +967,78 @@ while IFS= read -r file; do
 done < <(find "$root/skill/assets" -type f -name '*.plist' | sort)
 
 # --- .yml: real YAML parse ---------------------------------------------------
+# skill/assets 之外还有两份 YAML 是部署面的一部分：SKILL.md 的 frontmatter
+# （description 的拼写错误会静默改变 Skill 的触发条件）与 agents/openai.yaml
+# （Skill 元数据）。它们此前不在任何解析范围内——found 2026-10-25：把
+# frontmatter 改坏（未闭合的 `[`）后整个套件仍然全绿。
 yaml_count=0
 yaml_summary=0
 if python3 -c 'import yaml' >/dev/null 2>&1; then
-    while IFS= read -r file; do
-        yaml_count=$((yaml_count + 1))
-        if ! python3 -c 'import sys, yaml
+    yaml_parse_one() {
+        python3 -c 'import sys, yaml
 try:
     yaml.safe_load(open(sys.argv[1], "rb").read())
 except Exception as exc:
     print(exc, file=sys.stderr)
-    sys.exit(1)' "$file"; then
+    sys.exit(1)' "$1"
+    }
+    while IFS= read -r file; do
+        yaml_count=$((yaml_count + 1))
+        if ! yaml_parse_one "$file"; then
             printf 'YAML parse FAILED: %s\n' "${file#"$root"/}" >&2
             failures=$((failures + 1))
             continue
         fi
         yaml_summary=$((yaml_summary + 1))
     done < <(find "$root/skill/assets" -type f -name '*.yml' | sort)
+    # SKILL.md frontmatter: the YAML between the first two --- lines must
+    # parse, must be a mapping, and must carry a non-empty name and
+    # description.  The extractor fails LOUDLY if the delimiters move -- an
+    # empty extraction must never read as a parse.
+    skill_md="$root/skill/SKILL.md"
+    work_dir_yaml=$(mktemp -d "${TMPDIR:-/tmp}/agentq-skillmd.XXXXXX")
+    fm_file="$work_dir_yaml/skill-md-frontmatter.yml"
+    fm_status=0
+    # NOTE the flag: in awk, `exit` in the body STILL RUNS the END block, so an
+    # unconditional `END { exit 3 }` would overwrite the success exit -- the
+    # same shape smoke/23's extractor guards with its `done` flag.
+    awk 'NR == 1 { if ($0 != "---") { exit 2 }; next }
+         /^---$/ { done = 1; exit 0 }
+         { print }
+         END { if (!done) exit 3 }' "$skill_md" >"$fm_file" 2>/dev/null || fm_status=$?
+    if [ "$fm_status" -ne 0 ]; then
+        printf 'SKILL.md frontmatter extractor FAILED (status %s): the --- delimiters moved\n' "$fm_status" >&2
+        failures=$((failures + 1))
+    elif ! python3 -c 'import sys, yaml
+data = yaml.safe_load(open(sys.argv[1], "rb").read())
+assert isinstance(data, dict), "frontmatter is not a mapping"
+assert data.get("name"), "frontmatter has no name"
+assert data.get("description"), "frontmatter has no description"' "$fm_file"; then
+        printf 'SKILL.md frontmatter FAILED (must be a mapping with non-empty name and description)\n' >&2
+        failures=$((failures + 1))
+    fi
+    rm -rf -- "$work_dir_yaml"
+    work_dir_yaml=''
+    # agents/openai.yaml: same parse, plus the three interface keys the Skill
+    # metadata consumer reads.
+    openai_yaml="$root/skill/agents/openai.yaml"
+    if [ -f "$openai_yaml" ]; then
+        if ! yaml_parse_one "$openai_yaml"; then
+            printf 'YAML parse FAILED: %s\n' "${openai_yaml#"$root"/}" >&2
+            failures=$((failures + 1))
+        elif ! python3 -c 'import sys, yaml
+data = yaml.safe_load(open(sys.argv[1], "rb").read())
+iface = data.get("interface")
+assert isinstance(iface, dict), "no interface mapping"
+for key in ("display_name", "short_description", "default_prompt"):
+    assert iface.get(key), "interface." + key + " missing"' "$openai_yaml"; then
+            printf 'openai.yaml FAILED (interface must carry display_name, short_description, default_prompt)\n' >&2
+            failures=$((failures + 1))
+        fi
+    else
+        printf 'skill/agents/openai.yaml is missing\n' >&2
+        failures=$((failures + 1))
+    fi
 else
     yaml_summary='skipped(no pyyaml)'
 fi
@@ -1814,11 +1886,84 @@ if ! grep -qx 'zz_planted_uncalled_helper' <<<"$(awk "$unused_fn_prog" "$unused_
 fi
 rm -f "$unused_fn_selftest"
 
+# Every asset must belong to a kind that some rule above parses.  The kinds are
+# extension-based (.ps1/.cmd/.plist/.yml/.service) plus "first line names a
+# shell" -- the same shebang rule the parse arm uses.  Without this gate a NEW
+# kind of file (a .psm1, a .json) joins skill/assets and is parsed by nothing:
+# every counter below counts only its own category, so the summary would not
+# move.  Deliberately no "23 files" constant -- a count pins today's inventory
+# but not tomorrow's, while "is this file's kind parsed by a rule?" is the
+# question the summary line is actually making.
+#
+# OS artifacts are not deployment content and never will be; Finder creates
+# .DS_Store in any directory it displays, so a red there would be a false alarm
+# about a file .gitignore already keeps out.  Everything else -- including an
+# unknown ASSET kind -- must be classified.
+asset_is_classified() {
+    local asset_path=$1 asset_first
+    case ${asset_path##*/} in
+        .DS_Store|Thumbs.db|desktop.ini) return 0 ;;
+    esac
+    case $asset_path in
+        *.ps1|*.cmd|*.plist|*.yml|*.service) return 0 ;;
+    esac
+    asset_first=$(head -1 "$asset_path" 2>/dev/null || true)
+    case $asset_first in
+        "#!"*)
+            case ${asset_first##* } in
+                *sh) return 0 ;;
+            esac
+            ;;
+    esac
+    return 1
+}
+
+# Self-check, for the reason the other detectors carry one: a classifier that
+# accepts everything reports a clean tree forever.  Fixtures live in a temp
+# directory, NOT under skill/assets -- a self-test that plants its file in the
+# deployment unit and is SIGKILLed would leave residue that this very gate (and
+# the byte-parity checks) then reports on every later run.
+unclassified_selftest_dir=$(mktemp -d "${TMPDIR:-/tmp}/agentq-asset-kinds.XXXXXX")
+printf '{}\n' >"$unclassified_selftest_dir/zz.json"
+printf 'x\n' >"$unclassified_selftest_dir/zz.ps1"
+printf 'x\n' >"$unclassified_selftest_dir/.DS_Store"
+printf '#!/bin/sh\n:\n' >"$unclassified_selftest_dir/zz-shim"
+unclassified_selftest_bad=0
+asset_is_classified "$unclassified_selftest_dir/zz.json" && unclassified_selftest_bad=1
+asset_is_classified "$unclassified_selftest_dir/zz.ps1" || unclassified_selftest_bad=1
+asset_is_classified "$unclassified_selftest_dir/.DS_Store" || unclassified_selftest_bad=1
+asset_is_classified "$unclassified_selftest_dir/zz-shim" || unclassified_selftest_bad=1
+rm -rf -- "$unclassified_selftest_dir"
+if [ "$unclassified_selftest_bad" -ne 0 ]; then
+    printf '%s\n' 'asset-kind detector FAILED its self-check (.json must be rejected; .ps1, .DS_Store and a #!-shim must be accepted) -- the detector itself is broken' >&2
+    failures=$((failures + 1))
+fi
+
+unclassified_assets=0
+while IFS= read -r asset_file; do
+    if ! asset_is_classified "$asset_file"; then
+        printf 'asset FAILED (no rule parses this kind of file -- add a category, or do not ship it): %s\n' \
+            "${asset_file#"$root"/}" >&2
+        unclassified_assets=$((unclassified_assets + 1))
+    fi
+done < <(find "$root/skill/assets" -type f | sort)
+failures=$((failures + unclassified_assets))
+
+# `shell=` (files the parse arm checked) and `local_hazard_files=` (files the
+# static rules scanned) are the same set by construction -- both derive from
+# $shell_assets.  Pin it anyway: for one day they were 9 and 7, printed side by
+# side in this summary line, and nothing compared them.
+if [ "$shell_count" -ne "$local_hazard_file_count" ]; then
+    printf 'syntax-and-parity FAILED (the parse arm checked %s shell assets but the static rules scanned %s -- the two lists have drifted apart)\n' \
+        "$shell_count" "$local_hazard_file_count" >&2
+    failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 printf '%s\n' "$summary"
