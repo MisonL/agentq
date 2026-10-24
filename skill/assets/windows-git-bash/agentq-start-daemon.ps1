@@ -53,20 +53,20 @@ function Get-CurrentWindowsUserEnvironment {
 
     $accountName = $identity.Name
     $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($identity.User.Value)"
-    $profile = (Get-ItemProperty -LiteralPath $profileKey -Name ProfileImagePath -ErrorAction Stop).ProfileImagePath
-    $profile = [Environment]::ExpandEnvironmentVariables([string]$profile)
-    $profileItem = if ([string]::IsNullOrWhiteSpace($profile)) {
+    $userProfile = (Get-ItemProperty -LiteralPath $profileKey -Name ProfileImagePath -ErrorAction Stop).ProfileImagePath
+    $userProfile = [Environment]::ExpandEnvironmentVariables([string]$userProfile)
+    $profileItem = if ([string]::IsNullOrWhiteSpace($userProfile)) {
         $null
     } else {
-        Get-Item -LiteralPath $profile -Force -ErrorAction SilentlyContinue
+        Get-Item -LiteralPath $userProfile -Force -ErrorAction SilentlyContinue
     }
-    if ([string]::IsNullOrWhiteSpace($profile) -or ($null -eq $profileItem) -or !$profileItem.PSIsContainer) {
+    if ([string]::IsNullOrWhiteSpace($userProfile) -or ($null -eq $profileItem) -or !$profileItem.PSIsContainer) {
         throw "Windows user profile is unavailable for $($identity.Name)"
     }
-    if (!(Test-NonReparseWindowsProfilePath -Path $profile)) {
-        throw "Windows user profile path is not a regular non-reparse directory: $profile"
+    if (!(Test-NonReparseWindowsProfilePath -Path $userProfile)) {
+        throw "Windows user profile path is not a regular non-reparse directory: $userProfile"
     }
-    $acl = Get-Acl -LiteralPath $profile -ErrorAction Stop
+    $acl = Get-Acl -LiteralPath $userProfile -ErrorAction Stop
     $hasUserAccess = @($acl.Access | Where-Object {
         $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
         (($_.IdentityReference.Value -eq $accountName) -or ($_.IdentityReference.Value -eq $identity.User.Value)) -and
@@ -75,8 +75,8 @@ function Get-CurrentWindowsUserEnvironment {
     if (!$hasUserAccess) {
         throw "Windows user profile is not writable by $accountName"
     }
-    $profile = [System.IO.Path]::GetFullPath($profile)
-    $localAppData = Join-Path $profile "AppData\Local"
+    $userProfile = [System.IO.Path]::GetFullPath($userProfile)
+    $localAppData = Join-Path $userProfile "AppData\Local"
     $systemRoot = [Environment]::GetEnvironmentVariable("SystemRoot", [EnvironmentVariableTarget]::Machine)
     if ([string]::IsNullOrWhiteSpace($systemRoot)) {
         $systemRoot = [Environment]::GetEnvironmentVariable("windir", [EnvironmentVariableTarget]::Machine)
@@ -87,10 +87,10 @@ function Get-CurrentWindowsUserEnvironment {
     $systemRoot = [System.IO.Path]::GetFullPath($systemRoot)
     $systemDrive = [System.IO.Path]::GetPathRoot($systemRoot).TrimEnd("\\")
     if ([string]::IsNullOrWhiteSpace($systemDrive)) {
-        $systemDrive = [System.IO.Path]::GetPathRoot($profile).TrimEnd("\\")
+        $systemDrive = [System.IO.Path]::GetPathRoot($userProfile).TrimEnd("\\")
     }
-    $homeDrive = [System.IO.Path]::GetPathRoot($profile).TrimEnd("\\")
-    $homePath = $profile.Substring($homeDrive.Length)
+    $homeDrive = [System.IO.Path]::GetPathRoot($userProfile).TrimEnd("\\")
+    $homePath = $userProfile.Substring($homeDrive.Length)
     $userPath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::User)
     $machinePath = [Environment]::GetEnvironmentVariable("Path", [EnvironmentVariableTarget]::Machine)
     $pathParts = @(
@@ -119,8 +119,8 @@ function Get-CurrentWindowsUserEnvironment {
     return [pscustomobject]@{
         Identity = $identity.Name
         UserName = ($identity.Name -split "\\")[-1]
-        Profile = $profile
-        AppData = Join-Path $profile "AppData\Roaming"
+        Profile = $userProfile
+        AppData = Join-Path $userProfile "AppData\Roaming"
         LocalAppData = $localAppData
         Temp = Join-Path $localAppData "Temp"
         SystemRoot = $systemRoot
@@ -137,12 +137,12 @@ function Get-CurrentWindowsUserEnvironment {
 function Set-AgentQUserEnvironment {
     param([psobject]$UserEnvironment)
 
-    $profile = $UserEnvironment.Profile
+    $userProfile = $UserEnvironment.Profile
     $environmentValues = [ordered]@{
-        HOME = $profile
+        HOME = $userProfile
         USER = $UserEnvironment.UserName
         USERNAME = $UserEnvironment.UserName
-        USERPROFILE = $profile
+        USERPROFILE = $userProfile
         APPDATA = $UserEnvironment.AppData
         LOCALAPPDATA = $UserEnvironment.LocalAppData
         HOMEDRIVE = $UserEnvironment.HomeDrive

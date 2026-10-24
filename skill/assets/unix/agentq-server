@@ -44,8 +44,8 @@ resolve_windows_user_environment() {
                 $sid = $identity.User.Value
                 $accountName = $identity.Name
                 $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
-                $profile = (Get-ItemProperty -LiteralPath $profileKey -Name ProfileImagePath -ErrorAction Stop).ProfileImagePath
-                $profile = [Environment]::ExpandEnvironmentVariables([string]$profile)
+                $userProfile = (Get-ItemProperty -LiteralPath $profileKey -Name ProfileImagePath -ErrorAction Stop).ProfileImagePath
+                $userProfile = [Environment]::ExpandEnvironmentVariables([string]$userProfile)
                 function Test-NonReparseWindowsProfilePath {
                     param([string]$Path)
 
@@ -74,18 +74,18 @@ resolve_windows_user_environment() {
                     }
                     return $true
                 }
-                $profileItem = if ([string]::IsNullOrWhiteSpace($profile)) {
+                $profileItem = if ([string]::IsNullOrWhiteSpace($userProfile)) {
                     $null
                 } else {
-                    Get-Item -LiteralPath $profile -Force -ErrorAction SilentlyContinue
+                    Get-Item -LiteralPath $userProfile -Force -ErrorAction SilentlyContinue
                 }
-                if ([string]::IsNullOrWhiteSpace($profile) -or ($null -eq $profileItem) -or !$profileItem.PSIsContainer) {
+                if ([string]::IsNullOrWhiteSpace($userProfile) -or ($null -eq $profileItem) -or !$profileItem.PSIsContainer) {
                     exit 2
                 }
-                if (!(Test-NonReparseWindowsProfilePath -Path $profile)) {
+                if (!(Test-NonReparseWindowsProfilePath -Path $userProfile)) {
                     exit 2
                 }
-                $acl = Get-Acl -LiteralPath $profile -ErrorAction Stop
+                $acl = Get-Acl -LiteralPath $userProfile -ErrorAction Stop
                 $hasUserAccess = @($acl.Access | Where-Object {
                     $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
                     (($_.IdentityReference.Value -eq $accountName) -or ($_.IdentityReference.Value -eq $sid)) -and
@@ -94,10 +94,10 @@ resolve_windows_user_environment() {
                 if (!$hasUserAccess) {
                     exit 2
                 }
-                $profile = [System.IO.Path]::GetFullPath($profile)
+                $userProfile = [System.IO.Path]::GetFullPath($userProfile)
                 $userName = ($accountName -split "\\")[-1]
-                $appData = Join-Path $profile "AppData\Roaming"
-                $localAppData = Join-Path $profile "AppData\Local"
+                $appData = Join-Path $userProfile "AppData\Roaming"
+                $localAppData = Join-Path $userProfile "AppData\Local"
                 $temp = Join-Path $localAppData "Temp"
                 $systemRoot = [Environment]::GetEnvironmentVariable("SystemRoot", "Machine")
                 if ([string]::IsNullOrWhiteSpace($systemRoot)) {
@@ -109,10 +109,10 @@ resolve_windows_user_environment() {
                 $systemRoot = [System.IO.Path]::GetFullPath($systemRoot)
                 $systemDrive = [System.IO.Path]::GetPathRoot($systemRoot).TrimEnd("\\")
                 if ([string]::IsNullOrWhiteSpace($systemDrive)) {
-                    $systemDrive = [System.IO.Path]::GetPathRoot($profile).TrimEnd("\\")
+                    $systemDrive = [System.IO.Path]::GetPathRoot($userProfile).TrimEnd("\\")
                 }
-                $homeDrive = [System.IO.Path]::GetPathRoot($profile).TrimEnd("\\")
-                $homePath = $profile.Substring($homeDrive.Length)
+                $homeDrive = [System.IO.Path]::GetPathRoot($userProfile).TrimEnd("\\")
+                $homePath = $userProfile.Substring($homeDrive.Length)
                 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
                 $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
                 $pathParts = @(
@@ -140,7 +140,7 @@ resolve_windows_user_environment() {
                 $result = [ordered]@{
                     identity = $accountName
                     user_name = $userName
-                    profile = $profile
+                    profile = $userProfile
                     app_data = $appData
                     local_app_data = $localAppData
                     temp = $temp
