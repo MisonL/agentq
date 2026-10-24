@@ -10,10 +10,13 @@
 #                    also runs the static rules (ps1_static): a name assigned
 #                    only $null must not be read, a name assigned anywhere
 #                    must be read somewhere, no .NET API may be used that
-#                    .NET Framework 4.x lacks, and no variable may be written
-#                    under an automatic variable's name -- Windows PowerShell
-#                    5.1 and PowerShell 7.x must both be able to run these
-#                    assets (see the rule comments below)
+#                    .NET Framework 4.x lacks, no variable may be written
+#                    under an automatic variable's name, and no PowerShell
+#                    7-only syntax (??, &&, ternary, ?. -- parse errors on
+#                    5.1) may appear at all; the same rules also run over
+#                    PowerShell payloads EMBEDDED in shell assets -- Windows
+#                    PowerShell 5.1 and PowerShell 7.x must both be able to
+#                    run these assets (see the rule comments below)
 #   .plist assets -> XML well-formedness, plus plutil -lint on macOS
 #   .yml assets   -> YAML parse (python3 + pyyaml)
 #   .service      -> structural check: required sections and keys, absolute
@@ -258,7 +261,7 @@ $instanceOnlyTraps = @(
 )
 
 function Get-PsStaticViolations {
-    param([string]$Path, [string]$Text, [string]$DisplayName, [int]$LineOffset = 0, [switch]$ParseErrorsAreViolations)
+    param([string]$Path, [string]$Text, [string]$DisplayName, [int]$LineOffset = 0, [switch]$ParseErrorsAreViolations, [object[]]$FileTokens = @())
 
     $out = New-Object System.Collections.ArrayList
     $err = $null; $tok = $null
@@ -269,6 +272,7 @@ function Get-PsStaticViolations {
     } else {
         $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tok, [ref]$err)
     }
+    if ($FileTokens.Count -eq 0) { $FileTokens = @($tok) }
     $name = if ($DisplayName -ne '') { $DisplayName } else { Split-Path -Leaf $Path }
     if ($err.Count) {
         # A .ps1 file's syntax errors are owned by the separate parse pass, so
@@ -493,6 +497,25 @@ function Get-PsStaticViolations {
         }
     }
 
+    # Measured kinds (pwsh 7.5.4): `??`/`??=` are QuestionQuestion(Equals),
+    # `&&`/`||` are AndAnd/OrOr, the ternary `?` is QuestionMark (the
+    # Where-Object alias `?` tokenizes as Kind=Generic, so the alias survives).
+    # `$x?.y` has NO dedicated kind -- it comes back as a single Variable token
+    # whose text ends in `?`, handled by the variable arm below.  `:` is NOT in
+    # the list: it is the same kind as a switch label's separator and an
+    # unquoted hashtable key (measured), so it would cry wolf.
+    $ps7TokenKinds = @('QuestionQuestion','QuestionQuestionEquals','AndAnd','OrOr','QuestionMark')
+    foreach ($t in $FileTokens) {
+        # `$obj?.Name` tokenizes under pwsh 7 as a single Variable token whose
+        # text ends in `?` -- measured 2026-10-24, which is why the variable
+        # arm exists: the Kind table alone reports nothing for it.  No
+        # legitimate identifier ends in `?`.
+        $ps7Variable = ($t.Kind -eq 'Variable' -and $t.Text.Length -gt 1 -and $t.Text.EndsWith('?'))
+        if ($ps7TokenKinds -ccontains ([string]$t.Kind) -or $ps7Variable) {
+            [void]$out.Add(("{0}:{1}: PowerShell 7-only syntax `{2}` -- the .cmd and .bash launchers invoke Windows PowerShell 5.1, which cannot PARSE this (parse error before the first statement, for every user)" -f $name, $t.Extent.StartLineNumber, $t.Extent.Text))
+        }
+    }
+
     return $out
 }
 
@@ -625,6 +648,22 @@ function Invoke-Outer {
     # The P0's exact shape: mixed case still matches the automatic name.
     $LastExitCode = 0
     Write-Host $LastExitCode
+    # PowerShell 7-only syntax: `??`, `&&`, ternary, and `$x?.y` -- the last
+    # one tokenizes as a VARIABLE whose text ends in `?` (measured), which is
+    # why the rule needs a variable arm and not just a Kind table.
+    $fallback = $Missing ?? "default"
+    Write-Host $fallback
+    $coalesced = $null
+    $coalesced ??= 2
+    Write-Host $coalesced
+    $ok = $true && $false
+    Write-Host $ok
+    $either = $false || $true
+    Write-Host $either
+    $pick = $Missing ? "a" : "b"
+    Write-Host $pick
+    $len = $Missing?.Length
+    Write-Host $len
 }
 function Invoke-Inner {
     & sh -c 'true' 2> $errorPath
@@ -638,8 +677,8 @@ Invoke-Outer
             exit 2
         }
         $defectOut = Get-PsStaticViolations -Path $defect
-        if ($defectOut.Count -ne 7) {
-            Write-Host "calibration FAILED: the rules found $($defectOut.Count) violations in the defect fixture, expected 7"
+        if ($defectOut.Count -ne 13) {
+            Write-Host "calibration FAILED: the rules found $($defectOut.Count) violations in the defect fixture, expected 13"
             $defectOut | ForEach-Object { Write-Host "  $_" }
             exit 2
         }
@@ -683,7 +722,7 @@ expanded=$(powershell.exe -NoProfile -Command "Write-Output $profile")
             $doubleOut | ForEach-Object { Write-Host "  $_" }
             exit 2
         }
-        Write-Host "ps-static rules calibrated (legal=0 defects=7 payloads=1 double=1)"
+        Write-Host "ps-static rules calibrated (legal=0 defects=13 payloads=1 double=1)"
     } finally {
         Remove-Item -LiteralPath $calibration -Recurse -Force -ErrorAction SilentlyContinue
     }
