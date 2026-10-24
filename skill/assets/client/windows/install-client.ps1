@@ -54,20 +54,20 @@ function Resolve-CurrentWindowsUserProfile {
         }
         $accountName = $identity.Name
         $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($identity.User.Value)"
-        $profile = (Get-ItemProperty -LiteralPath $profileKey -Name ProfileImagePath -ErrorAction Stop).ProfileImagePath
-        $profile = [Environment]::ExpandEnvironmentVariables([string]$profile)
-        $profileItem = if ([string]::IsNullOrWhiteSpace($profile)) {
+        $userProfile = (Get-ItemProperty -LiteralPath $profileKey -Name ProfileImagePath -ErrorAction Stop).ProfileImagePath
+        $userProfile = [Environment]::ExpandEnvironmentVariables([string]$userProfile)
+        $profileItem = if ([string]::IsNullOrWhiteSpace($userProfile)) {
             $null
         } else {
-            Get-Item -LiteralPath $profile -Force -ErrorAction SilentlyContinue
+            Get-Item -LiteralPath $userProfile -Force -ErrorAction SilentlyContinue
         }
-        if ([string]::IsNullOrWhiteSpace($profile) -or ($null -eq $profileItem) -or !$profileItem.PSIsContainer) {
+        if ([string]::IsNullOrWhiteSpace($userProfile) -or ($null -eq $profileItem) -or !$profileItem.PSIsContainer) {
             throw "Windows user profile is unavailable for $($identity.Name)"
         }
-        if (!(Test-NonReparsePathChain -Path $profile)) {
-            throw "Windows user profile path is not a regular non-reparse directory: $profile"
+        if (!(Test-NonReparsePathChain -Path $userProfile)) {
+            throw "Windows user profile path is not a regular non-reparse directory: $userProfile"
         }
-        $acl = Get-Acl -LiteralPath $profile -ErrorAction Stop
+        $acl = Get-Acl -LiteralPath $userProfile -ErrorAction Stop
         $hasUserAccess = @($acl.Access | Where-Object {
             $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
             (($_.IdentityReference.Value -eq $accountName) -or ($_.IdentityReference.Value -eq $identity.User.Value)) -and
@@ -76,7 +76,7 @@ function Resolve-CurrentWindowsUserProfile {
         if (!$hasUserAccess) {
             throw "Windows user profile is not writable by $accountName"
         }
-        return [System.IO.Path]::GetFullPath($profile)
+        return [System.IO.Path]::GetFullPath($userProfile)
     } catch {
         throw "Unable to resolve the current Windows user profile from the process SID: $($_.Exception.Message)"
     }

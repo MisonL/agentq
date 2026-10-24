@@ -9,10 +9,11 @@
 #                    not be reported as seven broken assets.  The same AST pass
 #                    also runs the static rules (ps1_static): a name assigned
 #                    only $null must not be read, a name assigned anywhere
-#                    must be read somewhere, and no .NET API may be used that
-#                    .NET Framework 4.x lacks -- Windows PowerShell 5.1 and
-#                    PowerShell 7.x must both be able to run these assets
-#                    (see the rule comments below)
+#                    must be read somewhere, no .NET API may be used that
+#                    .NET Framework 4.x lacks, and no variable may be written
+#                    under an automatic variable's name -- Windows PowerShell
+#                    5.1 and PowerShell 7.x must both be able to run these
+#                    assets (see the rule comments below)
 #   .plist assets -> XML well-formedness, plus plutil -lint on macOS
 #   .yml assets   -> YAML parse (python3 + pyyaml)
 #   .service      -> structural check: required sections and keys, absolute
@@ -257,13 +258,38 @@ $instanceOnlyTraps = @(
 )
 
 function Get-PsStaticViolations {
-    param([string]$Path)
+    param([string]$Path, [string]$Text, [string]$DisplayName, [int]$LineOffset = 0, [switch]$ParseErrorsAreViolations)
 
     $out = New-Object System.Collections.ArrayList
     $err = $null; $tok = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tok, [ref]$err)
-    if ($err.Count) { return $out }   # the parse pass owns syntax failures
-    $name = Split-Path -Leaf $Path
+    if ($Text -ne '') {
+        # An embedded payload: parse the supplied text, attribute line numbers
+        # back into the shell file that carries it.
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($Text, $DisplayName, [ref]$tok, [ref]$err)
+    } else {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tok, [ref]$err)
+    }
+    $name = if ($DisplayName -ne '') { $DisplayName } else { Split-Path -Leaf $Path }
+    if ($err.Count) {
+        # A .ps1 file's syntax errors are owned by the separate parse pass, so
+        # the rules stay quiet about them.  An EMBEDDED payload has no such
+        # pass, and a truncated extraction (the shell quoter stops at the first
+        # apostrophe inside the payload) would otherwise parse as an error and
+        # return an EMPTY list -- a silently skipped payload.  So for payloads
+        # the parse error IS the finding.
+        if ($ParseErrorsAreViolations) {
+            foreach ($e in $err) { [void]$out.Add(("{0}:{1}: embedded PowerShell does not parse -- {2}" -f $name, ($LineOffset + $e.Extent.StartLineNumber), $e.Message)) }
+            return $out
+        }
+        return $out   # the parse pass owns syntax failures
+    }
+    # An embedded payload starts mid-file, so every reported line is offset by
+    # the payload's opening shell line (minus the payload's own line 1).
+    # NOTE the name: PowerShell variable names are case-insensitive, so a
+    # scriptblock called `$L` would be CLOBBERED by rule 1's `$l = $a.Left`
+    # (the same class as the `$lastExitCode` P0 this very rule exists to
+    # catch -- caught here by actually hitting it, not by reading).
+    $LineOf = { param($n) $LineOffset + $n.Extent.StartLineNumber }
 
     # --- rule 1: a variable whose only value is $null must not be read --------
     # A name is DECLARED by an assignment, a foreach loop variable, or a
@@ -291,10 +317,10 @@ function Get-PsStaticViolations {
         if ($rhs -is [System.Management.Automation.Language.PipelineAst] -and $rhs.PipelineElements.Count -eq 1) { $rhs = $rhs.PipelineElements[0] }
         if ($rhs -is [System.Management.Automation.Language.CommandExpressionAst]) { $rhs = $rhs.Expression }
         $isNull = ($rhs -is [System.Management.Automation.Language.VariableExpressionAst] -and $rhs.VariablePath.UserPath -eq 'null')
-        & $record $l $isNull $a.Extent.StartLineNumber
+        & $record $l $isNull (& $LineOf $a)
     }
     foreach ($fe in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ForEachStatementAst] }, $true)) {
-        & $record $fe.Variable $false $fe.Extent.StartLineNumber
+        & $record $fe.Variable $false (& $LineOf $fe)
     }
     $refUsed = @{}
     foreach ($c in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.ConvertExpressionAst] }, $true)) {
@@ -310,7 +336,7 @@ function Get-PsStaticViolations {
         if ($p -is [System.Management.Automation.Language.ConvertExpressionAst] -and $p.Parent -is [System.Management.Automation.Language.AssignmentStatementAst] -and $p.Parent.Left -eq $p) { continue }
         if ($p -is [System.Management.Automation.Language.ParameterAst]) { continue }
         if ($p -is [System.Management.Automation.Language.ForEachStatementAst]) { continue }
-        [void]$out.Add(("{0}:{1}: `${2} is assigned only `$null (line {3}) but read here; the read can never see anything else" -f $name, $v.Extent.StartLineNumber, $nullOnly[$k].Name, $nullOnly[$k].Line))
+        [void]$out.Add(("{0}:{1}: `${2} is assigned only `$null (line {3}) but read here; the read can never see anything else" -f $name, (& $LineOf $v), $nullOnly[$k].Name, $nullOnly[$k].Line))
     }
 
     # --- rule 2: a name assigned somewhere must be read somewhere -------------
@@ -328,7 +354,7 @@ function Get-PsStaticViolations {
         if ($raw.Contains(':')) { $raw = $raw.Substring($raw.LastIndexOf(':') + 1) }
         $k = $raw.ToLower()
         if ($raw -eq 'null' -or $runtimeRead -contains $k -or $k.StartsWith('_')) { continue }
-        if (-not $assigned.ContainsKey($k)) { $assigned[$k] = @($raw, $a.Extent.StartLineNumber) }
+        if (-not $assigned.ContainsKey($k)) { $assigned[$k] = @($raw, (& $LineOf $a)) }
     }
     $read = @{}
     foreach ($v in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) {
@@ -378,7 +404,7 @@ function Get-PsStaticViolations {
             # runtime) is caught here as well.
             foreach ($t in @($coreOnlyTraps) + @($instanceOnlyTraps)) {
                 if (($resolved -ieq $t.Type -or $written -ieq $t.Type) -and $member -ieq $t.Member -and ($t.Arity -eq -1 -or $arity -eq $t.Arity)) {
-                    [void]$out.Add(("{0}:{1}: [{2}]::{3} with {4} argument(s) -- {5}" -f $name, $n.Extent.StartLineNumber, $resolved, $member, $arity, $t.Why))
+                    [void]$out.Add(("{0}:{1}: [{2}]::{3} with {4} argument(s) -- {5}" -f $name, (& $LineOf $n), $resolved, $member, $arity, $t.Why))
                 }
             }
         } else {
@@ -411,12 +437,130 @@ function Get-PsStaticViolations {
                     try { $comparisonType = $second.Expression.TypeName.GetReflectionType().FullName } catch { }
                 }
                 if ($comparisonType -ine 'System.StringComparison') { continue }
-                [void]$out.Add(("{0}:{1}: .{2} with {3} argument(s) and a StringComparison -- {4}" -f $name, $n.Extent.StartLineNumber, $member, $arity, $t.Why))
+                [void]$out.Add(("{0}:{1}: .{2} with {3} argument(s) and a StringComparison -- {4}" -f $name, (& $LineOf $n), $member, $arity, $t.Why))
             }
         }
     }
 
+    # --- rule 4: no assignment to an automatic variable -----------------------
+    # The `$lastExitCode` P0 (0.1.16, round ten): $guard and $LASTEXITCODE are
+    # the SAME identifier (PowerShell variable names are case-insensitive), so
+    # a script-scope assignment REPLACED the integer with a PSVariable and
+    # every Windows task reported exit 2 with the real code lost.  Any
+    # assignment to an automatic variable is that same class of collision.
+    # The one that survived in the assets until 2026-10-24 is `profile`: it is
+    # ALSO the automatic variable holding the profile script path, and a
+    # script-scope `$profile = ...` clobbers it (measured on pwsh 7.5.4).
+    # The list holds the runtime-populated names only.  It deliberately
+    # EXCLUDES the preference variables ($ProgressPreference and friends --
+    # assignable by design; the assets set $ProgressPreference four times) and
+    # $null (the documented discard idiom, `$null = ...`).  It is a SUPERSET of
+    # PSScriptAnalyzer's PSAvoidAssignmentToAutomaticVariable set (measured
+    # 2026-10-24 against PSSA 1.25.0, one name per probe file): every name PSSA
+    # flags is here, plus `lastexitcode` (which PSSA treats as writable and so
+    # does not flag, but which is THIS repo's proven P0), `switch`, and
+    # `foreach`.  A superset is safe precisely because the check is on WRITES:
+    # no legitimate PowerShell writes any of these names.
+    # Write shapes covered: assignment LHS, foreach loop variable, param() --
+    # all three shadow the automatic name.  Scope-qualified writes
+    # (`$script:profile`) are a blind spot, as is any name missing from this
+    # list.  PSScriptAnalyzer is the independent oracle that found the class.
+    $automaticNames = @('args','consolefilename','error','event','eventargs','eventsubscriber',
+        'executioncontext','false','foreach','home','host','input','iscoreclr','islinux',
+        'ismacos','iswindows','lastexitcode','matches','myinvocation','nestedpromptlevel','pid',
+        'profile','psboundparameters','pscmdlet','pscommandpath','psculture','psdebugcontext',
+        'pshome','psitem','psscriptroot','pssenderinfo','psuiculture','psversiontable','pwd',
+        'sender','shellid','stacktrace','switch','this','true','_')
+    foreach ($n in $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
+        $v = $n.Left -as [System.Management.Automation.Language.VariableExpressionAst]
+        if ($null -eq $v) { continue }
+        if ($automaticNames -ccontains $v.VariablePath.UserPath.ToLowerInvariant()) {
+            [void]$out.Add(("{0}:{1}: assignment to automatic variable `${2}` -- PowerShell identifiers are case-insensitive, so this can collide with the runtime variable (the `$lastExitCode` P0); rename it" -f $name, (& $LineOf $n), $v.VariablePath.UserPath))
+        }
+    }
+    foreach ($n in $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.ForEachStatementAst] }, $true)) {
+        $v = $n.Variable -as [System.Management.Automation.Language.VariableExpressionAst]
+        if ($null -eq $v) { continue }
+        if ($automaticNames -ccontains $v.VariablePath.UserPath.ToLowerInvariant()) {
+            [void]$out.Add(("{0}:{1}: foreach loop variable `${2}` shadows the automatic variable of that name -- rename it" -f $name, (& $LineOf $n), $v.VariablePath.UserPath))
+        }
+    }
+    foreach ($n in $ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.ParameterAst] }, $true)) {
+        $v = $n.Name -as [System.Management.Automation.Language.VariableExpressionAst]
+        if ($null -eq $v) { continue }
+        if ($automaticNames -ccontains $v.VariablePath.UserPath.ToLowerInvariant()) {
+            [void]$out.Add(("{0}:{1}: parameter `${2}` shadows the automatic variable of that name -- rename it" -f $name, (& $LineOf $n), $v.VariablePath.UserPath))
+        }
+    }
+
     return $out
+}
+
+# --- the same rules over PowerShell EMBEDDED IN SHELL ASSETS ------------------
+# Nine PowerShell payloads live inside the shell assets as single-quoted shell
+# strings: three `-Command '...'` arguments in each copy of the server (the
+# canonical twins), two `*_script='...'` literals in the POSIX client, one
+# `windows_common_script='...'` in sshp.  They are shipped PowerShell and are
+# parsed by powershell.exe at runtime, so the rules above must see them too --
+# a scan by file EXTENSION is exactly the blind spot that let `$profile`
+# survive in all six payloads on 2026-10-24 while the .ps1 half was already
+# clean.
+#
+# The extraction follows shell quoting, not "the next quote": a shell
+# single-quoted string ends at the FIRST `'`.  Payloads containing an
+# apostrophe are therefore NOT supported by this extractor; a payload that
+# gets truncated this way still reports (as a parse error, via
+# -ParseErrorsAreViolations), so the failure is loud rather than silent.
+#
+# A payload written in DOUBLE quotes is a different matter: the shell expands
+# it before powershell.exe ever sees it, so `$profile` inside it may already
+# have become the shell's own empty variable -- nothing static can be said
+# about it.  Those are counted and REPORTED rather than skipped, because
+# `-Command "Get-ScheduledTask -TaskName 'AgentQ Pueued' ..."` in the server
+# is exactly such a payload: `$`-free today, and silently unchecked forever if
+# this arm only looked at single quotes.
+#
+# The count gate in the main loop refuses to report a pass if the asset tree
+# does not yield exactly 9 single-quoted payloads and 2 double-quoted ones, so
+# a payload added later (or an extractor regression) cannot be silently
+# skipped.  9, not 6: the canonical server twins carry the same three
+# single-quoted payloads, and both copies are scanned.
+$payloadPattern = "(?m)-Command '|[A-Za-z0-9_]+_script='"
+$doubleQuotedPattern = '(?m)-Command "'
+function Get-ShellPayloadViolations {
+    param([string]$Path)
+    $found = New-Object System.Collections.ArrayList
+    $shellText = Get-Content -LiteralPath $Path -Raw
+    foreach ($m in [regex]::Matches($shellText, $payloadPattern)) {
+        $start = $m.Index + $m.Length
+        $close = $shellText.IndexOf("'", $start)
+        if ($close -lt 0) { continue }
+        $body = $shellText.Substring($start, $close - $start)
+        $openingLine = ($shellText.Substring(0, $start) -split "`n").Count
+        $where = "{0}(shell line {1})" -f (Split-Path -Leaf $Path), $openingLine
+        foreach ($v in (Get-PsStaticViolations -Text $body -DisplayName $where -LineOffset ($openingLine - 1) -ParseErrorsAreViolations)) {
+            [void]$found.Add($v)
+        }
+    }
+    foreach ($m in [regex]::Matches($shellText, $doubleQuotedPattern)) {
+        $start = $m.Index + $m.Length
+        $close = $shellText.IndexOf('"', $start)
+        if ($close -lt 0) { continue }
+        $body = $shellText.Substring($start, $close - $start)
+        $openingLine = ($shellText.Substring(0, $start) -split "`n").Count
+        $where = "{0}(shell line {1})" -f (Split-Path -Leaf $Path), $openingLine
+        if ($body -match '[\$\\]') {
+            # Shell expansion makes the runtime text differ from the source
+            # text; nothing static can be asserted about such a payload, so it
+            # is REPORTED rather than skipped.
+            [void]$found.Add(("{0}: double-quoted PowerShell payload contains `$ or backslash -- the shell expands it before powershell.exe sees it, so these rules cannot verify it; rewrite it as a single-quoted payload" -f $where))
+            continue
+        }
+        foreach ($v in (Get-PsStaticViolations -Text $body -DisplayName $where -LineOffset ($openingLine - 1) -ParseErrorsAreViolations)) {
+            [void]$found.Add($v)
+        }
+    }
+    return $found
 }
 
 if ($Calibrate) {
@@ -454,6 +598,13 @@ function Get-Legal {
     # fixture turns red if that discrimination is ever lost.
     $set = [System.Collections.Generic.HashSet[string]]::new()
     if ($set.Contains("x", [System.StringComparer]::OrdinalIgnoreCase)) { Write-Host "collection contains is fine" }
+    # A name that merely CONTAINS an automatic variable's name is not that
+    # variable: the rule matches the whole user path, not a prefix, so these
+    # must stay legal (they are why `$profile` was renamed `$userProfile`
+    # rather than `$profilePath`).
+    $userProfile = "C:\Users\x"
+    $profileItem = Get-Item -LiteralPath $userProfile
+    Write-Host "$userProfile $($profileItem.Name)"
 }
 function Use-Legal { Get-Legal -Path "/tmp" }
 Use-Legal
@@ -469,6 +620,11 @@ function Invoke-Outer {
     [IO.File]::Move("/tmp/c", "/tmp/d", $true)
     $text = "abc"
     if ($text.Contains("b", [System.StringComparison]::Ordinal)) { Write-Host "hit" }
+    $profile = "C:\Users\x"
+    Write-Host $profile
+    # The P0's exact shape: mixed case still matches the automatic name.
+    $LastExitCode = 0
+    Write-Host $LastExitCode
 }
 function Invoke-Inner {
     & sh -c 'true' 2> $errorPath
@@ -482,12 +638,52 @@ Invoke-Outer
             exit 2
         }
         $defectOut = Get-PsStaticViolations -Path $defect
-        if ($defectOut.Count -ne 5) {
-            Write-Host "calibration FAILED: the rules found $($defectOut.Count) violations in the defect fixture, expected 5"
+        if ($defectOut.Count -ne 7) {
+            Write-Host "calibration FAILED: the rules found $($defectOut.Count) violations in the defect fixture, expected 7"
             $defectOut | ForEach-Object { Write-Host "  $_" }
             exit 2
         }
-        Write-Host "ps-static rules calibrated (legal=0 defects=5)"
+        # The embedded-payload arm needs its own calibration: it has a shell
+        # quoter in front of the parser, and a quoter that extracts the wrong
+        # span would report a clean tree forever.  The fixture below is a shell
+        # file with one legal payload and one that writes an automatic
+        # variable; the arm must find exactly that one, at the right shell line.
+        $shellFixture = Join-Path $calibration 'payload-fixture.sh'
+        Set-Content -LiteralPath $shellFixture -Value @'
+#!/bin/sh
+legit=$(powershell.exe -NoProfile -Command '
+    $ProgressPreference = "SilentlyContinue"
+    $userProfile = "C:\Users\x"
+    Write-Output $userProfile
+')
+broken=$(powershell.exe -NoProfile -Command '
+    $ProgressPreference = "SilentlyContinue"
+    $profile = "C:\Users\x"
+    Write-Output $profile
+')
+'@
+        $payloadOut = @(Get-ShellPayloadViolations -Path $shellFixture)
+        if ($payloadOut.Count -ne 1 -or $payloadOut[0] -notmatch 'payload-fixture\.sh\(shell line 7\):9: assignment to automatic variable \$profile') {
+            Write-Host "calibration FAILED: the embedded-payload arm found $($payloadOut.Count) violations in its fixture, expected exactly 1 naming `$profile at shell line 9"
+            $payloadOut | ForEach-Object { Write-Host "  $_" }
+            exit 2
+        }
+        # The double-quoted arm: a `$`-free payload is checked like any other,
+        # and a payload the shell would expand is REPORTED, not skipped.  Both
+        # directions here, because this arm exists to prevent silent skipping.
+        $doubleFixture = Join-Path $calibration 'payload-double.sh'
+        Set-Content -LiteralPath $doubleFixture -Value @'
+#!/bin/sh
+legal=$(powershell.exe -NoProfile -Command "Write-Output 'ok'")
+expanded=$(powershell.exe -NoProfile -Command "Write-Output $profile")
+'@
+        $doubleOut = @(Get-ShellPayloadViolations -Path $doubleFixture)
+        if ($doubleOut.Count -ne 1 -or $doubleOut[0] -notmatch 'payload-double\.sh\(shell line 3\): double-quoted PowerShell payload contains') {
+            Write-Host "calibration FAILED: the double-quoted arm found $($doubleOut.Count) violations in its fixture, expected exactly 1 reporting the shell-expanded payload"
+            $doubleOut | ForEach-Object { Write-Host "  $_" }
+            exit 2
+        }
+        Write-Host "ps-static rules calibrated (legal=0 defects=7 payloads=1 double=1)"
     } finally {
         Remove-Item -LiteralPath $calibration -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -500,8 +696,30 @@ foreach ($file in $files) {
     $found = Get-PsStaticViolations -Path $file.FullName
     foreach ($line in $found) { Write-Host $line; $violations++ }
 }
+
+# --- the same rules over PowerShell EMBEDDED IN SHELL ASSETS ------------------
+# (the extractor and its calibration live above, next to the rule they serve)
+# The counter below is incremented INSIDE a ForEach-Object scriptblock; that is
+# load-bearing and measured (2026-10-24): ForEach-Object runs in the CURRENT
+# scope, so `$violations++` reaches this variable, while a `& { ... }` script
+# block would run in a child scope and silently drop every count.
+$payloadCount = 0
+$doubleQuotedCount = 0
+Get-ChildItem -LiteralPath $Root -Recurse -File |
+    Where-Object { $_.Extension -ne '.ps1' } |
+    Sort-Object FullName |
+    ForEach-Object {
+        $raw = Get-Content -LiteralPath $_.FullName -Raw
+        foreach ($m in [regex]::Matches($raw, $payloadPattern)) { $payloadCount++ }
+        foreach ($m in [regex]::Matches($raw, $doubleQuotedPattern)) { $doubleQuotedCount++ }
+        foreach ($line in (Get-ShellPayloadViolations -Path $_.FullName)) { Write-Host $line; $violations++ }
+    }
+if ($payloadCount -ne 9 -or $doubleQuotedCount -ne 2) {
+    Write-Host ("embedded PowerShell payload count is single-quoted={0} double-quoted={1}, expected 9 and 2 -- the extractor no longer sees them, so a pass here would mean nothing" -f $payloadCount, $doubleQuotedCount)
+    exit 2
+}
 if ($violations -gt 0) { exit 1 }
-if (-not $Calibrate) { Write-Host ("ps-static rules ok (NOT calibrated): files={0}" -f $files.Count) }
+if (-not $Calibrate) { Write-Host ("ps-static rules ok (NOT calibrated): files={0} payloads={1}" -f $files.Count, $payloadCount) }
 exit 0
 PSEOF
     # -Calibrate is not optional.  It runs the rule over a LEGAL fixture and a
@@ -511,7 +729,7 @@ PSEOF
     # a clean tree -- the failure mode this repo has already paid for twice
     # (smoke/01's own config-pattern extraction, smoke/10's rule A).
     if ! pwsh -NoProfile -NonInteractive -File "$rules_ps1" -Root "$root/skill/assets" -Calibrate >/dev/null; then
-        printf '%s\n' 'PowerShell static rules FAILED (a $null-only variable that is read, an assignment nobody reads, or a .NET API that is missing on Windows PowerShell 5.1):' >&2
+        printf '%s\n' 'PowerShell static rules FAILED (a $null-only variable that is read, an assignment nobody reads, a .NET API that is missing on Windows PowerShell 5.1, or a write to an automatic variable):' >&2
         pwsh -NoProfile -NonInteractive -File "$rules_ps1" -Root "$root/skill/assets" -Calibrate >&2 || true
         failures=$((failures + 1))
     fi
