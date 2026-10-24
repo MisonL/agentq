@@ -258,9 +258,74 @@ if ! grep -q 'MoveFileReplaceExisting | MoveFileWriteThrough' "$asset"; then
     failures=$((failures + 1))
 fi
 
+# --- the C# body must compile under C# 5 (2026-10-24) ------------------------
+# The Add-Type block above is 3.3 KB of C# and NOTHING had ever compiled it:
+# the four cases in this file all die in PowerShell's PARAMETER BINDING, before
+# a single body statement runs (verified: a script with a missing mandatory
+# parameter never reaches its own body).  So a C# 6+ construct in here would
+# ship green on a dev Mac -- pwsh 7 compiles C# 6 fine -- and fail on every
+# real Windows host, where Add-Type uses .NET Framework's C# 5 compiler.
+#
+# The oracle is faithful and local: `-CompilerOptions "/langversion:5"` under
+# pwsh 7 uses the same C# 5 language rules (measured 2026-10-24: it rejects
+# `$"..."` with CS8026 "Feature 'interpolated strings' is not available in
+# C# 5" and `?.` with "Feature 'null propagating operator'").  That is a
+# LANGUAGE-version match, not a framework-API match -- the API side is rule 3
+# of smoke/01's ps1_static (both runtimes must have the member).  Both
+# directions are proven: the shipped body compiles (0 errors), and two planted
+# C# 6 constructs are rejected by name.
+cases=$((cases + 1))
+cs_body_file="$work/addtype-body.cs"
+python3 - "$asset" > "$cs_body_file" <<'PY'
+import io, re, sys
+src = io.open(sys.argv[1], encoding="utf-8").read()
+m = re.search(r'Add-Type -TypeDefinition @"\n(.*?)\n"@', src, re.S)
+if not m:
+    sys.exit("could not extract the C# body from the Add-Type here-string")
+sys.stdout.write(m.group(1))
+PY
+if [ ! -s "$cs_body_file" ]; then
+    printf 'durable-move: extracted an EMPTY C# body -- the extractor, not the asset, is broken\n' >&2
+    failures=$((failures + 1))
+else
+    # The path travels in an ENVIRONMENT variable, and MSYS bash does NOT
+    # rewrite POSIX paths in env vars the way it rewrites command-line
+    # arguments -- so on the Windows CI job powershell.exe would receive
+    # `/tmp/...` and ReadAllText would fail with "Could not find file",
+    # reporting a correct asset as broken.  Convert when cygpath exists.
+    cs_body_for_ps=$cs_body_file
+    if command -v cygpath >/dev/null 2>&1; then
+        cs_body_for_ps=$(cygpath -w -- "$cs_body_file")
+    fi
+    # The path travels through an ENVIRONMENT variable, not -Command arguments
+    # or a positional: measured 2026-10-24, `-Command '<script>' <path>` puts the
+    # path in $args reliably only under some hosts, and on macOS a bare .cs path
+    # can be handed to LaunchServices ("No application knows how to open URL
+    # file:///...") -- the first cut reported both as "TypeDefinition is null".
+    # `-CompilerOptions` is a PowerShell 7 parameter -- real 5.1 does not have it,
+    # and passing it there fails the BINDING, which would report a correct asset
+    # as broken on the Windows CI job.  5.1's Add-Type already uses the C# 5
+    # compiler, so on that host the plain call IS the faithful compile; on pwsh 7
+    # the switch is what makes it faithful.  Same assertion, dialect-correct
+    # spelling -- measured both ways (2026-10-24).
+    cs_out=$(AGENTQ_CS_BODY="$cs_body_for_ps" "$pwsh_binary" -NoProfile -NonInteractive -Command '
+        $body = [System.IO.File]::ReadAllText($env:AGENTQ_CS_BODY)
+        $arguments = @{ TypeDefinition = $body; ErrorAction = "Stop" }
+        if ($PSVersionTable.PSVersion.Major -ge 6) { $arguments.CompilerOptions = "/langversion:5" }
+        try { Add-Type @arguments; "OK" }
+        catch { "FAIL " + $_.Exception.Message.Split([char]10)[0] }' 2>&1) || true
+    case $cs_out in
+        OK*) ;;
+        *)
+            printf 'durable-move: the C# body does not compile under C# 5 (Windows PowerShell 5.1 uses that compiler): %s\n' "$cs_out" >&2
+            failures=$((failures + 1))
+            ;;
+    esac
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'durable-move-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'durable-move-contract checks passed: cases=%s pwsh=%s binder=%s contract=covered access-mask=pinned behaviour=NOT-covered(needs-Windows)\n' "$cases" \
+printf 'durable-move-contract checks passed: cases=%s pwsh=%s binder=%s contract=covered access-mask=pinned cs5=compiled behaviour=NOT-covered(needs-Windows)\n' "$cases" \
     "$("$pwsh_binary" -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()' 2>/dev/null || printf 'unknown')" "$pwsh_binder"

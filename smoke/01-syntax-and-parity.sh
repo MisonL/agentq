@@ -158,7 +158,13 @@ fi
 ps1_encoding_summary=checked
 
 if [ "$pwsh_state" = usable ]; then
-    parse_ps1=$(mktemp "${TMPDIR:-/tmp}/agentq-parse-ps1.XXXXXX.ps1")
+    # The template ENDS in the X's, deliberately: BSD mktemp (macOS) only
+    # randomizes when the X's are last -- `agentq-parse-ps1.XXXXXX.ps1` creates
+    # a file with that LITERAL name, so a SIGKILLed run (trap never fires)
+    # leaves it behind and every later run dies "File exists" (measured
+    # 2026-10-24, after a killed suite).  `pwsh -File` does not require a .ps1
+    # extension (measured).  smoke/01's `mktemp_suffix` rule pins this.
+    parse_ps1=$(mktemp "${TMPDIR:-/tmp}/agentq-parse-ps1.XXXXXX")
     trap 'rm -f -- "$parse_ps1"' EXIT
     cat > "$parse_ps1" <<'PSEOF'
 param([string]$Path)
@@ -210,7 +216,7 @@ PSEOF
     #
     # Neither rule is `PSUseDeclaredVarsMoreThanAssignments`: it misses rule 1
     # entirely (the name IS read), and it flags the `[ref]` out-parameters.
-    rules_ps1=$(mktemp "${TMPDIR:-/tmp}/agentq-ps-static-rules.XXXXXX.ps1")
+    rules_ps1=$(mktemp "${TMPDIR:-/tmp}/agentq-ps-static-rules.XXXXXX")
     trap 'rm -f -- "$parse_ps1" "$rules_ps1"' EXIT
     cat > "$rules_ps1" <<'PSEOF'
 param([string]$Root, [switch]$Calibrate)
@@ -1426,6 +1432,54 @@ EOF
     failures=$((failures + 1))
 fi
 
+# --- mktemp templates must END in their X's ----------------------------------
+# BSD mktemp (macOS) randomizes ONLY a trailing run of X's.  Given
+# `agentq-parse-ps1.XXXXXX.ps1` it creates a file with that LITERAL name --
+# no randomness, no uniqueness -- and `mkstemp` then fails with "File exists"
+# the second time.  Measured 2026-10-24: two such templates had shipped here,
+# invisible because the EXIT trap removes the literal file on a normal exit;
+# the first SIGKILLed suite left them behind and every later smoke/01 run died
+# before any assertion.  The failure also poisons the NEXT run, which is what
+# made it look like an environment fault (a stale temp dir) in the suite log.
+# GNU mktemp accepts either form, so this is BSD-only -- which is exactly why
+# the Mac suite must assert it and the Linux suite cannot.
+mktemp_suffix_count=0
+mktemp_suffix_hits=$(
+    while IFS= read -r repo_script; do
+        # `[^X"'"'"'[:space:]]` -- the X must ALSO be excluded from the
+        # follower class.  Without it `[X]{3,}` matches exactly three of six
+        # X's and the fourth X satisfies the follower, so a CORRECT template
+        # ending in XXXXXX matched (measured: three false reds on the first
+        # run of this rule).  The follower is "anything that is not X, quote
+        # or space": that is exactly a suffix after the randomizing run.
+        # `[^X"'"'"'[:space:])]` -- X, quotes, whitespace and the closing paren of
+        # `$( ... )` all mean "the X run ends here".  Two earlier versions of
+        # this follower class were wrong and BOTH cried wolf on correct code:
+        # without X it matched three of six X's (the fourth X was the
+        # "suffix"), and without `)` it flagged every `mktemp -d .../x.XXXXXX)`
+        # in smoke/04-07.  Measured both, on the real tree.
+        grep -nE 'mktemp[^|;]*[X]{3,}[^X"'"'"'[:space:])]' "$repo_script" 2>/dev/null |
+            grep -vE '^[0-9]+:[[:space:]]*#' |
+            sed "s|^|${repo_script#"$root"/}:|" || true
+    done <<SCRIPTS
+$(find "$root/smoke" -type f -name '*.sh' | sort)
+$root/run-tests.sh
+$root/sandbox.sh
+$shell_assets
+SCRIPTS
+)
+if [ -n "$mktemp_suffix_hits" ]; then
+    while IFS= read -r mktemp_hit; do
+        [ -n "$mktemp_hit" ] || continue
+        printf 'repo script FAILED (a mktemp template must END in its X run -- BSD mktemp treats a suffix after the Xs as a literal name, so the second run fails with File exists): %s\n' \
+            "$mktemp_hit" >&2
+        mktemp_suffix_count=$((mktemp_suffix_count + 1))
+    done <<EOF
+$mktemp_suffix_hits
+EOF
+    failures=$((failures + 1))
+fi
+
 # --- shell assets: unlocalized writes into a caller's local ------------------
 # bash resolves an unqualified assignment through the DYNAMIC scope: a write to
 # a name the callee did not declare `local` lands in whichever frame up the
@@ -1764,7 +1818,7 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s local_hazards=%s local_hazard_files=%s uncalled=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 printf '%s\n' "$summary"
