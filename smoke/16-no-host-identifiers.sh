@@ -163,6 +163,25 @@ r4_path_exempt() {
     esac
 }
 
+# is_derived_bytecode <path> -- Python bytecode caches are not text and are not
+# a gap in the scan: each one is compiled from a .py the walk scans, and
+# .gitignore declares `__pycache__/` and `*.pyc` never committed.  Before this
+# predicate existed they were caught by the NUL-byte arm below and reported as
+# "skipped a file that looks binary" -- which run-tests classifies as PART for
+# ANY line containing that word.  Measured 2026-10-25: one `import` of
+# smoke/01-farm-write.py during development left
+# smoke/__pycache__/01-farm-write.cpython-314.pyc in the tree, and the next
+# full suite reported "NOT A FULL PASS: 1 check(s) only partially verified" for
+# an artifact that cannot be committed and whose source was scanned.  The
+# exclusion is deliberately narrow and pinned in both directions by the
+# self-test below: a NUL file one directory over must still be REPORTED.
+is_derived_bytecode() {
+    case $1 in
+        */__pycache__/*|*.pyc) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # scan_file <path> -- one `grep -n` per rule, so a file costs one fork per rule
 # instead of one per line.  The per-rule loop is unrolled rather than looped so
 # the rule name and its regex stay adjacent to the code that uses them.
@@ -308,6 +327,35 @@ expect_path active .github/ISSUE_TEMPLATE/bug_report.md 'an issue template under
 expect_path active smoke/16-no-host-identifiers.sh 'the check itself'
 expect_path active CHANGELOG.md                  'a root document'
 
+# The bytecode exclusion's SCOPE, pinned in both directions for the same reason
+# as the R4 exemption above: widened to `*.py` or `*` it would still leave every
+# sample above green, while a NUL-bearing text file would stop being REPORTED.
+# Boundary, recorded: a .pyc force-added with `git add -f` would now be invisible
+# to the content scan -- it is compiled from a source the walk does scan, and
+# .gitignore declares the class uncommittable, so that is the accepted edge.
+expect_bytecode() { # expect_bytecode <derived|scanned> <path> <what>
+    local want=$1 path=$2 what=$3
+    if is_derived_bytecode "$path"; then
+        [ "$want" = derived ] || {
+            printf 'self-test: the bytecode exclusion covers %s (%s) but must not\n' "$path" "$what" >&2
+            selftest_failures=$((selftest_failures + 1))
+        }
+    else
+        [ "$want" = scanned ] || {
+            printf 'self-test: the bytecode exclusion misses %s (%s)\n' "$path" "$what" >&2
+            selftest_failures=$((selftest_failures + 1))
+        }
+    fi
+}
+expect_bytecode derived smoke/__pycache__/01-farm-write.cpython-314.pyc 'a compiled cache of a scanned .py'
+expect_bytecode derived "$root/smoke/nested/__pycache__/x.cpython-39.pyc" 'a nested cache, by absolute path'
+expect_bytecode derived smoke/standalone.pyc     'a lone .pyc outside __pycache__'
+expect_bytecode scanned smoke/01-farm-write.py   'the Python source itself'
+expect_bytecode scanned "$root/smoke/01-farm-write.py" 'the source by absolute path'
+expect_bytecode scanned smoke/16-no-host-identifiers.sh 'this check'
+expect_bytecode scanned smoke/notes.pyc.txt      'a name that only ends in .pyc.txt'
+expect_bytecode scanned smoke/__pycachex__/a.bin 'a directory that only looks like a cache'
+
 if [ "$selftest_failures" -ne 0 ]; then
     printf 'no-host-identifiers: %s self-test failure(s); the scan below would not have been trustworthy\n' \
         "$selftest_failures" >&2
@@ -354,6 +402,9 @@ scanned=$((scanned - 1))
 # files= counter still grew (measured 2026-10-13, review round 4).
 tree_scanned=0
 while IFS= read -r file; do
+    if is_derived_bytecode "$file"; then
+        continue
+    fi
     if ! grep -Iq . "$file" 2>/dev/null; then
         if [ -s "$file" ] && LC_ALL=C grep -q "$(printf '\x00')" "$file" 2>/dev/null; then
             printf 'no-host-identifiers: skipped a file that looks binary by NUL bytes (it could hide a text leak): %s\n' "$file" >&2

@@ -147,6 +147,35 @@ build_stub_path "$stub_bare" no
 build_stub_path "$stub_pkgmgr" no
 build_stub_path "$stub_full" yes
 
+# --- write_stub: the construction-level guard (2026-10-25) --------------------
+# Everything below creates stub scripts INSIDE directories that also contain
+# `ln -s` entries pointing at the host's REAL binaries.  `cat >` follows a
+# symlink: a stub written over a farm link truncates the binary it points at.
+# This repo hit it on a Linux CI host -- the loginctl case below documents the
+# `cat >` heredoc writing THROUGH its symlink toward /usr/bin/loginctl -- and on
+# 2026-10-25 the same shape, built the same way by a session-level fixture,
+# destroyed the developer's Homebrew python3 for ~40 minutes.  Every defence
+# until today was a hand-written exclusion list (`[ "$name" = curl ] ||`) paired
+# with a literal `cat >` elsewhere in the file -- get the pairing wrong and the
+# gun fires.  write_stub makes the pairing moot: an existing symlink is removed
+# before the write, so the stub always lands as a regular file in the fixture
+# directory and the farm entry is replaced, never followed.
+#
+# Refuses instead of deleting a REGULAR file: a farm directory is built once;
+# finding a real file at a stub path means something already wrote there, and
+# silently replacing it would hide that write.
+write_stub() {
+    local target=$1
+    if [ -L "$target" ]; then
+        rm -f -- "$target"
+    elif [ -e "$target" ]; then
+        printf 'write_stub: refusing to replace an existing regular file: %s\n' "$target" >&2
+        return 1
+    fi
+    cat >"$target"
+    chmod 700 "$target"
+}
+
 # The installer's Darwin branch runs `require_command launchctl plutil chown`
 # before it reaches ANY of the refusal cases below, and this fixture pins the
 # platform to Darwin on every host -- the messages under test are the macOS ones
@@ -158,7 +187,7 @@ build_stub_path "$stub_full" yes
 # A stub is created only where the host has nothing to link.
 for stub in "$stub_bare" "$stub_pkgmgr" "$stub_full"; do
     if [ ! -e "$stub/launchctl" ]; then
-        cat > "$stub/launchctl" <<'STUB'
+        write_stub "$stub/launchctl" <<'STUB'
 #!/bin/sh
 # This host has no launchd.  The reachable installer code only ASKS whether
 # com.agentq.pueued is loaded (bootstrap_existing_macos_service's `print`), and
@@ -170,10 +199,9 @@ case "${1:-}" in
     *) printf 'launchctl stub: this fixture does not model %s; failing rather than pretending it succeeded\n' "${1:-}" >&2; exit 1 ;;
 esac
 STUB
-        chmod 700 "$stub/launchctl"
     fi
     if [ ! -e "$stub/plutil" ]; then
-        cat > "$stub/plutil" <<'STUB'
+        write_stub "$stub/plutil" <<'STUB'
 #!/bin/sh
 # Reached only by prepare_service_stage, which sits behind a successful
 # download+verify of pueue/pueued -- out of scope for this offline fixture, so
@@ -183,7 +211,6 @@ STUB
 printf '%s\n' 'plutil stub: this fixture host has no plutil; -lint is not modelled' >&2
 exit 1
 STUB
-        chmod 700 "$stub/plutil"
     fi
 done
 
@@ -193,16 +220,15 @@ package_log="$work/package-manager-invocations"
 : >"$package_log"
 for destination in "$stub_pkgmgr" "$stub_full"; do
     for manager in brew port apt-get dnf yum pacman zypper apk; do
-        cat > "$destination/$manager" <<STUB
+        write_stub "$destination/$manager" <<STUB
 #!/bin/sh
 printf '%s\n' "$manager \$*" >> "$package_log"
 exit 1
 STUB
-        chmod 700 "$destination/$manager"
     done
 done
 
-cat > "$stub_full/sudo" <<'STUB'
+write_stub "$stub_full/sudo" <<'STUB'
 #!/bin/sh
 # Runs the command it was given, with no privilege change.  See the note above
 # build_stub_path: the installer deletes files through `run_as_root rm -f` on
@@ -228,7 +254,6 @@ for argument in "$@"; do
 done
 exec "$command_name" "$@"
 STUB
-chmod 700 "$stub_full/sudo"
 
 # uname is stubbed because the installer's platform table is keyed on it, and
 # the table decides which asset names and hashes it expects.  The stub reads a
@@ -236,7 +261,7 @@ chmod 700 "$stub_full/sudo"
 platform_file="$work/platform"
 printf 'Darwin\narm64\n' >"$platform_file"
 for stub in "$stub_bare" "$stub_pkgmgr" "$stub_full"; do
-    cat > "$stub/uname" <<STUB
+    write_stub "$stub/uname" <<STUB
 #!/bin/sh
 case "\$1" in
     -s) sed -n 1p "$platform_file" ;;
@@ -244,7 +269,6 @@ case "\$1" in
     *)  sed -n 1p "$platform_file" ;;
 esac
 STUB
-    chmod 700 "$stub/uname"
 done
 
 # The installer requires agentq-server, pueue.yml and agentq to sit next to it,
@@ -336,7 +360,7 @@ for entry in "$stub_full"/*; do
     name=${entry##*/}
     [ "$name" = curl ] || ln -s "$entry" "$stub_download/$name"
 done
-cat > "$stub_download/curl" <<'STUB'
+write_stub "$stub_download/curl" <<'STUB'
 #!/bin/sh
 # Writes a body whose hash cannot match the pinned one, then succeeds -- i.e. a
 # download that completed but delivered the wrong bytes.  That is the only way
@@ -351,7 +375,6 @@ done
 [ -n "$out" ] && printf 'this is not the pueue binary\n' >"$out"
 exit 0
 STUB
-chmod 700 "$stub_download/curl"
 
 # A PATH whose `ps` answers the identity question exactly once and then goes
 # quiet.  That models the TOCTOU window recover_stale_maintenance_lock exists to
@@ -371,7 +394,7 @@ for entry in "$stub_full"/*; do
     [ "$name" = ps ] || ln -s "$entry" "$stub_identity_gone/$name"
 done
 ps_query_counter="$work/ps-identity-queries"
-cat > "$stub_identity_gone/ps" <<STUB
+write_stub "$stub_identity_gone/ps" <<STUB
 #!/bin/sh
 for ps_argument in "\$@"; do
     case "\$ps_argument" in
@@ -391,7 +414,6 @@ for ps_argument in "\$@"; do
 done
 exec /bin/ps "\$@"
 STUB
-chmod 700 "$stub_identity_gone/ps"
 
 # A PATH that records every mkdir operand together with the pid of the shell
 # that invoked it -- that pid IS the installer's $$ -- and then does the real
@@ -408,14 +430,13 @@ done
 real_mkdir=$(readlink "$stub_full/mkdir")
 mkdir_log="$work/mkdir-invocations"
 : >"$mkdir_log"
-cat > "$stub_record_mkdir/mkdir" <<STUB
+write_stub "$stub_record_mkdir/mkdir" <<STUB
 #!/bin/sh
 for mkdir_argument in "\$@"; do
     printf '%s\t%s\n' "\$PPID" "\$mkdir_argument" >> "$mkdir_log"
 done
 exec "$real_mkdir" "\$@"
 STUB
-chmod 700 "$stub_record_mkdir/mkdir"
 
 status=0
 
@@ -617,12 +638,11 @@ for entry in "$stub_full"/*; do
     name=${entry##*/}
     [ "$name" = curl ] || ln -s "$entry" "$stub_curl_fail/$name"
 done
-cat > "$stub_curl_fail/curl" <<'STUB'
+write_stub "$stub_curl_fail/curl" <<'STUB'
 #!/bin/sh
 printf 'curl: (7) Failed to connect to example.invalid port 443\n' >&2
 exit 7
 STUB
-chmod 700 "$stub_curl_fail/curl"
 status=0
 env HOME="$home" PATH="$stub_curl_fail" \
     /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
@@ -686,7 +706,7 @@ for entry in "$stub_full"/*; do
     ln -s "$entry" "$stub_linux/$name"
 done
 for linux_command in systemctl loginctl; do
-    cat >"$stub_linux/$linux_command" <<'LINUXCMD'
+    write_stub "$stub_linux/$linux_command" <<'LINUXCMD'
 #!/bin/sh
 # `loginctl show-user ... -p Linger --value` must print something the installer
 # accepts; `yes` short-circuits the enable path.
@@ -695,7 +715,6 @@ case "$*" in
 esac
 exit 0
 LINUXCMD
-    chmod 700 "$stub_linux/$linux_command"
 done
 printf 'Linux\nx86_64\n' >"$platform_file"
 status=0
