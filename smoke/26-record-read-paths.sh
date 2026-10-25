@@ -37,7 +37,21 @@
 #   * `path_chain_is_safe` rejects any symlink component, and macOS /tmp is a
 #     symlink to /private/tmp, so the tree path is canonicalised with pwd -P.
 #
-# No SKIP: this needs only bash, jq and cp.
+# python3 is a real dependency: the record-rewriting steps below are Python.
+# The old header claimed "this needs only bash, jq and cp", which was wrong.
+# Probe that it RUNS, not that a name resolves -- measured 2026-10-20 on a
+# zh-CN Windows 10, where `python3` is the Microsoft Store alias.  Measured
+# 2026-10-25: with a stub python3 that exits 49, this check exited 49 with
+# ZERO output, which run-tests.sh can only report as a bare FAIL with no
+# cause -- an ENVIRONMENT fault presented as a contract failure.  Same rule as
+# the pwsh usability probes.
+python3_probe_status=0
+python3 -c 'import sys' >/dev/null 2>&1 || python3_probe_status=$?
+if [ "$python3_probe_status" -ne 0 ]; then
+    printf '%s\n' 'read-paths NOT run: the python3 on PATH cannot execute (a Microsoft Store alias cannot run scripts).' >&2
+    printf '%s\n' 'Install a real Python 3 and put it on PATH, then re-run.' >&2
+    exit 1
+fi
 
 set -euo pipefail
 
