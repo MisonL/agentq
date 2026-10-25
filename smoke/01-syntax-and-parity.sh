@@ -1681,7 +1681,19 @@ if [ "$python3_state" = usable ]; then
         python3 -I "$root/smoke/01-farm-write.py" "$root" 2>"$farm_write_err"
     ) || farm_write_rc=$?
     case $farm_write_rc in
-    0 | 1) ;;
+    0 | 1)
+        # Exit 1 means "hits found" ONLY IF there are hits to print.  A Python
+        # SyntaxError also exits 1, and so does any crash the classifier's own
+        # handler has not caught; either would otherwise read as "hits found,
+        # output empty" and leave farm_writes=0 green -- measured 2026-10-25 by
+        # planting a RuntimeError that only the real tree reaches (the
+        # self-test never walks skill/assets, so it stayed green).
+        if [ "$farm_write_rc" -eq 1 ] && [ -z "$farm_write_hits" ]; then
+            printf 'farm-write scan FAILED (exit 1 with no output; exit 1 means "hits found" only when there is output -- a crash or a syntax error in the classifier also exits 1):\n' >&2
+            sed 's/^/      /' "$farm_write_err" >&2
+            failures=$((failures + 1))
+        fi
+        ;;
     *)
         printf 'farm-write scan FAILED (exit %s; a scan that could not run must not read as farm_writes=0):\n' \
             "$farm_write_rc" >&2

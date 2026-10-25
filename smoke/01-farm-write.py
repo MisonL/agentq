@@ -40,7 +40,7 @@ Usage:
     01-farm-write.py <root>        scan the repo's shell scripts, print hits
     01-farm-write.py --self-test   run the fixtures below through analyse()
 
-Exit: 0 clean, 1 hits found, 2 self-test disagreement OR nothing enumerated
+Exit: 0 clean, 1 hits found, 2 self-test disagreement OR nothing enumerated, 3 crash
 (a scan that looked at no files must not share the clean verdict).  smoke/01
 invokes this file as its own source of truth, so the self-test exercises what
 actually ships.
@@ -96,6 +96,34 @@ def analyse(text):
             )
             if m:
                 farm.add(m.group(1))
+    # Aliases.  smoke/11 iterates `for stub in "$stub_bare" "$stub_pkgmgr"
+    # "$stub_full"` and writes through "$stub/..." -- three sites.  Without this
+    # propagation the lock is SILENT on them: measured 2026-10-25 by turning
+    # `write_stub "$stub/uname"` back into `cat > "$stub/uname"` (exit 0, zero
+    # hits).  A lock that misses the form the repo actually uses protects
+    # nothing.  Narrow by construction: a `for` word counts only when it is
+    # EXACTLY "$X"/$X with X already a farm (`"$work"/*` is a glob, not a
+    # farm), and an assignment counts only when its right side is exactly a
+    # farm reference.  Iterate to a fixpoint so chains (a -> b -> c) resolve.
+    for _ in range(8):
+        before = len(farm)
+        for l in code:
+            m = re.match(r"\s*for\s+([A-Za-z_]\w*)\s+in\s+(.+?)(?:\s*;\s*do\b.*)?$", l)
+            if m:
+                words = m.group(2).split()
+                if any(w.strip('"') in farm for w in words):
+                    farm.add("$" + m.group(1))
+                continue
+            m = re.match(
+                r"\s*(?:local\s+|export\s+|readonly\s+)?([A-Za-z_]\w*)=(?:\"(\$[A-Za-z_]\w*)\"|(\$[A-Za-z_]\w*))\s*$",
+                l,
+            )
+            if m:
+                src = m.group(2) or m.group(3)
+                if src in farm:
+                    farm.add("$" + m.group(1))
+        if len(farm) == before:
+            break
     hits = []
     for n, l in enumerate(code, 1):
         if not l or "write_stub" in l:
@@ -177,6 +205,14 @@ CASES = [
     ("single-link", 'for entry in /bin/*; do\n    ln -s "$entry" "$work/src-link"\ndone\nprintf \'x\\n\' > "$work/out"\n', False),
     ("deep-path", 'for side in a b; do\n    ln -s "$target" "$work/$side/data/x.json"\ndone\nprintf \'y\\n\' > "$work/base/data/y.json"\n', False),
     ("via-function", 'fill() {\n    local d=$1\n    for e in /usr/bin/*; do\n        ln -s "$e" "$d/$n"\n    done\n}\nfill "$stubdir"\ncat > "$stubdir/tool" <<\'S\'\n', True),
+    # smoke/11's real shape: the write goes through a LOOP ALIAS of the farm
+    # directories.  Measured 2026-10-25: without alias propagation this was
+    # silent on a genuine `cat >` regression at three sites.
+    ("via-loop-alias", 'A=$1\nB=$2\nfor e in /usr/bin/*; do\n    ln -s "$e" "$A/$n"\n    ln -s "$e" "$B/$n"\ndone\nfor stub in "$A" "$B"; do\n    cat > "$stub/tool" <<\'S\'\ndone\n', True),
+    ("via-alias-assignment", 'A=$1\nfor e in /usr/bin/*; do\n    ln -s "$e" "$A/$n"\ndone\nhere=$A\ncat > "$here/tool" <<\'S\'\n', True),
+    # A glob over a farm is NOT a farm: "$A"/* has one literal component and the
+    # expansion names real files, so a redirect into it follows nothing new.
+    ("glob-over-farm", 'A=$1\nfor e in /usr/bin/*; do\n    ln -s "$e" "$A/$n"\ndone\nfor f in "$A"/*; do\n    printf x > "$f"\ndone\n', False),
 ]
 
 
@@ -244,4 +280,20 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    # Exit codes are a contract with smoke/01: 0 clean, 1 hits, 2 usage /
+    # self-test disagreement / nothing enumerated.  An UNCAUGHT exception must
+    # not exit 1 -- the caller reads 1 as "hits found", and a crash on the real
+    # tree that the self-test never reaches would then report farm_writes=0
+    # (measured 2026-10-25: a RuntimeError raised only for paths under
+    # skill/assets passed --self-test and left smoke/01 green with 0 hits).
+    # A Python SyntaxError exits 1 before any of this runs; the caller's
+    # "exit 1 requires non-empty stdout" rule covers that side.
+    try:
+        sys.exit(main(sys.argv))
+    except SystemExit:
+        raise
+    except BaseException:
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(3)
