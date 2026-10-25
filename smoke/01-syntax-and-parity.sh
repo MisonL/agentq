@@ -125,6 +125,50 @@ done <<SHELL_ASSETS
 $shell_assets
 SHELL_ASSETS
 
+# --- the repo's OWN entry points (2026-10-25) --------------------------------
+# run-tests.sh and sandbox.sh are shell scripts that drive everything else, and
+# NOTHING parsed them: the arm above is scoped to skill/assets, and run-tests.sh
+# only `bash -n`s the checks it is about to run -- never itself, never sandbox.
+# Measured: a syntax error planted in run-tests.sh (before the verdict line)
+# leaves `./run-tests.sh --quick` exiting **0** with no PASS/FAIL line at all.
+# That is not a hypothetical: bash reaches EOF mid-compound-command, the
+# unterminated `if` never executes, the script's last `exit 0` stands, and the
+# only trace is a `syntax error` line on stderr that the CI gate never reads
+# (it greps stdout for `^PASS checks:`).  So a broken entry point reports a
+# green run with the summary silently missing.
+#
+# Why `bash -n` and NOT the shellcheck lock: measured on shellcheck 0.11.0,
+# `shellcheck -s bash -i SC2319,...` **suppresses parse errors too** -- a file
+# with SC1046/SC1047 (`Couldn't find 'fi'`) exits 0 under the `-i` spelling the
+# repo uses, and only the unrestricted form reports it.  `bash -n` is the
+# faithful grammar for both files (both are `#!/usr/bin/env bash`).
+repo_entry_failures=0
+repo_entry_count=0
+for repo_entry in "$root/run-tests.sh" "$root/sandbox.sh"; do
+    [ -f "$repo_entry" ] || {
+        printf 'repo entry point missing: %s\n' "${repo_entry#"$root"/}" >&2
+        repo_entry_failures=$((repo_entry_failures + 1))
+        continue
+    }
+    if ! bash -n "$repo_entry"; then
+        printf 'bash -n FAILED (the suite driver itself does not parse; a broken run-tests.sh can still exit 0 with NO summary line): %s\n' \
+            "${repo_entry#"$root"/}" >&2
+        repo_entry_failures=$((repo_entry_failures + 1))
+    fi
+    repo_entry_count=$((repo_entry_count + 1))
+done
+# Self-check: the detector must be able to FAIL.  A `bash -n` wrapper that
+# swallowed its status (a `2>&1` without the `if !`) reads exactly like a clean
+# tree.  Fixture lives in a temp dir, never in the repo.
+repo_entry_selftest=$(mktemp "${TMPDIR:-/tmp}/agentq-entry-parse.XXXXXX")
+printf '#!/usr/bin/env bash\necho start\nif [ 1 = 1 ]; then\n    :\n' >"$repo_entry_selftest"
+if bash -n "$repo_entry_selftest" 2>/dev/null; then
+    printf '%s\n' 'entry-point parser FAILED its self-check (a file with an unterminated `if` parsed clean) -- the detector itself is broken' >&2
+    repo_entry_failures=$((repo_entry_failures + 1))
+fi
+rm -f "$repo_entry_selftest"
+failures=$((failures + repo_entry_failures))
+
 ps_count=0
 # `command -v pwsh` only proves the binary is on PATH, not that it RUNS.  A
 # pwsh whose startup cache is corrupt aborts on every invocation -- and then
@@ -1043,6 +1087,46 @@ else
     yaml_summary='skipped(no pyyaml)'
 fi
 
+# --- .github/workflows: YAML parse -------------------------------------------
+# The workflows are the enforcement layer -- ci.yml pins the 29 check names, the
+# shellcheck/posix tokens and the NOT-covered allowlist; release.yml is the only
+# gate tying a tag to the recorded version.  A YAML typo in one of them does not
+# fail locally in any way (measured 2026-10-25: breaking ci.yml's indentation
+# left both `./smoke/01` and `./run-tests.sh --quick` exiting 0), and GitHub's
+# response to an unparseable workflow is to not run it at all -- the CI that
+# would have caught the mistake is the CI that stopped running.
+# `set -u` is on: the summary below reads this even when pyyaml is absent, so
+# the token is initialised OUTSIDE the probe.  A value that only exists when a
+# tool is present turns a missing tool into an unbound-variable crash.
+workflow_summary='skipped(no pyyaml)'
+if python3 -c 'import yaml' >/dev/null 2>&1; then
+    workflow_count=0
+    while IFS= read -r workflow_file; do
+        workflow_count=$((workflow_count + 1))
+        if ! python3 -c 'import sys, yaml
+try:
+    data = yaml.safe_load(open(sys.argv[1], "rb").read())
+except Exception as exc:
+    print(exc, file=sys.stderr)
+    sys.exit(1)
+assert isinstance(data, dict) and data.get("jobs"), "a workflow needs a jobs mapping"
+# PyYAML 1.1 resolves the bare key `on:` to the boolean True, so the trigger
+# key is truthy under EITHER spelling.  Accept both, and require one of them to
+# be present -- a workflow with no trigger never runs.
+assert (True in data) or ("on" in data), "a workflow needs an on/trigger key"
+' "$workflow_file"; then
+            printf 'workflow YAML FAILED (GitHub skips an unparseable workflow, so this failure would otherwise be invisible): %s\n' \
+                "${workflow_file#"$root"/}" >&2
+            failures=$((failures + 1))
+        fi
+    done < <(find "$root/.github/workflows" -type f -name '*.yml' | sort)
+    if [ "$workflow_count" -eq 0 ]; then
+        printf '%s\n' 'no workflow files were enumerated; refusing to report a pass' >&2
+        failures=$((failures + 1))
+    fi
+    workflow_summary=$workflow_count
+fi
+
 # --- .service: structural ----------------------------------------------------
 # systemd-analyze verify needs systemd, which macOS does not have, so this
 # asserts the shape the unit must have rather than asking systemd.  An
@@ -1552,6 +1636,52 @@ EOF
     failures=$((failures + 1))
 fi
 
+# --- repo scripts: no raw write into a symlink "farm" -------------------------
+# `cat > "$dir/tool"` FOLLOWS a symlink.  A stub-PATH fixture builds $dir by
+# symlinking the host's REAL binaries into it
+#   for entry in <dir>/*; do ln -s "$entry" "$D/$name"; done
+# so a raw write over one of those entries truncates the binary the link points
+# at.  This repo has paid for that twice: a Linux CI host hit it on
+# /usr/bin/loginctl while building smoke/11's stub_linux (the exclusion comment
+# there records the incident: the heredoc "would then write THROUGH it to
+# /usr/bin/loginctl"), and on 2026-10-25 the same shape -- built by a
+# session-level fixture rather than by a check -- TRUNCATED A DEVELOPER'S
+# HOMEBREW python3.  For ~40 minutes every python3 on that machine exited 0,
+# printed nothing and did nothing, which read as a working interpreter.
+#
+# Every defence before this was a hand-written pairing: an exclusion case in the
+# copy loop plus a literal `cat >` somewhere below it.  Get the pairing wrong and
+# the gun fires.  smoke/11 now routes every stub through `write_stub` (unlink
+# first, so the stub lands as a regular file), and this rule keeps a FUTURE raw
+# write from being introduced next to such a loop.
+#
+# The classifier is its own file (smoke/01-farm-write.py) so the self-test can
+# run the SAME code against fixtures -- a self-test that reimplements the rules
+# proves nothing about the rules that ship.  It is invoked as `python3 <file>`,
+# never as `./file`, so the checked-in mode stays 644 like every other asset.
+farm_write_count=0
+farm_write_hits=$(
+    python3 -I "$root/smoke/01-farm-write.py" "$root" 2>/dev/null || true
+)
+if [ -n "$farm_write_hits" ]; then
+    while IFS= read -r farm_hit; do
+        [ -n "$farm_hit" ] || continue
+        printf 'repo script FAILED (a raw redirect into a directory this file fills with symlinks writes THROUGH the link and truncates the real binary it points at; route it through write_stub, which unlinks first): %s\n' \
+            "$farm_hit" >&2
+        farm_write_count=$((farm_write_count + 1))
+    done <<EOF
+$farm_write_hits
+EOF
+    failures=$((failures + 1))
+fi
+# Both directions: a detector that cannot fire reports a clean tree forever.
+# The fixtures live in the .py file, so this exercises the shipped classifier.
+if ! farm_selftest_out=$(python3 -I "$root/smoke/01-farm-write.py" --self-test 2>&1); then
+    printf '%s\n' 'farm-write detector FAILED its self-check -- the detector itself is broken' >&2
+    printf '%s\n' "$farm_selftest_out" >&2
+    failures=$((failures + 1))
+fi
+
 # --- shell assets: unlocalized writes into a caller's local ------------------
 # bash resolves an unqualified assignment through the DYNAMIC scope: a write to
 # a name the callee did not declare `local` lands in whichever frame up the
@@ -1963,7 +2093,7 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s entrypoints=%s workflows=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_count" "$repo_entry_count" "$workflow_summary")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 printf '%s\n' "$summary"
