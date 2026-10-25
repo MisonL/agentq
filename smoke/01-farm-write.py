@@ -36,6 +36,12 @@ ordinary `> "$work/out"` in smoke/05 and smoke/18:
 A function whose body links "$p/$X" with p bound from $1 (smoke/11's
 build_stub_path) propagates: each "$VAR" argument at its call sites is a farm.
 
+Two more propagations, both added after a real mutation slipped through
+(measured 2026-10-25): a `for X in ...` whose words include a farm makes X a
+farm (smoke/11 writes through `for stub in "$stub_bare" ...`), and `X=$farm`
+does the same.  A glob over a farm -- `"$A"/*` -- is NOT one: it has a literal
+component and expands to real files, so a redirect into it follows nothing new.
+
 Usage:
     01-farm-write.py <root>        scan the repo's shell scripts, print hits
     01-farm-write.py --self-test   run the fixtures below through analyse()
