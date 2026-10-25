@@ -1741,15 +1741,66 @@ fi
 # a rule that fires on prose would be turned off within a week.  Narrow means it
 # can miss an exotic invocation; that is the accepted edge, and the census
 # floor below makes a broken enumeration visible.
+# A probe that RUNS but whose result nobody reads is not a probe.  Measured
+# 2026-10-25: `python3 -c 'import sys' >/dev/null 2>&1 || true` and
+# `... || probe_failed=1` with `probe_failed` never read both passed the first
+# version of this rule, which only asked whether the probe SPELLING appeared.
+# The rule now requires the probe line to consume its own result in one of the
+# three shapes this repo uses: `if/elif/while python3 ...`, `|| exit ...`, or
+# `|| VAR=` with VAR read somewhere later in the same file.  Anything else --
+# including `|| true` and `|| :` -- is a discarded probe.
 python3_census() { # <file> -> 0 usage+probe, 1 usage without probe, 2 no usage
-    local f=$1 usage probe
+    local f=$1 usage probe_lines line var n_ok=0 n_bad=0
     usage=$(grep -nE '(^|[^[:alnum:]_-])python3[[:space:]]+-' "$f" 2>/dev/null |
         grep -vE '^[0-9]+:[[:space:]]*#' || true)
     [ -n "$usage" ] || { printf '2'; return 0; }
     # Both probe spellings in use here: `python3 -c 'import sys'` and
     # `python3 -I -c 'pass'`.
-    probe=$(grep -cE "python3[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-c[[:space:]]+['\"](import sys|pass)" "$f" 2>/dev/null || true)
-    if [ "${probe:-0}" -gt 0 ]; then printf '0'; else printf '1'; fi
+    # The closing quote is part of the pattern: `-c 'import sys, yaml'` is a
+    # YAML probe, not a usability probe.  Measured 2026-10-25 -- the unanchored
+    # version reported smoke/01 itself as a violation because four YAML probes
+    # start with "import sys,".
+    # Two exclusions, both measured 2026-10-25:
+    #  * a leading `printf`/`echo` means the probe is FIXTURE TEXT being written
+    #    by a self-test, not a probe that runs -- this rule's own fixtures live
+    #    in this file, so without this the file reports itself as a violation;
+    #  * the closing quote is part of the pattern: `-c 'import sys, yaml'` is a
+    #    YAML probe, not a usability probe.
+    probe_lines=$(grep -E "python3[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-c[[:space:]]+('import sys'|\"import sys\"|'pass'|\"pass\")" "$f" 2>/dev/null |
+        grep -vE '^[[:space:]]*#' |
+        grep -vE '^[[:space:]]*(printf|echo)[[:space:]]' || true)
+    [ -n "$probe_lines" ] || { printf '1'; return 0; }
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case $line in
+        *'|| true'* | *'|| :'*)
+            n_bad=$((n_bad + 1))
+            continue
+            ;;
+        esac
+        case $line in
+        *'|| exit'*)
+            n_ok=$((n_ok + 1))
+            continue
+            ;;
+        esac
+        case $line in
+        *if\ python3* | *if\ !\ python3* | *elif\ python3* | *elif\ !\ python3* | *while\ python3*)
+            n_ok=$((n_ok + 1))
+            continue
+            ;;
+        esac
+        var=$(printf '%s\n' "$line" |
+            sed -nE 's/.*\|\|[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=.*/\1/p')
+        if [ -n "$var" ] && grep -qE "\\\$\{?${var}([^A-Za-z0-9_]|$)" "$f"; then
+            n_ok=$((n_ok + 1))
+        else
+            n_bad=$((n_bad + 1))
+        fi
+    done <<EOF
+$probe_lines
+EOF
+    if [ "$n_ok" -gt 0 ] && [ "$n_bad" -eq 0 ]; then printf '0'; else printf '1'; fi
 }
 # Fixtures first, built here rather than borrowed from the tree: a self-test
 # that runs against whatever the repo happens to contain cannot tell a working
@@ -1761,8 +1812,20 @@ printf '%s\n' '#!/bin/sh' "python3 -c 'import sys' >/dev/null 2>&1 || exit 1" \
 printf '%s\n' '#!/bin/sh' 'grep foo "$1"' >"$pc_dir/none"
 printf '%s\n' '#!/bin/sh' '# the python3 on PATH may be a store alias' \
     '# python3 -c is what a probe looks like' 'true' >"$pc_dir/prose"
+# A probe whose result is thrown away, and one whose variable is never read,
+# are both NOT probes -- measured to pass the first version of this rule.
+printf '%s\n' '#!/bin/sh' "python3 -c 'import sys' >/dev/null 2>&1 || true" \
+    'python3 - "$1" <<PY' 'print(1)' 'PY' >"$pc_dir/discarded-probe"
+printf '%s\n' '#!/bin/sh' "python3 -c 'import sys' >/dev/null 2>&1 || probe_broken=1" \
+    'python3 - "$1" <<PY' 'print(1)' 'PY' >"$pc_dir/unread-probe"
+printf '%s\n' '#!/bin/sh' "python3 -c 'import sys' >/dev/null 2>&1 || probe_broken=1" \
+    '[ "$probe_broken" = 1 ] && exit 1' \
+    'python3 - "$1" <<PY' 'print(1)' 'PY' >"$pc_dir/read-probe"
+printf '%s\n' '#!/bin/sh' \
+    "if ! python3 -c 'import sys' >/dev/null 2>&1; then exit 1; fi" \
+    'python3 - "$1" <<PY' 'print(1)' 'PY' >"$pc_dir/if-probe"
 python3_census_failures=0
-for spec in bare:1 probed:0 none:2 prose:2; do
+for spec in bare:1 probed:0 none:2 prose:2 discarded-probe:1 unread-probe:1 read-probe:0 if-probe:0; do
     pc_file=${spec%%:*}
     pc_want=${spec#*:}
     pc_got=$(python3_census "$pc_dir/$pc_file")
