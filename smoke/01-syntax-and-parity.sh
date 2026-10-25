@@ -1127,6 +1127,81 @@ assert (True in data) or ("on" in data), "a workflow needs an on/trigger key"
     workflow_summary=$workflow_count
 fi
 
+# --- ci.yml's pinned check list vs smoke/*.sh --------------------------------
+# ci.yml pins the exact set of check names that must report (`expected_checks`),
+# so a new or renamed check turns CI red.  Locally nothing noticed: a new
+# smoke/30-*.sh ran in the suite, bumped `ran` to 30, and smoke/01 stayed green
+# -- the developer sees a full pass and CI is the first thing to object, which
+# inverts the point of running locally.  Measured 2026-10-25 with a planted
+# smoke/30-probe-new-check.sh: smoke/01 exit 0, zero mentions of it.
+#
+# This compares the two lists directly rather than waiting for CI.  It does NOT
+# try to check the workflow's other pins (tokens, NOT-covered allowlist) --
+# those are behavioural and CI is where they get exercised; this one is a plain
+# set comparison and can be done locally for free.
+ci_pin_rc=0
+ci_pin_summary='skipped(no pyyaml)'
+if python3 -c 'import yaml' >/dev/null 2>&1; then
+    ci_pin_out=$(python3 - "$root" <<'PY'
+import glob
+import os
+import re
+import sys
+
+root = sys.argv[1]
+path = os.path.join(root, ".github", "workflows", "ci.yml")
+try:
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+except OSError as exc:
+    print("ci.yml is unreadable: %s" % exc, file=sys.stderr)
+    sys.exit(2)
+m = re.search(r"expected_checks='([^']*)'", text)
+if not m:
+    # A missing pin must not read as "nothing to compare": the pin is the CI
+    # gate, and silently dropping it would be the same false green.
+    print("ci.yml has no expected_checks='...' pin", file=sys.stderr)
+    sys.exit(2)
+pinned = sorted(m.group(1).split())
+present = sorted(
+    os.path.basename(p)[:-3] for p in glob.glob(os.path.join(root, "smoke", "*.sh"))
+)
+if not pinned or not present:
+    print(
+        "empty check list (pinned=%d present=%d); refusing to compare"
+        % (len(pinned), len(present)),
+        file=sys.stderr,
+    )
+    sys.exit(2)
+missing = [c for c in present if c not in pinned]
+stale = [c for c in pinned if c not in present]
+if missing or stale:
+    for c in missing:
+        print("smoke/%s.sh exists but ci.yml's expected_checks does not list it"
+              " (CI would fail on the next push; add it to the pin)" % c,
+              file=sys.stderr)
+    for c in stale:
+        print("ci.yml's expected_checks lists %s but smoke/%s.sh does not exist"
+              " (the pin is stale)" % (c, c), file=sys.stderr)
+    sys.exit(1)
+print("%d" % len(pinned))
+PY
+    ) || ci_pin_rc=$?
+    case $ci_pin_rc in
+    0) ci_pin_summary=$ci_pin_out ;;
+    *)
+        printf 'ci check-list pin FAILED (the pinned set and smoke/*.sh disagree; a local run must not be greener than CI):\n' >&2
+        sed 's/^/      /' >&2 <<EOF
+$ci_pin_out
+EOF
+        failures=$((failures + 1))
+        ci_pin_summary='failed'
+        ;;
+    esac
+else
+    ci_pin_summary='skipped(no pyyaml)'
+fi
+
 # --- .service: structural ----------------------------------------------------
 # systemd-analyze verify needs systemd, which macOS does not have, so this
 # asserts the shape the unit must have rather than asking systemd.  An
@@ -2270,7 +2345,7 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 printf '%s\n' "$summary"
