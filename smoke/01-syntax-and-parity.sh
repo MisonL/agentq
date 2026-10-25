@@ -1195,7 +1195,11 @@ PY
 $ci_pin_out
 EOF
         failures=$((failures + 1))
-        ci_pin_summary='failed'
+        # Deliberately NOT setting a token here: smoke/01 exits 1 before the
+        # summary line is printed, so `ci_pin_summary='failed'` would be dead
+        # code -- the same mistake `farm_write_summary='failed(scan)'` made in
+        # the round that introduced farm_writes.  The failure is already
+        # reported above, on stderr, which is where a failing run's detail goes.
         ;;
     esac
 else
@@ -2348,4 +2352,37 @@ fi
 summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s' \
     "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
+
+# Every token this check promises must actually appear in the line.  Why this
+# exists: a summary variable that is only ever assigned on a FAILING branch is
+# dead code (the failure path exits before the line prints), and so is one whose
+# printf argument was dropped during an edit.  Both were written and removed
+# twice in the rounds that added farm_writes and ci_pin.  This lock is about the
+# printed line, not the assignments: it catches a dropped printf argument and a
+# token that never gets a value, without trying to parse control flow.
+#
+# `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files uncalled unclassified farm_writes python3_users entrypoints workflows ci_pin'
+missing_tokens=''
+for tok in $summary_tokens; do
+    # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned
+    # only on the failing branch still printed as `ci_pin=` (empty) and the
+    # key-presence test passed it -- the dead assignment became a blank column
+    # that reads like a value nobody filled in.  The value must be non-empty up
+    # to the next space.
+    case " $summary " in
+    *" $tok=" | *" $tok= "*) missing_tokens="$missing_tokens $tok" ;;
+    *) ;;
+    esac
+done
+if [ -n "$missing_tokens" ]; then
+    printf 'syntax-and-parity FAILED (the summary line lost these tokens:%s -- a token that never prints cannot be read, and a token that only a failing branch assigns is dead code)\n' \
+        "$missing_tokens" >&2
+    failures=$((failures + 1))
+fi
+if [ "$failures" -ne 0 ]; then
+    printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
+    exit 1
+fi
+
 printf '%s\n' "$summary"
