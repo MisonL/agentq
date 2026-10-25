@@ -1660,25 +1660,127 @@ fi
 # proves nothing about the rules that ship.  It is invoked as `python3 <file>`,
 # never as `./file`, so the checked-in mode stays 644 like every other asset.
 farm_write_count=0
-farm_write_hits=$(
-    python3 -I "$root/smoke/01-farm-write.py" "$root" 2>/dev/null || true
-)
-if [ -n "$farm_write_hits" ]; then
-    while IFS= read -r farm_hit; do
-        [ -n "$farm_hit" ] || continue
-        printf 'repo script FAILED (a raw redirect into a directory this file fills with symlinks writes THROUGH the link and truncates the real binary it points at; route it through write_stub, which unlinks first): %s\n' \
-            "$farm_hit" >&2
-        farm_write_count=$((farm_write_count + 1))
-    done <<EOF
+farm_write_summary=0
+# An interpreter that cannot RUN is an environment fault and must be named as
+# one, not reported as a broken classifier (the pwsh-unusable lesson: four
+# startup-cache corruptions once reported 7 correct .ps1 assets as failures).
+# `command -v python3` is not a probe -- on a zh-CN Windows the Store alias
+# exists, exits 49 and prints nothing.
+python3_state=unusable
+if python3 -I -c 'pass' >/dev/null 2>&1; then
+    python3_state=usable
+fi
+if [ "$python3_state" = usable ]; then
+    # The exit code is LOAD-BEARING: the classifier exits 2 when it enumerated
+    # nothing, and `|| true` here would turn that into farm_writes=0 (measured
+    # 2026-10-25: an empty directory, a nonexistent path and `/` all exited 0
+    # before the guard existed).
+    farm_write_rc=0
+    farm_write_err=$(mktemp "${TMPDIR:-/tmp}/agentq-farm-scan.XXXXXX")
+    farm_write_hits=$(
+        python3 -I "$root/smoke/01-farm-write.py" "$root" 2>"$farm_write_err"
+    ) || farm_write_rc=$?
+    case $farm_write_rc in
+    0 | 1) ;;
+    *)
+        printf 'farm-write scan FAILED (exit %s; a scan that could not run must not read as farm_writes=0):\n' \
+            "$farm_write_rc" >&2
+        sed 's/^/      /' "$farm_write_err" >&2
+        failures=$((failures + 1))
+        ;;
+    esac
+    rm -f -- "$farm_write_err"
+    if [ -n "$farm_write_hits" ]; then
+        while IFS= read -r farm_hit; do
+            [ -n "$farm_hit" ] || continue
+            printf 'repo script FAILED (a raw redirect into a directory this file fills with symlinks writes THROUGH the link and truncates the real binary it points at; route it through write_stub, which unlinks first): %s\n' \
+                "$farm_hit" >&2
+            farm_write_count=$((farm_write_count + 1))
+        done <<EOF
 $farm_write_hits
 EOF
+        failures=$((failures + 1))
+    fi
+    farm_write_summary=$farm_write_count
+    # Both directions: a detector that cannot fire reports a clean tree forever.
+    # The fixtures live in the .py file, so this exercises the shipped classifier.
+    if ! farm_selftest_out=$(python3 -I "$root/smoke/01-farm-write.py" --self-test 2>&1); then
+        printf '%s\n' 'farm-write detector FAILED its self-check -- the detector itself is broken' >&2
+        printf '%s\n' "$farm_selftest_out" >&2
+        failures=$((failures + 1))
+    fi
+else
+    farm_write_summary='skipped(no-python3)'
+fi
+
+# --- checks that depend on python3 must probe that it RUNS -------------------
+# `command -v python3` is not a probe: on a zh-CN Windows 10 `python3` is the
+# Microsoft Store alias, which EXISTS, exits 49 and runs nothing.  The failure
+# this rule locks was measured 2026-10-25: with a stub python3 that exits 49,
+# smoke/26 exited 49 with ZERO output, and run-tests.sh can only report that as
+# a bare FAIL -- an environment fault presented as a contract failure, which is
+# the same misdirection as the pwsh startup-cache rounds.  smoke/26's header
+# even claimed "this needs only bash, jq and cp".  Every other python3 user
+# (01, 08, 10, 11, 12, 14, 20, 22, 29) already probes; the census below is what
+# keeps a NEW dependent from joining without one.
+#
+# The usage test is deliberately narrow (`python3 -`) rather than "the word
+# python3 appears": the prose in these headers discusses python3 constantly, and
+# a rule that fires on prose would be turned off within a week.  Narrow means it
+# can miss an exotic invocation; that is the accepted edge, and the census
+# floor below makes a broken enumeration visible.
+python3_census() { # <file> -> 0 usage+probe, 1 usage without probe, 2 no usage
+    local f=$1 usage probe
+    usage=$(grep -nE '(^|[^[:alnum:]_-])python3[[:space:]]+-' "$f" 2>/dev/null |
+        grep -vE '^[0-9]+:[[:space:]]*#' || true)
+    [ -n "$usage" ] || { printf '2'; return 0; }
+    # Both probe spellings in use here: `python3 -c 'import sys'` and
+    # `python3 -I -c 'pass'`.
+    probe=$(grep -cE "python3[[:space:]]+(-[A-Za-z]+[[:space:]]+)*-c[[:space:]]+['\"](import sys|pass)" "$f" 2>/dev/null || true)
+    if [ "${probe:-0}" -gt 0 ]; then printf '0'; else printf '1'; fi
+}
+# Fixtures first, built here rather than borrowed from the tree: a self-test
+# that runs against whatever the repo happens to contain cannot tell a working
+# rule from a lucky one.
+pc_dir=$(mktemp -d "${TMPDIR:-/tmp}/agentq-python3-census.XXXXXX")
+printf '%s\n' '#!/bin/sh' 'python3 - "$1" <<PY' 'print(1)' 'PY' >"$pc_dir/bare"
+printf '%s\n' '#!/bin/sh' "python3 -c 'import sys' >/dev/null 2>&1 || exit 1" \
+    'python3 - "$1" <<PY' 'print(1)' 'PY' >"$pc_dir/probed"
+printf '%s\n' '#!/bin/sh' 'grep foo "$1"' >"$pc_dir/none"
+printf '%s\n' '#!/bin/sh' '# the python3 on PATH may be a store alias' \
+    '# python3 -c is what a probe looks like' 'true' >"$pc_dir/prose"
+python3_census_failures=0
+for spec in bare:1 probed:0 none:2 prose:2; do
+    pc_file=${spec%%:*}
+    pc_want=${spec#*:}
+    pc_got=$(python3_census "$pc_dir/$pc_file")
+    if [ "$pc_got" != "$pc_want" ]; then
+        printf 'python3-census self-test: %s expected %s, got %s\n' \
+            "$pc_file" "$pc_want" "$pc_got" >&2
+        python3_census_failures=$((python3_census_failures + 1))
+    fi
+done
+rm -rf -- "$pc_dir"
+if [ "$python3_census_failures" -ne 0 ]; then
     failures=$((failures + 1))
 fi
-# Both directions: a detector that cannot fire reports a clean tree forever.
-# The fixtures live in the .py file, so this exercises the shipped classifier.
-if ! farm_selftest_out=$(python3 -I "$root/smoke/01-farm-write.py" --self-test 2>&1); then
-    printf '%s\n' 'farm-write detector FAILED its self-check -- the detector itself is broken' >&2
-    printf '%s\n' "$farm_selftest_out" >&2
+python3_users=0
+for pc_script in "$root"/smoke/*.sh "$root/run-tests.sh" "$root/sandbox.sh"; do
+    [ -f "$pc_script" ] || continue
+    pc_verdict=$(python3_census "$pc_script")
+    [ "$pc_verdict" = 2 ] && continue
+    python3_users=$((python3_users + 1))
+    if [ "$pc_verdict" = 1 ]; then
+        printf 'check FAILED (this script runs python3 but never probes that it can execute; with a Microsoft Store alias on PATH it dies with exit 49 and zero output, which reads as a contract failure instead of an environment fault -- add the `python3 -c import sys` probe the other checks use): %s\n' \
+            "${pc_script#"$root"/}" >&2
+        failures=$((failures + 1))
+    fi
+done
+# The floor is what makes a broken enumeration visible: a regex that stopped
+# matching would otherwise report `python3_users=0` and look perfect.
+if [ "$python3_users" -lt 5 ]; then
+    printf 'python3-census FAILED (only %s dependent scripts were enumerated; the census is broken, not the tree)\n' \
+        "$python3_users" >&2
     failures=$((failures + 1))
 fi
 
@@ -2093,7 +2195,7 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s entrypoints=%s workflows=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_count" "$repo_entry_count" "$workflow_summary")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 printf '%s\n' "$summary"

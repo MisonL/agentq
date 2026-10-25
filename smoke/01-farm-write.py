@@ -40,12 +40,15 @@ Usage:
     01-farm-write.py <root>        scan the repo's shell scripts, print hits
     01-farm-write.py --self-test   run the fixtures below through analyse()
 
-Exit: 0 clean, 1 hits found, 2 self-test disagreement.  smoke/01 invokes this
-file as its own source of truth, so the self-test exercises what actually ships.
+Exit: 0 clean, 1 hits found, 2 self-test disagreement OR nothing enumerated
+(a scan that looked at no files must not share the clean verdict).  smoke/01
+invokes this file as its own source of truth, so the self-test exercises what
+actually ships.
 """
 import os
 import re
 import sys
+import tempfile
 
 # one line:  ln -s <src> "$D/$X"   with BOTH destination components variables
 LINK = re.compile(r'\bln\s+-s\w*\s+[^|;&]*?"(\$[A-Za-z_]\w*)/(\$[A-Za-z_]\w*)"')
@@ -105,16 +108,66 @@ def analyse(text):
 
 
 def walk(root):
+    """Yield (path, group).  The group counts are a guard, not bookkeeping: a
+    scan that enumerates nothing must not read as a clean tree (the same shape
+    smoke/16 guards with its `tree_scanned -eq 0` arm, and smoke/01 with its
+    empty-`shell_assets` refusal).  Measured 2026-10-25: pointing this script
+    at an empty directory, at a nonexistent path, or at `/` all exited 0 with
+    no output -- "clean" for a scan that looked at nothing."""
     for name in ("run-tests.sh", "sandbox.sh"):
         p = os.path.join(root, name)
         if os.path.isfile(p):
-            yield p
-    for base in (os.path.join(root, "smoke"), os.path.join(root, "skill", "assets")):
+            yield p, "entry"
+    for group, base in (
+        ("smoke", os.path.join(root, "smoke")),
+        ("assets", os.path.join(root, "skill", "assets")),
+    ):
         for dirpath, _, files in os.walk(base):
             for f in sorted(files):
                 p = os.path.join(dirpath, f)
                 if f.endswith((".sh", ".bash")) or f in ("agentq", "agentq-server", "sshp"):
-                    yield p
+                    yield p, group
+
+
+GROUPS = ("entry", "smoke", "assets")
+
+
+def scan(root, quiet=False):
+    """Return (rc, [(relpath, lineno, text), ...]).
+
+    rc 0 = clean, 1 = hits, 2 = nothing to scan.  Exit 2 is deliberately not
+    folded into 0: a broken enumeration and a clean tree must not share a
+    verdict, and the caller (smoke/01) must be able to tell a classifier
+    failure from a clean run.
+    """
+    hits = []
+    seen = {}
+    for path, group in walk(root):
+        if path in seen:
+            continue
+        seen[path] = group
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        _, file_hits = analyse(text)
+        for n, l in file_hits:
+            hits.append((os.path.relpath(path, root), n, l))
+    counts = {g: 0 for g in GROUPS}
+    for group in seen.values():
+        counts[group] += 1
+    empty = [g for g in GROUPS if counts[g] == 0]
+    if empty:
+        if not quiet:
+            print(
+                "01-farm-write.py: enumerated no files for %s under %s -- a scan "
+                "that looked at nothing must not report a clean tree"
+                % (", ".join(empty), root),
+                file=sys.stderr,
+            )
+        return 2, hits
+    return (1 if hits else 0), hits
 
 
 CASES = [
@@ -148,6 +201,28 @@ def self_test():
                 % (name, "fire" if must_fire else "silent",
                    "fire" if fired else "silent", sorted(farm), hits[:1])
             )
+    # The enumeration guard is exercised through the SHIPPED scan(), on trees
+    # built here: an empty directory and a tree holding only the two entry
+    # points must both refuse to report clean.  Measured before the guard:
+    # all three exited 0 with no output.
+    tree_checks = 0
+    with tempfile.TemporaryDirectory() as t:
+        rc, _ = scan(t, quiet=True)
+        tree_checks += 1
+        if rc != 2:
+            failed.append("empty tree: expected rc 2 (nothing enumerated), got %d" % rc)
+        for name in ("run-tests.sh", "sandbox.sh"):
+            with open(os.path.join(t, name), "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\n")
+        rc, _ = scan(t, quiet=True)
+        tree_checks += 1
+        if rc != 2:
+            failed.append(
+                "entry-points-only tree: expected rc 2 (no smoke/ or assets/ "
+                "files), got %d" % rc
+            )
+    if tree_checks < 2:
+        failed.append("the tree-enumeration fixtures lost a case")
     if failed:
         for f in failed:
             print("farm-write self-test: " + f, file=sys.stderr)
@@ -162,18 +237,10 @@ def main(argv):
         print("usage: 01-farm-write.py <root> | --self-test", file=sys.stderr)
         return 2
     root = argv[1]
-    bad = 0
-    for path in sorted(set(walk(root))):
-        try:
-            with open(path, encoding="utf-8") as fh:
-                text = fh.read()
-        except (OSError, UnicodeDecodeError):
-            continue
-        _, hits = analyse(text)
-        for n, l in hits:
-            print("%s:%d: %s" % (os.path.relpath(path, root), n, l))
-            bad += 1
-    return 1 if bad else 0
+    rc, hits = scan(root)
+    for rel, n, l in hits:
+        print("%s:%d: %s" % (rel, n, l))
+    return rc
 
 
 if __name__ == "__main__":
