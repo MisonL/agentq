@@ -195,7 +195,10 @@ jobs:
           # tool_full=6/6: no probe tool (pwsh, xmllint, zsh, pyyaml, cmp,
           # find) was missing.  A `skipped(` marker means part of 01 did not
           # run and the job must not read as green.
-          grep -qE 'ps1=7 ps1_static=ok .*tool_full=6/6' smoke.log
+          # kinds=checked: the per-kind census compared every parse arm's
+          # count against the tree (measured 2026-10-26: a one-letter glob
+          # typo in any of the five arms left that kind at 0 with exit 0).
+          grep -qE 'ps1=7 ps1_static=ok .*tool_full=6/6 .*kinds=checked' smoke.log
           if grep -q 'skipped(' smoke.log; then
             echo 'part of the quick suite did not run' >&2
             exit 1
