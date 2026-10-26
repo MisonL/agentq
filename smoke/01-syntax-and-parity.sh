@@ -45,6 +45,18 @@
 #   uncalled      -> no function with a definition and no call site
 #   asset kinds   -> every file in skill/assets belongs to a kind some rule
 #                    above parses (extension, or a shebang naming a shell)
+#   config files  -> every path-qualified pattern in .gitattributes and
+#                    .editorconfig still names a real file, and .editorconfig
+#                    still has the section that stops editors rewriting the
+#                    byte-verified assets
+#   gitattributes -> the attribute VALUES resolve as required, asked of git:
+#                    all tracked deployment files keep `text: unset`, and the
+#                    two canonical copies keep `merge: unset` (only `-merge`
+#                    stops a silent three-way merge; `-diff` does not)
+#   gitignore     -> the credential blocklist still blocks: 41 credential
+#                    paths ignored BY THIS REPOSITORY's .gitignore, 5 that must
+#                    stay visible, the three protection files tracked, and no
+#                    tracked file swept up by an over-broad pattern
 #
 # The shell-asset list is computed ONCE (shell_assets below) and used by every
 # rule that scans them -- including the parse arm, whose `shell=` count is
@@ -1627,6 +1639,213 @@ EOF
     fi
 fi
 
+# --- .gitignore: the credential blocklist must actually block ----------------
+# CLAUDE.md states the credential rule and names .gitignore as its mechanism
+# ("凭据不进仓库、不进脚本、不留盘 ... 现在是可执行的").  Nothing read the file:
+# measured 2026-10-26, deleting .gitignore entirely leaves smoke/01 and smoke/16
+# at exit 0, and so does narrowing `agentq-askpass.*` to `agentq-askpass.tmp` --
+# the POSIX client's real askpass wrapper is `agentq-askpass.<random>`
+# (client/unix/agentq:607 via make_client_temporary_file), so that edit reopens
+# the exact leak the pattern exists to close.
+#
+# The oracle is `git check-ignore`, which answers for paths that do not exist
+# (measured: `--no-index` on a nonexistent path reports its rule), so no
+# fixture file is ever written.  Two guards keep the answer about THIS
+# repository: `-c core.excludesFile=/dev/null` drops the developer's global
+# ignore file, and the match must name `.gitignore` as its source (`-v` prints
+# it; measured: `.git/info/exclude` and a global file both name themselves
+# instead), so a machine-local rule cannot make a deleted pattern look alive.
+#
+# Bidirectional: the must-ignore table covers every credential pattern line;
+# the must-stay-visible table pins the name-anchoring the file's own comment
+# calls deliberate (`notes-about-askpass.md` must stay visible) and the root
+# anchors (`/out`, `/err` must not match in subdirectories).  Every tracked
+# file must also stay visible -- a broad `*` or `skill/` line would silently
+# untrack the deployment unit, which is how a fresh clone loses its assets.
+# And the three protection files themselves must be TRACKED: untracking one
+# leaves the working-tree copy (and every assertion above) intact while a
+# fresh clone gets no protection at all -- measured: untracking .gitignore,
+# .gitattributes or .editorconfig each leaves smoke/01 at exit 0.
+gitignore_source() { # $1=repo root, $2=path -> .gitignore | <other source> | none | error
+    local out rc=0
+    out=$(git -C "$1" -c core.excludesFile=/dev/null check-ignore -v --no-index -- "$2" 2>/dev/null) || rc=$?
+    case $rc in
+        0) printf '%s\n' "${out%%:*}" ;;
+        1) printf 'none\n' ;;
+        *) printf 'error\n' ;;
+    esac
+}
+gitignore_state='skipped(no-git)'
+if command -v git >/dev/null 2>&1 && git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+    gitignore_state='checked'
+    # Self-test first: the classifier must answer all four ways on a scratch
+    # repo whose rules are known, or the tables below prove nothing.  The
+    # info/exclude line is what proves the `.gitignore` source requirement
+    # discriminates; the fourth probe is a root that is not a repository, which
+    # must come back as `error` rather than as either answer.  This runs only
+    # inside the git-available branch: on a host without git the classifier
+    # cannot answer anything, and reporting that as a broken asset would be the
+    # pwsh-unusable mistake in git's clothing.
+    gitignore_selftest_dir=$(mktemp -d "${TMPDIR:-/tmp}/agentq-gitignore-selftest.XXXXXX")
+    git -C "$gitignore_selftest_dir" init -q 2>/dev/null || true
+    printf '*.secret\n' >"$gitignore_selftest_dir/.gitignore"
+    printf '*.excluded\n' >"$gitignore_selftest_dir/.git/info/exclude"
+    gitignore_selftest=''
+    for probe in a.secret b.txt c.excluded; do
+        gitignore_selftest="$gitignore_selftest $(gitignore_source "$gitignore_selftest_dir" "$probe")"
+    done
+    gitignore_selftest="$gitignore_selftest $(gitignore_source "$gitignore_selftest_dir/does-not-exist" x.secret)"
+    rm -rf -- "$gitignore_selftest_dir"
+    if [ "$gitignore_selftest" != ' .gitignore none .git/info/exclude error' ]; then
+        printf 'gitignore self-test FAILED (expected ".gitignore none .git/info/exclude error", got "%s")\n' \
+            "$gitignore_selftest" >&2
+        failures=$((failures + 1))
+    fi
+    for gitignore_file in .gitignore .gitattributes .editorconfig; do
+        if ! git -C "$root" ls-files --error-unmatch "$gitignore_file" >/dev/null 2>&1; then
+            printf 'gitignore FAILED (%s is not tracked, so a fresh clone has no protection at all while this working tree still looks protected): %s\n' \
+                "$gitignore_file" "$gitignore_file" >&2
+            failures=$((failures + 1))
+        fi
+    done
+    # Each fixture stands for one credential pattern line in .gitignore.
+    gitignore_must_ignore='.askpass
+.askpass.a1
+askpass
+askpass.log
+agentq-askpass.9fXq2
+.aq-bootstrap/x
+.env
+.env.staging
+tokens.env
+server.pem
+daemon.key
+client.ppk
+id_rsa
+id_ed25519
+id_ecdsa
+id_dsa
+ssh_host_ed25519_key
+.git-credentials
+.netrc
+authorized_keys
+known_hosts
+shared_secret
+daemon.cert
+daemon.crt
+bundle.p12
+bundle.pfx
+certs/daemon.key
+home/.agentq/data/records.json
+config/agentq/hosts.json
+out
+err
+run.smoke-out
+x.syntax.y
+.DS_Store
+docs/.DS_Store
+notes.swp
+notes.swo
+backup.txt~
+smoke/__pycache__/x.pyc
+stray.pyc
+aqsb/home/.agentq'
+    gitignore_must_stay='notes-about-askpass.md
+sub/out
+sub/err
+README.md
+skill/SKILL.md'
+    gitignore_fixtures=0
+    while IFS= read -r gitignore_path; do
+        [ -n "$gitignore_path" ] || continue
+        gitignore_fixtures=$((gitignore_fixtures + 1))
+        case $(gitignore_source "$root" "$gitignore_path") in
+            .gitignore) ;;
+            none)
+                printf 'gitignore FAILED (this credential path is no longer ignored by .gitignore, so it would be committed): %s\n' \
+                    "$gitignore_path" >&2
+                failures=$((failures + 1))
+                ;;
+            error)
+                printf 'gitignore: the check-ignore query itself failed for %s; refusing to read that as either answer\n' \
+                    "$gitignore_path" >&2
+                failures=$((failures + 1))
+                ;;
+            *)
+                printf 'gitignore FAILED (this credential path is only ignored by a machine-local rule, not by the repository .gitignore, so a fresh clone would commit it): %s\n' \
+                    "$gitignore_path" >&2
+                failures=$((failures + 1))
+                ;;
+        esac
+    done <<EOF
+$gitignore_must_ignore
+EOF
+    while IFS= read -r gitignore_path; do
+        [ -n "$gitignore_path" ] || continue
+        gitignore_fixtures=$((gitignore_fixtures + 1))
+        case $(gitignore_source "$root" "$gitignore_path") in
+            none) ;;
+            error)
+                printf 'gitignore: the check-ignore query itself failed for %s; refusing to read that as either answer\n' \
+                    "$gitignore_path" >&2
+                failures=$((failures + 1))
+                ;;
+            *)
+                printf 'gitignore FAILED (a file that must stay committable is ignored -- the pattern is broader than the credential class it was written for): %s\n' \
+                    "$gitignore_path" >&2
+                failures=$((failures + 1))
+                ;;
+        esac
+    done <<EOF
+$gitignore_must_stay
+EOF
+    # A floor, not the exact count: deleting half the table must not silently
+    # narrow the coverage while every surviving fixture still passes.
+    if [ "$gitignore_fixtures" -lt 40 ]; then
+        printf 'gitignore: only %s fixtures were enumerated (expected at least 40); refusing to report a pass\n' \
+            "$gitignore_fixtures" >&2
+        failures=$((failures + 1))
+    fi
+    # No tracked file may resolve as ignored by .gitignore.  `--no-index` is
+    # what makes this meaningful: without it git exempts tracked files from
+    # ignore rules (measured), so a broad pattern would be invisible here.
+    gitignore_sweep=$(mktemp "${TMPDIR:-/tmp}/agentq-gitignore-sweep.XXXXXX")
+    gitignore_tracked=$(mktemp "${TMPDIR:-/tmp}/agentq-gitignore-tracked.XXXXXX")
+    gitignore_sweep_rc=0
+    git -C "$root" ls-files -z >"$gitignore_tracked" || gitignore_sweep_rc=$?
+    # An empty or failed enumeration would feed check-ignore nothing and pass
+    # silently -- the empty-enumeration class this repo keeps re-finding.
+    gitignore_tracked_count=$(( $(tr -cd '\0' <"$gitignore_tracked" | wc -c) ))
+    if [ "$gitignore_sweep_rc" -ne 0 ] || [ "$gitignore_tracked_count" -eq 0 ]; then
+        printf 'gitignore: could not enumerate the tracked files (exit %s, %s paths); refusing to report a pass\n' \
+            "$gitignore_sweep_rc" "$gitignore_tracked_count" >&2
+        failures=$((failures + 1))
+    else
+        git -C "$root" -c core.excludesFile=/dev/null check-ignore -v -z --stdin --no-index \
+            <"$gitignore_tracked" >"$gitignore_sweep" 2>/dev/null || gitignore_sweep_rc=$?
+        case $gitignore_sweep_rc in
+            0 | 1) ;;
+            *)
+                printf 'gitignore: the tracked-file sweep failed (check-ignore exit %s); refusing to report a pass\n' \
+                    "$gitignore_sweep_rc" >&2
+                failures=$((failures + 1))
+                ;;
+        esac
+    fi
+    rm -f -- "$gitignore_tracked"
+    # Four NUL-terminated fields per record: source, line, pattern, path.
+    while IFS= read -r -d '' gitignore_source_file &&
+        IFS= read -r -d '' gitignore_line &&
+        IFS= read -r -d '' gitignore_pattern &&
+        IFS= read -r -d '' gitignore_path; do
+        [ "$gitignore_source_file" = .gitignore ] || continue
+        printf 'gitignore FAILED (a tracked file is matched by .gitignore:%s (%s), so it would be silently untracked on a fresh add): %s\n' \
+            "$gitignore_line" "$gitignore_pattern" "$gitignore_path" >&2
+        failures=$((failures + 1))
+    done <"$gitignore_sweep"
+    rm -f -- "$gitignore_sweep"
+fi
+
 # Zero shell assets parsed means the enumeration itself failed (missing find,
 # wrong root), not that there was nothing to check.
 if [ "$shell_count" -eq 0 ]; then
@@ -2435,8 +2654,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s gitattr=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary" "$gitattr_state")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s gitattr=%s gitignore=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary" "$gitattr_state" "$gitignore_state")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
@@ -2448,7 +2667,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files uncalled unclassified farm_writes python3_users entrypoints workflows ci_pin gitattr'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files uncalled unclassified farm_writes python3_users entrypoints workflows ci_pin gitattr gitignore'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned
