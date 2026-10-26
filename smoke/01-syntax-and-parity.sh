@@ -1519,31 +1519,89 @@ for config_file in .editorconfig .gitattributes; do
     )
 done
 
-# ...and the section that protects the assets must still exist.  Deleting it
-# leaves every surviving pattern valid, so the rule above stays green while the
-# protection is gone -- measured: removing the [skill/assets/**] section drops
-# configpaths from 3 to 2 and the check reports a pass.
-asset_protection=0
-section=
-while IFS= read -r line; do
-    case $line in
-        \[*\])
-            section=${line#\[}
-            section=${section%\]}
-            continue
-            ;;
-    esac
-    case $line in
-        *end_of_line*unset*)
-            if [ -n "$section" ] && pattern_matches_under "$section" skill/assets; then
-                asset_protection=$((asset_protection + 1))
-            fi
-            ;;
-    esac
-done < "$root/.editorconfig"
-if [ "$asset_protection" -eq 0 ]; then
-    printf '%s\n' '.editorconfig: no section sets end_of_line = unset for anything under skill/assets -- the byte-verified assets are no longer protected from editor rewrites' >&2
+# ...and the section that protects the assets must still set every key that
+# decides whether an editor may REWRITE them -- not just end_of_line.  Measured
+# 2026-10-26: the section has three keys; deleting `trim_trailing_whitespace =
+# false` or `insert_final_newline = unset`, or flipping trim to `true`, each
+# left smoke/01 at exit 0 while only the end_of_line line was read.  A
+# half-locked section is the shape this repo keeps fixing: the surviving line
+# keeps the check green and reads like the whole section is guarded.
+#
+# Required values, and why each is the only safe one:
+#   end_of_line = unset            -- `lf` would rewrite a CRLF asset
+#   trim_trailing_whitespace = false -- `true` would strip trailing blanks
+#   insert_final_newline = unset   -- `true` would append a newline
+# `unset` is not the platform default; it is editorconfig's "remove the
+# effect", which is what leaves the bytes alone.  Verified against a real
+# implementation (py-editorconfig 0.17.1): all three resolve for files under
+# skill/assets, and a file outside the section resolves to lf/true instead.
+editorconfig_key_value() { # $1=file, $2=section glob, $3=key -> last value in that section
+    awk -v want_section="$2" -v want_key="$3" '
+        /^\[.*\]$/ {
+            section = $0
+            gsub(/^\[/, "", section)
+            gsub(/\]$/, "", section)
+            next
+        }
+        section == want_section {
+            eq = index($0, "=")
+            if (eq == 0) next
+            key = substr($0, 1, eq - 1)
+            gsub(/^[ \t]+|[ \t]+$/, "", key)
+            if (key == want_key) {
+                value = substr($0, eq + 1)
+                gsub(/^[ \t]+|[ \t]+$/, "", value)
+                found = value
+            }
+        }
+        END { if (found != "") print found }
+    ' "$1"
+}
+# Self-test: the extractor must read the LAST value in a section, must not read
+# a key from a neighbouring section, and must report nothing for a missing key.
+editorconfig_selftest_file=$(mktemp "${TMPDIR:-/tmp}/agentq-editorconfig-selftest.XXXXXX")
+printf '[a/**]\nk = first\nk = second\n[b/**]\nk = other\n' >"$editorconfig_selftest_file"
+editorconfig_selftest="$(
+    printf '%s|%s|%s' \
+        "$(editorconfig_key_value "$editorconfig_selftest_file" 'a/**' k)" \
+        "$(editorconfig_key_value "$editorconfig_selftest_file" 'b/**' k)" \
+        "$(editorconfig_key_value "$editorconfig_selftest_file" 'a/**' missing)"
+)"
+rm -f -- "$editorconfig_selftest_file"
+if [ "$editorconfig_selftest" != 'second|other|' ]; then
+    printf 'editorconfig self-test FAILED (expected "second|other|", got "%s")\n' \
+        "$editorconfig_selftest" >&2
     failures=$((failures + 1))
+fi
+asset_protection=0
+# The section that covers skill/assets is found by the same pattern matcher the
+# arm above uses, so a renamed-but-equivalent section keeps working.
+asset_protection_section=
+while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    if pattern_matches_under "$candidate" skill/assets; then
+        asset_protection_section=$candidate
+        break
+    fi
+done < <(sed -n 's/^\[\(.*\)\]$/\1/p' "$root/.editorconfig")
+if [ -z "$asset_protection_section" ]; then
+    printf '%s\n' '.editorconfig: no section matches anything under skill/assets -- the byte-verified assets are no longer protected from editor rewrites' >&2
+    failures=$((failures + 1))
+else
+    while IFS='|' read -r asset_key asset_want; do
+        asset_got=$(editorconfig_key_value "$root/.editorconfig" "$asset_protection_section" "$asset_key")
+        if [ "$asset_got" != "$asset_want" ]; then
+            printf 'editorconfig FAILED (section [%s] resolves %s to "%s", not "%s" -- an editor may rewrite the byte-verified assets): %s\n' \
+                "$asset_protection_section" "$asset_key" "$asset_got" "$asset_want" "$asset_key" >&2
+            failures=$((failures + 1))
+        else
+            asset_protection=$((asset_protection + 1))
+        fi
+    done <<'EOF'
+end_of_line|unset
+trim_trailing_whitespace|false
+insert_final_newline|unset
+EOF
 fi
 
 # A pattern count of zero means the extraction broke, not that there was
@@ -1851,6 +1909,94 @@ fi
 if [ "$shell_count" -eq 0 ]; then
     printf '%s\n' 'no shell assets were enumerated; refusing to report a pass' >&2
     failures=$((failures + 1))
+fi
+
+# --- skill/: the index file modes must be exactly the intended ones ----------
+# CLAUDE.md states the rule ("不要把 skill/assets/ 下的文件设成可执行后提交——
+# install-agentq.sh 刻意保持 644"), and nothing asserted it.  Measured
+# 2026-10-26, both directions were silent: `git update-index --chmod=+x
+# skill/assets/unix/install-agentq.sh` (the exact forbidden state) left smoke/01
+# AND --quick at exit 0, and so did `--chmod=-x skill/assets/unix/agentq-server`
+# (a fresh clone would get a server binary that cannot be executed -- the
+# installer's `cp` copies the source mode, and the later `chmod 700` applies to
+# the staged copy only after that cp).
+#
+# The oracle is the INDEX (`git ls-files -s`), not the worktree: the mode that
+# matters is the one a fresh clone gets, and `core.fileMode=false` makes the
+# worktree bit invisible to `git status` while the index still carries it.
+# The expected set is stated as two explicit lists rather than "whatever is
+# there today", because the point is to fail on a CHANGE, in either direction.
+# `install-client.sh` is in the executable list: the client installer documents
+# copying with cp/chmod and SKILL.md does not invoke it via `sh ./`.
+skill_modes_expected_exec='skill/assets/client/unix/agentq
+skill/assets/client/unix/install-client.sh
+skill/assets/client/unix/sshp
+skill/assets/client/windows/agentq.bash
+skill/assets/client/windows/sshp.bash
+skill/assets/unix/agentq
+skill/assets/unix/agentq-server
+skill/assets/windows-git-bash/agentq'
+skill_modes_want() { # $1=path -> executable | non-executable (exact line match)
+    local path
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        if [ "$path" = "$1" ]; then
+            printf 'executable\n'
+            return 0
+        fi
+    done <<EOF
+$skill_modes_expected_exec
+EOF
+    printf 'non-executable\n'
+}
+# Self-test: the classifier must separate the prefix pair (`.../unix/agentq` is
+# a prefix of `.../unix/agentq-server`) and must not be fooled by a path that
+# merely contains an expected one as a substring.
+skill_modes_selftest="$(skill_modes_want skill/assets/unix/agentq)|$(skill_modes_want skill/assets/unix/agentq-server)|$(skill_modes_want skill/assets/unix/agentq-pueued.service)|$(skill_modes_want x/skill/assets/unix/agentq)"
+if [ "$skill_modes_selftest" != 'executable|executable|non-executable|non-executable' ]; then
+    printf 'skill modes self-test FAILED (expected "executable|executable|non-executable|non-executable", got "%s")\n' \
+        "$skill_modes_selftest" >&2
+    failures=$((failures + 1))
+fi
+skill_modes_state='skipped(no-git)'
+if command -v git >/dev/null 2>&1 && git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+    skill_modes_state='checked'
+    skill_modes_tmp=$(mktemp "${TMPDIR:-/tmp}/agentq-skill-modes.XXXXXX")
+    skill_modes_rc=0
+    git -C "$root" ls-files -s -- skill/ >"$skill_modes_tmp" || skill_modes_rc=$?
+    skill_modes_count=$(wc -l <"$skill_modes_tmp" | tr -d ' ')
+    if [ "$skill_modes_rc" -ne 0 ] || [ "$skill_modes_count" -eq 0 ]; then
+        printf 'skill modes: could not enumerate the index (exit %s, %s paths); refusing to report a pass\n' \
+            "$skill_modes_rc" "$skill_modes_count" >&2
+        failures=$((failures + 1))
+    else
+        while IFS= read -r skill_modes_line; do
+            skill_modes_mode=${skill_modes_line%% *}
+            skill_modes_path=${skill_modes_line#*	}
+            case $skill_modes_mode in
+                100644) skill_modes_got='non-executable' ;;
+                100755) skill_modes_got='executable' ;;
+                *)
+                    printf 'skill modes FAILED (unexpected index mode %s -- only 100644 and 100755 are used in this repo): %s\n' \
+                        "$skill_modes_mode" "$skill_modes_path" >&2
+                    failures=$((failures + 1))
+                    continue
+                    ;;
+            esac
+            skill_modes_is=$(skill_modes_want "$skill_modes_path")
+            if [ "$skill_modes_got" != "$skill_modes_is" ]; then
+                printf 'skill modes FAILED (this file is %s in the index but must be %s -- CLAUDE.md pins the deployment modes: install-agentq.sh stays 644 because SKILL.md calls it as `sh ./install-agentq.sh`, and the server copies must stay executable): %s\n' \
+                    "$skill_modes_got" "$skill_modes_is" "$skill_modes_path" >&2
+                failures=$((failures + 1))
+            fi
+        done <"$skill_modes_tmp"
+        rm -f -- "$skill_modes_tmp"
+        if [ "$skill_modes_count" -lt 25 ]; then
+            printf 'skill modes: only %s tracked files under skill/ (expected at least 25); refusing to report a pass\n' \
+                "$skill_modes_count" >&2
+            failures=$((failures + 1))
+        fi
+    fi
 fi
 
 # --- repo scripts: no pipeline into a quiet grep -----------------------------
@@ -2654,8 +2800,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s gitattr=%s gitignore=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary" "$gitattr_state" "$gitignore_state")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
@@ -2667,7 +2813,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files uncalled unclassified farm_writes python3_users entrypoints workflows ci_pin gitattr gitignore'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files uncalled unclassified farm_writes python3_users entrypoints workflows ci_pin gitattr gitignore skill_modes'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned
