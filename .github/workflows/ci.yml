@@ -198,7 +198,12 @@ jobs:
           # kinds=checked: the per-kind census compared every parse arm's
           # count against the tree (measured 2026-10-26: a one-letter glob
           # typo in any of the five arms left that kind at 0 with exit 0).
-          grep -qE 'ps1=7 ps1_static=ok .*tool_full=6/6 .*kinds=checked' smoke.log
+          # summary_census=N: the summary-line coverage-count lock enumerated
+          # the smoke checks (measured 2026-10-27: three checks printed a
+          # coverage number nothing computed).  Pinned as present and
+          # non-zero, not to a value, so adding a check does not need this
+          # line edited -- 01's own zero-gate is what refuses a blind census.
+          grep -qE 'ps1=7 ps1_static=ok .*tool_full=6/6 .*kinds=checked .*summary_census=[1-9][0-9]*' smoke.log
           if grep -q 'skipped(' smoke.log; then
             echo 'part of the quick suite did not run' >&2
             exit 1

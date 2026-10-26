@@ -116,6 +116,88 @@ fail() {
     failures=$((failures + 1))
 }
 
+# --- the summary's coverage numbers must be COMPUTED -------------------------
+# Neither of this check's two coverage numbers used to be.  `files=5` was a
+# literal in the final printf for as long as the check existed, and no rule
+# reported how many sites it examined -- so a rule whose enumerator matched
+# nothing printed the same `rules=N violations=0` as a rule that verified
+# sixteen sites.  Both were measured red on 2026-10-27 before this block:
+#
+#  * `files=5` while the rules read 10 distinct files, and a COPY of this
+#    script with an eleventh file reference still printed `files=5`: the token
+#    could not move no matter what the rules read.
+#  * removing move_client_file's re-check AND respelling its `mv` as `/bin/mv`
+#    exited 0 with `posix-mv-recheck=asserted violations=0`; the same violation
+#    with the `mv` spelling kept exits 1.  `grep` matching nothing yields one
+#    blank line through `$( )`, the `while read` body skips it, and the rule
+#    ends green -- an asset respelled out of the pattern silently disables the
+#    rule.  Rule I already carried this guard (`render_pairs_seen -lt 3`); the
+#    enumerating rules did not.
+#
+# The census is derived from this script's own text, so a rule that starts
+# reading a new file moves the number automatically.  `census_dollar` keeps
+# this pattern line out of the set it counts -- a detector that matches itself
+# inflates its own census.
+census_dollar='$'
+census_re="\\${census_dollar}(root/skill/assets|root/smoke|AGENTQ_SMOKE_INSTALLER_DIR)/[A-Za-z0-9._/-]+"
+file_census() { # stdin = this script's text -> resolved distinct paths, one per line
+    { grep -vE '^[[:space:]]*#' |
+        grep -oE "$census_re" |
+        sed -e "s|^\\${census_dollar}root/|$root/|" \
+            -e "s|^\\${census_dollar}AGENTQ_SMOKE_INSTALLER_DIR/|$AGENTQ_SMOKE_INSTALLER_DIR/|" |
+        sort -u; } 2>/dev/null || true
+}
+# The census must count a fixture correctly before its number is trusted:
+# three distinct paths survive, the duplicate and the comment do not.
+census_fixture=$(
+    printf '%s%s\n' "$census_dollar" 'root/skill/assets/self-test-a'
+    printf '%s%s\n' "$census_dollar" 'root/skill/assets/self-test-a'
+    printf '%s%s\n' "$census_dollar" 'root/smoke/self-test-b'
+    printf '%s%s\n' "$census_dollar" 'AGENTQ_SMOKE_INSTALLER_DIR/self-test-c'
+    printf '%s%s%s\n' '# ' "$census_dollar" 'root/skill/assets/self-test-d'
+)
+census_selftest_count=$(printf '%s\n' "$census_fixture" | file_census | grep -c . || true)
+if [ "$census_selftest_count" -ne 3 ]; then
+    fail 'smoke/10' "the file census failed its self-test (expected 3 distinct non-comment paths, got $census_selftest_count); the summary's files= number would be meaningless"
+fi
+self_name=${BASH_SOURCE[0]##*/}
+self_path="$root/smoke/$self_name"
+census_file_count=$(file_census <"$self_path" | grep -c . || true)
+if [ "$census_file_count" -eq 0 ]; then
+    fail 'smoke/10' "the file census enumerated 0 references; a blind census must not print a clean file count"
+fi
+
+# A rule that examined nothing is not a pass.  Granularity is per rule AND,
+# where the asset's design requires the construct in every file, per file: the
+# measured mutant respelled ONE installer's move, so a per-rule total would
+# have stayed green on the other installer's sixteen sites.
+rule_sites_checked=0
+rule_sites_total=0
+rule_sites() { # $1 = rule label, $2 = sites examined -> 0 = usable
+    rule_sites_checked=$((rule_sites_checked + 1))
+    case ${2:-} in
+        '' | *[!0-9]*)
+            fail 'smoke/10' "rule $1 reported site count [${2:-}], which is not a number; the rule cannot conclude"
+            return 1
+            ;;
+    esac
+    if [ "$2" -eq 0 ]; then
+        fail 'smoke/10' "rule $1 enumerated 0 site(s); a rule that examined nothing is not a pass. If the construct is genuinely gone from the assets, replace the rule deliberately instead of letting it report green"
+        return 1
+    fi
+    rule_sites_total=$((rule_sites_total + $2))
+    return 0
+}
+# A gate that cannot fire is the false green it exists to prevent: prove it
+# fires on 0 and on a non-number, and passes on a real count.
+rule_sites_selftest=ok
+if ( rule_sites SELFTEST 0 ) >/dev/null 2>&1; then rule_sites_selftest='blind-on-zero'; fi
+if ! ( rule_sites SELFTEST 2 ) >/dev/null 2>&1; then rule_sites_selftest='dead-on-count'; fi
+if ( rule_sites SELFTEST nope ) >/dev/null 2>&1; then rule_sites_selftest='blind-on-text'; fi
+if [ "$rule_sites_selftest" != ok ]; then
+    fail 'smoke/10' "the coverage gate failed its own self-test ($rule_sites_selftest)"
+fi
+
 # --- RULE A: the JSON read limit must be raisable ----------------------------
 # The defect was not "a limit exists" but "the limit is a literal no caller can
 # change", which made the installer refuse to update a host whose status had
@@ -179,7 +261,8 @@ fi
 # scopes to its function.
 rules_checked=$((rules_checked + 1))
 redirect_sites=$(grep -nE '& .*1> \$' "$server_installer" 2>/dev/null | grep -v '1> \$null' | grep -vE ':[[:space:]]*#' || true)
-if [ -n "$redirect_sites" ]; then
+redirect_site_count=$(printf '%s\n' "$redirect_sites" | grep -c . || true)
+if rule_sites B "$redirect_site_count"; then
     # The reader that consumes those redirects.  Every redirect site is followed
     # by a Read-AgentQInstallerJsonFile call; if a future site uses a different
     # reader, the extraction below will not find BOM handling in THIS one and
@@ -222,8 +305,12 @@ fi
 # that must be self-verifying.
 rules_checked=$((rules_checked + 1))
 for file in "$server_installer" "$client_installer"; do
+    setacl_sites=0
     while IFS=$'\t' read -r lineno where; do
         [ -n "$lineno" ] || continue
+        case "$lineno" in
+            __SITES__*) setacl_sites=$((setacl_sites + ${lineno#__SITES__})); continue ;;
+        esac
         fail "$file" "line $lineno calls Set-Acl with no Get-Acl read-back in the same function ($where)"
     done < <(awk '
         FNR == NR {
@@ -242,8 +329,10 @@ for file in "$server_installer" "$client_installer"; do
                 for (k = 1; k <= nga; k++) if (ga[k] > s && ga[k] <= fend[owner]) ok = 1
                 if (!ok) print s "\t" fname[owner]
             }
+            printf "__SITES__%d\n", nsa
         }
     ' "$file" "$file")
+    rule_sites "D(${file##*/})" "$setacl_sites" || true
 done
 
 # --- RULE F: ACL property names must exist on the .NET type ------------------
@@ -271,7 +360,9 @@ for file in "$server_installer" "$client_installer"; do
     # The variables that hold an ACL object in THIS file.
     acl_vars=$(grep -oE '\$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[[:space:]]*Get-Acl' "$file" 2>/dev/null |
         sed -E 's/^\$([A-Za-z_][A-Za-z0-9_]*).*/\1/' | sort -u)
+    acl_sites=0
     for acl_var in $acl_vars; do
+    acl_sites=$((acl_sites + 1))
     while IFS=$'\t' read -r lineno prop; do
         [ -n "$lineno" ] || continue
         case " $acl_property_allowlist " in
@@ -315,6 +406,7 @@ for file in "$server_installer" "$client_installer"; do
         }
     ' aclvar="$acl_var" aclvar_file="$file" "$file")
     done
+    rule_sites "F(${file##*/})" "$acl_sites" || true
 done
 
 # --- RULE E: the launcher protocol text must agree across all three copies ---
@@ -387,6 +479,7 @@ for posix_installer in $posix_installers; do
         exit 1
     }
     rules_checked=$((rules_checked + 1))
+    mv_sites=0
     # The window is the ENCLOSING FUNCTION, not a fixed line count.  My first
     # version used 9 lines and produced two false positives: the re-checks at
     # lines 1804 and 1852 sit 18 lines below their `mv` (inside an `if ! mv`
@@ -420,6 +513,7 @@ for posix_installer in $posix_installers; do
                 fi
                 ;;
         esac
+        mv_sites=$((mv_sites + 1))
         # `end` must be the FIRST `^}` after the move -- the enclosing
         # function's closing brace.  My first version kept overwriting `end`
         # with every later `^}`, so the scan ran to the end of the FILE and
@@ -492,6 +586,7 @@ for posix_installer in $posix_installers; do
     done <<EOF
 $(grep -nE '(^|[[:space:]])(run_as_root[[:space:]]+)?mv([[:space:]]|$)' "$posix_installer" | grep -vE '^[0-9]+:[[:space:]]*#')
 EOF
+    rule_sites "G(${posix_installer##*/})" "$mv_sites" || true
 done
 
 # --- RULE H: a [AllowNull()][string] guard must test for empty, not $null -----
@@ -515,10 +610,14 @@ done
 # that hold filesystem objects.  The AllowNull attribute is precisely what makes
 # a $null guard look necessary while being ineffective.
 rules_checked=$((rules_checked + 1))
+# Per-rule total, not per-file: the client installer legitimately declares no
+# [AllowNull()][string] parameter, so a per-file floor would fail correct code.
+allownull_sites=0
 for file in "$server_installer" "$client_installer"; do
     allownull_vars=$(grep -oE '\[AllowNull\(\)\][[:space:]]*\[string\][[:space:]]*\$[A-Za-z_][A-Za-z0-9_]*' "$file" 2>/dev/null |
         sed -E 's/.*\$//' | sort -u || true)
     for var in $allownull_vars; do
+        allownull_sites=$((allownull_sites + 1))
         # `grep -vE '^[0-9]+:[[:space:]]*#'` drops comments.  A comment is not a
         # guard, and the fix for this very defect quotes the bad pattern in one
         # -- a rule that counted it would fail the corrected file.
@@ -535,6 +634,7 @@ $(grep -nE "\\\$null[[:space:]]+-(eq|ne)[[:space:]]+\\\$$var([^A-Za-z0-9_]|$)|\\
 EOF
     done
 done
+rule_sites H "$allownull_sites" || true
 
 # --- RULE I: a rendered template's placeholders must be substituted -----------
 # Three templates in this repo are rendered by substituting `__AGENTQ_*__`
@@ -794,4 +894,15 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 
-printf 'installer-invariants checks passed: rules=%s files=5 violations=0 acl-properties=verified posix-mv-recheck=asserted placeholder-substitution=guarded lock-release=unconditional\n' "$rules_checked"
+# Every gated rule must actually call the gate, or a rule silently goes back to
+# reading as verified when it examined nothing.  The arithmetic: B(1 file) +
+# D(2) + F(2) + G(2) + H(1 total) = 8 calls.  A new enumerating rule must add
+# its call here too, which is the point: the count is a reminder, not a census.
+if [ "$rule_sites_checked" -ne 8 ]; then
+    printf 'installer-invariants: the coverage gate ran %s time(s), expected 8 (B 1, D 2, F 2, G 2, H 1); a rule lost its gate call and is back to reporting green on zero sites\n' \
+        "$rule_sites_checked" >&2
+    exit 1
+fi
+
+printf 'installer-invariants checks passed: rules=%s files=%s sites=%s violations=%s acl-properties=verified posix-mv-recheck=asserted placeholder-substitution=guarded lock-release=unconditional\n' \
+    "$rules_checked" "$census_file_count" "$rule_sites_total" "$failures"
