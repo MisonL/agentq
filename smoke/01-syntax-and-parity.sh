@@ -1541,6 +1541,92 @@ if [ "$config_patterns" -eq 0 ]; then
     failures=$((failures + 1))
 fi
 
+# --- .gitattributes: the attribute VALUES, not just the path patterns -------
+# The arm above proves every path pattern in .gitattributes/.editorconfig names
+# a real file.  It cannot see the value stop applying: deleting the `* -text`
+# line leaves every surviving pattern valid, the suite green, and 10 of the 25
+# deployment files resolving to `text: unspecified`.  Measured 2026-10-26 with
+# the line removed: `git check-attr text` reports `unspecified` for SKILL.md,
+# agents/openai.yaml, client/unix/agentq, client/unix/sshp, unix/agentq,
+# the .service, both .plists and both pueue.yml -- and smoke/01 still exits 0.
+# CLAUDE.md calls `* -text` a hard requirement and records the measured
+# consequence: the same CRLF file is stored 0d 0a with the file and 0a without
+# it, which is exactly how the two canonical copies stop being identical.
+#
+# The oracle is git, not the file's text: what matters is the attribute a
+# checkout/commit actually applies, so a future rewrite of .gitattributes that
+# spells the protection differently but keeps the value stays green.
+#
+# `merge: unset` on the two canonical copies is pinned separately.  Their lines
+# say `-text -diff -merge`.  `-merge` is the one that matters: measured
+# 2026-10-26 (git 2.55.0, scratch repos), two branches editing different lines
+# of the same file auto-merge silently when only `-text -diff` is set, and
+# conflict (`Cannot merge binary files`) once `-merge` is set -- a one-sided
+# change still merges cleanly either way.  `-diff` only changes how `git diff`
+# displays the file; it does not stop the merge.  Both statements were the
+# opposite of what the .gitattributes comments said until this arm existed, and
+# deleting those two lines left the suite green.
+gitattr_violations() { # stdin: NUL-separated (path, attr, value) triples
+    local path attr value
+    while IFS= read -r -d '' path && IFS= read -r -d '' attr && IFS= read -r -d '' value; do
+        [ -n "$path" ] || continue
+        [ "$value" = unset ] || printf '%s\n' "$path"
+    done
+}
+gitattr_selftest=$(printf 'a\0text\0unset\0b\0text\0set\0c\0text\0unspecified\0' |
+    gitattr_violations | sort | tr '\n' ' ')
+if [ "$gitattr_selftest" != 'b c ' ]; then
+    printf 'gitattributes self-test FAILED (expected b and c to be reported, got "%s")\n' \
+        "$gitattr_selftest" >&2
+    failures=$((failures + 1))
+fi
+gitattr_state='skipped(no-git)'
+gitattr_count=0
+if command -v git >/dev/null 2>&1 && git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+    gitattr_state='checked'
+    gitattr_tmp=$(mktemp "${TMPDIR:-/tmp}/agentq-gitattr.XXXXXX")
+    git -C "$root" ls-files -z -- skill/ |
+        git -C "$root" check-attr -z --stdin text >"$gitattr_tmp"
+    # Each record is three NUL-terminated fields, so the file count is
+    # field_count / 3.  Counting fields (not lines) is what lets this handle
+    # paths with spaces, which `check-attr --stdin` accepts verbatim.
+    gitattr_count=$(( $(tr -cd '\0' <"$gitattr_tmp" | wc -c) / 3 ))
+    while IFS= read -r gitattr_path; do
+        [ -n "$gitattr_path" ] || continue
+        printf 'gitattributes FAILED (this tracked deployment file no longer resolves `text` to unset, so core.autocrlf may rewrite its bytes on checkout -- the .gitattributes protection stopped covering it): %s\n' \
+            "$gitattr_path" >&2
+        failures=$((failures + 1))
+    done <<EOF
+$(gitattr_violations <"$gitattr_tmp")
+EOF
+    rm -f -- "$gitattr_tmp"
+    # The two canonical copies must also stay out of textual merges.
+    gitattr_pair=$(mktemp "${TMPDIR:-/tmp}/agentq-gitattr-pair.XXXXXX")
+    git -C "$root" check-attr -z merge -- \
+        skill/assets/unix/agentq-server skill/assets/windows-git-bash/agentq >"$gitattr_pair"
+    # Same shape as the empty-enumeration guards elsewhere: zero records means
+    # the query broke (wrong paths, git gone), not that both copies are safe.
+    gitattr_pair_count=$(( $(tr -cd '\0' <"$gitattr_pair" | wc -c) / 3 ))
+    if [ "$gitattr_pair_count" -ne 2 ]; then
+        printf 'gitattributes: expected 2 canonical server copies in the merge-attribute query, got %s; refusing to report a pass\n' \
+            "$gitattr_pair_count" >&2
+        failures=$((failures + 1))
+    fi
+    while IFS= read -r gitattr_path; do
+        [ -n "$gitattr_path" ] || continue
+        printf 'gitattributes FAILED (a canonical server copy is no longer marked `-merge`, so a three-way merge can rewrite one copy and leave the other, breaking the byte-identity constraint silently): %s\n' \
+            "$gitattr_path" >&2
+        failures=$((failures + 1))
+    done <<EOF
+$(gitattr_violations <"$gitattr_pair")
+EOF
+    rm -f -- "$gitattr_pair"
+    if [ "$gitattr_count" -eq 0 ]; then
+        printf '%s\n' 'gitattributes: no tracked deployment file was enumerated; refusing to report a pass' >&2
+        failures=$((failures + 1))
+    fi
+fi
+
 # Zero shell assets parsed means the enumeration itself failed (missing find,
 # wrong root), not that there was nothing to check.
 if [ "$shell_count" -eq 0 ]; then
@@ -2349,8 +2435,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s gitattr=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary" "$gitattr_state")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
@@ -2362,7 +2448,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files uncalled unclassified farm_writes python3_users entrypoints workflows ci_pin'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files uncalled unclassified farm_writes python3_users entrypoints workflows ci_pin gitattr'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned
