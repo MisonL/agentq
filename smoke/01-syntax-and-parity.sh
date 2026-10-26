@@ -2128,6 +2128,86 @@ EOF
     failures=$((failures + 1))
 fi
 
+# --- a coverage count in a check's summary line must be COMPUTED -------------
+# A summary line is this suite's evidence, and a number in it that nothing
+# computes is a claim, not an observation: it cannot move when the check's
+# coverage changes, and it can be wrong for the check's whole life.  Measured
+# 2026-10-27, three instances, all invisible to every other rule here:
+# smoke/10 printed `files=5` while its rules read 10 distinct files (a copy
+# with an 11th reference still printed 5), smoke/16 printed `rules=7` from a
+# literal, and smoke/15 printed `tombstones=0` while asserting only a DELTA --
+# a sandbox that started with one tombstone would have made the printed 0
+# false.  smoke/08 had already argued the principle in a comment ("computed,
+# not a literal"); nothing checked the other 28.
+#
+# Scope: coverage QUANTITIES -- how many files/rules/sites/cases this check
+# examined.  Contract tokens such as `exit=0/1/2` or `wait=6/unavailable` are
+# NOT in the vocabulary: there the literal IS the value the check asserts, and
+# it exits non-zero before printing if the assertion fails, so the number
+# cannot drift away from what ran.  A coverage literal is different in kind --
+# no assertion inside the file can make it right, because the number has to be
+# derived from what was scanned.
+#
+# The fixture is assembled with the phrase in a variable so this file does not
+# contain a literal summary line of its own; the detector must not match its
+# own source (the same self-match lesson as smoke/16's samples).
+summary_quantity_words='files rules sites cases scripts programs records blocks invocations tombstones tokens functions specs'
+summary_quantity_re="(^|[^A-Za-z0-9_.-])(${summary_quantity_words// /|})=[0-9]"
+summary_quantity_hits() { # $1 = script -> "line:text" per literal coverage count in a summary line
+    summary_line_no=0
+    while IFS= read -r summary_line; do
+        summary_line_no=$((summary_line_no + 1))
+        summary_trimmed=${summary_line#"${summary_line%%[![:space:]]*}"}
+        case $summary_trimmed in '#'*) continue ;; esac
+        case $summary_line in
+            *'checks passed'*) ;;
+            *) continue ;;
+        esac
+        if grep -qE "$summary_quantity_re" <<< "$summary_line"; then
+            printf '%s:%s\n' "$summary_line_no" "$summary_line"
+        fi
+    done <"$1"
+}
+summary_quantity_fixture=$(mktemp "${TMPDIR:-/tmp}/agentq-summary-quantity.XXXXXX")
+summary_quantity_phrase='checks passed'
+cat >"$summary_quantity_fixture" <<FIXTURE
+printf 'x $summary_quantity_phrase: files=5\n'
+printf 'x $summary_quantity_phrase: files=%s\n'
+printf 'x $summary_quantity_phrase: exit=0/1/2 wait=6/unavailable\n'
+printf 'x $summary_quantity_phrase: rules=7 sites=%s\n'
+# printf 'x $summary_quantity_phrase: files=5\n'
+printf 'not a summary files=5\n'
+FIXTURE
+summary_quantity_selftest=$(summary_quantity_hits "$summary_quantity_fixture" | cut -d: -f1 | tr '\n' ' ')
+rm -f "$summary_quantity_fixture"
+if [ "$summary_quantity_selftest" != '1 4 ' ]; then
+    printf 'syntax-and-parity FAILED (the summary coverage-count lock failed its self-test: expected literal counts on fixture lines 1 and 4, got [%s])\n' \
+        "$summary_quantity_selftest" >&2
+    failures=$((failures + 1))
+fi
+summary_census_checked=0
+summary_quantity_count=0
+while IFS= read -r summary_script; do
+    summary_census_checked=$((summary_census_checked + 1))
+    while IFS= read -r summary_hit; do
+        [ -n "$summary_hit" ] || continue
+        printf 'syntax-and-parity FAILED (a coverage count in a summary line is a literal; it cannot move when the check'"'"'s coverage changes -- compute it from what was examined): %s:%s\n' \
+            "${summary_script#"$root"/}" "$summary_hit" >&2
+        summary_quantity_count=$((summary_quantity_count + 1))
+    done <<EOF
+$(summary_quantity_hits "$summary_script")
+EOF
+done <<EOF
+$(find "$root/smoke" -type f -name '*.sh' | sort)
+EOF
+if [ "$summary_census_checked" -eq 0 ]; then
+    printf '%s\n' 'no smoke scripts were enumerated for the summary coverage-count lock; refusing to report a pass' >&2
+    failures=$((failures + 1))
+fi
+if [ "$summary_quantity_count" -ne 0 ]; then
+    failures=$((failures + 1))
+fi
+
 # --- mktemp templates must END in their X's ----------------------------------
 # BSD mktemp (macOS) randomizes ONLY a trailing run of X's.  Given
 # `agentq-parse-ps1.XXXXXX.ps1` it creates a file with that LITERAL name --
@@ -2907,8 +2987,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
@@ -2920,7 +3000,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files uncalled unclassified farm_writes python3_users entrypoints workflows ci_pin gitattr gitignore skill_modes kinds'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files uncalled unclassified farm_writes python3_users entrypoints workflows ci_pin gitattr gitignore skill_modes kinds summary_census'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned

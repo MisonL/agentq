@@ -356,6 +356,39 @@ expect_bytecode scanned smoke/16-no-host-identifiers.sh 'this check'
 expect_bytecode scanned smoke/notes.pyc.txt      'a name that only ends in .pyc.txt'
 expect_bytecode scanned smoke/__pycachex__/a.bin 'a directory that only looks like a cache'
 
+# --- the rule set must be wired everywhere it is declared -------------------
+# The summary's `rules=7` was a literal in the final printf (measured
+# 2026-10-27: nothing computed it, so adding a rule or wiring one into only
+# some of the places that must know it could not change the number).  The
+# count is derived from the RE_Rn definitions below, and every defined rule
+# must be wired into BOTH places that have to know it: first_match's case arm
+# (the self-test's dispatcher) and scan_file's body (the real scan).  A rule
+# defined but wired into one of them is exactly the drift this file's header
+# warns about -- the self-test that was written and never called.
+self_name=${BASH_SOURCE[0]##*/}
+self_path="$root/smoke/$self_name"
+rules_defined=$(grep -oE '^RE_R[0-9]+=' "$self_path" | sed -E 's/^RE_(R[0-9]+)=/\1/' | sort -u || true)
+rules_count=$(printf '%s\n' "$rules_defined" | grep -c . || true)
+if [ "$rules_count" -eq 0 ]; then
+    printf 'self-test: no RE_Rn rule is defined; the scan would check nothing\n' >&2
+    selftest_failures=$((selftest_failures + 1))
+fi
+scan_body=$(awk '/^scan_file\(\) \{/ { in_fn = 1 }
+                 in_fn { print }
+                 in_fn && /^\}/ { exit }' "$self_path")
+for rule_name in $rules_defined; do
+    if ! grep -qF "\$RE_${rule_name}" <<< "$scan_body"; then
+        printf 'self-test: rule %s is defined but scan_file never greps with $RE_%s; it would never run\n' \
+            "$rule_name" "$rule_name" >&2
+        selftest_failures=$((selftest_failures + 1))
+    fi
+    if ! grep -qE "^    ${rule_name}\)" "$self_path"; then
+        printf 'self-test: rule %s is defined but first_match has no %s) arm; the self-test cannot calibrate it\n' \
+            "$rule_name" "$rule_name" >&2
+        selftest_failures=$((selftest_failures + 1))
+    fi
+done
+
 if [ "$selftest_failures" -ne 0 ]; then
     printf 'no-host-identifiers: %s self-test failure(s); the scan below would not have been trustworthy\n' \
         "$selftest_failures" >&2
@@ -463,5 +496,5 @@ if [ "$memory_state" != scanned ]; then
     exit 0
 fi
 
-printf 'no-host-identifiers checks passed: files=%s rules=7 selftest=calibrated memory=%s violations=0\n' \
-    "$scanned" "$memory_state"
+printf 'no-host-identifiers checks passed: files=%s rules=%s selftest=calibrated memory=%s violations=%s\n' \
+    "$scanned" "$rules_count" "$memory_state" "$failures"

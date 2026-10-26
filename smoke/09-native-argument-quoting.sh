@@ -262,11 +262,11 @@ for file in $ps_files; do
     fi
 done
 
-if [ -s "$work_violations" ]; then
-    count=$(wc -l <"$work_violations" | tr -d ' ')
+count=$(wc -l <"$work_violations" | tr -d ' ')
+if [ "$count" -ne 0 ]; then
     printf 'native-argument-quoting: %s violation(s)\n' "$count" >&2
     exit 1
 fi
 
-printf 'native-argument-quoting checks passed: files=%s call_sites=%s violations=0\n' \
-    "$files" "$sites"
+printf 'native-argument-quoting checks passed: files=%s call_sites=%s violations=%s\n' \
+    "$files" "$sites" "$count"

@@ -211,7 +211,10 @@ if [ "$(record_count)" != "$records_before" ]; then
     note "a live request was archived during a transient failure (records $records_before -> $(record_count))"
     failures=$((failures + 1))
 fi
-if [ "$(tombstone_count)" != "$tombstones_before" ]; then
+# Computed, not a literal: the summary prints this number, and `tombstones=0`
+# typed into the printf could not move if the sandbox ever started with one.
+tombstones_written=$(( $(tombstone_count) - tombstones_before ))
+if [ "$tombstones_written" -ne 0 ]; then
     note "a tombstone was written for a live request during a transient failure"
     failures=$((failures + 1))
 fi
@@ -413,4 +416,4 @@ if [ "$failures" -ne 0 ]; then
     printf 'transient-pueue-failure: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'transient-pueue-failure checks passed: exit=2/reason live-request-preserved=yes tombstones=0 recovery=ok task=survived\n'
+printf 'transient-pueue-failure checks passed: exit=2/reason live-request-preserved=yes tombstones=%s recovery=ok task=survived\n' "$tombstones_written"

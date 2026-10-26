@@ -393,7 +393,7 @@ if violations:
     sys.exit(1)
 
 print(
-    "jq-reserved-identifiers checks passed: jq_invocations=%d programs=%d violations=0"
-    % (len(records), programs_seen)
+    "jq-reserved-identifiers checks passed: jq_invocations=%d programs=%d violations=%d"
+    % (len(records), programs_seen, len(violations))
 )
 PY
