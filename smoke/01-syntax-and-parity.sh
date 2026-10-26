@@ -1101,12 +1101,16 @@ fi
 
 # --- .github/workflows: YAML parse -------------------------------------------
 # The workflows are the enforcement layer -- ci.yml pins the 29 check names, the
-# shellcheck/posix tokens and the NOT-covered allowlist; release.yml is the only
-# gate tying a tag to the recorded version.  A YAML typo in one of them does not
-# fail locally in any way (measured 2026-10-25: breaking ci.yml's indentation
-# left both `./smoke/01` and `./run-tests.sh --quick` exiting 0), and GitHub's
-# response to an unparseable workflow is to not run it at all -- the CI that
-# would have caught the mistake is the CI that stopped running.
+# two tool-summary tokens (shellcheck/posix) and the NOT-covered allowlist;
+# release.yml is the only gate tying a tag to the recorded version.  A YAML typo
+# in one of them does not fail locally in any way (measured 2026-10-25: breaking
+# ci.yml's indentation left both `./smoke/01` and `./run-tests.sh --quick`
+# exiting 0), and GitHub's response to an unparseable workflow is to not run it
+# at all -- the CI that would have caught the mistake is the CI that stopped
+# running.  (The tool word sits mid-line on purpose: a comment whose FIRST word
+# after `#` is that token is parsed as a directive, and a malformed one -- as
+# this line was until 2026-10-26 -- makes shellcheck stop analysing the rest of
+# the file.)
 # `set -u` is on: the summary below reads this even when pyyaml is absent, so
 # the token is initialised OUTSIDE the probe.  A value that only exists when a
 # tool is present turns a missing tool into an unbound-variable crash.
@@ -1636,15 +1640,21 @@ fi
 # displays the file; it does not stop the merge.  Both statements were the
 # opposite of what the .gitattributes comments said until this arm existed, and
 # deleting those two lines left the suite green.
-gitattr_violations() { # stdin: NUL-separated (path, attr, value) triples
-    local path attr value
+gitattr_violations() { # $1 = the attr name the query asked for; stdin: NUL triples
+    local attr_name=$1 path attr value
     while IFS= read -r -d '' path && IFS= read -r -d '' attr && IFS= read -r -d '' value; do
+        # `attr` is the middle field of every triple; asserting it equals what
+        # the caller asked for is this function's only use of it -- a parse
+        # that drifted would otherwise skip silently.  (Before 2026-10-26 the
+        # field was read and never used, which the shellcheck lock reported
+        # the moment this file's analysis stopped aborting at line 1104.)
+        [ "$attr" = "$attr_name" ] || continue
         [ -n "$path" ] || continue
         [ "$value" = unset ] || printf '%s\n' "$path"
     done
 }
 gitattr_selftest=$(printf 'a\0text\0unset\0b\0text\0set\0c\0text\0unspecified\0' |
-    gitattr_violations | sort | tr '\n' ' ')
+    gitattr_violations text | sort | tr '\n' ' ')
 if [ "$gitattr_selftest" != 'b c ' ]; then
     printf 'gitattributes self-test FAILED (expected b and c to be reported, got "%s")\n' \
         "$gitattr_selftest" >&2
@@ -1667,7 +1677,7 @@ if command -v git >/dev/null 2>&1 && git -C "$root" rev-parse --git-dir >/dev/nu
             "$gitattr_path" >&2
         failures=$((failures + 1))
     done <<EOF
-$(gitattr_violations <"$gitattr_tmp")
+$(gitattr_violations text <"$gitattr_tmp")
 EOF
     rm -f -- "$gitattr_tmp"
     # The two canonical copies must also stay out of textual merges.
@@ -1688,7 +1698,7 @@ EOF
             "$gitattr_path" >&2
         failures=$((failures + 1))
     done <<EOF
-$(gitattr_violations <"$gitattr_pair")
+$(gitattr_violations merge <"$gitattr_pair")
 EOF
     rm -f -- "$gitattr_pair"
     if [ "$gitattr_count" -eq 0 ]; then
@@ -2314,8 +2324,15 @@ python3_census() { # <file> -> 0 usage+probe, 1 usage without probe, 2 no usage
             continue
             ;;
         esac
+        # `*if\ python3*` is a SUBSTRING match, so it already covers
+        # `elif python3` (the letters `if` end `elif`).  The two `elif`
+        # alternatives were therefore dead branches -- shellcheck's SC2221/
+        # SC2222, reported the moment this file's analysis stopped aborting at
+        # line 1104.  Dropping them changes nothing: the surviving patterns
+        # still accept `if python3`, `if ! python3`, `elif python3`,
+        # `elif ! python3` and `while python3`, and still reject `|| true`.
         case $line in
-        *if\ python3* | *if\ !\ python3* | *elif\ python3* | *elif\ !\ python3* | *while\ python3*)
+        *if\ python3* | *if\ !\ python3* | *while\ python3*)
             n_ok=$((n_ok + 1))
             continue
             ;;

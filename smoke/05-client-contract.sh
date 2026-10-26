@@ -1676,26 +1676,207 @@ shellcheck_summary=absent
 shellcheck_assets=0
 shellcheck_scripts=0
 shellcheck_bad=0
+shellcheck_directives=0
 if command -v shellcheck >/dev/null 2>&1; then
+    # The locked codes.  SC2221/SC2222 joined on 2026-10-20: a duplicated case
+    # pattern (''|en|en-*|'') makes the repeated branch DEAD, and a dead branch
+    # in a check is the same defect class as a dead variable -- an assertion
+    # that silently never runs.  It was found by widening the lock in a
+    # real-host run, after three checks had shipped with it.
+    #
+    # SC1072/SC1073 joined on 2026-10-26, and they are a different KIND of
+    # code: "shellcheck stopped parsing this file".  Two prose comments that
+    # began with the directive token made shellcheck emit SC1073 + SC1072 and
+    # then ANALYSE NOTHING AFTER THAT LINE -- measured by planting a dead
+    # variable after smoke/01's line 1104: the lock exited 0.  Without these
+    # two codes in the include list the lock cannot see the very event that
+    # switches it off, because `-i` suppresses parse errors along with
+    # everything else.  Measured 2026-10-26: with the six codes, all 40 shell
+    # files in this repo are otherwise clean, so the two add signal, not noise.
+    shellcheck_codes='SC2319,SC2034,SC2221,SC2222,SC1072,SC1073'
+    shellcheck_probe_dir=$work/shellcheck-probe
+    mkdir -p "$shellcheck_probe_dir"
+    # ONE invocation shape for the real lint, the directive probes and the
+    # self-check below, so the three cannot drift apart.  `--norc` and the
+    # explicit `-S style` are not decoration: `-i` was measured (2026-10-26) to
+    # accept its narrowing from OUTSIDE the file as well --
+    #   * a `.shellcheckrc` anywhere above the file (`disable=SC2034` -> a
+    #     planted dead variable went unreported, rc 0),
+    #   * `$XDG_CONFIG_HOME/shellcheckrc` (same),
+    #   * `SHELLCHECK_OPTS` (`-e SC2034`, `-i SC2319`, `--rcfile=<narrowing>`
+    #     and `-S error` each silenced it),
+    # and each one turns the lock off for every file at once.  Measured on
+    # 0.11.0: an explicit flag on the command line wins over every one of those
+    # channels -- `--norc` over an rc file however it was named, `-S style`
+    # over `-S error`, `-i` over `-e`/`-i`/`--include`/`--exclude` -- so the
+    # three flags below are the whole defence.  (No `SHELLCHECK_OPTS=`
+    # prefix: it was measured to change nothing, and an element that no
+    # mutation can turn red is decoration; the self-check below is what
+    # reddens if a future shellcheck lets the environment win.)
+    run_shellcheck() { # $1 = dialect, rest = arguments for shellcheck
+        local sc_dialect=$1
+        shift
+        shellcheck --norc -S style -s "$sc_dialect" -i "$shellcheck_codes" "$@"
+    }
+    # A line shaped like a directive is a CANDIDATE.  The enumerator is
+    # deliberately BROADER than the tool's own rule -- any comment line
+    # containing the word, any case -- because the cost of a false candidate is
+    # one probe that passes, and the cost of a missed candidate is the defect
+    # this arm exists for.  The probe, not this grep, is the judge: it asks the
+    # tool what the line DOES.
+    #
+    # Why this arm exists at all, measured 2026-10-26: two prose comments began
+    # with the token (smoke/01 and smoke/20), which shellcheck parses as a
+    # MALFORMED directive -- SC1073/SC1072 -- and then ABORTS the rest of that
+    # file's analysis.  `-i` suppresses parse errors too, so both files had
+    # been passing with everything from the offending line to EOF unlinted:
+    # measured by planting a dead variable AFTER smoke/01's line 1104, the lock
+    # still exited 0.  The same shape also hides a second, quieter class: a
+    # WELL-FORMED directive (`disable=SC2034`, `disable=all`, and the
+    # line-scoped `disable-next=`) narrows the lock from inside the file it
+    # guards -- measured by putting `disable=SC2319,SC2034` at the top of
+    # client/unix/sshp: smoke/05 stayed green at checked(9).
+    shellcheck_directive_candidates() { # $1 = file -> "line:text" per candidate
+        grep -n '^[[:space:]]*#.*[Ss][Hh][Ee][Ll][Ll][Cc][Hh][Ee][Cc][Kk]' "$1" 2>/dev/null
+    }
+    shellcheck_directive_violation() { # $1 = candidate line; rc 0 = clean
+        local probe=$shellcheck_probe_dir/probe.sh parse_probe=$shellcheck_probe_dir/parse-probe.sh found parse_found
+        {
+            printf '%s\n' '#!/bin/sh'
+            printf '%s\n' "$1"
+            # One trigger per locked code.  If the candidate narrows any of
+            # them (file-level `disable=`, or `disable-next=` -- the next line
+            # is a trigger) that code goes missing; if it is malformed,
+            # analysis stops at it and ALL of them go missing.
+            printf '%s\n' 'agentq_sc_probe_dead=1'
+            printf '%s\n' 'if [ -n "" ]; then agentq_sc_probe_status=$?; fi'
+            printf '%s\n' 'printf "%s\n" "$agentq_sc_probe_status"'
+            printf '%s\n' 'case agentq_sc_probe_kind in a) printf a ;; a) printf dup ;; esac'
+        } >"$probe"
+        # `-f gcc` only shapes the output; the detection flags are the shared
+        # ones.  The expected set is EXACT: a missing code means the directive
+        # silenced it, an extra code means the directive did not parse.
+        found=$(run_shellcheck sh -f gcc "$probe" 2>&1 | grep -o '\[SC[0-9]*\]' | tr -d '[]' | sort -u | tr '\n' ' ')
+        [ "$found" = 'SC2034 SC2221 SC2222 SC2319 ' ] || return 1
+        # A SECOND fixture, because one file cannot answer both questions: a
+        # parse abort suppresses every other finding (measured -- a dead
+        # variable plus an unterminated `if` reports only SC1072/SC1073), so
+        # the parse-error signal has to be provoked in a file of its own.
+        # Without this probe a file could carry
+        # `# shellcheck disable=SC1072,SC1073` at the top and every later
+        # parse abort -- the exact event that makes the lock blind -- would be
+        # silent; measured: rc 0 on a file with an unterminated `if`.
+        {
+            printf '%s\n' '#!/bin/sh'
+            printf '%s\n' "$1"
+            printf '%s\n' 'if true; then'
+        } >"$parse_probe"
+        parse_found=$(run_shellcheck sh -f gcc "$parse_probe" 2>&1 | grep -o '\[SC[0-9]*\]' | tr -d '[]' | sort -u | tr '\n' ' ')
+        case $parse_found in
+            *SC1072*SC1073*) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    # The detector must be able to fail, and its "clean" answer must be a real
+    # answer.  Five planted lines: a narrowing directive, a malformed one and
+    # one that switches off the parse-error signal itself must be flagged; an
+    # unrelated valid directive and plain prose must pass.
+    shellcheck_directive_selftest() {
+        local selftest_got=
+        shellcheck_directive_violation '# shellcheck disable=SC2034' && selftest_got="$selftest_got missed-narrowing"
+        shellcheck_directive_violation '# shellcheck reported it SC2034' && selftest_got="$selftest_got missed-malformed"
+        shellcheck_directive_violation '# shellcheck disable=SC1072,SC1073' && selftest_got="$selftest_got missed-parse-signal"
+        shellcheck_directive_violation '# shellcheck disable=SC2016' || selftest_got="$selftest_got false-valid"
+        shellcheck_directive_violation '# see shellcheck disable=SC2034' || selftest_got="$selftest_got false-prose"
+        if [ -n "$selftest_got" ]; then
+            printf 'client-contract: the shellcheck-directive probe FAILED its self-check:%s -- a narrowing directive is invisible, or a clean one is reported as a defect\n' "$selftest_got" >&2
+            shellcheck_bad=$((shellcheck_bad + 1))
+        fi
+    }
+    # The enumerator is the SHIPPED one, exercised through the same function the
+    # lint loop calls -- a self-test that re-spells the pattern would validate a
+    # copy, not the code.  The fixture has four candidate lines (directive
+    # shaped, prose, unspaced, uppercase) and two decoys (token after code,
+    # no token); a drift in the pattern must move the line set.
+    shellcheck_enumerator_selftest() {
+        local fixture=$shellcheck_probe_dir/enum.sh enum_lines
+        {
+            printf '%s\n' '#!/bin/sh'
+            printf '%s\n' '# shellcheck disable=SC2016'
+            printf '%s\n' '# see shellcheck disable=SC2016'
+            printf '%s\n' '    #shellcheck disable=SC2016'
+            printf '%s\n' '# Shellcheck disable=SC2016'
+            printf '%s\n' 'printf x  # shellcheck disable=SC2016'
+            printf '%s\n' 'printf y'
+        } >"$fixture"
+        enum_lines=$(shellcheck_directive_candidates "$fixture" | cut -d: -f1 | tr '\n' ' ')
+        if [ "$enum_lines" != '2 3 4 5 ' ]; then
+            printf 'client-contract: the shellcheck-directive enumerator returned lines [%s] in a fixture whose candidates are lines 2-5; it no longer matches the lines the lock must probe\n' "${enum_lines:-none}" >&2
+            shellcheck_bad=$((shellcheck_bad + 1))
+        fi
+    }
+    # The lock must not be silenceable from the environment either.  Plant a
+    # known defect in a directory that carries a narrowing `.shellcheckrc`, and
+    # run with `SHELLCHECK_OPTS='-S error'`: the defect must still be reported.
+    # A tool that rejects the invocation (unknown flag on an older shellcheck)
+    # is a THIRD outcome and is reported as such -- reading it as "not silenced"
+    # would be the same false green this arm exists to prevent.
+    shellcheck_external_config_selftest() {
+        local dir=$shellcheck_probe_dir/external rc=0
+        mkdir -p "$dir"
+        printf '%s\n' '#!/bin/sh' 'agentq_sc_probe_dead=1' >"$dir/defect.sh"
+        printf 'disable=SC2034\n' >"$dir/.shellcheckrc"
+        (unset CDPATH; cd "$dir" && SHELLCHECK_OPTS='-S error' run_shellcheck sh defect.sh >/dev/null 2>&1) || rc=$?
+        case $rc in
+            0) printf 'client-contract: shellcheck can be silenced from OUTSIDE the file on this host (a narrowing .shellcheckrc or SHELLCHECK_OPTS defeated --norc/-S style) -- every file would pass unlinted\n' >&2
+               shellcheck_bad=$((shellcheck_bad + 1)) ;;
+            1) : ;;
+            *) printf 'client-contract: shellcheck rejected the lock invocation itself (rc=%s; an older shellcheck without --norc or -S?) -- the lock never ran, so nothing was linted\n' "$rc" >&2
+               shellcheck_bad=$((shellcheck_bad + 1)) ;;
+        esac
+    }
     # $1 = path to lint, $2 = the name to print.  Runs in this shell, not a
     # subshell, so `shellcheck_bad` accumulates.
     lint_shell_file() {
-        local shell_file=$1 shell_label=$2 shell_dialect first
+        local shell_file=$1 shell_label=$2 shell_dialect first directive_line directive_text candidate_line
         first=$(head -1 "$shell_file")
         case $first in
             *bash*) shell_dialect=bash ;;
             *) shell_dialect=sh ;;
         esac
-        # SC2221/SC2222 joined the lock on 2026-10-20: a duplicated case
-        # pattern (''|en|en-*|'') makes the repeated branch DEAD, and a dead
-        # branch in a check is the same defect class as a dead variable -- an
-        # assertion that silently never runs.  It was found by widening the
-        # lock in a real-host run, after three checks had shipped with it.
-        if ! shellcheck -s "$shell_dialect" -i SC2319,SC2034,SC2221,SC2222 "$shell_file" >/dev/null 2>&1; then
-            printf 'client-contract: shellcheck found SC2319/SC2034/SC2221/SC2222 in %s (a `$?` after a test, a dead variable, or a dead case branch):\n' "$shell_label" >&2
-            shellcheck -s "$shell_dialect" -i SC2319,SC2034,SC2221,SC2222 "$shell_file" >&2 || true
+        if ! run_shellcheck "$shell_dialect" "$shell_file" >/dev/null 2>&1; then
+            printf 'client-contract: shellcheck found SC2319/SC2034/SC2221/SC2222 (a `$?` after a test, a dead variable, or a dead case branch) or SC1072/SC1073 (a file shellcheck stopped parsing -- often a comment that begins with the directive token, which aborts the rest of the analysis) in %s:\n' "$shell_label" >&2
+            run_shellcheck "$shell_dialect" "$shell_file" >&2 || true
             shellcheck_bad=$((shellcheck_bad + 1))
         fi
+        # Every candidate line is probed, so a directive that narrows the lock
+        # or fails to parse is named with its file and line.
+        #
+        # The empty line is skipped: a command substitution that yields nothing
+        # still leaves one empty here-doc line, so a candidate-less file used to
+        # contribute one phantom probe (measured 2026-10-26 on the tree of that
+        # day: 31 such files inflated the counter from 47 real candidates to 78).
+        # Worse, a grep that failed on an unreadable file was indistinguishable
+        # from a clean one -- and the `checked(0)` guard below, which exists to
+        # catch a blind enumerator, could never fire while every file
+        # contributed one.
+        # (The split itself is fine: `IFS=: read` gives the last variable the
+        # remainder INCLUDING later separators -- measured -- so the text was
+        # never truncated.  Splitting with parameter expansion anyway keeps the
+        # line number and text visibly one field apart.)
+        while IFS= read -r candidate_line; do
+            [ -n "$candidate_line" ] || continue
+            directive_line=${candidate_line%%:*}
+            directive_text=${candidate_line#*:}
+            shellcheck_directives=$((shellcheck_directives + 1))
+            if ! shellcheck_directive_violation "$directive_text"; then
+                printf 'client-contract: shellcheck directive in %s:%s is malformed or disables a locked code -- a malformed one makes shellcheck stop analysing the rest of the file, and either kind turns this lock off for that file: %s\n' \
+                    "$shell_label" "$directive_line" "$directive_text" >&2
+                shellcheck_bad=$((shellcheck_bad + 1))
+            fi
+        done <<EOF
+$(shellcheck_directive_candidates "$shell_file")
+EOF
     }
     while IFS= read -r shell_asset; do
         lint_shell_file "$shell_asset" "${shell_asset#"$root"/}"
@@ -1728,9 +1909,24 @@ if command -v shellcheck >/dev/null 2>&1; then
         printf 'client-contract: no repo scripts were enumerated for shellcheck; refusing to report a pass\n' >&2
         shellcheck_bad=$((shellcheck_bad + 1))
     fi
+    # The three self-checks run LAST, after every file has been probed, so a
+    # detector that has gone blind cannot be hidden by an empty candidate set.
+    # `shellcheck_directives` is a count of what was actually probed; the
+    # enumerator is broad (any comment line mentioning the tool), so the number
+    # is much larger than the directive count a human would tally -- that is
+    # the point: a line is judged by what the tool DOES with it, not by how it
+    # looks.  Zero means the enumerator matched nothing across every shell file
+    # in the repo, which is a broken enumerator, not a clean tree.
+    shellcheck_directive_selftest
+    shellcheck_enumerator_selftest
+    shellcheck_external_config_selftest
+    if [ "$shellcheck_directives" -eq 0 ]; then
+        printf 'client-contract: not one shellcheck-directive candidate was enumerated across %s files; the enumerator is blind and the directive lock never ran\n' "$((shellcheck_assets + shellcheck_scripts))" >&2
+        shellcheck_bad=$((shellcheck_bad + 1))
+    fi
     cases=$((cases + 1))
     failures=$((failures + shellcheck_bad))
-    shellcheck_summary="checked($shellcheck_assets) scriptcheck=checked($shellcheck_scripts)"
+    shellcheck_summary="checked($shellcheck_assets) scriptcheck=checked($shellcheck_scripts) directives=checked($shellcheck_directives)"
 else
     # `skipped(...)`, not a bare `absent`: run-tests.sh buckets a check into
     # PART on the word "skipped", so the old token read as a full pass on a
