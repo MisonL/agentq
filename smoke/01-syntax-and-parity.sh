@@ -2753,23 +2753,32 @@ rm -f "$unused_fn_selftest"
 # .DS_Store in any directory it displays, so a red there would be a false alarm
 # about a file .gitignore already keeps out.  Everything else -- including an
 # unknown ASSET kind -- must be classified.
-asset_is_classified() {
+# The same table, asked for the KIND rather than a yes/no.  One table, so the
+# classifier and the per-kind census below cannot answer differently.
+asset_kind() { # $1 = path -> ps1|cmd|plist|yml|service|shell|junk|unknown
     local asset_path=$1 asset_first
     case ${asset_path##*/} in
-        .DS_Store|Thumbs.db|desktop.ini) return 0 ;;
+        .DS_Store|Thumbs.db|desktop.ini) printf 'junk\n'; return 0 ;;
     esac
     case $asset_path in
-        *.ps1|*.cmd|*.plist|*.yml|*.service) return 0 ;;
+        *.ps1) printf 'ps1\n'; return 0 ;;
+        *.cmd) printf 'cmd\n'; return 0 ;;
+        *.plist) printf 'plist\n'; return 0 ;;
+        *.yml) printf 'yml\n'; return 0 ;;
+        *.service) printf 'service\n'; return 0 ;;
     esac
     asset_first=$(head -1 "$asset_path" 2>/dev/null || true)
     case $asset_first in
         "#!"*)
             case ${asset_first##* } in
-                *sh) return 0 ;;
+                *sh) printf 'shell\n'; return 0 ;;
             esac
             ;;
     esac
-    return 1
+    printf 'unknown\n'
+}
+asset_is_classified() {
+    [ "$(asset_kind "$1")" != unknown ]
 }
 
 # Self-check, for the reason the other detectors carry one: a classifier that
@@ -2803,6 +2812,87 @@ while IFS= read -r asset_file; do
 done < <(find "$root/skill/assets" -type f | sort)
 failures=$((failures + unclassified_assets))
 
+# --- per-kind census: each arm's count must equal what the tree holds --------
+# Every per-kind arm above enumerates with its own glob (`-name '*.plist'`,
+# `-name '*.yml'`, ...) and prints how many files it saw.  Measured 2026-10-26:
+# a one-letter typo in ANY of those five globs (`*.plst`, `*.yam2`, `*.srvc`,
+# `*.cmdx`, `*.psx`) left that arm enumerating nothing while this check exited
+# 0 -- the summary printed `plist=0` / `yml=0` / ... and the whole kind was
+# parsed by no rule at all.  The `unclassified` gate above answers the
+# OPPOSITE question (a file whose kind nothing parses); it cannot see an
+# existing kind whose enumerator stopped matching.  The four `*_count`
+# variables were write-only, and SC2034 does not flag a self-referencing
+# increment (measured: `dead=0; dead=$((dead+1))` is clean), so the shellcheck
+# lock could not see them either.
+#
+# The oracle is an independent enumeration: classify EVERY file under
+# skill/assets (asset_kind, the same table the unclassified gate uses) and
+# compare the per-kind totals with what each arm counted.  This proves the
+# arm's glob still matches its kind.  It does NOT prove the deployment unit is
+# complete -- a deleted asset is a different question, answered by the index
+# floor in skill_modes (`-lt 25`); a file deleted from the WORKTREE but still
+# in the index is caught by neither and shows only in `git status`.
+kind_census() { # $1 = directory -> "kind count" per kind, sorted
+    local census_asset
+    while IFS= read -r census_asset; do
+        asset_kind "$census_asset"
+    done < <(find "$1" -type f | sort) | sort | uniq -c | awk '{printf "%s %s\n", $2, $1}'
+}
+kind_census_gate() { # $1=census text $2=kind $3=arm count $4=arm label -> rc 0 = agree
+    local want
+    want=$(printf '%s\n' "$1" | awk -v k="$2" '$1 == k { printf "%s", $2 }')
+    [ -n "$want" ] || want=0
+    if [ "$3" -ne "$want" ]; then
+        printf 'per-kind census FAILED (%s: the %s arm counted %s file(s) but the tree holds %s -- the arm'"'"'s glob no longer matches its kind, so those files are parsed by nothing)\n' \
+            "$2" "$4" "$3" "$want" >&2
+        return 1
+    fi
+    return 0
+}
+# Self-checks, for the reason every other detector here carries one.  The census
+# must classify a known fixture correctly, and the comparator must FIRE on a
+# wrong count -- a comparator that always agrees would keep this gate green
+# forever.
+kind_census_selftest_dir=$(mktemp -d "${TMPDIR:-/tmp}/agentq-kind-census.XXXXXX")
+printf 'x\n' >"$kind_census_selftest_dir/a.plist"
+printf 'x\n' >"$kind_census_selftest_dir/b.cmd"
+printf '#!/bin/sh\n:\n' >"$kind_census_selftest_dir/c-shim"
+printf '{}\n' >"$kind_census_selftest_dir/d.json"
+kind_census_selftest=$(kind_census "$kind_census_selftest_dir" | tr '\n' ' ')
+rm -rf -- "$kind_census_selftest_dir"
+if [ "$kind_census_selftest" != 'cmd 1 plist 1 shell 1 unknown 1 ' ]; then
+    printf 'per-kind census FAILED its self-check (expected "cmd 1 plist 1 shell 1 unknown 1 ", got "%s")\n' \
+        "$kind_census_selftest" >&2
+    failures=$((failures + 1))
+fi
+kind_census_fixture='plist 2
+ps1 7'
+if ! kind_census_gate "$kind_census_fixture" plist 2 'self-check (agreeing)'; then
+    printf '%s\n' 'per-kind census comparator FAILED its self-check (a matching count was reported as a mismatch)' >&2
+    failures=$((failures + 1))
+fi
+if kind_census_gate "$kind_census_fixture" plist 0 'self-check (mismatched)' 2>/dev/null; then
+    printf '%s\n' 'per-kind census comparator FAILED its self-check (a wrong count was accepted)' >&2
+    failures=$((failures + 1))
+fi
+if ! kind_census_gate "$kind_census_fixture" cmd 0 'self-check (absent kind)' 2>/dev/null; then
+    printf '%s\n' 'per-kind census comparator FAILED its self-check (an absent kind must compare as 0)' >&2
+    failures=$((failures + 1))
+fi
+
+kind_census_checked='checked'
+kind_census_text=$(kind_census "$root/skill/assets")
+kind_census_gate "$kind_census_text" shell "$shell_count" 'shell' || failures=$((failures + 1))
+kind_census_gate "$kind_census_text" plist "$plist_count" '.plist' || failures=$((failures + 1))
+kind_census_gate "$kind_census_text" service "$service_count" '.service' || failures=$((failures + 1))
+kind_census_gate "$kind_census_text" cmd "$cmd_count" '.cmd' || failures=$((failures + 1))
+if [ "$pwsh_state" = usable ]; then
+    kind_census_gate "$kind_census_text" ps1 "$ps_count" '.ps1' || failures=$((failures + 1))
+fi
+if [ "$yaml_summary" != 'skipped(no pyyaml)' ]; then
+    kind_census_gate "$kind_census_text" yml "$yaml_count" '.yml' || failures=$((failures + 1))
+fi
+
 # `shell=` (files the parse arm checked) and `local_hazard_files=` (files the
 # static rules scanned) are the same set by construction -- both derive from
 # $shell_assets.  Pin it anyway: for one day they were 9 and 7, printed side by
@@ -2817,8 +2907,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
@@ -2830,7 +2920,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files uncalled unclassified farm_writes python3_users entrypoints workflows ci_pin gitattr gitignore skill_modes'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files uncalled unclassified farm_writes python3_users entrypoints workflows ci_pin gitattr gitignore skill_modes kinds'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned
