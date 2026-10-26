@@ -36,10 +36,11 @@ jobs:
         # under zsh, and lints the plists (xmllint); 07 and 17 start their own
         # sshd on a high port, which needs the binary and its privilege
         # separation directory; smoke/05's shellcheck lock covers the nine
-        # shell assets and the repo's own 31 scripts, and WITHOUT the tool it
-        # degrades to `shellcheck=absent` and exits 0 -- the assertion below
-        # is what keeps that degradation from reading as green.  pwsh and jq
-        # are already on the runner image.
+        # shell assets, the repo's own 31 scripts and every comment line that
+        # could be a directive, and WITHOUT the tool it degrades to
+        # `shellcheck=absent` and exits 0 -- the assertion below is what keeps
+        # that degradation from reading as green.  pwsh and jq are already on
+        # the runner image.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -122,7 +123,7 @@ jobs:
           # layer that parses those assets under the grammar they actually
           # ship with, since bash -n and zsh -n both accept bashisms dash
           # rejects (measured 2026-10-24).  ubuntu-latest always has dash.
-          grep -qE 'shellcheck=checked\([1-9][0-9]*\) scriptcheck=checked\([1-9][0-9]*\) posix=checked\([1-9][0-9]*\)' smoke.log
+          grep -qE 'shellcheck=checked\([1-9][0-9]*\) scriptcheck=checked\([1-9][0-9]*\) directives=checked\([1-9][0-9]*\) posix=checked\([1-9][0-9]*\)' smoke.log
           # NOT-covered is platform-expected, so it is neither skipped nor
           # partial and must not disturb the line above.  But the word has to
           # be pinned somewhere: every check allowed to admit it must be in the

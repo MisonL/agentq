@@ -345,7 +345,7 @@ cases=0
 # Asserts the LAST argv element (the remote command) survives the model:
 # exactly one argument, and byte-identical to what the client built.
 # (A <client.ps1> parameter used to sit second here and was never read --
-# shellcheck reported it SC2034; it is gone rather than left looking
+# a shellcheck run reported it SC2034; it is gone rather than left looking
 # load-bearing.)
 check_roundtrip() {
     local label=$1 argvfile=$2 expected=$3
