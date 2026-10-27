@@ -1,0 +1,19 @@
+# Check names allowed to declare a NOT-covered platform gap.
+#
+# ONE list, two consumers: run-tests.sh's local gate and the linux job in
+# .github/workflows/ci.yml both read this file, so a name added for one cannot
+# be missing from the other.  Before 2026-10-27 the list lived only in ci.yml
+# and the local run merely PRINTED the NOT-covered line and exited 0 -- a check
+# that started declaring a gap was green here and red in CI.
+#
+# Adding a name is a deliberate decision: say which platform cannot exercise
+# the sub-part (and why) in docs/PLAN.md, and keep the reason named inside the
+# token itself (`staging=NOT-covered(needs-Windows)`).  Dropping a name is
+# fine: the gate is a subset test, so a check that stops declaring a gap is a
+# platform covering more, not a failure.
+05-client-contract
+12-ps-client-contract
+13-ps-installer-contract
+22-launcher-contract
+23-durable-move-contract
+25-ps-client-installer-contract

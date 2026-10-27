@@ -143,7 +143,17 @@ jobs:
           # 05 self-reports a lowercase not-covered when no strict-POSIX shell
           # (dash/busybox/ksh refusing ${x//pat/}) is on PATH -- a runner
           # property, so it is a legitimate platform-gap declaration here too.
-          known_ncov=" 05-client-contract 12-ps-client-contract 13-ps-installer-contract 22-launcher-contract 23-durable-move-contract 25-ps-client-installer-contract "
+          # The known set lives in smoke/not-covered-known.txt, which
+          # run-tests.sh reads for its LOCAL gate too -- one list, two
+          # consumers, so a name added for one cannot be missing from the
+          # other.  (Until 2026-10-27 the list existed only here and the local
+          # run printed the NOT-covered line and exited 0: measured on a
+          # fixture tree, local PASS vs this gate's exit 1.)
+          known_ncov=" $(grep -vE '^[[:space:]]*(#|$)' smoke/not-covered-known.txt 2>/dev/null | tr '\n' ' ' || true)"
+          if [ -z "${known_ncov// /}" ]; then
+            echo 'smoke/not-covered-known.txt is missing or names no check' >&2
+            exit 1
+          fi
           unknown=''
           for name in $(grep -E '^NOT-covered:' smoke.log | sed -E 's/^NOT-covered: [0-9]+ check\(s\) declared platform-unverifiable sub-parts: //'); do
             case "$known_ncov" in
