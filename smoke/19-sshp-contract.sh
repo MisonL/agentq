@@ -215,6 +215,26 @@ if [ "$status" -ne 2 ] || ! grep -qF 'SSHP_SSH is not executable' "$work/err"; t
     failures=$((failures + 1))
 fi
 
+# `[ -x ]` is TRUE for a directory (it tests the search bit), so a directory
+# passed the SSHP_SSH guard and the failure came back as exit 126 with a
+# MISLEADING message ("remote dependency probe failed for both Unix and
+# Windows shells" -- blaming the remote for a local misconfiguration).
+# Measured 2026-10-27; the Windows twin refuses the same input with exit 2.
+cases=$((cases + 1))
+mkdir -p "$work/ssh-dir"
+if SSHP_STUB_DIR="$stub_dir" SSHP_SSH="$work/ssh-dir" HOME="$home" TMPDIR="$work/tmp" \
+        PATH="$work/bin:/usr/bin:/bin" \
+        /bin/sh "$client" --check smoke-host >"$work/out" 2>"$work/err"; then status=0; else status=$?; fi
+if [ "$status" -ne 2 ] || ! grep -qF 'SSHP_SSH must be a regular file' "$work/err"; then
+    printf 'sshp-contract: SSHP_SSH=directory: expected exit 2 naming the shape, got %s [%s]\n' \
+        "$status" "$(head -1 "$work/err")" >&2
+    failures=$((failures + 1))
+fi
+if grep -qF 'remote dependency probe failed' "$work/err"; then
+    printf '%s\n' 'sshp-contract: SSHP_SSH=directory: the failure was blamed on the remote host' >&2
+    failures=$((failures + 1))
+fi
+
 # ---------------------------------------------------------------------------
 # --help is a success path and must not touch ssh.
 # ---------------------------------------------------------------------------

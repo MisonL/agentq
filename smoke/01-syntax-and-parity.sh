@@ -2707,6 +2707,159 @@ else
 fi
 rm -f "$local_hazard_selftest"
 
+# --- shell assets: `-x` is not "is a regular executable file" ----------------
+# `test -x` asks whether the EXECUTE/SEARCH bit is set, and EVERY directory has
+# it.  So a `[ -x "$path" ]` guard that decides "can I run this?" accepts a
+# directory, and the failure happens later, at exec time.  Measured 2026-10-27
+# on three assets at once, with the same input:
+#   AGENTQ_SSH=<dir>  -> exit 126 (outside the documented 0-6 / 42-45 / 124)
+#                        with ZERO bytes on stdout AND stderr
+#   AGENTQ_JQ=<dir>   -> the SHELL's own "is a directory" line reached stderr,
+#                        and a VALID remote response was reported as
+#                        "invalid JSON response" -- blaming the server for a
+#                        local misconfiguration
+#   SSHP_SSH=<dir>    -> exit 126 blaming "remote dependency probe"
+# The Windows twins refuse all three with exit 2 and a controlled message.
+#
+# The rule: inside one function, every `-x "$VAR"` test on a VARIABLE must be
+# PRECEDED by a `-f "$VAR"` test on the same variable.  Literal operands
+# (`[ -x /bin/bash ]`) are exempt -- a directory there is not a plausible
+# state.  The order is part of the rule because it is the order every real site
+# uses (shape first, then executability) and a single left-to-right pass can
+# then be the whole check.
+#
+# Scope is every shell asset, for the same reason as the quiet-grep and
+# local-hazard locks next to it: a rule scoped to the file it was found in has
+# a one-file hole.
+executable_shape_prog=$(
+    cat <<'AWK'
+FNR == 1 { depth = 0; infn = 0; fnkey = 0; fnname = "" }
+function leading(s,   i) {
+    i = 1
+    while (i <= length(s) && (substr(s, i, 1) == " " || substr(s, i, 1) == "\t")) i++
+    return substr(s, 1, i - 1)
+}
+function var_of(token) {
+    v = token
+    sub(/^-[fx] "/, "", v)
+    sub(/"$/, "", v)
+    sub(/^\$/, "", v)
+    return v
+}
+/^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*\(\) \{/ {
+    depth++
+    stackkey[depth] = fnkey
+    stackfn[depth] = fnname
+    stacklead[depth] = leading($0)
+    fnkey = FNR
+    fnname = $0
+    sub(/^[[:space:]]*/, "", fnname)
+    sub(/\(\).*/, "", fnname)
+    infn = 1
+    next
+}
+infn && $0 == stacklead[depth] "}" {
+    depth--
+    fnkey = stackkey[depth + 1]
+    fnname = stackfn[depth + 1]
+    infn = (depth > 0)
+    next
+}
+{
+    if ($0 ~ /^[[:space:]]*#/) next
+    tmp = $0
+    while (match(tmp, /-f "[$][A-Za-z_0-9]+"/)) {
+        fseen[fnkey SUBSEP var_of(substr(tmp, RSTART, RLENGTH))] = 1
+        tmp = substr(tmp, RSTART + RLENGTH)
+    }
+    tmp = $0
+    while (match(tmp, /-x "[$][A-Za-z_0-9]+"/)) {
+        v = var_of(substr(tmp, RSTART, RLENGTH))
+        sites++
+        if (!((fnkey SUBSEP v) in fseen))
+            printf "%s: -x on $%s with no preceding -f on the same variable (%s:%d)\n", \
+                (fnname == "" ? "[top level]" : fnname), v, FILENAME, FNR
+        tmp = substr(tmp, RSTART + RLENGTH)
+    }
+}
+END { printf "__SITES__%d\n" , sites }
+AWK
+)
+executable_shape_report=$(awk "$executable_shape_prog" $shell_assets)
+executable_shape_sites=$(printf '%s\n' "$executable_shape_report" | sed -n 's/^__SITES__//p')
+executable_shape_hits=$(printf '%s\n' "$executable_shape_report" | grep -v '^__SITES__' || true)
+executable_shape_count=0
+if [ -n "$executable_shape_hits" ]; then
+    while IFS= read -r hit; do
+        [ -n "$hit" ] || continue
+        printf 'shell FAILED (an executability guard that accepts a directory: add a `-f "$VAR"` test before the `-x`): %s\n' \
+            "$hit" >&2
+        executable_shape_count=$((executable_shape_count + 1))
+    done <<EOF
+$executable_shape_hits
+EOF
+    failures=$((failures + 1))
+fi
+# The blind-enumerator lesson: a rule that enumerated zero sites is not a clean
+# tree, it is a rule that stopped seeing anything.  Today the tree has 8.
+if [ "${executable_shape_sites:-0}" -lt 5 ]; then
+    printf 'shell FAILED (the executable-shape rule saw only %s -x site(s); it is no longer reading the assets)\n' \
+        "${executable_shape_sites:-0}" >&2
+    failures=$((failures + 1))
+    executable_shape_count=$((executable_shape_count + 1))
+fi
+# Self-check, both directions, on a self-contained fixture.  A rule that never
+# fires reads exactly like a clean tree -- the failure mode that killed the
+# local-hazard rule twice while it was being written.
+executable_shape_selftest=$(mktemp)
+cat > "$executable_shape_selftest" <<'FIXTURE'
+#!/bin/sh
+zz_missing_regular() {
+    [ -x "$zz_path" ] || fail "no shape test"
+}
+zz_has_regular() {
+    if [ -e "$zz_path" ] && [ ! -f "$zz_path" ]; then
+        fail "not a regular file"
+    fi
+    [ -x "$zz_path" ] || fail "not executable"
+}
+zz_literal_path() {
+    [ -x /bin/bash ] || fail "literal operand"
+}
+zz_other_function() {
+    [ -f "$zz_shared" ] || fail "declared here only"
+}
+zz_scoped() {
+    [ -x "$zz_shared" ] || fail "the -f was in a DIFFERENT function"
+}
+FIXTURE
+executable_shape_selftest_report=$(awk "$executable_shape_prog" "$executable_shape_selftest")
+# Redirect, then grep the file: `... | grep -q` is the quiet-grep trap this
+# suite already locks elsewhere (a quiet grep exits at the first match and the
+# writer takes SIGPIPE, which pipefail turns into a FAILED pipeline).
+printf '%s\n' "$executable_shape_selftest_report" > "$executable_shape_selftest.report"
+if ! grep -q 'zz_missing_regular: -x on \$zz_path' "$executable_shape_selftest.report"; then
+    printf '%s\n' 'shell FAILED (the executable-shape rule is silent on a planted `-x` with no `-f`: the detector itself is broken)' >&2
+    failures=$((failures + 1))
+    executable_shape_count=$((executable_shape_count + 1))
+fi
+if grep -q 'zz_has_regular' "$executable_shape_selftest.report"; then
+    printf '%s\n' 'shell FAILED (the executable-shape rule reports a guard that DOES test `-f` first)' >&2
+    failures=$((failures + 1))
+    executable_shape_count=$((executable_shape_count + 1))
+fi
+if grep -q 'zz_literal_path' "$executable_shape_selftest.report"; then
+    printf '%s\n' 'shell FAILED (the executable-shape rule reports a LITERAL operand: a directory at /bin/bash is not a plausible state)' >&2
+    failures=$((failures + 1))
+    executable_shape_count=$((executable_shape_count + 1))
+fi
+if ! grep -q 'zz_scoped: -x on \$zz_shared' "$executable_shape_selftest.report"; then
+    printf '%s\n' 'shell FAILED (the executable-shape rule does not scope `-f` to the function: a -f in another function satisfied it)' >&2
+    failures=$((failures + 1))
+    executable_shape_count=$((executable_shape_count + 1))
+fi
+rm -f "$executable_shape_selftest" "$executable_shape_selftest.report"
+
 # --- shell assets: a defined function nobody calls ---------------------------
 # A function with zero call sites is not automatically a defect -- an API surface
 # kept for a future caller is a legitimate choice.  What is NOT legitimate is a
@@ -2987,8 +3140,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s executable_shape=%s exec_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$executable_shape_count" "$executable_shape_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
@@ -3000,7 +3153,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files uncalled unclassified farm_writes python3_users entrypoints workflows ci_pin gitattr gitignore skill_modes kinds summary_census'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files executable_shape exec_sites uncalled unclassified farm_writes python3_users entrypoints workflows ci_pin gitattr gitignore skill_modes kinds summary_census'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned

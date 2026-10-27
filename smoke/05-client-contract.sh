@@ -486,6 +486,116 @@ if [ "$host_shape_cases" -lt 15 ]; then
     failures=$((failures + 1))
 fi
 
+# --- "is this executable?" must mean "a regular file you can exec" -----------
+# `[ -x ]` tests the SEARCH BIT, which every directory has.  So a directory
+# passed this client's AGENTQ_SSH and AGENTQ_JQ guards, and the failure that
+# followed was not controlled at all -- measured 2026-10-27:
+#   AGENTQ_SSH=<directory>  -> exit 126 with ZERO bytes on stdout AND stderr
+#                              (126 is outside the documented contract
+#                              0-6 / 42-45 / 124, and there is no diagnostic)
+#   AGENTQ_JQ=<directory>   -> the shell's own line leaks to stderr
+#                              ("line 1768: ...: is a directory") AND a
+#                              perfectly VALID response is reported as
+#                              "invalid JSON response" -- the blame lands on
+#                              the server for a local misconfiguration
+# The Windows twin refuses the same input with exit 2 and a controlled message
+# ("not a regular non-reparse file").  The askpass guard in this same file
+# already had the right ladder (-L, -e, -f, -x); these three siblings did not.
+#
+# `-f` FOLLOWS symlinks, so a symlink to a real executable still works -- that
+# is deliberate: /usr/local/bin/ssh is a symlink on plenty of systems, and the
+# accept-side case below pins it.
+executable_shape_cases=0
+mkdir -p "$work/exec-dir"
+ln -sfn "$work/exec-dir" "$work/exec-dirlink" 2>/dev/null || true
+ln -sf "$work/bin/ssh-count" "$work/exec-link" 2>/dev/null || true
+# expect_not_a_regular_file <label> <env-var> <value>
+expect_not_a_regular_file() {
+    local label=$1 variable=$2 value=$3 status=0
+    cases=$((cases + 1)); executable_shape_cases=$((executable_shape_cases + 1))
+    : > "$work/ssh-count.log"
+    host_status=0
+    env AGENTQ_SSH_COUNT="$work/ssh-count.log" \
+        AGENTQ_SSH="$work/bin/ssh-count" AGENTQ_HOST=smoke-host \
+        AGENTQ_CONFIG="$work/absent-config" AGENTQ_REMOTE_PLATFORM=unix \
+        AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+        "$variable=$value" \
+        "$client" status >"$work/out" 2>"$work/err" || host_status=$?
+    if [ "$host_status" -ne 2 ]; then
+        printf 'client executable [%s]: expected exit 2, got %s\n' "$label" "$host_status" >&2
+        head -2 "$work/err" >&2 || true
+        failures=$((failures + 1))
+        return
+    fi
+    if ! grep -qF -- "must be a regular file" "$work/err"; then
+        printf 'client executable [%s]: stderr does not name the shape: %s\n' \
+            "$label" "$(head -2 "$work/err" | tr '\n' '|')" >&2
+        failures=$((failures + 1))
+    fi
+    # A raw shell diagnostic is not an AgentQ diagnostic: the client withholds
+    # raw remote output everywhere else, and "line NNNN: ...: is a directory"
+    # is the shell's own text about a LOCAL path.
+    if grep -qE 'is a directory|: line [0-9]+:' "$work/err"; then
+        printf 'client executable [%s]: a raw shell diagnostic reached stderr: %s\n' \
+            "$label" "$(head -2 "$work/err" | tr '\n' '|')" >&2
+        failures=$((failures + 1))
+    fi
+    if [ -s "$work/ssh-count.log" ]; then
+        printf 'client executable [%s]: ssh was invoked for a locally refused path\n' "$label" >&2
+        failures=$((failures + 1))
+    fi
+}
+expect_not_a_regular_file 'AGENTQ_SSH=directory' AGENTQ_SSH "$work/exec-dir"
+expect_not_a_regular_file 'AGENTQ_SSH=symlink-to-dir' AGENTQ_SSH "$work/exec-dirlink"
+expect_not_a_regular_file 'AGENTQ_JQ=directory' AGENTQ_JQ "$work/exec-dir"
+
+# The JQ face has its own assertion: the refusal must happen BEFORE the remote
+# response is judged, so a valid response can never be called invalid.
+cases=$((cases + 1)); executable_shape_cases=$((executable_shape_cases + 1))
+host_status=0
+env AGENTQ_JQ="$work/exec-dir" AGENTQ_SSH="$work/bin/ssh-modes" \
+    AGENTQ_ARGV_CAPTURE="$work/exec-jq.argv" AGENTQ_HOST=smoke-host \
+    AGENTQ_CONFIG="$work/absent-config" AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    "$client" status >"$work/out" 2>"$work/err" || host_status=$?
+if [ "$host_status" -ne 2 ]; then
+    printf 'client executable [AGENTQ_JQ=directory, valid response]: expected exit 2, got %s\n' \
+        "$host_status" >&2
+    failures=$((failures + 1))
+elif grep -qF 'invalid JSON response' "$work/err"; then
+    printf '%s\n' 'client executable [AGENTQ_JQ=directory, valid response]: the client blamed the REMOTE response for a local misconfiguration' >&2
+    failures=$((failures + 1))
+fi
+if [ -s "$work/exec-jq.argv" ]; then
+    printf '%s\n' 'client executable [AGENTQ_JQ=directory]: ssh was invoked before the parser was validated' >&2
+    failures=$((failures + 1))
+fi
+
+# Accept side: a symlink to a real executable must still be accepted (exit 255
+# here means "handed to the stub ssh"), or the fix would break /usr/local/bin
+# style installs.
+cases=$((cases + 1)); executable_shape_cases=$((executable_shape_cases + 1))
+: > "$work/ssh-count.log"
+host_status=0
+AGENTQ_SSH_COUNT="$work/ssh-count.log" AGENTQ_SSH="$work/exec-link" \
+    AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+    AGENTQ_REMOTE_PLATFORM=unix AGENTQ_OPERATION_RETRY_ATTEMPTS=1 \
+    AGENTQ_OPERATION_RETRY_DELAY=1 \
+    "$client" status >"$work/out" 2>"$work/err" || host_status=$?
+if [ "$host_status" -ne 255 ]; then
+    printf 'client executable [AGENTQ_SSH=symlink-to-executable]: expected 255 (accepted), got %s: %s\n' \
+        "$host_status" "$(head -1 "$work/err")" >&2
+    failures=$((failures + 1))
+elif [ ! -s "$work/ssh-count.log" ]; then
+    printf '%s\n' 'client executable [AGENTQ_SSH=symlink-to-executable]: ssh was never invoked, yet exit was 255' >&2
+    failures=$((failures + 1))
+fi
+if [ "$executable_shape_cases" -lt 5 ]; then
+    printf 'client executable shape: only %s case(s) ran (expected at least 5); the enumeration broke\n' \
+        "$executable_shape_cases" >&2
+    failures=$((failures + 1))
+fi
+
 # --- mode forwarding and response validation ---------------------------------
 # Each case runs against ssh-modes and asserts BOTH that the run succeeds (the
 # response passed the client's validation for that mode) and that the mode
@@ -2219,4 +2329,4 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 
-printf 'client-contract checks passed: cases=%s env=%s cred=%s global=%s host=%s stub-ssh=yes reason=forwarded/injection-safe exit-token=last-wins windows-probe=stdin-fed/no-leak windows-submit=payload-delivered/args-checked/no-leak shellcheck=%s posix=%s\n' "$cases" "$env_rejections" "$credential_cases" "$global_variants" "$host_shape_cases" "$shellcheck_summary" "$posix_parse_state"
+printf 'client-contract checks passed: cases=%s env=%s cred=%s global=%s host=%s exec=%s stub-ssh=yes reason=forwarded/injection-safe exit-token=last-wins windows-probe=stdin-fed/no-leak windows-submit=payload-delivered/args-checked/no-leak shellcheck=%s posix=%s\n' "$cases" "$env_rejections" "$credential_cases" "$global_variants" "$host_shape_cases" "$executable_shape_cases" "$shellcheck_summary" "$posix_parse_state"
