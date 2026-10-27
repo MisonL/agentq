@@ -1594,7 +1594,10 @@ stage_verified_binary() {
     if [ -e "$existing_path" ] || [ -L "$existing_path" ]; then
         require_installer_stage_file "$existing_path" 'existing AgentQ binary path'
     fi
-    if [ -x "$existing_path" ]; then
+    # `-x` is true for a directory (search bit), so require a regular file too:
+    # the guard above already refuses one, but this keeps the executability
+    # test local and honest instead of depending on a helper three calls away.
+    if [ -f "$existing_path" ] && [ -x "$existing_path" ]; then
         source_path=$existing_path
         actual_sha256=$(sha256_file "$source_path")
         if [ "$actual_sha256" = "$expected_sha256" ]; then
@@ -1650,7 +1653,10 @@ assert_existing_queue_has_no_active_tasks() {
         fail "existing AgentQ installation contains an unsafe path; refuse to overwrite $agentq_home"
     [ -d "$agentq_home" ] || fail "existing AgentQ path is not a directory: $agentq_home"
     [ ! -L "$agentq_home" ] || fail "existing AgentQ path must not be a symbolic link: $agentq_home"
-    [ -x "$existing_client" ] || fail "existing AgentQ installation is incomplete; refuse to overwrite $agentq_home"
+    # `-x` is true for a directory (search bit); a directory at the client path
+    # is a corrupt installation, not a complete one.
+    [ -f "$existing_client" ] && [ -x "$existing_client" ] ||
+        fail "existing AgentQ installation is incomplete; refuse to overwrite $agentq_home"
     [ -f "$existing_config" ] || fail "existing AgentQ installation is incomplete; refuse to overwrite $agentq_home"
 
     existing_pid_file="$agentq_home/runtime/pueued.pid"

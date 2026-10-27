@@ -339,6 +339,15 @@ fail() {
 }
 
 require_executable() {
+    # `-x` tests the SEARCH BIT, which every directory has, so a directory in
+    # the install tree passed this guard.  Measured 2026-10-27: `doctor` then
+    # printed the SHELL's own diagnostic inside its machine-readable version
+    # block ("pueue=...line 5805: ...: is a directory") and the contract says
+    # this program only ever emits controlled diagnostics.  `-f` follows
+    # symlinks, so a symlinked binary still works.
+    if [ -e "$1" ] && [ ! -f "$1" ]; then
+        fail "required executable must be a regular file: $1"
+    fi
     [ -x "$1" ] || fail "required executable is missing: $1"
 }
 

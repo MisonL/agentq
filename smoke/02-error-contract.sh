@@ -75,6 +75,40 @@ expect_rejected remove-label-missing-flag 'remove --label requires --confirm' pr
 expect_rejected remove-label-empty 'remove --label requires a non-empty label' protocol_error remove --label '' --confirm
 expect_rejected doctor-extra-arg 'doctor accepts --full or no arguments' protocol_error doctor --bogus
 
+# `[ -x ]` is TRUE for a directory (it tests the search bit), so a directory
+# where the Pueue binary belongs passed require_executable.  Measured
+# 2026-10-27: `doctor` then printed the SHELL's own diagnostic inside its
+# machine-readable version block --
+#   pueue=<path>/agentq-server: line 5805: <path>/pueue: is a directory
+# -- and the contract says this program only ever exits 0-6 with controlled
+# diagnostics.  The guard must name the shape and stop before anything execs.
+cases=$((cases + 1))
+pueue_backup="$work/pueue.regular-backup"
+mv "$work/pueue" "$pueue_backup"
+mkdir -p "$work/pueue"
+server_status=0
+"$server" doctor >"$work/pueue-dir.stdout" 2>"$work/pueue-dir.stderr" || server_status=$?
+rmdir "$work/pueue"
+mv "$pueue_backup" "$work/pueue"
+if [ "$server_status" -ne 2 ]; then
+    printf 'pueue-directory: expected exit 2, got %s\n' "$server_status" >&2
+    failures=$((failures + 1))
+fi
+if ! grep -qF 'must be a regular file' "$work/pueue-dir.stderr"; then
+    printf 'pueue-directory: stderr does not name the shape: %s\n' \
+        "$(head -2 "$work/pueue-dir.stderr" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+fi
+if ! grep -qxF -- 'agentq-server: reason=protocol_error' "$work/pueue-dir.stderr"; then
+    printf 'pueue-directory: stderr does not carry reason=protocol_error\n' >&2
+    failures=$((failures + 1))
+fi
+if grep -qE 'is a directory|: line [0-9]+:' "$work/pueue-dir.stderr"; then
+    printf 'pueue-directory: a raw shell diagnostic reached doctor stderr: %s\n' \
+        "$(head -2 "$work/pueue-dir.stderr" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+fi
+
 # A malformed Pueue status must NOT surface as exit 5.  The contract reserves 5
 # for a REMOVED task; but compact_status's jq filter ends in
 # error("invalid visible Pueue task metadata"), and jq exits 5 on error() -- so

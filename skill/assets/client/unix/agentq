@@ -1555,6 +1555,15 @@ windows_argument_identity_for_path() {
 
 resolve_ssh_binary() {
     if [ -n "$ssh_binary" ]; then
+        # `-x` tests the SEARCH BIT, which every directory has, so a directory
+        # used to pass this guard and then fail at exec time with exit 126 --
+        # outside this client's documented exit codes -- and with NO diagnostic
+        # at all (measured 2026-10-27; the Windows twin refuses it with exit 2).
+        # `-f` FOLLOWS symlinks, so a symlink to a real executable still works;
+        # /usr/local/bin/ssh is a symlink on plenty of systems.
+        if [ -e "$ssh_binary" ] && [ ! -f "$ssh_binary" ]; then
+            fail "AGENTQ_SSH must be a regular file: $ssh_binary"
+        fi
         [ -x "$ssh_binary" ] || fail "AGENTQ_SSH is not executable: $ssh_binary"
         return
     fi
@@ -1565,6 +1574,14 @@ resolve_ssh_binary() {
 
 resolve_json_parser() {
     if [ -n "$json_parser" ]; then
+        # Same shape rule as resolve_ssh_binary above.  A directory here passed
+        # the guard, then the shell's own "is a directory" line leaked to
+        # stderr and a VALID response was reported as "invalid JSON response"
+        # -- blaming the server for a local misconfiguration (measured
+        # 2026-10-27).
+        if [ -e "$json_parser" ] && [ ! -f "$json_parser" ]; then
+            fail "AGENTQ_JQ must be a regular file: $json_parser"
+        fi
         [ -x "$json_parser" ] || fail "AGENTQ_JQ is not executable: $json_parser"
         return
     fi

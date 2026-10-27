@@ -39,6 +39,14 @@ fail() {
 
 resolve_ssh_binary() {
     if [ -n "$ssh_binary" ]; then
+        # `-x` tests the SEARCH BIT, which every directory has, so a directory
+        # passed this guard and the failure came back as exit 126 with the
+        # remote blamed ("remote dependency probe failed for both Unix and
+        # Windows shells") -- measured 2026-10-27.  `-f` follows symlinks, so a
+        # symlink to a real executable still works.
+        if [ -e "$ssh_binary" ] && [ ! -f "$ssh_binary" ]; then
+            fail "SSHP_SSH must be a regular file: $ssh_binary"
+        fi
         [ -x "$ssh_binary" ] || fail "SSHP_SSH is not executable: $ssh_binary"
         return
     fi
