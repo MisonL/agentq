@@ -480,7 +480,18 @@ if [ -r "$config_path" ]; then
     fi
 fi
 
-default_host=${AGENTQ_HOST:-$configured_host}
+# Whitespace-only counts as UNSET, matching the Windows twin's
+# IsNullOrWhiteSpace: a value that is nothing but spaces is not a host.  The
+# `:-` substitution below covers only the EMPTY case, so a whitespace-only
+# AGENTQ_HOST used to be kept verbatim and handed to ssh -- measured
+# 2026-10-27, with a config file naming `cfg-host` and AGENTQ_HOST=' ' the two
+# clients reached DIFFERENT machines.  Locale caveat: `[![:space:]]` agrees
+# with .NET on NBSP and U+3000 under a UTF-8 locale; under LC_ALL=C it does not
+# treat them as space.  Same rule as the host-shape guard below.
+case "${AGENTQ_HOST:-}" in
+    *[![:space:]]*) default_host=$AGENTQ_HOST ;;
+    *) default_host=$configured_host ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Password authentication sources
@@ -4176,7 +4187,22 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-[ -n "$host" ] || fail 'no SSH host configured; pass --host or set AGENTQ_HOST'
+# A host has a SHAPE, not just a length.  The Windows twin refuses a
+# whitespace-only host (IsNullOrWhiteSpace) and one that begins with a hyphen
+# (StartsWith("-")); this client checked only for emptiness, so the same argv
+# exited 2 there and 255 here -- and 255 is the RETRYABLE transport class, so a
+# caller following the contract would retry a permanent typo forever after
+# paying an SSH round trip.  Measured 2026-10-27 for `--host -x`, `--host ' '`
+# and the rest of the whitespace family.  Order is the twin's: blank, then
+# hyphen.  Locale caveat: `[![:space:]]` matches NBSP and U+3000 under a UTF-8
+# locale (as .NET does) but not under LC_ALL=C.
+case "$host" in
+    *[![:space:]]*) : ;;
+    *) fail 'no SSH host configured; pass --host or set AGENTQ_HOST' ;;
+esac
+case "$host" in
+    -*) fail 'SSH host must not begin with a hyphen' ;;
+esac
 [ "$#" -ge 1 ] || {
     usage >&2
     exit 2

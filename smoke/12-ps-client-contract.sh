@@ -493,16 +493,19 @@ twin_table='0|agentq 0.1.|--version
 255||remove --label smoke-x --CONFIRM
 2|--tail must be a positive integer or all|logs 1 --tail ALL
 2|--tail must be a positive integer or all|logs 1 --tail All
-2|--tail must be a positive integer or all|logs 1 --tail 05'
+2|--tail must be a positive integer or all|logs 1 --tail 05
+2|SSH host must not begin with a hyphen|--host -x status
+2|SSH host must not begin with a hyphen|--host -- status
+2|SSH host must not begin with a hyphen|--host -evil status'
 twin_table_rows=$(grep -c . <<< "$twin_table")
 twin_rows=0
 # A table that lost most of its rows still agrees with a loop that runs what is
 # left, so the equality gate below cannot see it -- the same shape as a shrunk
 # enumeration.  The floor is a LOWER BOUND, not the count (the reported count
-# stays computed): today's table has 23 rows and a rewrite that drops below 20
+# stays computed): today's table has 26 rows and a rewrite that drops below 25
 # is a different table, not a smaller one.
-if [ "$twin_table_rows" -lt 20 ]; then
-    printf 'ps-client twin: the differential table has %s row(s), below the floor of 20; it no longer covers the token surface it was built for\n' \
+if [ "$twin_table_rows" -lt 25 ]; then
+    printf 'ps-client twin: the differential table has %s row(s), below the floor of 25; it no longer covers the token surface it was built for\n' \
         "$twin_table_rows" >&2
     failures=$((failures + 1))
 fi
@@ -544,6 +547,96 @@ if [ "$twin_rows" -ne "$twin_table_rows" ]; then
         "$twin_rows" "$twin_table_rows" >&2
     failures=$((failures + 1))
 fi
+# --- the host VALUE's shape: argv cannot carry a whitespace-only word ---------
+# `read -ra` word-splits, so the table above can express `--host -x` but never
+# `--host ' '`.  The whitespace family goes through AGENTQ_HOST instead -- which
+# is also the env path where the twin resolves the value with
+# IsNullOrWhiteSpace.  A whitespace-only host is a permanent argument error,
+# not a transport failure: measured 2026-10-27, the POSIX client exited 255
+# (the RETRYABLE class) on every one of these while the twin exited 2.
+twin_host_run() {
+    local posix_copy=$1 host_value=$2
+    twin_p_status=0
+    twin_w_status=0
+    AGENTQ_HOST="$host_value" AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$twin_stub_posix" AGENTQ_CONFIG="$work/absent-config" \
+        /bin/sh "$posix_copy" status >"$work/twin-p.out" 2>"$work/twin-p.err" || twin_p_status=$?
+    AGENTQ_HOST="$host_value" AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$twin_stub_arg" AGENTQ_CONFIG="$work/absent-config" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
+        >"$work/twin-w.out" 2>"$work/twin-w.err" || twin_w_status=$?
+}
+twin_host_rows=0
+# twin_host_case <label> <host-value>
+twin_host_case() {
+    local label=$1 host_value=$2 problems=''
+    twin_host_rows=$((twin_host_rows + 1))
+    cases=$((cases + 1))
+    twin_host_run "$twin_posix" "$host_value"
+    [ "$twin_p_status" -eq 2 ] || problems="$problems posix-exit=$twin_p_status"
+    [ "$twin_w_status" -eq 2 ] || problems="$problems windows-exit=$twin_w_status"
+    grep -qF 'no SSH host configured' "$work/twin-p.err" \
+        || problems="$problems posix-missing-message"
+    { flatten_err "$work/twin-w.err"; cat "$work/twin-w.out"; } > "$work/twin-w.combined"
+    grep -qF 'no SSH host configured' "$work/twin-w.combined" \
+        || problems="$problems windows-missing-message"
+    if [ -n "$problems" ]; then
+        printf 'ps-client twin host-value [%s]:%s\n' "$label" "$problems" >&2
+        head -2 "$work/twin-p.err" "$work/twin-w.err" >&2 || true
+        failures=$((failures + 1))
+    fi
+}
+twin_host_case space ' '
+twin_host_case tab $'\t'
+twin_host_case carriage-return $'\r'
+twin_host_case space-newline $' \n'
+twin_host_case vertical-tab $'\v'
+# A block that stopped enumerating reports green on nothing (the
+# blind-enumerator class), so the executed count has its own floor.
+if [ "$twin_host_rows" -lt 5 ]; then
+    printf 'ps-client twin host-value: only %s case(s) ran (expected 5); the enumeration broke\n' \
+        "$twin_host_rows" >&2
+    failures=$((failures + 1))
+fi
+# The sharpest face of this defect is not the exit code.  With a config file
+# naming one host while AGENTQ_HOST holds only whitespace, the twin resolves
+# with IsNullOrWhiteSpace and uses the CONFIGURED host; `:-` substitutes only
+# for EMPTY, so the POSIX client ssh'd to " ".  Same environment, two different
+# machines -- measured 2026-10-27.  Capture the host each side actually hands
+# ssh and require the configured one on both.
+twin_capture_stub="$twin_stub_dir/ssh-capture"
+printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "${TWIN_ARGV_LOG:?}"\nexit 255\n' > "$twin_capture_stub"
+chmod 700 "$twin_capture_stub"
+printf 'AGENTQ_HOST=cfg-host\n' > "$work/twin-config"
+chmod 600 "$work/twin-config"
+twin_capture_host() {
+    # <posix|windows> <argv-log>
+    local side=$1 log=$2
+    if [ "$side" = posix ]; then
+        TWIN_ARGV_LOG="$log" AGENTQ_HOST=' ' AGENTQ_REMOTE_PLATFORM=unix \
+        AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+        AGENTQ_SSH="$twin_capture_stub" AGENTQ_CONFIG="$work/twin-config" \
+            /bin/sh "$twin_posix" status >/dev/null 2>&1 || true
+    else
+        TWIN_ARGV_LOG="$log" AGENTQ_HOST=' ' AGENTQ_REMOTE_PLATFORM=unix \
+        AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+        AGENTQ_SSH="$twin_capture_stub" AGENTQ_CONFIG="$work/twin-config" \
+            "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
+            >/dev/null 2>&1 || true
+    fi
+}
+cases=$((cases + 1))
+twin_capture_host posix "$work/twin-cfg-p.argv"
+twin_capture_host windows "$work/twin-cfg-w.argv"
+twin_cfg_p=$(awk 'p{print; exit} $0=="--"{p=1}' "$work/twin-cfg-p.argv" 2>/dev/null || true)
+twin_cfg_w=$(awk 'p{print; exit} $0=="--"{p=1}' "$work/twin-cfg-w.argv" 2>/dev/null || true)
+if [ "$twin_cfg_p" != cfg-host ] || [ "$twin_cfg_w" != cfg-host ]; then
+    printf 'ps-client twin host-value [config fallback]: AGENTQ_HOST was whitespace-only and the config names cfg-host, but ssh was sent to posix=[%s] windows=[%s] (both must be cfg-host)\n' \
+        "$twin_cfg_p" "$twin_cfg_w" >&2
+    failures=$((failures + 1))
+fi
 # And the comparator must be provably able to go RED, or the section is a
 # rubber stamp.  Revert the POSIX client's global-token fold in a copy and
 # require the same row to disagree; if the fold line cannot be found the
@@ -561,7 +654,39 @@ else
         failures=$((failures + 1))
     fi
 fi
-twin_state="checked($twin_rows/$twin_table_rows)"
+# The host guard is two separate rules, so a mutation of one says nothing about
+# the other: revert each in its own copy and require the corresponding row to
+# disagree.  If the guard line cannot be found the mutation never happened, and
+# saying so beats passing on nothing (same rule as the fold self-test above).
+twin_host_mutant_hyphen="$work/twin-posix-nohyphen"
+sed "s/^    -\*) fail 'SSH host must not begin with a hyphen' ;;/    __twin_nomatch__) fail 'SSH host must not begin with a hyphen' ;;/" \
+    "$twin_posix" > "$twin_host_mutant_hyphen"
+if cmp -s "$twin_posix" "$twin_host_mutant_hyphen"; then
+    printf '%s\n' 'ps-client twin self-test: the POSIX hyphen-host guard was not found; the host rows cannot be proven able to fail' >&2
+    failures=$((failures + 1))
+else
+    twin_run_pair "$twin_host_mutant_hyphen" --host -x status
+    if [ "$twin_p_status" -eq "$twin_w_status" ]; then
+        printf 'ps-client twin self-test: a POSIX client without the hyphen guard still agreed with the twin on --host -x (posix=%s windows=%s)\n' \
+            "$twin_p_status" "$twin_w_status" >&2
+        failures=$((failures + 1))
+    fi
+fi
+twin_host_mutant_blank="$work/twin-posix-noblank"
+sed "s/^    \*) fail 'no SSH host configured; pass --host or set AGENTQ_HOST' ;;/    *) : ;;/" \
+    "$twin_posix" > "$twin_host_mutant_blank"
+if cmp -s "$twin_posix" "$twin_host_mutant_blank"; then
+    printf '%s\n' 'ps-client twin self-test: the POSIX blank-host guard was not found; the host rows cannot be proven able to fail' >&2
+    failures=$((failures + 1))
+else
+    twin_host_run "$twin_host_mutant_blank" ' '
+    if [ "$twin_p_status" -eq "$twin_w_status" ]; then
+        printf 'ps-client twin self-test: a POSIX client without the blank guard still agreed with the twin on a whitespace host (posix=%s windows=%s)\n' \
+            "$twin_p_status" "$twin_w_status" >&2
+        failures=$((failures + 1))
+    fi
+fi
+twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)"
 else
 twin_state=$twin_platform_state
 fi
