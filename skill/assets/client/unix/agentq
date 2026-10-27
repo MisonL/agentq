@@ -4144,8 +4144,16 @@ else
 fi
 
 host=$default_host
+# Only the OPTION TOKENS are folded here, never their values: `--host`'s argument
+# is passed to ssh untouched.  The Windows twin matches these tokens with `-eq`,
+# which is case-INSENSITIVE by language rule, so `--VERSION`, `--HELP`, `HELP` and
+# `-H` answered there while this `case` refused them with exit 2 (measured
+# 2026-10-27: the same input gave 0 and 2).  Same rule and same fix as sshp's
+# first-token fold and the operation fold below -- normalise the value the parser
+# matches, do not widen every pattern.
 while [ "$#" -gt 0 ]; do
-    case "$1" in
+    global_option=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$global_option" in
         --host)
             [ "$#" -ge 2 ] || fail '--host requires an SSH host'
             host=$2

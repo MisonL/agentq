@@ -296,6 +296,57 @@ for client_file in "$root/skill/assets/client/unix/agentq" "$root/skill/assets/c
 done
 failures=$((failures + static_failures))
 
+# --- the global option TOKENS are case-insensitive; their VALUES are not ------
+# The Windows twin matches `--host`/`-h`/`--help`/`help`/`--version` with `-eq`,
+# which is case-INSENSITIVE by language rule.  This client's `case` is
+# case-sensitive, so `--VERSION`, `--HELP`, `HELP` and `-H` exited 2
+# `unknown command` here while the twin answered with the version line / usage
+# -- measured 2026-10-27, the same input giving 0 and 2.  Same class as the
+# operation fold below and as sshp's first-token fold: normalise the token the
+# parser matches, never the value beside it.
+#
+# Each variant is compared against its canonical spelling AND against the
+# expected answer (exit 0, byte-identical stdout): the self-comparison alone
+# would stay green if both spellings broke the same way.
+global_variants=0
+for global_case in '--VERSION:--version' '--Version:--version' '--HELP:--help' 'Help:--help' 'HELP:--help' '-H:-h'; do
+    variant=${global_case%%:*}
+    canonical=${global_case#*:}
+    cases=$((cases + 1))
+    global_variants=$((global_variants + 1))
+    canonical_status=0
+    variant_status=0
+    AGENTQ_SSH="$work/bin/ssh" AGENTQ_HOST=smoke-host "$client" "$canonical" \
+        >"$work/canonical.out" 2>"$work/canonical.err" || canonical_status=$?
+    AGENTQ_SSH="$work/bin/ssh" AGENTQ_HOST=smoke-host "$client" "$variant" \
+        >"$work/variant.out" 2>"$work/variant.err" || variant_status=$?
+    if [ "$canonical_status" -ne 0 ] || [ "$variant_status" -ne 0 ]; then
+        printf 'client %s: exit %s, canonical %s exits %s (both must be 0)\n' \
+            "$variant" "$variant_status" "$canonical" "$canonical_status" >&2
+        head -2 "$work/variant.err" >&2 || true
+        failures=$((failures + 1))
+    elif ! cmp -s "$work/canonical.out" "$work/variant.out"; then
+        printf 'client %s: stdout differs from %s (the Windows twin accepts any case)\n' \
+            "$variant" "$canonical" >&2
+        failures=$((failures + 1))
+    fi
+done
+# The other half of the rule: the fold must stop at the token.  `--host`'s
+# VALUE is a hostname handed to ssh verbatim; folding it would silently connect
+# to a different host.  Assert the recorded ssh argv carries the mixed-case
+# value unchanged (ssh-argv writes one argv element per line).
+: > "$work/global-host.argv"
+: > "$work/global-host.argv.env"
+AGENTQ_ARGV_CAPTURE="$work/global-host.argv" AGENTQ_SSH="$work/bin/ssh-argv" \
+    AGENTQ_HOST=smoke-host "$client" --HOST MiXeD-Case-Host status \
+    >/dev/null 2>&1 || true
+cases=$((cases + 1))
+if ! grep -qxF -- 'MiXeD-Case-Host' "$work/global-host.argv"; then
+    printf 'client --HOST: the host value did not reach ssh verbatim: %s\n' \
+        "$(tr '\n' '|' < "$work/global-host.argv")" >&2
+    failures=$((failures + 1))
+fi
+
 # --- mode forwarding and response validation ---------------------------------
 # Each case runs against ssh-modes and asserts BOTH that the run succeeds (the
 # response passed the client's validation for that mode) and that the mode
@@ -532,6 +583,13 @@ expect_rejected '--tail must be a positive integer or all' logs 1 --tail x
 # integer must stay accepted; the accepted side is pinned by the usage cases.
 expect_rejected '--tail must be a positive integer or all' logs 1 --tail 05
 expect_rejected '--tail must be a positive integer or all' logs 1 --tail 00
+# `all` is a VALUE forwarded verbatim to the server, and the server compares it
+# with `[ "$2" = all ]` -- case-sensitive.  So a case variant is NOT accepted
+# here, and the Windows twin now refuses it too (it used `-eq` and forwarded
+# `ALL`, paying a round trip to be told what it could have said locally --
+# measured 2026-10-27).  The tokens around it stay case-insensitive.
+expect_rejected '--tail must be a positive integer or all' logs 1 --tail ALL
+expect_rejected '--tail must be a positive integer or all' logs 1 --tail All
 expect_rejected 'cancel requires one task id' cancel
 expect_rejected 'task id must be a non-negative integer' cancel abc
 expect_rejected 'remove requires one task id' remove
@@ -2022,4 +2080,4 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 
-printf 'client-contract checks passed: cases=%s env=%s cred=%s stub-ssh=yes reason=forwarded/injection-safe exit-token=last-wins windows-probe=stdin-fed/no-leak windows-submit=payload-delivered/args-checked/no-leak shellcheck=%s posix=%s\n' "$cases" "$env_rejections" "$credential_cases" "$shellcheck_summary" "$posix_parse_state"
+printf 'client-contract checks passed: cases=%s env=%s cred=%s global=%s stub-ssh=yes reason=forwarded/injection-safe exit-token=last-wins windows-probe=stdin-fed/no-leak windows-submit=payload-delivered/args-checked/no-leak shellcheck=%s posix=%s\n' "$cases" "$env_rejections" "$credential_cases" "$global_variants" "$shellcheck_summary" "$posix_parse_state"
