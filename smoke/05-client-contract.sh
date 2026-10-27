@@ -347,6 +347,145 @@ if ! grep -qxF -- 'MiXeD-Case-Host' "$work/global-host.argv"; then
     failures=$((failures + 1))
 fi
 
+# --- the host VALUE has a shape, not just a length ---------------------------
+# This client only checked that the host was non-empty (`[ -n "$host" ]`) while
+# the Windows twin refuses a host that is whitespace-only (IsNullOrWhiteSpace)
+# or begins with a hyphen (StartsWith("-")).  Same argv, opposite answers --
+# measured 2026-10-27: `--host -x` and `--host ' '` exited 2 on the twin and
+# 255 here.  255 is the RETRYABLE transport class ("the connection failed, try
+# again"), so a caller following the contract would retry a permanent typo
+# forever, after paying an SSH round trip it did not need.
+#
+# The sharpest face is not the exit code: with a config file naming one host
+# while AGENTQ_HOST held only spaces, the two clients reached DIFFERENT
+# machines (measured 2026-10-27 -- this one ssh'd to " ", the twin to the
+# configured host).  That case is asserted at the end of this block.
+#
+# The stub counts its own invocations.  The platform probe runs before argument
+# validation in general, so "the host was refused" must also mean "no
+# connection was opened": otherwise the probe budget is spent on an argument
+# the client was always going to reject.  AGENTQ_REMOTE_PLATFORM bypasses the
+# probe so the only possible call is the operation itself, which makes a
+# non-zero count unambiguous.
+cat > "$work/bin/ssh-count" <<'STUB'
+#!/bin/sh
+printf 'invoked\n' >> "${AGENTQ_SSH_COUNT:?}"
+for argument in "$@"; do
+    case "$argument" in
+        *uname*) printf 'Linux\n'; exit 0 ;;
+    esac
+done
+exit 255
+STUB
+chmod 700 "$work/bin/ssh-count"
+
+host_shape_cases=0
+# host_shape_run <uses-env(yes|no)> <host-value> [args...] -> sets host_status
+host_shape_run() {
+    local via_env=$1 value=$2
+    shift 2
+    : > "$work/ssh-count.log"
+    host_status=0
+    if [ "$via_env" = yes ]; then
+        AGENTQ_SSH_COUNT="$work/ssh-count.log" AGENTQ_SSH="$work/bin/ssh-count" \
+            AGENTQ_HOST="$value" AGENTQ_CONFIG="$work/absent-config" \
+            AGENTQ_REMOTE_PLATFORM=unix AGENTQ_OPERATION_RETRY_ATTEMPTS=1 \
+            AGENTQ_OPERATION_RETRY_DELAY=1 \
+            "$client" "$@" >"$work/out" 2>"$work/err" || host_status=$?
+    else
+        AGENTQ_SSH_COUNT="$work/ssh-count.log" AGENTQ_SSH="$work/bin/ssh-count" \
+            AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+            AGENTQ_REMOTE_PLATFORM=unix AGENTQ_OPERATION_RETRY_ATTEMPTS=1 \
+            AGENTQ_OPERATION_RETRY_DELAY=1 \
+            "$client" --host "$value" "$@" >"$work/out" 2>"$work/err" || host_status=$?
+    fi
+}
+# expect_host_rejected <fragment> <label> <uses-env> <host-value>
+expect_host_rejected() {
+    local expected=$1 label=$2 via_env=$3 value=$4
+    cases=$((cases + 1)); host_shape_cases=$((host_shape_cases + 1))
+    host_shape_run "$via_env" "$value" status
+    if [ "$host_status" -ne 2 ]; then
+        printf 'client host [%s]: expected exit 2, got %s\n' "$label" "$host_status" >&2
+        head -2 "$work/err" >&2 || true
+        failures=$((failures + 1))
+        return
+    fi
+    if ! grep -qF -- "$expected" "$work/err"; then
+        printf 'client host [%s]: stderr does not contain %s\n' "$label" "$expected" >&2
+        head -2 "$work/err" >&2 || true
+        failures=$((failures + 1))
+    fi
+    if [ -s "$work/ssh-count.log" ]; then
+        printf 'client host [%s]: ssh was invoked %s time(s) for a locally refused host\n' \
+            "$label" "$(tr -d ' ' < "$work/ssh-count.log" | wc -l)" >&2
+        failures=$((failures + 1))
+    fi
+}
+# expect_host_accepted <label> <uses-env> <host-value>
+# The accept side is the boundary that stops a later "tighten the check" from
+# silently widening to sshp's rule: sshp refuses whitespace ANYWHERE in the
+# host, but both agentq twins hand an embedded space to ssh (measured
+# 2026-10-27: both exit 255).  Pinning it keeps the two rules distinct.
+expect_host_accepted() {
+    local label=$1 via_env=$2 value=$3
+    cases=$((cases + 1)); host_shape_cases=$((host_shape_cases + 1))
+    host_shape_run "$via_env" "$value" status
+    if [ "$host_status" -ne 255 ]; then
+        printf 'client host [%s]: expected 255 (host handed to ssh), got %s: %s\n' \
+            "$label" "$host_status" "$(head -2 "$work/err" | tr '\n' ' ')" >&2
+        failures=$((failures + 1))
+        return
+    fi
+    if [ ! -s "$work/ssh-count.log" ]; then
+        printf 'client host [%s]: ssh was never invoked, yet exit was 255\n' "$label" >&2
+        failures=$((failures + 1))
+    fi
+}
+no_host='no SSH host configured; pass --host or set AGENTQ_HOST'
+hyphen='SSH host must not begin with a hyphen'
+expect_host_rejected "$hyphen"  'argv -x'      no -x
+expect_host_rejected "$hyphen"  'argv -'       no -
+expect_host_rejected "$hyphen"  'argv --'      no --
+expect_host_rejected "$hyphen"  'argv -evil'   no -evil
+expect_host_rejected "$no_host" 'argv space'   no ' '
+expect_host_rejected "$no_host" 'argv tab'     no $'\t'
+expect_host_rejected "$no_host" 'argv cr'      no $'\r'
+expect_host_rejected "$no_host" 'argv nl'      no $'\n'
+expect_host_rejected "$no_host" 'argv sp-nl'   no $' \n'
+expect_host_rejected "$hyphen"  'env -x'       yes -x
+expect_host_rejected "$no_host" 'env space'    yes ' '
+expect_host_rejected "$no_host" 'env tab'      yes $'\t'
+expect_host_rejected "$no_host" 'env cr'       yes $'\r'
+expect_host_accepted 'argv embedded-space' no 'a b'
+expect_host_accepted 'argv leading-space'  no ' a'
+
+# The "different machines" face: a config file naming cfg-host, with
+# AGENTQ_HOST holding only whitespace.  IsNullOrWhiteSpace falls back to the
+# configured host; `:-` substitutes only for EMPTY, so this client used to send
+# ssh to " ".  Assert the host that actually reached ssh.
+printf 'AGENTQ_HOST=cfg-host\n' > "$work/host-config"
+chmod 600 "$work/host-config"
+cases=$((cases + 1)); host_shape_cases=$((host_shape_cases + 1))
+: > "$work/cfg-host.argv"; : > "$work/cfg-host.argv.env"
+AGENTQ_ARGV_CAPTURE="$work/cfg-host.argv" AGENTQ_SSH="$work/bin/ssh-argv" \
+    AGENTQ_HOST=' ' AGENTQ_CONFIG="$work/host-config" AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    "$client" status >/dev/null 2>"$work/err" || true
+cfg_host_seen=$(awk 'p{print; exit} $0=="--"{p=1}' "$work/cfg-host.argv")
+if [ "$cfg_host_seen" != cfg-host ]; then
+    printf 'client host [config fallback]: AGENTQ_HOST was whitespace-only and the config names cfg-host, but ssh was sent to [%s]; the Windows twin sends [cfg-host]\n' \
+        "$cfg_host_seen" >&2
+    failures=$((failures + 1))
+fi
+# The floor: a block that silently stopped enumerating would report green on
+# nothing, the blind-enumerator class this suite keeps re-learning.
+if [ "$host_shape_cases" -lt 15 ]; then
+    printf 'client host shape: only %s case(s) ran (expected at least 15); the enumeration broke\n' \
+        "$host_shape_cases" >&2
+    failures=$((failures + 1))
+fi
+
 # --- mode forwarding and response validation ---------------------------------
 # Each case runs against ssh-modes and asserts BOTH that the run succeeds (the
 # response passed the client's validation for that mode) and that the mode
@@ -2080,4 +2219,4 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 
-printf 'client-contract checks passed: cases=%s env=%s cred=%s global=%s stub-ssh=yes reason=forwarded/injection-safe exit-token=last-wins windows-probe=stdin-fed/no-leak windows-submit=payload-delivered/args-checked/no-leak shellcheck=%s posix=%s\n' "$cases" "$env_rejections" "$credential_cases" "$global_variants" "$shellcheck_summary" "$posix_parse_state"
+printf 'client-contract checks passed: cases=%s env=%s cred=%s global=%s host=%s stub-ssh=yes reason=forwarded/injection-safe exit-token=last-wins windows-probe=stdin-fed/no-leak windows-submit=payload-delivered/args-checked/no-leak shellcheck=%s posix=%s\n' "$cases" "$env_rejections" "$credential_cases" "$global_variants" "$host_shape_cases" "$shellcheck_summary" "$posix_parse_state"
