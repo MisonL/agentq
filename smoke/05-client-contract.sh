@@ -478,10 +478,47 @@ if [ "$cfg_host_seen" != cfg-host ]; then
         "$cfg_host_seen" >&2
     failures=$((failures + 1))
 fi
+
+# The config FILE's value grammar: both clients take the LAST `AGENTQ_HOST=`
+# line, so an EMPTY value is an assignment and a trailing blank line means "no
+# host".  Pinned here as well as in smoke/12's twin table because this check
+# runs on every platform while the twin block is NOT-covered on Windows.
+printf 'AGENTQ_HOST=first-host\nAGENTQ_HOST=\n' > "$work/host-config-blank-last"
+chmod 600 "$work/host-config-blank-last"
+cases=$((cases + 1)); host_shape_cases=$((host_shape_cases + 1))
+: > "$work/ssh-count.log"
+host_status=0
+env -u AGENTQ_HOST AGENTQ_SSH_COUNT="$work/ssh-count.log" \
+    AGENTQ_SSH="$work/bin/ssh-count" AGENTQ_CONFIG="$work/host-config-blank-last" \
+    AGENTQ_REMOTE_PLATFORM=unix AGENTQ_OPERATION_RETRY_ATTEMPTS=1 \
+    AGENTQ_OPERATION_RETRY_DELAY=1 \
+    "$client" status >"$work/out" 2>"$work/err" || host_status=$?
+if [ "$host_status" -ne 2 ] || ! grep -qF 'no SSH host configured' "$work/err"; then
+    printf 'client host [config blank-last]: a trailing empty AGENTQ_HOST= must mean "no host" (exit 2), got %s [%s]\n' \
+        "$host_status" "$(head -1 "$work/err")" >&2
+    failures=$((failures + 1))
+elif [ -s "$work/ssh-count.log" ]; then
+    printf '%s\n' 'client host [config blank-last]: ssh was invoked despite no resolved host' >&2
+    failures=$((failures + 1))
+fi
+printf 'AGENTQ_HOST=alpha\nAGENTQ_HOST=beta\n' > "$work/host-config-two"
+chmod 600 "$work/host-config-two"
+cases=$((cases + 1)); host_shape_cases=$((host_shape_cases + 1))
+: > "$work/two-host.argv"; : > "$work/two-host.argv.env"
+AGENTQ_ARGV_CAPTURE="$work/two-host.argv" AGENTQ_SSH="$work/bin/ssh-argv" \
+    AGENTQ_CONFIG="$work/host-config-two" AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    "$client" status >/dev/null 2>"$work/err" || true
+two_host_seen=$(awk 'p{print; exit} $0=="--"{p=1}' "$work/two-host.argv")
+if [ "$two_host_seen" != beta ]; then
+    printf 'client host [config two-values]: the LAST AGENTQ_HOST= line must win (beta), ssh was sent to [%s]\n' \
+        "$two_host_seen" >&2
+    failures=$((failures + 1))
+fi
 # The floor: a block that silently stopped enumerating would report green on
 # nothing, the blind-enumerator class this suite keeps re-learning.
-if [ "$host_shape_cases" -lt 15 ]; then
-    printf 'client host shape: only %s case(s) ran (expected at least 15); the enumeration broke\n' \
+if [ "$host_shape_cases" -lt 17 ]; then
+    printf 'client host shape: only %s case(s) ran (expected at least 17); the enumeration broke\n' \
         "$host_shape_cases" >&2
     failures=$((failures + 1))
 fi

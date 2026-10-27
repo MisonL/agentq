@@ -678,6 +678,80 @@ if [ "$twin_exec_rows" -lt 1 ]; then
         "$twin_exec_rows" >&2
     failures=$((failures + 1))
 fi
+# --- the config FILE's value grammar ----------------------------------------
+# Both clients read `AGENTQ_HOST=<value>` from the config and both take the
+# LAST matching line, so the regex quantifier decides what a trailing
+# `AGENTQ_HOST=` means.  The POSIX parser accepts an empty value (`*`); this
+# twin's required at least one character (`+`), so the blank line did not
+# match, the earlier value survived, and the SAME config resolved to different
+# hosts -- measured 2026-10-27: `AGENTQ_HOST=first-host` followed by
+# `AGENTQ_HOST=` made the POSIX client refuse with exit 2 ("no SSH host
+# configured") while this one connected to first-host.  Blanking a line is how
+# a user unsets a host; the fail-closed answer is the POSIX one, and the twin
+# rule is that the same input gets the same answer.
+#
+# The rows that reach ssh also assert WHICH host arrived: an exit code alone
+# cannot tell `alpha` from `beta`.
+twin_config_rows=0
+twin_config_run() { # <posix-copy> <windows-copy> <config-path>
+    local posix_copy=$1 windows_copy=$2 config=$3
+    twin_p_status=0
+    twin_w_status=0
+    : > "$work/twin-cfg-p.argv"
+    : > "$work/twin-cfg-w.argv"
+    TWIN_ARGV_LOG="$work/twin-cfg-p.argv" env -u AGENTQ_HOST \
+    AGENTQ_REMOTE_PLATFORM=unix AGENTQ_OPERATION_RETRY_ATTEMPTS=1 \
+    AGENTQ_OPERATION_RETRY_DELAY=1 AGENTQ_SSH="$twin_capture_stub" \
+    AGENTQ_CONFIG="$config" \
+        /bin/sh "$posix_copy" status >"$work/twin-p.out" 2>"$work/twin-p.err" || twin_p_status=$?
+    TWIN_ARGV_LOG="$work/twin-cfg-w.argv" env -u AGENTQ_HOST \
+    AGENTQ_REMOTE_PLATFORM=unix AGENTQ_OPERATION_RETRY_ATTEMPTS=1 \
+    AGENTQ_OPERATION_RETRY_DELAY=1 AGENTQ_SSH="$twin_capture_stub" \
+    AGENTQ_CONFIG="$config" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$windows_copy" status \
+        >"$work/twin-w.out" 2>"$work/twin-w.err" || twin_w_status=$?
+    twin_cfg_p_host=$(awk 'p{print; exit} $0=="--"{p=1}' "$work/twin-cfg-p.argv" 2>/dev/null || true)
+    twin_cfg_w_host=$(awk 'p{print; exit} $0=="--"{p=1}' "$work/twin-cfg-w.argv" 2>/dev/null || true)
+}
+# twin_config_case <label> <expected-exit> <expected-host|-> <content>
+twin_config_case() { # <windows-copy> <label> <expected-exit> <expected-host> <content>
+    local windows_copy=$1 label=$2 want=$3 want_host=$4 content=$5 problems=''
+    twin_config_rows=$((twin_config_rows + 1)); cases=$((cases + 1))
+    printf '%s' "$content" > "$work/twin-config-$label"
+    chmod 600 "$work/twin-config-$label"
+    twin_config_run "$twin_posix" "$windows_copy" "$work/twin-config-$label"
+    [ "$twin_p_status" -eq "$want" ] || problems="$problems posix-exit=$twin_p_status"
+    [ "$twin_w_status" -eq "$want" ] || problems="$problems windows-exit=$twin_w_status"
+    if [ "$want" -eq 255 ]; then
+        [ "$twin_cfg_p_host" = "$want_host" ] || problems="$problems posix-host=[$twin_cfg_p_host]"
+        [ "$twin_cfg_w_host" = "$want_host" ] || problems="$problems windows-host=[$twin_cfg_w_host]"
+    fi
+    if [ -n "$problems" ]; then
+        printf 'ps-client twin config [%s]: expected exit %s host %s;%s\n' \
+            "$label" "$want" "$want_host" "$problems" >&2
+        head -1 "$work/twin-p.err" "$work/twin-w.err" >&2 || true
+        failures=$((failures + 1))
+    fi
+}
+twin_config_case "$client_arg" empty-last    2   -      'AGENTQ_HOST=first-host
+AGENTQ_HOST=
+'
+twin_config_case "$client_arg" empty-only    2   -      'AGENTQ_HOST=
+'
+twin_config_case "$client_arg" two-values    255 beta   'AGENTQ_HOST=alpha
+AGENTQ_HOST=beta
+'
+twin_config_case "$client_arg" space-value   2   -      'AGENTQ_HOST=
+'
+twin_config_case "$client_arg" blank-middle  255 beta   'AGENTQ_HOST=alpha
+AGENTQ_HOST=
+AGENTQ_HOST=beta
+'
+if [ "$twin_config_rows" -lt 5 ]; then
+    printf 'ps-client twin config: only %s row(s) ran (expected 5); the enumeration broke\n' \
+        "$twin_config_rows" >&2
+    failures=$((failures + 1))
+fi
 # And the comparator must be provably able to go RED, or the section is a
 # rubber stamp.  Revert the POSIX client's global-token fold in a copy and
 # require the same row to disagree; if the fold line cannot be found the
@@ -743,7 +817,25 @@ else
         failures=$((failures + 1))
     fi
 fi
-twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)"
+# Same for the config grammar this round aligned: put the `+` back in a copy of
+# the WINDOWS client and require the empty-last row to disagree.  The sed anchor
+# is the quantifier itself; if it cannot be found the mutation never happened,
+# and saying so beats passing on nothing.
+twin_config_mutant="$work/twin-windows-plus"
+sed "s/AGENTQ_HOST=(\[^\\\\s\]\*)/AGENTQ_HOST=([^\\\\s]+)/" \
+    "$client" > "$twin_config_mutant"
+if cmp -s "$client" "$twin_config_mutant"; then
+    printf '%s\n' 'ps-client twin self-test: the Windows config-value quantifier was not found; the config rows cannot be proven able to fail' >&2
+    failures=$((failures + 1))
+else
+    twin_config_run "$twin_posix" "$twin_config_mutant" "$work/twin-config-empty-last"
+    if [ "$twin_p_status" -eq "$twin_w_status" ]; then
+        printf 'ps-client twin self-test: a Windows client with the old `+` quantifier still agreed with the POSIX side on a trailing blank host line (posix=%s windows=%s)\n' \
+            "$twin_p_status" "$twin_w_status" >&2
+        failures=$((failures + 1))
+    fi
+fi
+twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+config($twin_config_rows/5)"
 else
 twin_state=$twin_platform_state
 fi
