@@ -522,7 +522,16 @@ function Get-ConfiguredHost {
     $configuredHost = ""
     $configText = Read-AgentQConfigFile -Path $script:ConfigPath
     foreach ($line in @($configText -split "`r?`n")) {
-        if ($line -match '^AGENTQ_HOST=([^\s]+)$') {
+        # `[^\s]*`, not `[^\s]+`: an EMPTY value is an assignment too.  Both
+        # clients take the LAST matching line, so the quantifier decides what a
+        # trailing `AGENTQ_HOST=` means.  With `+` this line did not match, the
+        # earlier value survived, and the two clients resolved the SAME config
+        # to different hosts -- measured 2026-10-27: a file holding
+        # `AGENTQ_HOST=first-host` then `AGENTQ_HOST=` made the POSIX client
+        # refuse with exit 2 ("no SSH host configured") while this one connected
+        # to first-host.  Blanking the line is how a user unsets a host; the
+        # fail-closed answer is the POSIX one.
+        if ($line -match '^AGENTQ_HOST=([^\s]*)$') {
             $configuredHost = $Matches[1]
         }
     }
