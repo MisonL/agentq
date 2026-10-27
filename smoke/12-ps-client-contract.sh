@@ -360,6 +360,16 @@ fi
 # different things depending on which client the caller happened to run.  Both
 # now take `^[1-9][0-9]*$` or the literal `all`; the accepted forms are asserted
 # too, or a validator that refused everything would pass the refusal cases.
+#
+# `ALL`/`All` joined on 2026-10-27, and they are the OTHER direction: `all` is a
+# value forwarded verbatim, and the server compares it case-SENSITIVELY
+# (`[ "$2" = all ]`), so the POSIX client refused the variant locally with exit
+# 2 while this one -- whose Test-PositiveIntegerOrAll used `-eq` -- accepted it,
+# paid an SSH round trip, and (on an unreachable host) reported a transport
+# failure for a typo.  The option TOKENS stay case-insensitive (that is what
+# `-eq` is for); this value must not be folded.  Those rows are also why the
+# expected codes here are not all read off this client: `ALL:2` is the POSIX
+# client's answer, and the point of the row is that the two now agree.
 # A stub that fails like an unreachable host: the accepted forms must get PAST
 # validation and reach ssh (255), which is what distinguishes "accepted" from
 # "refused" here -- without it the accepted rows would pass on any error.  Two
@@ -378,7 +388,7 @@ else
     chmod 700 "$tail_stub_win"
     tail_stub_arg="$tail_stub_win"
 fi
-for tail_case in "05:2" "00:2" "x:2" "5:255" "all:255"; do
+for tail_case in "05:2" "00:2" "x:2" "5:255" "all:255" "ALL:2" "All:2"; do
     tail_value=${tail_case%:*}
     tail_expected=${tail_case#*:}
     cases=$((cases + 1))
@@ -395,6 +405,166 @@ for tail_case in "05:2" "00:2" "x:2" "5:255" "all:255"; do
         failures=$((failures + 1))
     fi
 done
+
+# --- the two clients are one contract: same argv, same answer ----------------
+# The twin-client rule had been checked by hand before (a differential sweep on
+# 2026-10-21 found five divergences that reading the code did not), but nothing
+# in the suite RAN both clients on the same argv: each check exercised one side
+# against expectations transcribed from that side.  That is exactly how the
+# 2026-10-27 pair stayed invisible -- `--VERSION`/`--HELP`/`HELP`/`-H` exited 0
+# here and 2 on the POSIX client, and `--tail ALL` exited 2 there and 255 here
+# (accepted locally, forwarded, refused by the case-sensitive server after a
+# round trip).  So: one table, both clients, exit code plus a message fragment,
+# and the expected code asserted on BOTH sides -- a comparison that only asked
+# "do they agree" would pass if both broke the same way.  Rows are locally
+# decided (refusal, or reaching the stub ssh and failing there as 255), so no
+# remote is needed and no row depends on a live server.
+#
+# The differential needs a host that can run BOTH clients, which a Windows host
+# cannot: this client's twin is the POSIX one, a `/bin/sh` artifact that ships
+# to Linux/macOS and expects jq on PATH, while Git Bash's `sh` is neither the
+# platform it ships to nor a faithful `sh` for it.  Running it on the Windows CI
+# job would report the harness's gaps as contract divergences.  So that host
+# declares the sub-part NOT-covered with a named reason -- NOT `SKIPPED`, which
+# the Windows job refuses, and NOT a silent pass, which would let a section that
+# never ran read as green.
+twin_platform_state='checked'
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) twin_platform_state='NOT-covered(needs-non-Windows)' ;;
+esac
+twin_posix="$root/skill/assets/client/unix/agentq"
+twin_stub_dir="$work/twin-ssh"
+mkdir -p "$twin_stub_dir"
+# Each side gets the stub shape IT can execute: the POSIX client runs under
+# /bin/sh and needs the shebang script at a POSIX path; the Windows client needs
+# the Windows form when this check itself runs under Git Bash.  Handing one
+# arg to both would make the POSIX side refuse `AGENTQ_SSH is not executable`
+# on Windows and read as a contract divergence that is really the harness's.
+twin_stub_posix="$twin_stub_dir/ssh"
+printf '#!/bin/sh\nexit 255\n' > "$twin_stub_posix"
+chmod 700 "$twin_stub_posix"
+if [ "$client_arg" != "$client" ]; then
+    twin_stub_win="$twin_stub_dir/ssh.cmd"
+    printf '%s\r\n' '@echo off' 'exit /b 255' > "$twin_stub_win"
+    twin_stub_arg=$(cygpath -w "$twin_stub_win")
+else
+    twin_stub_arg="$twin_stub_posix"
+fi
+
+# twin_run_pair <posix-copy> [args...] -> twin_p_status / twin_w_status
+# Same environment for both, in one place: the first hand sweep of this class
+# produced two false divergences because the two sides were set up separately
+# (an `env VAR=` / `env VAR` mix-up, and AGENTQ_SSH left unset for one of them).
+twin_run_pair() {
+    local posix_copy=$1
+    shift
+    twin_p_status=0
+    twin_w_status=0
+    AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$twin_stub_posix" AGENTQ_CONFIG="$work/absent-config" \
+        /bin/sh "$posix_copy" "$@" >"$work/twin-p.out" 2>"$work/twin-p.err" || twin_p_status=$?
+    AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$twin_stub_arg" AGENTQ_CONFIG="$work/absent-config" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" "$@" \
+        >"$work/twin-w.out" 2>"$work/twin-w.err" || twin_w_status=$?
+}
+
+twin_table='0|agentq 0.1.|--version
+0|agentq 0.1.|--VERSION
+0|agentq 0.1.|--Version
+0|Usage:|--help
+0|Usage:|--HELP
+0|Usage:|HELP
+0|Usage:|Help
+0|Usage:|-h
+0|Usage:|-H
+2|--host requires an SSH host|--host
+2|--host requires an SSH host|--HOST
+2|unknown command: bogus|bogus
+255||--HOST smoke-host status
+255||status
+255||STATUS
+255||doctor --FULL
+255||logs 1 --tail all
+255||logs 1 --TAIL all
+255||logs 1 --tail 5
+255||remove --label smoke-x --CONFIRM
+2|--tail must be a positive integer or all|logs 1 --tail ALL
+2|--tail must be a positive integer or all|logs 1 --tail All
+2|--tail must be a positive integer or all|logs 1 --tail 05'
+twin_table_rows=$(grep -c . <<< "$twin_table")
+twin_rows=0
+# A table that lost most of its rows still agrees with a loop that runs what is
+# left, so the equality gate below cannot see it -- the same shape as a shrunk
+# enumeration.  The floor is a LOWER BOUND, not the count (the reported count
+# stays computed): today's table has 23 rows and a rewrite that drops below 20
+# is a different table, not a smaller one.
+if [ "$twin_table_rows" -lt 20 ]; then
+    printf 'ps-client twin: the differential table has %s row(s), below the floor of 20; it no longer covers the token surface it was built for\n' \
+        "$twin_table_rows" >&2
+    failures=$((failures + 1))
+fi
+if [ "$twin_platform_state" = checked ]; then
+while IFS='|' read -r twin_expected twin_fragment twin_args; do
+    [ -n "$twin_expected" ] || continue
+    twin_rows=$((twin_rows + 1))
+    cases=$((cases + 1))
+    # read -ra, not `set --`: this runs in the script's own shell, and `set --`
+    # would replace the check's positional parameters for everything after the
+    # sweep.  The row IS an argv, so word splitting is the point.
+    read -ra twin_argv <<< "$twin_args"
+    twin_run_pair "$twin_posix" "${twin_argv[@]}"
+    twin_problems=''
+    [ "$twin_p_status" -eq "$twin_expected" ] || twin_problems="$twin_problems posix-exit=$twin_p_status"
+    [ "$twin_w_status" -eq "$twin_expected" ] || twin_problems="$twin_problems windows-exit=$twin_w_status"
+    [ "$twin_p_status" -eq "$twin_w_status" ] || twin_problems="$twin_problems clients-disagree"
+    if [ -n "$twin_fragment" ]; then
+        grep -qF -- "$twin_fragment" "$work/twin-p.out" "$work/twin-p.err" \
+            || twin_problems="$twin_problems posix-missing-message"
+        # Not `... | grep -qF`: a quiet grep exits at the first match and the
+        # writer takes SIGPIPE, which pipefail turns into a FAILED pipeline --
+        # the repo's own quiet-grep trap.  Redirect, then grep the file.
+        { flatten_err "$work/twin-w.err"; cat "$work/twin-w.out"; } > "$work/twin-w.combined"
+        grep -qF -- "$twin_fragment" "$work/twin-w.combined" \
+            || twin_problems="$twin_problems windows-missing-message"
+    fi
+    if [ -n "$twin_problems" ]; then
+        printf 'ps-client twin [%s]: expected exit %s;%s\n' "$twin_args" "$twin_expected" "$twin_problems" >&2
+        head -2 "$work/twin-p.err" "$work/twin-w.err" >&2 || true
+        failures=$((failures + 1))
+    fi
+done <<< "$twin_table"
+# The table's row count is computed independently of the loop that runs it: a
+# loop that silently dropped rows would otherwise report a shorter sweep as a
+# complete one (the blind-enumerator class).
+if [ "$twin_rows" -ne "$twin_table_rows" ]; then
+    printf 'ps-client twin: ran %s of %s table row(s); a truncated sweep proves nothing\n' \
+        "$twin_rows" "$twin_table_rows" >&2
+    failures=$((failures + 1))
+fi
+# And the comparator must be provably able to go RED, or the section is a
+# rubber stamp.  Revert the POSIX client's global-token fold in a copy and
+# require the same row to disagree; if the fold line cannot be found the
+# mutation never happened, and saying so beats passing on nothing.
+twin_mutant="$work/twin-posix-unfolded"
+sed 's/^    global_option=.*/    global_option=$1/' "$twin_posix" > "$twin_mutant"
+if cmp -s "$twin_posix" "$twin_mutant"; then
+    printf '%s\n' 'ps-client twin self-test: the POSIX global-token fold line was not found; the comparator cannot be proven able to fail' >&2
+    failures=$((failures + 1))
+else
+    twin_run_pair "$twin_mutant" --VERSION
+    if [ "$twin_p_status" -eq "$twin_w_status" ]; then
+        printf 'ps-client twin self-test: an unfolded --VERSION still agreed with the Windows twin (posix=%s windows=%s)\n' \
+            "$twin_p_status" "$twin_w_status" >&2
+        failures=$((failures + 1))
+    fi
+fi
+twin_state="checked($twin_rows/$twin_table_rows)"
+else
+twin_state=$twin_platform_state
+fi
 
 # --- the reason channel must survive the client's redaction -------------------
 # Write-Diagnostics deliberately withholds raw SSH diagnostics and prints only a
@@ -1901,5 +2071,5 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 
-printf 'ps-client-contract checks passed: cases=%s pwsh=%s ps51=%s reason=forwarded/injection-safe modes=validated\n' \
-    "$cases" "$ps_version" "$ps51_state"
+printf 'ps-client-contract checks passed: cases=%s twin=%s pwsh=%s ps51=%s reason=forwarded/injection-safe modes=validated\n' \
+    "$cases" "$twin_state" "$ps_version" "$ps51_state"

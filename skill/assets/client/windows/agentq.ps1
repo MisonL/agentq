@@ -334,7 +334,16 @@ function Convert-ToPositiveInt32 {
 function Test-PositiveIntegerOrAll {
     param([string]$Value)
 
-    return (($Value -eq "all") -or (Test-PositiveInteger -Value $Value))
+    # -ceq, NOT -eq.  `all` is a VALUE the client forwards verbatim to the
+    # server, and the server compares it with `[ "$2" = all ]` -- case-SENSITIVE.
+    # With -eq this accepted `--tail ALL` locally and forwarded it, so the user
+    # paid an SSH round trip to be told what the POSIX twin says immediately and
+    # locally with exit 2.  Measured 2026-10-27 on the same input: 2 there before
+    # any connection, and here past the local check, reaching ssh (255 against a
+    # stub whose connection always fails).  The option TOKENS above stay
+    # case-insensitive -- `-eq` is right for those; they are consumed by the
+    # client.  This value is not.
+    return (($Value -ceq "all") -or (Test-PositiveInteger -Value $Value))
 }
 
 function Test-TaskId {
