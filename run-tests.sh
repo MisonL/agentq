@@ -155,6 +155,56 @@ if [ "$quick" = false ] && [ "$ran" -ne "$check_count" ]; then
     failures=$((failures + 1))
 fi
 
+# --- a NOT-covered declaration must be in the known set ----------------------
+# CI has always policed this: the linux job compares every reported name
+# against a known list and fails on a new one.  The local run did not -- it
+# printed the list and exited 0.  Measured 2026-10-27 on a two-check fixture
+# tree: a check printing `staging=NOT-covered(needs-Windows)` produced
+# `PASS checks: 2 ran, 0 skipped, 0 partial, 0 failed` and exit 0 here, while
+# the linux job's gate rejected the same log with exit 1.  A local run must not
+# be greener than CI -- the same shape the ci_pin round fixed for the check
+# list itself.  The known set lives in ONE file that both consumers read, so
+# the two lists cannot drift apart.
+not_covered_unknown() { # $1 = known set (space-delimited), $2 = reported -> unknown names
+    local unknown='' name
+    for name in $2; do
+        case " $1 " in
+            *" $name "*) ;;
+            *) unknown="$unknown $name" ;;
+        esac
+    done
+    printf '%s' "$unknown"
+}
+# A subset test that always passes is the false green this gate exists to
+# prevent: prove it flags an unknown name and accepts a known one.
+ncov_selftest_ok=true
+[ "$(not_covered_unknown 'a-check b-check' 'b-check c-check')" = ' c-check' ] || ncov_selftest_ok=false
+[ -z "$(not_covered_unknown 'a-check b-check' 'a-check b-check')" ] || ncov_selftest_ok=false
+if [ "$ncov_selftest_ok" = false ]; then
+    printf 'FAIL  the NOT-covered known-set matcher failed its self-test (it must flag an unknown name and accept a known one)\n' >&2
+    failures=$((failures + 1))
+fi
+known_ncov_file="$root/smoke/not-covered-known.txt"
+if [ ! -f "$known_ncov_file" ]; then
+    printf 'FAIL  %s is missing; the platform-gap policy cannot be read, and an unreadable policy must not pass\n' \
+        "${known_ncov_file#"$root"/}" >&2
+    failures=$((failures + 1))
+else
+    known_ncov_names=$(grep -vE '^[[:space:]]*(#|$)' "$known_ncov_file" | tr '\n' ' ' || true)
+    if [ -z "$known_ncov_names" ]; then
+        printf 'FAIL  %s names no check; every declared platform gap would read as unknown\n' \
+            "${known_ncov_file#"$root"/}" >&2
+        failures=$((failures + 1))
+    fi
+    unknown_ncov=$(not_covered_unknown "$known_ncov_names" "$notcovered_list")
+    if [ -n "$unknown_ncov" ]; then
+        printf 'FAIL  check(s) declared NOT-covered without being in %s:%s\n' \
+            "${known_ncov_file#"$root"/}" "$unknown_ncov" >&2
+        printf '      Add the name there deliberately (and say which platform cannot exercise the sub-part in docs/PLAN.md), or drop the token -- a gap claimed for the first time is exactly what this gate exists for.\n' >&2
+        failures=$((failures + 1))
+    fi
+fi
+
 elapsed=$(( $(date +%s) - start ))
 
 # A skipped check is not a passing check, and the summary line is what people

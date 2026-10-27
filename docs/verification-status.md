@@ -224,7 +224,7 @@ canonical 资产一致、坏参数被正确拒绝、命令集合没漂移。它�
 
 ### `run-tests.sh` 自身的防假绿
 
-`run-tests.sh` 自身有五道防假绿：**先 `bash -n` 每个检查，不通过就 FAIL**
+`run-tests.sh` 自身有六道防假绿：**先 `bash -n` 每个检查，不通过就 FAIL**
 （脚本在末行出现语法错误时仍可能以自身的 `exit 0` 收尾，退出码看不出问题——
 2026-09-20 实测：`exit 0` 后跟一个未闭合的 `if`，bash 打印
 `syntax error: unexpected end of file` 却仍退出 `0`）；`exit 0` 但无输出的检查记为
@@ -240,6 +240,8 @@ verified.`——**SKIP 不是 PASS**，而原先把提示放在总结行下方�
 此前匹配还是大小写敏感的，`01` 的小写 `skipped(...)` 被记成 `0 skipped`、七个
 `.ps1` 未验而读作全绿。
 
+**第六道（2026-10-27 补）：本地也要做 NOT-covered 已知集合判定。** 第五桶 NCOV 的已知集合此前只写在 `ci.yml` 里，本地 `run-tests.sh` 只打印清单、不判定——实测两检查的夹具树上，一个声明 `staging=NOT-covered(needs-Windows)` 的未知名字得本地 `PASS ... 0 failed` 与 exit 0，同一份日志在 CI 闸门上退 1。现在已知集合只有一份（`smoke/not-covered-known.txt`），两个消费者同读；本地闸门还要求文件存在且非空（读不到的策略不得读成通过），并对子集判定做双向自检（未知名字必须被点名、已知名字必须静默）。红证：未知名字 → 本地退 1 并点名；同名改到已知集合内→ 退 0（对照组）；删掉已知文件 → 退 1；只留注释 → 两条同时点名、退 1；把判定函数改成恒返回空→ 自检报「failed its self-test」并退 1。
+
 **第四桶 NCOV（`NOT-covered`，2026-10-12 补）**：检查整体跑完、exit 0，但自报了一个
 **平台固有**、本次运行**不可能**验证的子部分——`13`/`22`/`23`/`25` 的
 `staging=NOT-covered(needs-Windows)`。它与 PART 的区别正是「缺口能否被更好的运行关闭」：
@@ -247,9 +249,16 @@ PART 是「本可跑却没跑」，NCOV 是「在此平台永远跑不了」。*
 每次 macOS/Linux 跑都报 `4 partial` + `NOT A FULL PASS`，唯一保住 CI 绿灯的办法是把
 `0 partial` 闸门放宽，而那会连**真实** partial 一起放掉。故 NCOV 单列**可见的一桶 + 计数**，
 并在总结行后打印一行 `NOT-covered: N check(s) declared platform-unverifiable sub-parts: <清单>`；
-CI 的 linux job 断言这个清单里的**每个名字**都在已知集合内（子集判定：某个已知检查在
+这个清单里的**每个名字**都必须在一个已知集合内（子集判定：某个已知检查在
 pwsh 恰好是 5.1 时不再报 NOT-covered 是覆盖变强、不是回归；出现**未知**名字则红）——
-一个**新**的 `NOT-covered`（某个检查悄悄不再覆盖某物）就落在这道闸门里。**注意 `22`/`23`
+一个**新**的 `NOT-covered`（某个检查悄悄不再覆盖某物）就落在这道闸门里。
+**已知集合自 2026-10-27 起只有一份**（`smoke/not-covered-known.txt`），由
+`run-tests.sh` 的本地闸门与 CI 的 linux job 共同读取：此前它只写在 `ci.yml` 里，
+本地只**打印**清单、退 0——实测一个打印 `staging=NOT-covered(needs-Windows)` 的
+检查在本地得 `PASS ... 0 failed` 与 exit 0，同一份日志在 linux job 的闸门退 1，
+正是 `ci_pin` 那一轮为检查清单修过的「本地比 CI 绿」形状。本地闸门还要求该文件
+存在且至少命名一个检查（读不到的策略不得读成通过），并对子集判定本身做双向自检
+（未知名字必须被点名、已知名字必须静默）。**注意 `22`/`23`
 的 token 是无条件的**（`windows-api=NOT-covered(needs-Windows)` 即使真在 Windows 上也打印，
 因为那两个检查本就不驱动 Windows 身份 API 路径），所以 Windows job **不能**断言「这 4 个
 检查不得报 NOT-covered」——最初加过、首跑即被 CI 证伪并撤回。**此前这个词完全隐形**：
