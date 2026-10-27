@@ -156,8 +156,9 @@ fi
 # message text") got nothing there, and would read the silence as a client-side
 # regression.
 #
-# The rule is structural, not a fixed line window: a printf writing to stderr
-# that does not itself carry `reason=` and whose next statement is `exit 2`.
+# The rule is structural, not a fixed line window: a line writing to stderr
+# (`>&2`, whatever the printer -- see the widening note below) that does not
+# itself carry `reason=` and whose next statement is `exit 2`.
 # Windows in either direction are wrong -- a narrow one misses a re-check a few
 # lines later, a wide one matches the next function (both mistakes were made in
 # smoke/10's rule G).  Blank lines and comments between the two are tolerated.
@@ -181,7 +182,20 @@ fi
 # `reason=protocol_error` before returning.  Matching `return 2` here instead
 # would have reported all 13 and buried the one real gap, so the rule stays on
 # `exit 2` and the return-2 audit lives in this comment plus the fix above.
-reason_gap_sites=$(
+# The scan is a FUNCTION so the self-test below exercises the published code
+# instead of a copy of it (the smoke/05 lesson).  It prints one line per gap
+# and, as its last line, `__SITES__N` -- the number of message sites it
+# EXAMINED, gaps and conforming sites alike.  That count is the positive
+# control: an absence rule whose enumerator finds nothing reports "no gaps" for
+# exactly the same reason a broken one does.
+#
+# A message site is ANY line writing to stderr (`>&2`) whose next statement is
+# `exit 2` -- not only `printf`.  Measured 2026-10-27: with the literal
+# `printf` requirement, a server copy carrying an `echo ... >&2` + `exit 2`
+# site with no reason line printed `reason-gaps=0` and exited 0.  Widening to
+# `>&2` finds the same 9 sites on the real server, so it added no false
+# positives.
+reason_gap_scan() { # $1 = file -> gap lines + a final __SITES__N line
     awk '
         {
             line = $0
@@ -196,20 +210,64 @@ reason_gap_sites=$(
         END {
             if (pending != "") joined[++n] = pending
             for (i = 1; i < n; i++) {
-                if (joined[i] !~ /printf/ || joined[i] ~ /reason=/ || joined[i] !~ />&2/) continue
+                if (joined[i] ~ /^[[:space:]]*#/ || joined[i] !~ />&2/) continue
                 j = i + 1
                 while (j <= n && (joined[j] ~ /^[[:space:]]*$/ || joined[j] ~ /^[[:space:]]*#/)) j++
-                if (j <= n && joined[j] ~ /^[[:space:]]*exit 2[[:space:]]*$/) printf "%d:%s\n", i, joined[i]
+                if (j <= n && joined[j] ~ /^[[:space:]]*exit 2[[:space:]]*$/) {
+                    sites++
+                    if (joined[i] !~ /reason=/) printf "%d:%s\n", i, joined[i]
+                }
                 # Same one-liner shape on a single physical line
                 # (`printf ... >&2; exit 2`): none exist today (checked
                 # 2026-10-13) but the shape escapes the join above -- a
-                # semicolon-joined printf+exit-2 is reported as
+                # semicolon-joined message+exit-2 is reported as
                 # cannot-conclude rather than silently invisible.
-                if (j == i + 1 && joined[i] ~ /printf.*>&2;[[:space:]]*exit 2[[:space:]]*$/ && joined[i] !~ /reason=/)
-                    printf "%d:CANNOT-CONCLUDE(one-liner printf+exit2):%s\n", i, joined[i]
+                if (j == i + 1 && joined[i] ~ />&2;[[:space:]]*exit 2[[:space:]]*$/ && joined[i] !~ /reason=/) {
+                    sites++
+                    printf "%d:CANNOT-CONCLUDE(one-liner message+exit2):%s\n", i, joined[i]
+                }
             }
-        }' "$server"
-)
+            printf "__SITES__%d\n", sites
+        }' "$1"
+}
+
+# The scan must catch a message site with no reason line in BOTH spellings --
+# `printf` and `echo` -- and must count the conforming site it examined.  A scan
+# that silently stopped matching would otherwise read as a clean server.
+reason_fixture=$work/reason-sites.fixture
+cat >"$reason_fixture" <<'FIXTURE'
+good_site() {
+    printf '%s: reason=protocol_error\n' "$program" >&2
+    exit 2
+}
+printf_missing_reason() {
+    printf '%s: no reason here\n' "$program" >&2
+    exit 2
+}
+echo_missing_reason() {
+    echo 'no reason here either' >&2
+    exit 2
+}
+FIXTURE
+reason_fixture_raw=$(reason_gap_scan "$reason_fixture")
+reason_fixture_sites=$(printf '%s\n' "$reason_fixture_raw" | sed -n 's/^__SITES__//p')
+reason_fixture_gaps=$(printf '%s\n' "$reason_fixture_raw" | grep -v '^__SITES__' | grep -c . || true)
+if [ "$reason_fixture_sites" != 3 ] || [ "$reason_fixture_gaps" != 2 ]; then
+    printf 'error-contract: the exit-2 reason scan failed its self-test (expected 3 sites / 2 gaps, got %s / %s); a blind scan would read as a clean server\n' \
+        "$reason_fixture_sites" "$reason_fixture_gaps" >&2
+    failures=$((failures + 1))
+fi
+
+reason_scan_raw=$(reason_gap_scan "$server")
+reason_sites=$(printf '%s\n' "$reason_scan_raw" | sed -n 's/^__SITES__//p')
+case ${reason_sites:-} in
+    '' | *[!0-9]*) reason_sites=0 ;;
+esac
+if [ "$reason_sites" -eq 0 ]; then
+    printf '%s\n' 'error-contract: the exit-2 reason rule examined 0 message sites; a rule that examined nothing must not report "no gaps" -- the join or the site predicate has stopped matching the server' >&2
+    failures=$((failures + 1))
+fi
+reason_gap_sites=$(printf '%s\n' "$reason_scan_raw" | grep -v '^__SITES__' || true)
 if [ -n "$reason_gap_sites" ]; then
     printf 'exit-2 sites print a message but no reason line:\n%s\n' "$reason_gap_sites" >&2
     failures=$((failures + 1))
@@ -244,7 +302,12 @@ fi
 # rule exists for was reachable simply by passing an argument.  A fourth form was
 # added 2026-10-20 after the same exercise on the REPAIR path: a call joined by
 # a semicolon on one physical line.
-return2_gap_sites=$(
+# Same shape as the exit-2 scan: a function, a __SITES__ positive control and a
+# self-test, so this rule also cannot report "no gaps" after examining
+# nothing.  The site predicate is widened the same way -- any `>&2` writer,
+# not only `printf`; measured on the real server, both predicates select the
+# same 13 candidates and the same 3 judged sites.
+return2_gap_scan() { # $1 = file -> gap lines + a final __SITES__N line
     awk '
         {
             line = $0
@@ -263,7 +326,7 @@ return2_gap_sites=$(
                 # followed by arguments -- but never when it is part of a
                 # pipeline, an `if`/`while` head, an assignment, or a
                 # substitution, all of which fold the status instead.
-                if (joined[i] !~ /^[[:space:]]*[a-z_]+([[:space:]]|$)/) continue
+                if (joined[i] !~ /^[[:space:]]*[a-z_][a-z0-9_]*([[:space:]]|$)/) continue
                 if (joined[i] ~ /[|&;]/ || joined[i] ~ /\$\(/ || joined[i] ~ /\\x60/) continue
                 if (joined[i] ~ /(^|[[:space:]])[<>]/) continue
                 f = joined[i]; sub(/^[[:space:]]*/, "", f); sub(/[[:space:]].*$/, "", f)
@@ -283,9 +346,9 @@ return2_gap_sites=$(
                 # judged.  (No apostrophes in this block: it is inside a single-
                 # quoted awk program and one would close it -- the exact crash
                 # recorded for smoke/10 rule J.)
-                if (joined[i] !~ /^[[:space:]]*[a-z_]+\(\) \{[[:space:]]*$/) {
+                if (joined[i] !~ /^[[:space:]]*[a-z_][a-z0-9_]*\(\) \{[[:space:]]*$/) {
                     f = joined[i]; sub(/^[[:space:]]*/, "", f)
-                    if (f ~ /^[a-z_]+([[:space:]]|$)/ && f !~ /[|&;]/ && f !~ /\$\(/ && f !~ /\\x60/ &&
+                    if (f ~ /^[a-z_][a-z0-9_]*([[:space:]]|$)/ && f !~ /[|&;]/ && f !~ /\$\(/ && f !~ /\\x60/ &&
                         f !~ /(^|[[:space:]])[<>]/) {
                         sub(/[[:space:]].*$/, "", f)
                         k = i + 1
@@ -296,16 +359,64 @@ return2_gap_sites=$(
             }
             cur = ""
             for (i = 1; i < n; i++) {
-                if (joined[i] ~ /^[[:space:]]*[a-z_]+\(\) \{[[:space:]]*$/) {
+                if (joined[i] ~ /^[[:space:]]*[a-z_][a-z0-9_]*\(\) \{[[:space:]]*$/) {
                     cur = joined[i]; sub(/^[[:space:]]*/, "", cur); sub(/\(\) \{[[:space:]]*$/, "", cur)
                 }
-                if (joined[i] !~ /printf/ || joined[i] ~ /reason=/ || joined[i] !~ />&2/) continue
+                if (joined[i] ~ /^[[:space:]]*#/ || joined[i] !~ />&2/) continue
                 j = i + 1
                 while (j <= n && (joined[j] ~ /^[[:space:]]*$/ || joined[j] ~ /^[[:space:]]*#/)) j++
-                if (j <= n && joined[j] ~ /^[[:space:]]*return 2[[:space:]]*$/ && cur != "" && bare[cur] && !(cur in folded)) printf "%d [%s]: %s\n", i, cur, joined[i]
+                if (j <= n && joined[j] ~ /^[[:space:]]*return 2[[:space:]]*$/ && cur != "" && bare[cur] && !(cur in folded)) {
+                    sites++
+                    if (joined[i] !~ /reason=/) printf "%d [%s]: %s\n", i, cur, joined[i]
+                }
             }
-        }' "$server"
-)
+            printf "__SITES__%d\n", sites
+        }' "$1"
+}
+
+# The scan must catch a reason-less site in a bare-invoked function in BOTH
+# spellings, count the conforming one, and NOT count a function that is never
+# called bare (the rule's own boundary).
+return2_fixture=$work/return2-sites.fixture
+cat >"$return2_fixture" <<'FIXTURE'
+conforming_helper() {
+    printf '%s: reason=protocol_error\n' "$program" >&2
+    return 2
+}
+missing_reason_helper() {
+    echo 'no reason here' >&2
+    return 2
+}
+never_called_helper() {
+    echo 'not judged' >&2
+    return 2
+}
+bare_caller() {
+    conforming_helper
+}
+another_bare_caller() {
+    missing_reason_helper
+}
+FIXTURE
+return2_fixture_raw=$(return2_gap_scan "$return2_fixture")
+return2_fixture_sites=$(printf '%s\n' "$return2_fixture_raw" | sed -n 's/^__SITES__//p')
+return2_fixture_gaps=$(printf '%s\n' "$return2_fixture_raw" | grep -v '^__SITES__' | grep -c . || true)
+if [ "$return2_fixture_sites" != 2 ] || [ "$return2_fixture_gaps" != 1 ]; then
+    printf 'error-contract: the return-2 reason scan failed its self-test (expected 2 judged sites / 1 gap, got %s / %s); a blind scan would read as a clean server\n' \
+        "$return2_fixture_sites" "$return2_fixture_gaps" >&2
+    failures=$((failures + 1))
+fi
+
+return2_scan_raw=$(return2_gap_scan "$server")
+return2_sites=$(printf '%s\n' "$return2_scan_raw" | sed -n 's/^__SITES__//p')
+case ${return2_sites:-} in
+    '' | *[!0-9]*) return2_sites=0 ;;
+esac
+if [ "$return2_sites" -eq 0 ]; then
+    printf '%s\n' 'error-contract: the return-2 reason rule judged 0 sites; a rule that examined nothing must not report "no gaps" -- the bare-call detection or the join has stopped matching the server' >&2
+    failures=$((failures + 1))
+fi
+return2_gap_sites=$(printf '%s\n' "$return2_scan_raw" | grep -v '^__SITES__' || true)
 if [ -n "$return2_gap_sites" ]; then
     printf 'return-2 sites in bare-invoked functions print a message but no reason line:\n%s\n' "$return2_gap_sites" >&2
     failures=$((failures + 1))
@@ -352,7 +463,7 @@ if [ "$failures" -ne 0 ]; then
     printf 'error-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'error-contract checks passed: cases=%s commands=%s runtime=synthetic reasons=asserted reason-gaps=%s\n' \
+printf 'error-contract checks passed: cases=%s commands=%s runtime=synthetic reasons=asserted reason-sites=%s return2-sites=%s reason-gaps=%s\n' \
     "$cases" \
     "$(printf '%s\n' $documented_commands | wc -l | tr -d ' ')" \
-    "$reason_gap_count"
+    "$reason_sites" "$return2_sites" "$reason_gap_count"
