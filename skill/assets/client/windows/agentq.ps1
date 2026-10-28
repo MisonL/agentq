@@ -254,7 +254,18 @@ $script:CredentialSource = ""
 $script:CredentialOptionLines = @()
 
 function Show-Usage {
-    [Console]::Out.WriteLine(@"
+    param([switch]$ToStandardError)
+    # stdout is the DATA channel and stderr is the DIAGNOSTIC channel -- the
+    # whole redaction policy in SKILL.md is built on that split, and the POSIX
+    # twin honours it (`usage` on stdout for --help, `usage >&2` for a bad
+    # invocation).  Printing usage to stdout on the ERROR path put the banner in
+    # the caller's captured result and left stderr empty: measured 2026-10-28,
+    # `agentq.ps1` with no arguments gave stdout 2673 B / stderr 0 B where the
+    # POSIX client gave stdout 0 B / stderr 2596 B.  The twin differential in
+    # smoke/12 could not see it because its fragment check reads both streams
+    # together.
+    $writer = if ($ToStandardError) { [Console]::Error } else { [Console]::Out }
+    $writer.WriteLine(@"
 Usage:
   $($script:Program) [--host <ssh-host>] submit --workdir <remote-directory> [--label <label>] [--request-id <id>] -- <command> [arguments...]
   $($script:Program) [--host <ssh-host>] submit --workdir <remote-directory> [--label <label>] [--request-id <id>] --stdin-script < script
@@ -3166,7 +3177,7 @@ if ($script:TargetHost.StartsWith("-", [System.StringComparison]::Ordinal)) {
     Stop-AgentQ "SSH host must not begin with a hyphen"
 }
 if ($position -ge $arguments.Count) {
-    Show-Usage
+    Show-Usage -ToStandardError
     exit 2
 }
 
