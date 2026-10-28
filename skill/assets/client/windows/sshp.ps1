@@ -789,52 +789,49 @@ function Get-UnixProbeCommand {
     return Convert-ToPosixScriptCommand -Script @'
 set -eu
 platform=$(uname -s 2>/dev/null || printf "%s" unknown)
+
 case "$platform" in
     MINGW*|MSYS*|CYGWIN*)
+        # Let native PowerShell decide Windows dependencies and executable paths.
         printf "%s\n" "__SSHP_WINDOWS_SHELL__:$platform"
         exit 43
         ;;
-    *)
-        if command -v tmux >/dev/null 2>&1 || command -v screen >/dev/null 2>&1 || command -v zellij >/dev/null 2>&1; then
-            printf "%s\n" "__SSHP_READY__:$platform"
-            exit 0
-        fi
-        ;;
 esac
 
+# Readiness is decided before any platform question: the session command needs
+# only one multiplexer, so a host that has one can run it whatever uname -s
+# reports.  A platform allow-list here refused a FreeBSD host that HAD tmux and
+# told the user to install it (measured 2026-10-28: 127 here, READY on the
+# Windows twin for the same target).
+if command -v tmux >/dev/null 2>&1 ||
+    command -v screen >/dev/null 2>&1 ||
+    command -v zellij >/dev/null 2>&1; then
+    printf "%s\n" "__SSHP_READY__:$platform"
+    exit 0
+fi
+
+# This candidate list is FLAT and must stay equal to the list the install
+# command below tries, in the same order: a platform-scoped list here refused
+# (127) an install that the very same client would have performed (measured
+# 2026-10-28: Linux with only Homebrew).
 installer=
 installer_label=
-package_label=tmux
-case "$platform" in
-    MINGW*|MSYS*|CYGWIN*)
-        package_label=zellij
-        if command -v winget.exe >/dev/null 2>&1; then installer=winget; installer_label=winget
-        elif command -v scoop >/dev/null 2>&1; then installer=scoop; installer_label=scoop
-        elif command -v choco.exe >/dev/null 2>&1; then installer=choco; installer_label=Chocolatey
-        fi
-        ;;
-    Darwin*)
-        if command -v brew >/dev/null 2>&1; then installer=brew; installer_label=Homebrew
-        elif command -v port >/dev/null 2>&1; then installer=port; installer_label=MacPorts
-        fi
-        ;;
-    Linux*)
-        if command -v apt-get >/dev/null 2>&1; then installer=apt; installer_label=apt
-        elif command -v dnf >/dev/null 2>&1; then installer=dnf; installer_label=dnf
-        elif command -v yum >/dev/null 2>&1; then installer=yum; installer_label=yum
-        elif command -v pacman >/dev/null 2>&1; then installer=pacman; installer_label=pacman
-        elif command -v zypper >/dev/null 2>&1; then installer=zypper; installer_label=zypper
-        elif command -v apk >/dev/null 2>&1; then installer=apk; installer_label=apk
-        fi
-        ;;
-esac
+if command -v apt-get >/dev/null 2>&1; then installer=apt; installer_label=apt
+elif command -v dnf >/dev/null 2>&1; then installer=dnf; installer_label=dnf
+elif command -v yum >/dev/null 2>&1; then installer=yum; installer_label=yum
+elif command -v pacman >/dev/null 2>&1; then installer=pacman; installer_label=pacman
+elif command -v zypper >/dev/null 2>&1; then installer=zypper; installer_label=zypper
+elif command -v apk >/dev/null 2>&1; then installer=apk; installer_label=apk
+elif command -v brew >/dev/null 2>&1; then installer=brew; installer_label=Homebrew
+elif command -v port >/dev/null 2>&1; then installer=port; installer_label=MacPorts
+fi
 
 if [ -z "$installer" ]; then
-    printf "%s\n" "sshp: no supported package manager found for $platform; install $package_label manually." >&2
+    printf "%s\n" "sshp: no supported package manager found for $platform; install tmux, GNU screen, or Zellij manually." >&2
     printf "%s\n" "__SSHP_INSTALL_UNAVAILABLE__:$platform"
     exit 127
 fi
-printf "%s\n" "sshp: $package_label is missing; installer candidate: $installer_label." >&2
+printf "%s\n" "sshp: a persistent session tool is missing; installer candidate: $installer_label." >&2
 printf "%s\n" "__SSHP_INSTALL_REQUIRED__:$platform"
 exit 42
 '@
@@ -881,22 +878,48 @@ exit ([int]$installerProbe.Value)
 function Get-UnixInstallCommand {
     return Convert-ToPosixScriptCommand -Script @'
 set -eu
-if command -v tmux >/dev/null 2>&1 || command -v screen >/dev/null 2>&1 || command -v zellij >/dev/null 2>&1; then
+if command -v tmux >/dev/null 2>&1 ||
+    command -v screen >/dev/null 2>&1 ||
+    command -v zellij >/dev/null 2>&1; then
     exit 0
 fi
+
 run_as_root() {
-    if [ "$(id -u)" -eq 0 ]; then "$@"; elif command -v sudo >/dev/null 2>&1; then sudo "$@"; else exit 127; fi
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        printf "%s\n" "sshp: $1 requires root privileges, but sudo is unavailable." >&2
+        exit 127
+    fi
 }
-if command -v apt-get >/dev/null 2>&1; then run_as_root apt-get update && run_as_root apt-get install -y tmux
-elif command -v dnf >/dev/null 2>&1; then run_as_root dnf install -y tmux
-elif command -v yum >/dev/null 2>&1; then run_as_root yum install -y tmux
-elif command -v pacman >/dev/null 2>&1; then run_as_root pacman -S --needed --noconfirm tmux
-elif command -v zypper >/dev/null 2>&1; then run_as_root zypper --non-interactive install tmux
-elif command -v apk >/dev/null 2>&1; then run_as_root apk add tmux
-elif command -v brew >/dev/null 2>&1; then brew install tmux
-elif command -v port >/dev/null 2>&1; then run_as_root port install tmux
-else exit 127
+
+# This list is FLAT and must stay equal to the probe candidate list above: a
+# platform-scoped list here would refuse an install the probe just offered.
+if command -v apt-get >/dev/null 2>&1; then
+    run_as_root apt-get update
+    run_as_root apt-get install -y tmux
+elif command -v dnf >/dev/null 2>&1; then
+    run_as_root dnf install -y tmux
+elif command -v yum >/dev/null 2>&1; then
+    run_as_root yum install -y tmux
+elif command -v pacman >/dev/null 2>&1; then
+    run_as_root pacman -S --needed --noconfirm tmux
+elif command -v zypper >/dev/null 2>&1; then
+    run_as_root zypper --non-interactive install tmux
+elif command -v apk >/dev/null 2>&1; then
+    run_as_root apk add tmux
+elif command -v brew >/dev/null 2>&1; then
+    brew install tmux
+elif command -v port >/dev/null 2>&1; then
+    run_as_root port install tmux
+else
+    printf "%s\n" "sshp: no supported package manager found; install tmux, GNU screen, or Zellij manually." >&2
+    exit 127
 fi
+
+printf "%s\n" "sshp: dependency installation finished; rechecking in a fresh SSH session." >&2
 '@
 }
 
