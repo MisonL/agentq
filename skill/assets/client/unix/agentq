@@ -1113,10 +1113,14 @@ run_operation_ssh() {
 # and 124 is returned (the probe-timeout convention; the recovery loop's
 # 255-retry branch never sees it).  On unix targets the remote wait itself is
 # also bounded with coreutils `timeout`, because killing the LOCAL ssh does
-# not stop the remote process -- measured 2026-10-15 (session-log mining):
-# those remote orphans kept holding the server operation lock and were the
-# largest reliability pain in real agent usage.  Windows targets have no
-# equivalent guaranteed on PATH, so there the bound is local-only.  On a
+# not stop the remote process -- measured 2026-10-28 over a real sshd: without
+# the bound each elapsed-budget poll leaves one `agentq-server wait` (plus its
+# `pueue wait --quiet` child) alive until the task ends, so a polling caller
+# accumulates them linearly (1,2,3,4,5 across five polls).  They do NOT hold
+# the server operation lock -- `wait_for_task` releases it before `pueue wait`
+# -- that earlier note here was wrong; what they hold is a process and a
+# pueued connection.  Windows targets have no equivalent guaranteed on PATH,
+# so there the bound is local-only.  On a
 # completed (non-timed-out) run the ssh status is recovered from the child,
 # the server reason token is extracted from a captured stderr exactly as
 # run_ssh_logged does, and the output/log temporaries are LEFT in place for
@@ -1128,10 +1132,14 @@ run_wait_ssh_with_timeout() {
 
     wait_remote_command=$wait_ssh_command
     if [ "$remote_platform" != windows ]; then
-        # Bound the REMOTE wait with coreutils `timeout` so a task that never
-        # ends cannot leave the server holding its operation lock after the
-        # local ssh is killed -- measured 2026-10-15: those remote orphans were
-        # the largest reliability pain in real agent usage.
+        # Bound the REMOTE wait with coreutils `timeout`: killing the local ssh
+        # does not stop the remote process, so without the bound each
+        # elapsed-budget poll leaves one `agentq-server wait` (plus its
+        # `pueue wait --quiet` child) alive until the task ends -- measured
+        # 2026-10-28 over a real sshd, 1,2,3,4,5 across five polls.  The
+        # orphan does not hold the operation lock (the server releases it
+        # before `pueue wait`); what it holds is a process and a pueued
+        # connection, which a polling caller accumulates linearly.
         #
         # The bound is NOT a `timeout <N>s <command>` prefix.  The unix remote
         # command BEGINS with a function definition
@@ -1325,13 +1333,18 @@ run_submit_recovery_ssh() {
 }
 
 agentq_stop_background_ssh() {
-    # A signal handler that only exits leaves the backgrounded ssh child alive:
-    # the client returns 130 while the remote `wait` keeps holding the server
-    # operation lock until its own budget elapses.  Killing the local ssh closes
-    # the channel, which makes the remote sshd HUP the remote command.  Only the
-    # wait-with-timeout path backgrounds an ssh (the platform probe does too, but
-    # it runs inside a $( ) subshell, so its pid never reaches this shell -- that
-    # path is bounded by its own 30s probe timeout instead).
+    # A signal handler that only exits leaves the backgrounded ssh child alive,
+    # which is a local orphan the caller cannot see; the client kills it here
+    # before returning 130.  Killing the local ssh does NOT reap the remote
+    # command -- measured 2026-10-28 against a real sshd: a remote `sleep 60`
+    # and a remote `agentq-server wait` both outlived SIGTERM and SIGKILL of
+    # the local ssh.  What bounds the remote wait is the AGENTQ_WAIT_BUDGET
+    # wrapper on the command itself (unix targets with coreutils `timeout`);
+    # on a Windows target there is no such bound, and the remote wait lives
+    # until the task ends.  Only the wait-with-timeout path backgrounds an ssh
+    # (the platform probe does too, but it runs inside a $( ) subshell, so its
+    # pid never reaches this shell -- that path is bounded by its own 30s probe
+    # timeout instead).
     if [ -n "${agentq_operation_ssh_pid:-}" ]; then
         kill "$agentq_operation_ssh_pid" >/dev/null 2>&1 || true
         wait "$agentq_operation_ssh_pid" >/dev/null 2>&1 || true
@@ -3272,12 +3285,17 @@ initialize_remote_invocation() {
             # `agentq_run` honours AGENTQ_WAIT_BUDGET when the caller set it:
             # the wait path prepends `AGENTQ_WAIT_BUDGET=<N>s; ` to the command
             # (see run_wait_ssh_with_timeout) so the REMOTE wait is bounded by
-            # coreutils `timeout` and cannot outlive the local ssh holding the
-            # server's operation lock.  `command -v` degrades to a local-only
-            # bound -- the shape Windows targets already have -- when the
-            # target ships no timeout (macOS has none by default, and a
-            # non-interactive ssh PATH may miss a Homebrew one).  Every other
-            # operation leaves the variable unset, so this is inert for them.
+            # coreutils `timeout` and dies with the budget instead of living
+            # until the task ends -- measured 2026-10-28 over a real sshd: an
+            # unbounded remote wait survives killing the local ssh and a
+            # polling caller accumulates one per poll.  The orphan does not
+            # hold the server's operation lock (`wait_for_task` releases it
+            # before `pueue wait`); what it holds is a process and a pueued
+            # connection.  `command -v` degrades to a local-only bound -- the
+            # shape Windows targets already have -- when the target ships no
+            # timeout (macOS has none by default, and a non-interactive ssh
+            # PATH may miss a Homebrew one).  Every other operation leaves the
+            # variable unset, so this is inert for them.
             remote_base_command='agentq_run() { agentq_server="$HOME/.local/bin/agentq"; if [ -n "$AGENTQ_WAIT_BUDGET" ] && command -v timeout >/dev/null 2>&1; then exec timeout "$AGENTQ_WAIT_BUDGET" "$agentq_server" "$@"; fi; exec "$agentq_server" "$@"; }; agentq_run'
             remote_command=$remote_base_command
             ;;

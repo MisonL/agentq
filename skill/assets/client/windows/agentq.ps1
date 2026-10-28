@@ -1512,11 +1512,17 @@ function Invoke-WaitSshWithTimeout {
     # read the pipes at all, so even a small completed response came back empty
     # and every `wait --timeout` failed validation with "response was empty").
     #
-    # Killing the LOCAL ssh does not stop the remote wait (the Windows test
-    # host has no coreutils timeout; the bound is local-only here), which is
-    # the measured 2026-10-15 orphan-lock shape -- the caller surfaces exit 6
-    # and the caller may poll status/logs instead.  On a completed run the
-    # exit token and reason handling match Invoke-SshLogged.
+    # Killing the LOCAL ssh does not stop the remote wait, so a timed-out wait
+    # would otherwise leave a remote `agentq-server wait` (and its `pueue wait
+    # --quiet` child) running until the task ends.  On a UNIX target that is
+    # bounded by the AGENTQ_WAIT_BUDGET assignment New-UnixRemoteInvocation
+    # puts on the remote command; on a WINDOWS target there is no guaranteed
+    # `timeout` on PATH, so the bound stays local-only -- the same asymmetry the
+    # POSIX twin documents (measured 2026-10-28 over a real sshd: without the
+    # assignment the Windows client left 1..5 orphans across five polls where
+    # the POSIX client left 0).  Either way the caller surfaces exit 6 and may
+    # poll status/logs instead.  On a completed run the exit token and reason
+    # handling match Invoke-SshLogged.
     param(
         [string]$RemoteCommand,
         [AllowNull()][string]$InputPayload,
@@ -2412,9 +2418,34 @@ function Convert-ToPosixQuotedArgument {
 }
 
 function New-UnixRemoteInvocation {
-    param([string[]]$Arguments)
+    param(
+        [string[]]$Arguments,
+        [int]$WaitBudgetSeconds = 0
+    )
 
-    $script = 'agentq_run() { agentq_server="$HOME/.local/bin/agentq"; exec "$agentq_server" "$@"; }; agentq_run'
+    # The wrapper is the POSIX client's, byte for byte (remote_base_command in
+    # client/unix/agentq).  The two clients are one contract, so the same argv
+    # against the same unix target must produce the same remote command; a
+    # differential on the decoded command is what smoke/12 now runs.
+    #
+    # The budget clause is load-bearing, not decoration.  Before 2026-10-28
+    # this wrapper had no AGENTQ_WAIT_BUDGET handling and the wait path never
+    # set the variable, so a timed-out `wait --timeout` left the remote
+    # `agentq-server wait` (and its `pueue wait --quiet` child) alive until the
+    # task ended -- measured over a real sshd: 1,2,3,4,5 orphans across five
+    # polls, where the POSIX client against the same target left 0.  The bound
+    # is conditional because `timeout` is not guaranteed on PATH (macOS ships
+    # none), in which case the budget stays local-only, exactly as the POSIX
+    # twin documents.
+    $script = 'agentq_run() { agentq_server="$HOME/.local/bin/agentq"; if [ -n "$AGENTQ_WAIT_BUDGET" ] && command -v timeout >/dev/null 2>&1; then exec timeout "$AGENTQ_WAIT_BUDGET" "$agentq_server" "$@"; fi; exec "$agentq_server" "$@"; }; agentq_run'
+    if ($WaitBudgetSeconds -gt 0) {
+        # A leading assignment statement, not a `timeout <N>s <command>`
+        # prefix: the command begins with a function definition, which shell
+        # grammar allows only in command position (measured 2026-10-16 on the
+        # POSIX twin -- a prefix makes the whole line a syntax error and every
+        # wait dies with an empty response).
+        $script = "AGENTQ_WAIT_BUDGET=${WaitBudgetSeconds}s; " + $script
+    }
     foreach ($argument in $Arguments) {
         $script += " " + (Convert-ToPosixQuotedArgument -Value $argument)
     }
@@ -2514,11 +2545,18 @@ exit $agentqLauncherExit
 }
 
 function New-RemoteInvocation {
-    param([string[]]$Arguments)
+    param(
+        [string[]]$Arguments,
+        # The client-side wait budget, in seconds; 0 means "no budget".  Only
+        # the unix arm carries it remotely -- on a windows target there is no
+        # guaranteed `timeout`, exactly as the POSIX twin's
+        # `if [ "$remote_platform" != windows ]` gate.
+        [int]$WaitBudgetSeconds = 0
+    )
 
     switch ($script:RemotePlatform) {
         "unix" {
-            return New-UnixRemoteInvocation -Arguments $Arguments
+            return New-UnixRemoteInvocation -Arguments $Arguments -WaitBudgetSeconds $WaitBudgetSeconds
         }
         "windows" {
             return New-WindowsRemoteInvocation -Arguments $Arguments
@@ -3448,7 +3486,9 @@ switch ($operation) {
             # The budget is client-side only: the server's `wait` takes exactly
             # one task id, so --timeout must NOT travel on the remote command
             # (forwarding it makes the server answer `wait requires one task id`
-            # with exit 2).  $remoteWaitArgs stays as plain `wait <id>`.
+            # with exit 2).  $remoteWaitArgs stays as plain `wait <id>`; the
+            # budget reaches the target as the AGENTQ_WAIT_BUDGET assignment
+            # the unix wrapper consumes, so the remote wait is bounded too.
         } elseif (![string]::IsNullOrWhiteSpace($env:AGENTQ_WAIT_TIMEOUT)) {
             if ($env:AGENTQ_WAIT_TIMEOUT -notmatch '^[1-9][0-9]*$') {
                 Stop-AgentQ "AGENTQ_WAIT_TIMEOUT must be a positive integer"
@@ -3461,7 +3501,13 @@ switch ($operation) {
             $waitTimeoutSeconds = Convert-ToPositiveInt32 -Value $env:AGENTQ_WAIT_TIMEOUT -Name "AGENTQ_WAIT_TIMEOUT"
         }
         Initialize-ClientTransport
-        $invocation = New-RemoteInvocation -Arguments $remoteWaitArgs
+        # The budget is handed to the invocation builder, not appended here:
+        # only the unix arm can use it (the windows launcher has no guaranteed
+        # `timeout`), and that arm decides where the assignment goes.  Building
+        # it at the call site would put the variable in front of the whole
+        # `printf ... | base64 -d | sh` pipeline, where the assignment is not
+        # visible to the decoded script.
+        $invocation = New-RemoteInvocation -Arguments $remoteWaitArgs -WaitBudgetSeconds $waitTimeoutSeconds
         if ($waitTimeoutSeconds -gt 0) {
             exit (Invoke-SafeOperationWithRecovery -OperationName "wait" -Invocation $invocation -ExpectedTaskId $arguments[$position] -WaitTimeoutSeconds $waitTimeoutSeconds)
         }
