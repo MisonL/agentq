@@ -797,11 +797,16 @@ A5b 随之修复并经两列双向验证——见 A5b 正文与本节 A5b 行。
   （第一条语句之后的全部，实测在 macOS 上不可达）。**分子不变**（该资产本就被计入
   「已覆盖」），但证据从源码级升到了行为级。
 
-- `client/unix/sshp`（**1,235** 行，2026-10-14 复核未变）：本地契约 **21 例**（`smoke/19`，2026-10-02 新增；2026-10-07 加 `--check` 重试预算，2026-10-12 加两条 trap 位置锁）。
+- `client/unix/sshp`（**1,346** 行；**1,235** 是 2026-10-14 的复核值，此后第四十五类等轮次又改过）：本地契约 **53 例**（`smoke/19`，2026-10-02 新增；2026-10-07 加 `--check` 重试预算，2026-10-12 加两条 trap 位置锁，2026-10-28 第四十五类加 18 例「远端脚本执行矩阵」——见下）。
   覆盖参数校验、环境变量校验、`--help`、探测分派（含 `--check` **不得安装**）、
   重连策略、实际 argv、TMPDIR 零残留，以及会话名的注入守卫。
   **任何真实远端仍是零覆盖**——桩证明的是 sshp **发出什么**；交互会话本体、
   Windows 路径、远端安装路径都未覆盖（见 `smoke/19` 头注释的边界清单）。
+  **第四十五类起，两个客户端内嵌的远端探针/安装脚本本身有了执行覆盖**：四个 body
+  从两份资产里抽出后**逐字节**互比，并在只含一个撒谎 `uname` 的假 PATH 上按 8 行
+  探针矩阵 + 5 行安装矩阵各自断言绝对期望。此前 `smoke/14` 只量长度、`smoke/20`
+  只验证编码、本检查的 `plan_stub` 喂的是预写 marker——四个脚本从未被执行过，
+  而两份实现答案不同（`FreeBSD + tmux` 一侧 READY 一侧 127）。
 
 `client/windows/sshp.ps1`（1,179 行，2026-10-14 复核未变）**不再属于「从未被执行过」那一类**：`smoke/20`
 （2026-10-02）在 pwsh 里真跑它 `--check`、捕获它实际发给 ssh 的 argv 并断言往返。
@@ -1173,6 +1178,15 @@ A5b 随之修复并经两列双向验证——见 A5b 正文与本节 A5b 行。
     - **修法**：`shell_assets` 改为**按 shebang 枚举**（与解析臂同一判据），解析臂改吃同一变量——单一来源。再加两道闸门：`shell=` ≠ `local_hazard_files=` 即失败（同一行摘要里 9≠7 曾经全绿，这正是「计数印出来没人看」的形状）；**无归属资产闸门**——skill/assets 里任何不属于已解析类别（`.ps1`/`.cmd`/`.plist`/`.yml`/`.service`/shebang-shell）的文件即失败，堵住「新种类资产静默加入、任何规则都不解析它」这个类（`.DS_Store`/`Thumbs.db`/`desktop.ini` 豁免——Finder 会在任何被显示的目录创建它，而 .gitignore 已挡住它；对它报红是假警报）。闸门刻意**不用**「23 个文件」常数：常数钉死今天的清单，而「这个文件的种类有没有规则解析」才是摘要行真正在说的问题。
     - **红证（四个方向）**：往 `sshp.bash` 植入五类构造（quiet-grep 管道、`< f 2>/dev/null`、mktemp 带后缀模板、动态作用域 hazard、未调用函数）→ **五条锁逐条点名**并退 1（改前同植入零命中）；让解析臂跳过 `.bash` → 漂移闸门点名「7 vs 9」并退 1；种入 `zz-probe.json` → 无归属闸门点名并退 1；把分类器改成永远接受 → 自检报错。还原后全绿。
     - **顺带的实测**：shellcheck `-S warning` 全量（未加 `-i` 白名单）在 9 个资产上只有 3 条——SC3045（POSIX sh 的 `ulimit -c`，本仓已有注释说明 best-effort 且 dash/bash 实测都接受）与 SC2140/SC1078（服务端 jq 双引号 filter 里的注释文本，`bash -n`/`zsh -n`/`dash -n` 全部接受）。两者都判为既有边界、不进锁，如实记录。
+  - **第四十五类（2026-10-28）：两份 `sshp` 客户端内嵌的远端依赖探针和安装脚本从未被执行过——同一个目标，POSIX 客户端说「去装 tmux」、Windows 客户端直接连上去；另一类目标上两者又把「可安装」和「没救」对调。**
+    - **怎么找到的**：第四十四类把「同一 argv 喂两份」推到了 `agentq` 的远端命令。`sshp` 这一对还有两层没被比过：退出码表（第四十三类已补）和**两个客户端各自内嵌的远端脚本体**。先问「谁执行过这两个 body」——`grep` 遍历 29 个检查：`smoke/14` 只量它们的**长度**（base64 后的命令行字符数），`smoke/20` 只验证 Windows 侧的**编码**（base64 往返后仍是单个 argv），`smoke/19` 的 `plan_stub` 喂给 POSIX 客户端的全是**预先写好的 marker**——`grep -n 'uname' smoke/*.sh` 只命中 `smoke/05` 自己的桩。**没有任何一处真正运行过这两个脚本。**
+    - **实测方法**：把四个 body（探针 ×2、安装 ×2）从两份资产里原样抽出，在只含一个「撒谎的 `uname`」和指定工具的 PATH 上执行。**PATH 必须收窄到假目录**：第一版把假目录前置到真实 PATH，宿主自己的 `/usr/bin/screen` 替「什么都没装」的行回答了 `command -v`，于是每一行都报 READY——这本身就是一次「桩没照抄现实」的假绿；`/bin/sh` 要用绝对路径（PATH 收窄后裸 `sh` 也解析不到，第一版因此每行都退 127）。
+    - **两类分歧（都是真缺陷，方向相反）**：① **平台门在就绪判断之前**。POSIX 探针先按 `case "$platform" in Darwin*|Linux*) ;; *) 拒绝` 过滤，之后才检查多路复用器；Windows 探针没有这道门。实测 `FreeBSD + tmux` → POSIX `127 __SSHP_INSTALL_UNAVAILABLE__`（用户被告知「去装 tmux」，而该机**已经装有 tmux**）、Windows `0 __SSHP_READY__`；`SunOS + tmux`、`unknown + tmux` 同形。**客户端级**：`sshp <freebsd-host>` POSIX 退 127、Windows 正常进会话。会话命令本身是 `exec tmux new-session -A -s '<name>'` 这样的可移植 shell，**不需要**任何平台知识，所以这道门是纯粹的假阴性。② **候选安装器按平台分桶**。Windows 探针的 `case` 只给 Darwin 列 brew/port、给 Linux 列 apt..apk；POSIX 探针是**扁平**列表。而两份客户端的**安装** body 都是扁平的 apt/dnf/yum/pacman/zypper/apk/brew/port。实测 `Linux + 只有 Homebrew` → POSIX `42 __SSHP_INSTALL_REQUIRED__`、Windows `127 __SSHP_INSTALL_UNAVAILABLE__`；**客户端级**：POSIX 退 1（询问是否安装后因无 tty 拒绝）、Windows 退 127 并让用户自己去装。也就是 Windows 探针**拒绝了一台它自己的安装器本来就能装好的机器**。
+    - **修法**：把两个 body 各自统一成**同一份文本**。就绪判断移到最前（有 tmux/screen/zellij 就 READY，不看 `uname`），候选列表改成扁平、与安装 body 的列表**同序相同**；MINGW 分支保持最先（`__SSHP_WINDOWS_SHELL__` + 43），`package_label`/分桶 `case` 一并删除。删除是等价的，且这一点是逐分支核对过的：旧 body 里那个 `case` 的 `MINGW*` 臂（`package_label=zellij` + winget/scoop/choco）**不可达**——同一个函数体上方已经有一个 `case` 在 `MINGW*|MSYS*|CYGWIN*` 上 `exit 43`，Windows 目标根本走不到这里（winget/scoop/choco 三条也从未被执行过）；`Darwin*`/`Linux*` 之外的任何平台在旧 body 里本来就得到空 `installer`，安装 body 的差异（POSIX 有 `run_as_root` 的 sudo 缺失消息和收尾行、Windows 是压缩版且静默退 127）也一并对齐到 POSIX 的完整形态。
+    - **为什么不是「加一道门到 Windows 侧」**：那道门唯一的产物是拒绝一台**已经有依赖**的机器，且给出的建议（装 tmux）在该机上是错的。判据不是「平台白名单谁更严」，而是「会话命令需要什么」——它只需要一个多路复用器。
+    - **锁**：`smoke/19` 新增一节，四件事。① **抽取守卫**：四个 body 都必须以 `set -eu` 开头，抽到空文件即报错——两个空 body 相等，是本仓反复踩的假绿形状。② **逐字节相等**：探针一对、安装一对各一条 `cmp`，不等就打印 `diff -u`。③ **执行矩阵**：探针 8 行（Linux/Darwin/FreeBSD × 有无 tmux、Linux+brew、Darwin+port、MINGW）、安装 5 行（apt-get/brew/port 的真 argv 轨迹、`pkg` 无候选、空 PATH），每行对**两个 body 各自**断言绝对期望（只问「两边是否一致」会放过两边一起漂）；安装行比的是**会运行什么命令**（假安装器把 argv 写进 trace），不是退出码。行数下界 8/5。④ **自检**：把平台门重新插回探针副本，要求 `FreeBSD+tmux` 行必须报错（锚点找不到时点名「mutation did not apply」，而不是静默通过）。
+    - **红证（先证能红，双向）**：预修复形态的 POSIX 副本喂 `AGENTQ_SMOKE_CLIENT` → 报 `clients embed DIFFERENT dependency probes`（附 diff）+ `probe matrix [FreeBSD tools=tmux]` 行两侧对调，退 1；预修复形态的 Windows 副本喂 `AGENTQ_SMOKE_SSHP_PS_CLIENT` → 同样两条，其中矩阵行是 `Linux tools=brew`，退 1。**另外两个方向各一**：只把候选列表改回分桶（保留平台门的删除）的 POSIX 副本 → `Linux tools=brew` 与 `Darwin tools=port` 两行同时点名，退 1（证明矩阵不只钉平台门）；把探针表删掉一行的检查副本 → 下界点名「shrank to 7 probe row(s)」，退 1（证明下界不是摆设——删行时「跑的行数」与「表声明的行数」一起变，等值闸门看不见，只有下界能抓）。修复后 `smoke/19 cases=53 … remote-scripts=identical(2/2) matrix=13/13` 退 0。
+    - **边界**：两个 body 现在逐字节相同，但仍各自内嵌两份副本（`agents/openai.yaml` 之外没有共享机制）；本节的锁是**检测**漂移，不是消除重复。矩阵里的平台名是 fixture 文本，覆盖的是「探测脚本读到某个 `uname -s` 时怎么答」，不是真在 FreeBSD 上跑过 `sshp`——**没有任何一个非 Linux/macOS/Windows 的远端被实测过**。Windows 目标的 `sshp` 会话路径不经过这两个 body（走 `__SSHP_WINDOWS_SHELL__` 就转 PowerShell），所以本节不覆盖它。
   - **第四十四类（2026-10-28）：两份客户端给同一个 argv 构建的**远端命令**从未被比过——Windows 客户端的 unix 远端命令里没有 `AGENTQ_WAIT_BUDGET` 机制，每次 `wait --timeout` 预算耗尽都在目标机上留一个孤儿 `agentq-server wait`（带一个 `pueue wait --quiet` 子进程），而 POSIX 孪生留 0。**
     - **怎么找到的**：第四十三类之后把「同一 argv 喂两份」从退出码推到**远端命令本身**。先证明缺口存在：`grep` 遍历 29 个检查，没有任何一处把两份客户端发出的远端命令放在一起比过——`smoke/05` 钉 POSIX 侧（对着从 POSIX 侧抄下来的期望）、`smoke/20` 钉 Windows 侧的 base64 通道形状，各自内部自洽，互不相见。手工差分（桩 ssh 捕获最后一个 argv，Windows 侧先 base64 解码）：**9 行 argv 全部不同**——差异是 POSIX 的 wrapper 带 `if [ -n "$AGENTQ_WAIT_BUDGET" ] && command -v timeout …exec timeout…` 子句，Windows 的没有。
     - **为什么它是真缺陷而不是编码差异**：base64 传输层是刻意的（PLAN A21），两客户端的**解码后命令**应当同义。实测后果（真实 sshd + 真实 agentq-server + 真实 pueued，目标 PATH 含 coreutils `timeout`，即任何正常 Linux 主机）：同一 argv `wait <id> --timeout 3` 连跑三次，POSIX 客户端**0 个**孤儿（远端 `timeout 3s` 把等待进程杀在预算上），Windows 客户端 **1、2、3 个**孤儿累加；5 次轮询 5 个。每个孤儿是一个 `agentq-server wait` 进程加一条 pueued socket 连接，**活到任务终态为止**（实测任务 cancel 后归零）——轮询型 agent（SKILL.md 的推荐用法）在长任务上会线性堆积。

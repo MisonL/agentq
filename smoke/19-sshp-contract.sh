@@ -2,10 +2,10 @@
 # Smoke: the POSIX `sshp` client's LOCAL contract.  No remote is contacted -- a
 # stub `SSHP_SSH` answers the platform probe and records the argv it was given.
 #
-# Why this check exists: `assets/client/unix/sshp` is 1,190 lines and, before
+# Why this check exists: `assets/client/unix/sshp` is 1,346 lines and, before
 # this file, NOTHING in the suite had ever executed it.  `01` parses it
 # (`sh -n`), `10` asserts a couple of installer invariants about other files,
-# and that was the whole of it.  Together with `sshp.ps1` (1,092 lines) it is
+# and that was the whole of it.  Together with `sshp.ps1` (1,361 lines) it is
 # the largest zero-coverage asset in the repo -- and unlike the installers it is
 # not a one-shot tool: it is the interactive session path a human uses every
 # day.
@@ -412,7 +412,10 @@ if [ "$install_calls" -ne 1 ]; then
     failures=$((failures + 1))
 fi
 
-# An unsupported remote platform must be refused, not guessed at.
+# A probe that reports INSTALL_UNAVAILABLE must be refused, not guessed at.
+# The stub feeds the MARKER, so this case is about the client's routing, not
+# about which platforms the probe treats as supported (that is the matrix
+# below); the platform in the marker is irrelevant here.
 plan_stub '127	__SSHP_INSTALL_UNAVAILABLE__:FreeBSD'
 run_case 'check: unsupported platform' 127 'install tmux, GNU screen, or Zellij manually' -- --check smoke-host
 
@@ -540,6 +543,236 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# The two sshp clients embed ONE remote dependency probe and ONE remote
+# installer.
+# ---------------------------------------------------------------------------
+# Why this section exists (docs/PLAN.md 第四十五类): both clients carry the
+# probe and the installer as a single-quoted shell string / a PowerShell
+# here-string, and NOTHING ran either one.  `14` measured their LENGTH, `20`
+# measured the Windows side's encoding, and the `plan_stub` cases here feed the
+# POSIX client CANNED markers -- so the two bodies could answer different
+# things, and did, with every check green.
+#
+# Measured 2026-10-28 by executing both extracted bodies against a fake `uname`
+# and a fake PATH:
+#   * FreeBSD with tmux: the POSIX body said 127 `__SSHP_INSTALL_UNAVAILABLE__`
+#     ("install tmux ... manually" -- on a host that HAS tmux), the Windows body
+#     said 0 READY.  The platform allow-list sat BEFORE the readiness check,
+#     and the session command (`exec tmux new-session ...`) is portable shell
+#     that needs no platform at all.
+#   * Linux with only Homebrew: the POSIX body said 42 INSTALL_REQUIRED, the
+#     Windows body said 127 UNAVAILABLE -- while BOTH clients' install bodies
+#     are a flat apt/dnf/yum/pacman/zypper/apk/brew/port list, so the Windows
+#     probe refused an install the same client would have performed.
+#
+# The rule is therefore two-sided, and both sides are asserted: the bodies are
+# byte-identical, AND each one answers every row of the matrix below from an
+# absolute oracle (a comparison that only asked "do they agree" would pass if
+# both drifted the same way).  The self-test at the end re-adds the platform
+# gate to a copy and requires the FreeBSD row to go red, so the matrix is
+# proven able to see the defect it was written for.
+sshp_ps_client=${AGENTQ_SMOKE_SSHP_PS_CLIENT:-$root/skill/assets/client/windows/sshp.ps1}
+if [ ! -f "$sshp_ps_client" ]; then
+    printf 'sshp-contract: missing the Windows sshp asset: %s\n' "$sshp_ps_client" >&2
+    exit 1
+fi
+
+# extract_posix_body <file> <variable-name> -> the body on stdout.
+# The body is the text between `<var>='` and the next line that is exactly `'`.
+extract_posix_body() {
+    awk -v var="$2" -v q="'" '
+        $0 == var "=" q { inside = 1; next }
+        inside && $0 == q { exit }
+        inside { print }
+    ' "$1"
+}
+# extract_ps_body <file> <function-name> -> the body on stdout.
+# The body is the text between `-Script @'` (inside that function) and the next
+# line that is exactly `'@`.
+extract_ps_body() {
+    awk -v fn="function $2 {" -v open="    return Convert-ToPosixScriptCommand -Script @'" -v q="'" '
+        $0 == fn { infn = 1; next }
+        infn && $0 == open { inside = 1; next }
+        inside && $0 == q "@" { exit }
+        inside { print }
+    ' "$1"
+}
+
+probe_posix="$work/remote-probe-posix.sh"
+probe_win="$work/remote-probe-windows.sh"
+install_posix="$work/remote-install-posix.sh"
+install_win="$work/remote-install-windows.sh"
+extract_posix_body "$client" remote_probe_command > "$probe_posix"
+extract_ps_body "$sshp_ps_client" Get-UnixProbeCommand > "$probe_win"
+extract_posix_body "$client" remote_install_command > "$install_posix"
+extract_ps_body "$sshp_ps_client" Get-UnixInstallCommand > "$install_win"
+
+# An extractor whose anchor moved yields an EMPTY body, and comparing two empty
+# bodies is green.  Refuse to compare anything that is not the script it claims
+# to be: every one of the four starts with `set -eu`.
+for extracted in "$probe_posix" "$probe_win" "$install_posix" "$install_win"; do
+    if ! grep -qx 'set -eu' "$extracted"; then
+        printf 'sshp-contract: no remote script was extracted into %s (the anchor moved); refusing to compare two empty bodies\n' \
+            "${extracted#"$work"/}" >&2
+        failures=$((failures + 1))
+    fi
+done
+
+# Both pairs must be the SAME text.  A divergence here is always a defect: the
+# two clients face the same target with the same requirements.
+cases=$((cases + 1))
+if ! cmp -s "$probe_posix" "$probe_win"; then
+    printf '%s\n' 'sshp-contract: the two clients embed DIFFERENT dependency probes:' >&2
+    diff -u "$probe_posix" "$probe_win" >&2 || true
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if ! cmp -s "$install_posix" "$install_win"; then
+    printf '%s\n' 'sshp-contract: the two clients embed DIFFERENT installers:' >&2
+    diff -u "$install_posix" "$install_win" >&2 || true
+    failures=$((failures + 1))
+fi
+
+# run_probe_body <body> <uname> [tool...] -> "<status>\t<stdout>"
+# The target is modelled by a PATH that contains ONLY a lying `uname` and the
+# named tools: a host tool left on PATH would answer `command -v` for a row
+# that is meant to model its absence (measured 2026-10-28 -- prepending to the
+# real PATH made every "nothing installed" row report a multiplexer).
+run_probe_body() {
+    local body=$1 uname_value=$2
+    shift 2
+    local fake status=0 out tool
+    fake=$(mktemp -d "$work/fake-target.XXXXXX")
+    printf '#!/bin/sh\nprintf "%%s\\n" "%s"\n' "$uname_value" > "$fake/uname"
+    chmod 700 "$fake/uname"
+    for tool in "$@"; do
+        printf '#!/bin/sh\nexit 0\n' > "$fake/$tool"
+        chmod 700 "$fake/$tool"
+    done
+    out=$(PATH="$fake" /bin/sh "$body" 2>/dev/null) || status=$?
+    rm -rf -- "$fake"
+    printf '%s\t%s' "$status" "$out"
+}
+
+# run_install_body <body> <uname> [installer...] -> "<status>\t<trace>"
+# `id` answers 0 so `run_as_root` execs the installer directly (no sudo in the
+# fake PATH), and every installer records "<tool> <args>" to a trace, so the
+# comparison is on what WOULD RUN, not merely on an exit code.
+run_install_body() {
+    local body=$1 uname_value=$2
+    shift 2
+    local fake trace status=0 tool
+    fake=$(mktemp -d "$work/fake-target.XXXXXX")
+    trace="$work/fake-trace"
+    : > "$trace"
+    printf '#!/bin/sh\nprintf "%%s\\n" "%s"\n' "$uname_value" > "$fake/uname"
+    printf '#!/bin/sh\nprintf "0\\n"\n' > "$fake/id"
+    chmod 700 "$fake/uname" "$fake/id"
+    for tool in "$@"; do
+        printf '#!/bin/sh\nprintf "%%s %%s\\n" "%s" "$*" >> "%s"\nexit 0\n' "$tool" "$trace" > "$fake/$tool"
+        chmod 700 "$fake/$tool"
+    done
+    PATH="$fake" /bin/sh "$body" >/dev/null 2>&1 || status=$?
+    rm -rf -- "$fake"
+    printf '%s\t%s' "$status" "$(tr '\n' ';' < "$trace")"
+}
+
+# Rows: <uname>|<tools>|<expected status>|<expected stdout>.  `tools` is
+# word-split on purpose -- it is this fixture's own text, never user input.
+probe_matrix='Linux|tmux|0|__SSHP_READY__:Linux
+Darwin|screen|0|__SSHP_READY__:Darwin
+FreeBSD|tmux|0|__SSHP_READY__:FreeBSD
+Linux||127|__SSHP_INSTALL_UNAVAILABLE__:Linux
+FreeBSD||127|__SSHP_INSTALL_UNAVAILABLE__:FreeBSD
+Linux|brew|42|__SSHP_INSTALL_REQUIRED__:Linux
+Darwin|port|42|__SSHP_INSTALL_REQUIRED__:Darwin
+MINGW64_NT-10.0-19045||43|__SSHP_WINDOWS_SHELL__:MINGW64_NT-10.0-19045'
+probe_rows=0
+while IFS='|' read -r row_uname row_tools row_status row_marker; do
+    [ -n "$row_uname" ] || continue
+    probe_rows=$((probe_rows + 1)); cases=$((cases + 1))
+    expected=$(printf '%s\t%s' "$row_status" "$row_marker")
+    # shellcheck disable=SC2086 # row_tools is this fixture's own word list
+    got_posix=$(run_probe_body "$probe_posix" "$row_uname" $row_tools)
+    # shellcheck disable=SC2086
+    got_windows=$(run_probe_body "$probe_win" "$row_uname" $row_tools)
+    if [ "$got_posix" != "$expected" ] || [ "$got_windows" != "$expected" ]; then
+        printf 'sshp-contract: probe matrix [%s tools=%s]: expected [%s]\n  posix   got [%s]\n  windows got [%s]\n' \
+            "$row_uname" "${row_tools:-<none>}" "$expected" "$got_posix" "$got_windows" >&2
+        failures=$((failures + 1))
+    fi
+done <<< "$probe_matrix"
+
+# The installer half.  A candidate the probe offers must be a command the
+# installer actually runs -- that invariant is what the Windows side broke.
+install_matrix='Linux|apt-get|0|apt-get update;apt-get install -y tmux;
+Linux|brew|0|brew install tmux;
+Darwin|port|0|port install tmux;
+FreeBSD|pkg|127|
+Linux||127|'
+install_rows=0
+while IFS='|' read -r row_uname row_tools row_status row_trace; do
+    [ -n "$row_uname" ] || continue
+    install_rows=$((install_rows + 1)); cases=$((cases + 1))
+    expected=$(printf '%s\t%s' "$row_status" "$row_trace")
+    # shellcheck disable=SC2086
+    got_posix=$(run_install_body "$install_posix" "$row_uname" $row_tools)
+    # shellcheck disable=SC2086
+    got_windows=$(run_install_body "$install_win" "$row_uname" $row_tools)
+    if [ "$got_posix" != "$expected" ] || [ "$got_windows" != "$expected" ]; then
+        printf 'sshp-contract: install matrix [%s tools=%s]: expected [%s]\n  posix   got [%s]\n  windows got [%s]\n' \
+            "$row_uname" "${row_tools:-<none>}" "$expected" "$got_posix" "$got_windows" >&2
+        failures=$((failures + 1))
+    fi
+done <<< "$install_matrix"
+
+# A matrix that stopped enumerating reports green on nothing.  The expected
+# count is COMPUTED from the table (the twin table's rule: a literal cannot
+# move when the coverage changes), and an independent FLOOR is kept under it so
+# a table truncated together with its expectation still trips something.
+probe_matrix_rows=$(grep -c . <<< "$probe_matrix")
+install_matrix_rows=$(grep -c . <<< "$install_matrix")
+cases=$((cases + 1))
+if [ "$probe_rows" -ne "$probe_matrix_rows" ] || [ "$install_rows" -ne "$install_matrix_rows" ]; then
+    printf 'sshp-contract: the remote-script matrix ran %s probe row(s) and %s install row(s); the tables declare %s and %s\n' \
+        "$probe_rows" "$install_rows" "$probe_matrix_rows" "$install_matrix_rows" >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if [ "$probe_matrix_rows" -lt 8 ] || [ "$install_matrix_rows" -lt 5 ]; then
+    printf 'sshp-contract: the remote-script tables shrank to %s probe row(s) and %s install row(s); the floor is 8 and 5\n' \
+        "$probe_matrix_rows" "$install_matrix_rows" >&2
+    failures=$((failures + 1))
+fi
+
+# Self-test: the matrix must be able to SEE the defect this round fixed.
+# Re-insert the platform allow-list (the exact pre-fix shape) after the MINGW
+# case and require the FreeBSD+tmux row to stop being READY.  If the mutation
+# does not apply, say so -- a self-test that silently did nothing passes on
+# nothing.
+probe_gated="$work/remote-probe-gated.sh"
+awk '
+    { print }
+    $0 == "esac" && !done {
+        print "case \"$platform\" in Darwin*|Linux*) ;; *) exit 127 ;; esac"
+        done = 1
+    }
+' "$probe_posix" > "$probe_gated"
+cases=$((cases + 1))
+if cmp -s "$probe_posix" "$probe_gated"; then
+    printf '%s\n' 'sshp-contract: probe matrix self-test: the platform-gate mutation did not apply; the matrix cannot be proven able to fail' >&2
+    failures=$((failures + 1))
+else
+    gated_answer=$(run_probe_body "$probe_gated" FreeBSD tmux)
+    if [ "$gated_answer" = "$(printf '0\t%s' '__SSHP_READY__:FreeBSD')" ]; then
+        printf 'sshp-contract: probe matrix self-test: a probe carrying the old platform allow-list still answered READY for FreeBSD+tmux [%s]; the matrix cannot see the class it was written for\n' \
+            "$gated_answer" >&2
+        failures=$((failures + 1))
+    fi
+fi
+remote_script_state="identical(2/2) matrix=$((probe_rows + install_rows))/$((probe_matrix_rows + install_matrix_rows))"
+
+# ---------------------------------------------------------------------------
 # No residue.  sshp creates a private runtime directory under TMPDIR and removes
 # it in the EXIT trap.  A leak here is invisible in every other check and would
 # accumulate one directory per invocation on a long-lived machine.
@@ -596,4 +829,5 @@ if [ "$failures" -ne 0 ]; then
     printf 'sshp-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'sshp-contract checks passed: cases=%s stub-ssh=yes reconnect=covered argv=checked residue=none trap-window=pinned\n' "$cases"
+printf 'sshp-contract checks passed: cases=%s stub-ssh=yes reconnect=covered argv=checked residue=none trap-window=pinned remote-scripts=%s\n' \
+    "$cases" "$remote_script_state"

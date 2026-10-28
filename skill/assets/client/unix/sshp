@@ -492,15 +492,13 @@ case "$platform" in
         printf "%s\n" "__SSHP_WINDOWS_SHELL__:$platform"
         exit 43
         ;;
-    Darwin*|Linux*)
-        ;;
-    *)
-        printf "%s\n" "sshp: unsupported remote platform: $platform" >&2
-        printf "%s\n" "__SSHP_INSTALL_UNAVAILABLE__:$platform"
-        exit 127
-        ;;
 esac
 
+# Readiness is decided before any platform question: the session command needs
+# only one multiplexer, so a host that has one can run it whatever uname -s
+# reports.  A platform allow-list here refused a FreeBSD host that HAD tmux and
+# told the user to install it (measured 2026-10-28: 127 here, READY on the
+# Windows twin for the same target).
 if command -v tmux >/dev/null 2>&1 ||
     command -v screen >/dev/null 2>&1 ||
     command -v zellij >/dev/null 2>&1; then
@@ -508,6 +506,10 @@ if command -v tmux >/dev/null 2>&1 ||
     exit 0
 fi
 
+# This candidate list is FLAT and must stay equal to the list the install
+# command below tries, in the same order: a platform-scoped list here refused
+# (127) an install that the very same client would have performed (measured
+# 2026-10-28: Linux with only Homebrew).
 installer=
 installer_label=
 if command -v apt-get >/dev/null 2>&1; then installer=apt; installer_label=apt
@@ -550,6 +552,8 @@ run_as_root() {
     fi
 }
 
+# This list is FLAT and must stay equal to the probe candidate list above: a
+# platform-scoped list here would refuse an install the probe just offered.
 if command -v apt-get >/dev/null 2>&1; then
     run_as_root apt-get update
     run_as_root apt-get install -y tmux
