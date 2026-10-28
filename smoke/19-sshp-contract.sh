@@ -773,6 +773,390 @@ fi
 remote_script_state="identical(2/2) matrix=$((probe_rows + install_rows))/$((probe_matrix_rows + install_matrix_rows))"
 
 # ---------------------------------------------------------------------------
+# The same contract for the pair ONE FILE OVER: the WINDOWS-target resolver,
+# probe and installer that both clients embed.
+# ---------------------------------------------------------------------------
+# Why this section exists (docs/PLAN.md 第四十六类): the section above unified
+# the two clients' UNIX-target bodies.  Both clients ALSO carry a Windows-target
+# half -- a resolver prelude (`windows_common_script` / `Get-WindowsZellijResolver
+# Script`) plus a probe and an installer that each concatenate it -- and that
+# half had drifted into three different programs.  The extractors above cannot
+# reach it: neither POSIX tail opens with `<var>='` (both are
+# `$windows_common_script'` concatenations), and both Windows tails open with
+# `-ScriptText ($resolver + @'`.
+#
+# Measured 2026-10-28 by extracting all three parts from both clients (pre-fix
+# sizes: resolver 8105/8097, probe 580/637, install 736/1073 bytes) and driving
+# the two INSTALL bodies through the real channel both clients use -- the payload
+# on stdin to `pwsh -NoProfile -NonInteractive -Command -`, preceded by the two
+# preamble lines and followed by the trailing blank line, with the resolver
+# replaced by a stub.  Of the eleven rows below, five disagreed, and each side
+# held one half the other was missing:
+#   * no installer resolvable -- POSIX 127 with the intended one-line message,
+#     Windows 1 with a `Write-Error:` block.  `$ErrorActionPreference = "Stop"`
+#     makes Write-Error THROW, so the `exit 127` beneath it was dead code -- the
+#     class agentq-start-daemon.ps1 fixed on 2026-10-07, and the last live
+#     Write-Error left anywhere in skill/assets/.
+#   * unsupported installer kind -- POSIX 127, Windows 1 with an `Exception:`
+#     block (`throw` under the same preference).
+#   * the installer call returns WITHOUT setting $LASTEXITCODE -- Windows 1 via
+#     the fail-closed guard, POSIX **0**: a FAILED install reported as SUCCESS
+#     (`exit $LASTEXITCODE` with the variable unset is `exit $null`).
+# The probe tails differed too: only the Windows copy emitted
+# `__SSHP_ZELLIJ__:<path>`.  The POSIX client never consumes that line (its
+# Windows session command is `exec zellij attach --create` with a bare name --
+# checked, not assumed), so this one was inert THERE; it is still a divergence
+# of the same contract, and the Windows twin parses it into the path its session
+# command embeds (`& '<path>' attach --create`), so a body that stopped emitting
+# it would break that client alone.  The resolver also spelled one constructor
+# two ways (`New-Object "…List[string]"` vs `[…]::new()`; pwsh 7.5 answers
+# identically, measured).
+#
+# The rule is the round-45 rule applied to the Windows pair, and it is asserted
+# the same two-sided way: the three parts are byte-identical, AND each body
+# answers every row of the matrix from an absolute oracle -- a comparison that
+# only asked "do they agree" would pass if both drifted the same way.  The
+# resolver prelude is compared byte-for-byte but NOT executed: it calls
+# WindowsIdentity, Get-Acl and the profile registry key, so only a Windows host
+# can run it (the same boundary smoke/22 reports as windows-api=NOT-covered).
+# The two tails ARE executed, with the resolver replaced by a stub -- the stub
+# is this fixture's model of the target, exactly as the fake PATH above is.
+#
+# extract_posix_windows_part <file> <opening-line> -> the body on stdout.
+# The body runs from a line that EQUALS the opening line to the next line that
+# is exactly `'`.  The three openings differ (`windows_common_script='` assigns;
+# the two tails are `$windows_common_script'` concatenations), so the opening
+# line is passed in rather than derived.
+extract_posix_windows_part() {
+    awk -v open="$2" -v q="'" '
+        $0 == open { inside = 1; next }
+        inside && $0 == q { exit }
+        inside { print }
+    ' "$1"
+}
+# extract_ps_windows_part <file> <function-name> -> the here-string body.
+# Anchored on `function <name> {` and then the FIRST line whose last two
+# characters are `@'`, so a neighbouring function's here-string cannot be picked
+# up; it ends at the first line that STARTS with `'@` (the tails close with
+# `'@)`, the resolver with a bare `'@`).
+extract_ps_windows_part() {
+    awk -v fn="function $2 {" -v open_at="@" -v q="'" '
+        $0 == fn { infn = 1; next }
+        infn && !inside && substr($0, length($0) - 1) == open_at q { inside = 1; next }
+        inside && substr($0, 1, 2) == q "@" { exit }
+        inside { print }
+    ' "$1"
+}
+
+win_resolver_posix="$work/win-resolver-posix.ps1"
+win_resolver_win="$work/win-resolver-windows.ps1"
+win_probe_posix="$work/win-probe-posix.ps1"
+win_probe_win="$work/win-probe-windows.ps1"
+win_install_posix="$work/win-install-posix.ps1"
+win_install_win="$work/win-install-windows.ps1"
+extract_posix_windows_part "$client" "windows_common_script='" > "$win_resolver_posix"
+extract_ps_windows_part "$sshp_ps_client" Get-WindowsZellijResolverScript > "$win_resolver_win"
+extract_posix_windows_part "$client" "windows_probe_script=\$windows_common_script'" > "$win_probe_posix"
+extract_ps_windows_part "$sshp_ps_client" Get-WindowsProbeCommand > "$win_probe_win"
+extract_posix_windows_part "$client" "windows_install_script=\$windows_common_script'" > "$win_install_posix"
+extract_ps_windows_part "$sshp_ps_client" Get-WindowsInstallCommand > "$win_install_win"
+
+# An anchor that moved yields an EMPTY body, and two empty bodies compare equal.
+# A NON-empty wrong body is the other half of the same hazard, so the guard is a
+# content sentinel unique to each part rather than a length test.
+cases=$((cases + 1))
+win_extract_bad=0
+if ! grep -qF 'function Resolve-RemoteInstaller {' "$win_resolver_posix" ||
+    ! grep -qF 'function Resolve-RemoteInstaller {' "$win_resolver_win"; then
+    printf '%s\n' 'sshp-contract: no Windows dependency resolver was extracted from one of the two clients (the anchor moved); refusing to compare two empty bodies' >&2
+    win_extract_bad=1
+fi
+cases=$((cases + 1))
+if ! grep -qF '__SSHP_READY__:Windows' "$win_probe_posix" ||
+    ! grep -qF '__SSHP_READY__:Windows' "$win_probe_win"; then
+    printf '%s\n' 'sshp-contract: no Windows probe tail was extracted from one of the two clients (the anchor moved); refusing to compare two empty bodies' >&2
+    win_extract_bad=1
+fi
+cases=$((cases + 1))
+if ! grep -qF 'switch ($installer.Kind) {' "$win_install_posix" ||
+    ! grep -qF 'switch ($installer.Kind) {' "$win_install_win"; then
+    printf '%s\n' 'sshp-contract: no Windows install tail was extracted from one of the two clients (the anchor moved); refusing to compare two empty bodies' >&2
+    win_extract_bad=1
+fi
+if [ "$win_extract_bad" -ne 0 ]; then
+    failures=$((failures + 1))
+fi
+
+# Both sides must be the SAME text.  A divergence here is always a defect: the
+# two clients face the same Windows target with the same requirements.
+compare_windows_part() { # <label> <posix-file> <windows-file>
+    cases=$((cases + 1))
+    if cmp -s "$2" "$3"; then
+        return 0
+    fi
+    printf 'sshp-contract: the two clients embed DIFFERENT Windows-target %s scripts:\n' "$1" >&2
+    diff -u "$2" "$3" >&2 || true
+    failures=$((failures + 1))
+}
+compare_windows_part resolver "$win_resolver_posix" "$win_resolver_win"
+compare_windows_part probe "$win_probe_posix" "$win_probe_win"
+compare_windows_part installer "$win_install_posix" "$win_install_win"
+windows_script_state='identical(3/3)'
+
+# --- The behavioural half.  Needs a WORKING pwsh. --------------------------
+# Present is not the same as working (a corrupt startup cache makes every launch
+# die -- five occurrences in this repo, four different messages), so the probe
+# below runs before any case and an unusable interpreter is named as an
+# ENVIRONMENT fault rather than reported as an asset defect.
+pwsh_binary=${AGENTQ_SMOKE_PWSH:-$(command -v pwsh || true)}
+windows_matrix_state='not-run'
+if [ -z "$pwsh_binary" ] || ! command -v "$pwsh_binary" >/dev/null 2>&1; then
+    printf '%s\n' 'sshp-contract: the Windows-target scripts were extracted and compared byte-for-byte, but NOT executed: no pwsh is available (skipped(pwsh-absent))'
+    windows_matrix_state='skipped(pwsh-absent)'
+else
+    pwsh_probe_status=0
+    "$pwsh_binary" -NoProfile -NonInteractive -Command 'exit 0' >/dev/null 2>&1 || pwsh_probe_status=$?
+    if [ "$pwsh_probe_status" -ne 0 ]; then
+        printf '%s\n' 'sshp-contract: the pwsh on PATH cannot execute (startup cache); the Windows-target scripts were compared but NOT executed -- an ENVIRONMENT fault, not an asset result' >&2
+        printf '%s\n' 'Try: mv ~/.cache/powershell/StartupProfileData-NonInteractive{,.broken}' >&2
+        windows_matrix_state='skipped(pwsh-unusable)'
+        failures=$((failures + 1))
+    else
+        windows_matrix_state='run'
+    fi
+fi
+
+if [ "$windows_matrix_state" = 'run' ]; then
+    # The stub stands in for the resolver prelude.  Its SHAPE is the contract the
+    # tails consume -- `Resolve-RemoteZellij` returns a path or $null,
+    # `Resolve-RemoteInstaller` returns Kind+Path or $null -- and it is driven by
+    # environment variables so each row can model one target state.
+    win_stub="$work/win-resolver-stub.ps1"
+    cat > "$win_stub" <<'POWERSHELL'
+$script:SshpStubZellij = $env:SSHP_SMOKE_ZELLIJ
+$script:SshpStubInstallerKind = $env:SSHP_SMOKE_INSTALLER_KIND
+$script:SshpStubInstallerPath = $env:SSHP_SMOKE_INSTALLER_PATH
+function Resolve-RemoteZellij {
+    if ([string]::IsNullOrEmpty($script:SshpStubZellij)) { return $null }
+    return $script:SshpStubZellij
+}
+function Resolve-RemoteInstaller {
+    if ([string]::IsNullOrEmpty($script:SshpStubInstallerKind)) { return $null }
+    return [pscustomobject]@{ Kind = $script:SshpStubInstallerKind; Path = $script:SshpStubInstallerPath }
+}
+POWERSHELL
+
+    # Installer fixtures.  `zero`/`five` are native children that exit with that
+    # status; `noexec` is a file the OS refuses to START (mode 0644), which is
+    # this fixture's model of the CreateProcess failure a Windows AV or policy
+    # would cause -- the call returns, a non-terminating error is recorded, and
+    # $LASTEXITCODE is never set (measured 2026-10-17, and again here: success=
+    # False, lastExitPresent=False).  `noop.ps1` is the same state reached
+    # in-process, which needs no exec bit and is therefore portable.
+    printf '#!/bin/sh\nexit 0\n' > "$work/win-installer-zero"
+    printf '#!/bin/sh\nexit 5\n' > "$work/win-installer-five"
+    printf '#!/bin/sh\nexit 7\n' > "$work/win-installer-noexec"
+    chmod 700 "$work/win-installer-zero" "$work/win-installer-five"
+    chmod 644 "$work/win-installer-noexec"
+    printf '%s\n' '# no-op installer: an in-process call that never sets $LASTEXITCODE' > "$work/win-installer-noop.ps1"
+
+    # run_windows_target_body <body> <zellij> <kind> <path> -> "<status>\t<stdout>\t<stderr>"
+    # The channel is the clients' own: `$ProgressPreference` and
+    # `$env:MSYS_NO_PATHCONV` first, then the script, then a BLANK line -- `-`
+    # reads stdin in interactive mode and DISCARDS a pending block at EOF without
+    # one (A20; measured again here: without it every row answers 0).
+    run_windows_target_body() {
+        local body=$1 status=0
+        {
+            printf '%s\n' '$ProgressPreference = "SilentlyContinue"'
+            printf '%s\n' '$env:MSYS_NO_PATHCONV = "1"'
+            cat "$win_stub"
+            cat "$body"
+            printf '\n'
+        } > "$work/win-target-payload.ps1"
+        SSHP_SMOKE_ZELLIJ="$2" SSHP_SMOKE_INSTALLER_KIND="$3" SSHP_SMOKE_INSTALLER_PATH="$4" \
+            "$pwsh_binary" -NoProfile -NonInteractive -Command - \
+            < "$work/win-target-payload.ps1" \
+            > "$work/win-target-out" 2> "$work/win-target-err" || status=$?
+        printf '%s\t%s\t%s' "$status" \
+            "$(flatten_pwsh_stream "$work/win-target-out")" \
+            "$(flatten_pwsh_stream "$work/win-target-err")"
+    }
+    # pwsh's console host emits ANSI cursor escapes on a pipe; they are noise,
+    # not output.  CRLF is normalised because [Console]::Error.WriteLine on a
+    # Windows target writes it and the twin's own marker matcher strips it.
+    flatten_pwsh_stream() {
+        sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' "$1" | tr -d '\r' | tr '\n' '|' | sed 's/^ *//; s/ *$//'
+    }
+
+    # Rows: <label>|<zellij>|<kind>|<path>|<expected status>|<stderr must contain>|
+    # <stderr must NOT contain>.  The oracle is ABSOLUTE on purpose: the expected
+    # values are the contract's, not the other body's answer.  The three rows the
+    # pre-fix bodies failed are `no-installer`, `unsupported-kind` and
+    # `call-sets-no-exit-code`; the "must NOT contain" column is what pins the
+    # defect CLASS rather than one exit code -- `Write-Error:` and `Exception:`
+    # are the two shapes the pre-fix Windows body produced.
+    win_install_matrix="zellij-present|C:\\zellij.exe|||0||
+no-installer||||127|sshp: no supported Windows installer found for Zellij.|Write-Error,Exception:
+unsupported-kind||bogus|@WORK@/win-installer-zero|127|sshp: unsupported Windows installer: bogus|Write-Error,Exception:
+installer-exits-5||winget|@WORK@/win-installer-five|5||
+installer-exits-0||scoop|@WORK@/win-installer-zero|0||
+call-sets-no-exit-code||choco|@WORK@/win-installer-noop.ps1|1||
+cannot-start||choco|@WORK@/win-installer-noexec|1||
+path-absent||winget|@WORK@/win-installer-absent|1||"
+    win_install_rows=0
+    while IFS='|' read -r row_label row_zellij row_kind row_path row_status row_err_must row_err_mustnot; do
+        [ -n "$row_label" ] || continue
+        win_install_rows=$((win_install_rows + 1)); cases=$((cases + 1))
+        row_path=${row_path//@WORK@/$work}
+        for side in posix windows; do
+            if [ "$side" = posix ]; then
+                body=$win_install_posix
+            else
+                body=$win_install_win
+            fi
+            got=$(run_windows_target_body "$body" "$row_zellij" "$row_kind" "$row_path")
+            got_status=${got%%	*}
+            got_rest=${got#*	}
+            got_stdout=${got_rest%%	*}
+            got_stderr=${got_rest#*	}
+            why=''
+            if [ "$got_status" != "$row_status" ]; then
+                why="status $got_status, expected $row_status"
+            fi
+            if [ -n "$row_err_must" ]; then
+                case $got_stderr in
+                    *"$row_err_must"*) ;;
+                    *) why="$why; stderr does not contain [$row_err_must]" ;;
+                esac
+            fi
+            if [ -n "$row_err_mustnot" ]; then
+                old_ifs=$IFS; IFS=','
+                for forbidden in $row_err_mustnot; do
+                    case $got_stderr in
+                        *"$forbidden"*) why="$why; stderr contains [$forbidden] (a refusal must not be reported as a PowerShell error record)" ;;
+                    esac
+                done
+                IFS=$old_ifs
+            fi
+            if [ -n "$why" ]; then
+                printf 'sshp-contract: Windows install matrix [%s] on the %s body: %s (stdout=[%s] stderr=[%s])\n' \
+                    "$row_label" "$side" "$why" "$got_stdout" "$got_stderr" >&2
+                failures=$((failures + 1))
+            fi
+        done
+    done <<< "$win_install_matrix"
+
+    # The probe tail has its own oracle: the READY answer must carry the resolved
+    # Zellij path (the session command embeds it -- smoke/14's M4 covers the same
+    # property statically), and the two refusal answers must carry their markers
+    # and their messages.
+    win_probe_matrix="ready|C:\\zellij.exe|||0|__SSHP_READY__:Windows|__SSHP_ZELLIJ__:C:\\zellij.exe
+install-required||winget|@WORK@/win-installer-zero|42|__SSHP_INSTALL_REQUIRED__:Windows|
+unavailable||||127|__SSHP_INSTALL_UNAVAILABLE__:Windows|"
+    win_probe_rows=0
+    while IFS='|' read -r row_label row_zellij row_kind row_path row_status row_stdout_must row_stdout_mustnot; do
+        [ -n "$row_label" ] || continue
+        win_probe_rows=$((win_probe_rows + 1)); cases=$((cases + 1))
+        row_path=${row_path//@WORK@/$work}
+        for side in posix windows; do
+            if [ "$side" = posix ]; then
+                body=$win_probe_posix
+            else
+                body=$win_probe_win
+            fi
+            got=$(run_windows_target_body "$body" "$row_zellij" "$row_kind" "$row_path")
+            got_status=${got%%	*}
+            got_rest=${got#*	}
+            got_stdout=${got_rest%%	*}
+            why=''
+            if [ "$got_status" != "$row_status" ]; then
+                why="status $got_status, expected $row_status"
+            fi
+            if [ -n "$row_stdout_must" ]; then
+                case $got_stdout in
+                    *"$row_stdout_must"*) ;;
+                    *) why="$why; stdout does not contain [$row_stdout_must]" ;;
+                esac
+            fi
+            if [ -n "$row_stdout_mustnot" ]; then
+                # The path line is asserted as a SEPARATE requirement rather than
+                # as part of the READY marker: the pre-fix POSIX tail answered
+                # READY without it, and a single-substring expectation would have
+                # been satisfiable by a body that emitted the marker twice.
+                case $got_stdout in
+                    *"$row_stdout_mustnot"*) ;;
+                    *) why="$why; stdout does not contain [$row_stdout_mustnot]" ;;
+                esac
+            fi
+            if [ -n "$why" ]; then
+                printf 'sshp-contract: Windows probe matrix [%s] on the %s body: %s (stdout=[%s])\n' \
+                    "$row_label" "$side" "$why" "$got_stdout" >&2
+                failures=$((failures + 1))
+            fi
+        done
+    done <<< "$win_probe_matrix"
+
+    # Row-count gates: computed from the tables, with an independent floor under
+    # them (the same shape as the round-45 tables above).
+    win_install_matrix_rows=$(grep -c . <<< "$win_install_matrix")
+    win_probe_matrix_rows=$(grep -c . <<< "$win_probe_matrix")
+    cases=$((cases + 1))
+    if [ "$win_install_rows" -ne "$win_install_matrix_rows" ] || [ "$win_probe_rows" -ne "$win_probe_matrix_rows" ]; then
+        printf 'sshp-contract: the Windows-target matrix ran %s install row(s) and %s probe row(s); the tables declare %s and %s\n' \
+            "$win_install_rows" "$win_probe_rows" "$win_install_matrix_rows" "$win_probe_matrix_rows" >&2
+        failures=$((failures + 1))
+    fi
+    cases=$((cases + 1))
+    if [ "$win_install_matrix_rows" -lt 8 ] || [ "$win_probe_matrix_rows" -lt 3 ]; then
+        printf 'sshp-contract: the Windows-target tables shrank to %s install row(s) and %s probe row(s); the floor is 8 and 3\n' \
+            "$win_install_matrix_rows" "$win_probe_matrix_rows" >&2
+        failures=$((failures + 1))
+    fi
+
+    # Self-test: the matrix must be able to SEE the two defects this round fixed.
+    # Each mutation re-creates the exact PRE-FIX shape (measured above) in a copy
+    # and requires the row to stop answering correctly.  A mutation that does not
+    # apply is reported -- a self-test that silently did nothing passes on
+    # nothing.
+    win_install_writeerror="$work/win-install-writeerror.ps1"
+    sed 's|^    \[Console\]::Error.WriteLine("sshp: no supported Windows installer found for Zellij.")$|    Write-Error "sshp: no supported Windows installer found for Zellij."|' \
+        "$win_install_posix" > "$win_install_writeerror"
+    cases=$((cases + 1))
+    if cmp -s "$win_install_posix" "$win_install_writeerror"; then
+        printf '%s\n' 'sshp-contract: Windows matrix self-test: the Write-Error mutation did not apply; the matrix cannot be proven able to fail' >&2
+        failures=$((failures + 1))
+    else
+        got=$(run_windows_target_body "$win_install_writeerror" '' '' '')
+        if [ "${got%%	*}" = '127' ]; then
+            printf 'sshp-contract: Windows matrix self-test: an install body that reports its refusal with Write-Error still exited 127 [%s]; the matrix cannot see the class it was written for\n' \
+                "$got" >&2
+            failures=$((failures + 1))
+        fi
+    fi
+    win_install_bare="$work/win-install-bare.ps1"
+    awk '
+        index($0, "# NOT $lastExitCode:") == 1 { inblock = 1; next }
+        inblock && $0 == "exit ([int]$installerProbe.Value)" { print "exit $LASTEXITCODE"; inblock = 0; next }
+        inblock { next }
+        { print }
+    ' "$win_install_posix" > "$win_install_bare"
+    cases=$((cases + 1))
+    if cmp -s "$win_install_posix" "$win_install_bare"; then
+        printf '%s\n' 'sshp-contract: Windows matrix self-test: the bare-LASTEXITCODE mutation did not apply; the matrix cannot be proven able to fail' >&2
+        failures=$((failures + 1))
+    else
+        got=$(run_windows_target_body "$win_install_bare" '' choco "$work/win-installer-noop.ps1")
+        if [ "${got%%	*}" = '1' ]; then
+            printf 'sshp-contract: Windows matrix self-test: an install body ending in a bare `exit $LASTEXITCODE` still exited 1 for a call that never set it [%s]; a failed install would be reported as success\n' \
+                "$got" >&2
+            failures=$((failures + 1))
+        fi
+    fi
+    windows_matrix_state="$((win_probe_rows + win_install_rows))/$((win_probe_matrix_rows + win_install_matrix_rows))"
+fi
+
+# ---------------------------------------------------------------------------
 # No residue.  sshp creates a private runtime directory under TMPDIR and removes
 # it in the EXIT trap.  A leak here is invisible in every other check and would
 # accumulate one directory per invocation on a long-lived machine.
@@ -829,5 +1213,5 @@ if [ "$failures" -ne 0 ]; then
     printf 'sshp-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'sshp-contract checks passed: cases=%s stub-ssh=yes reconnect=covered argv=checked residue=none trap-window=pinned remote-scripts=%s\n' \
-    "$cases" "$remote_script_state"
+printf 'sshp-contract checks passed: cases=%s stub-ssh=yes reconnect=covered argv=checked residue=none trap-window=pinned remote-scripts=%s windows-scripts=%s windows-matrix=%s\n' \
+    "$cases" "$remote_script_state" "$windows_script_state" "$windows_matrix_state"

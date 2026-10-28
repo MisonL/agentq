@@ -68,11 +68,19 @@ installer=${AGENTQ_SMOKE_INSTALLER:-$root/skill/assets/windows-git-bash/install-
 # silently regressed.
 ps_client=${AGENTQ_SMOKE_PS_CLIENT:-$root/skill/assets/client/windows/agentq.ps1}
 sshp_client=${AGENTQ_SMOKE_SSHP_PS_CLIENT:-$root/skill/assets/client/windows/sshp.ps1}
+# The POSIX client is not a `.ps1` file, and that is exactly why the rules below
+# never read it: the root was a hand-written list of five `.ps1` assets, and this
+# one carries the same fail-closed guard inside a here-string it hands to
+# `powershell.exe -Command -` on a Windows target (0.1.19 unified it with the
+# Windows twin's).  Overridable like the rest so the widened root keeps its red
+# proof.
+posix_sshp=${AGENTQ_SMOKE_POSIX_SSHP_CLIENT:-$root/skill/assets/client/unix/sshp}
 [ -f "$launcher" ] || { printf '%s\n' 'launcher-contract: missing launcher asset' >&2; exit 1; }
 [ -f "$start_daemon" ] || { printf '%s\n' 'launcher-contract: missing start-daemon asset' >&2; exit 1; }
 [ -f "$installer" ] || { printf '%s\n' 'launcher-contract: missing installer asset' >&2; exit 1; }
 [ -f "$ps_client" ] || { printf '%s\n' 'launcher-contract: missing Windows client asset' >&2; exit 1; }
 [ -f "$sshp_client" ] || { printf '%s\n' 'launcher-contract: missing Windows sshp asset' >&2; exit 1; }
+[ -f "$posix_sshp" ] || { printf '%s\n' 'launcher-contract: missing POSIX sshp asset' >&2; exit 1; }
 
 pwsh_binary=${AGENTQ_SMOKE_PWSH:-$(command -v pwsh || true)}
 if [ -z "$pwsh_binary" ]; then
@@ -770,12 +778,122 @@ assert_last_exitcode_alias "$launcher" 'launcher Git Bash spawn'
 assert_last_exitcode_alias "$installer" 'installer native calls'
 assert_last_exitcode_alias "$ps_client" 'Windows client'
 assert_last_exitcode_alias "$sshp_client" 'Windows sshp'
+assert_last_exitcode_alias "$posix_sshp" 'POSIX sshp embedded installer'
 
 assert_last_exitcode_guard "$start_daemon" 'start-daemon probe' 'exit 2'
 assert_last_exitcode_guard "$launcher" 'launcher Git Bash spawn' 'exit 2'
 assert_last_exitcode_guard "$installer" 'installer native calls' 'return 1'
 assert_last_exitcode_guard "$ps_client" 'Windows client' 'return 1|exit 1'
 assert_last_exitcode_guard "$sshp_client" 'Windows sshp' 'return 1|exit 1'
+# The POSIX client carries the same guard inside the PowerShell INSTALLER it
+# embeds, and the root below was five `.ps1` files -- so the rule could not see
+# it.  Measured 2026-10-28 at HEAD: the same file held a bare `exit
+# $LASTEXITCODE` at line 824, the exact defect every rule above exists for, in
+# an asset none of them had ever read (`bare_last_exitcode_lines` reports it,
+# see the blanket scan below).  The token is `exit 1` because this tail is a
+# standalone script, not a helper that returns.
+assert_last_exitcode_guard "$posix_sshp" 'POSIX sshp embedded installer' 'exit 1'
+
+# --- the ROOT of both rules, derived from the tree ---------------------------
+# A hand-written list of files has a one-file hole, and this round found it: the
+# five `.ps1` assets were asserted, the embedded PowerShell in the POSIX client
+# was not.  The root is therefore DERIVED -- every asset that carries the
+# `$x = Get-Variable -Name LASTEXITCODE` assignment must be one whose token the
+# calls above pin -- and a member the calls do not name is a failure rather than
+# a silent gap.  The rule is deliberately scoped to the GUARD shape; a file with
+# a bare read and no guard (the HEAD shape) has no such assignment and is caught
+# by the blanket scan below instead.
+lastexitcode_root_missing() { # <assets-dir> <asserted-newline-list> -> unasserted paths
+    local derived path asserted_block
+    derived=$(grep -rliE '^[[:space:]]*[$][a-z_][a-z0-9_]*[[:space:]]*=[[:space:]]*get-variable[[:space:]]+-name[[:space:]]+lastexitcode' "$1" | sort)
+    [ -n "$derived" ] || return 0
+    # A whole-line membership test rather than `comm`: this check also runs in
+    # the windows CI job under Git Bash, and a set tool the host happens to lack
+    # would kill the check with `command not found` -- which then reads as an
+    # asset defect.  `-x` (whole line) so one path cannot satisfy another by
+    # being its prefix.
+    asserted_block=$(printf '%s\n' "$2")
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        if ! grep -qxF "$path" <<< "$asserted_block"; then
+            printf '%s\n' "$path"
+        fi
+    done <<EOF
+$derived
+EOF
+}
+# The census is about the TREE, so it compares against the DEFAULT paths, not
+# the AGENTQ_SMOKE_* overrides: those exist to feed a mutated copy to the two
+# behavioural rules, and a census that followed them would report the real asset
+# as unasserted every time the suite is run for a red proof.
+lastexitcode_root_asserted=$(printf '%s\n' \
+    "$root/skill/assets/windows-git-bash/agentq-start-daemon.ps1" \
+    "$root/skill/assets/windows-git-bash/agentq-launcher.ps1" \
+    "$root/skill/assets/windows-git-bash/install-agentq.ps1" \
+    "$root/skill/assets/client/windows/agentq.ps1" \
+    "$root/skill/assets/client/windows/sshp.ps1" \
+    "$root/skill/assets/client/unix/sshp")
+cases=$((cases + 1))
+if [ -z "$(grep -rliE '^[[:space:]]*[$][a-z_][a-z0-9_]*[[:space:]]*=[[:space:]]*get-variable[[:space:]]+-name[[:space:]]+lastexitcode' "$root/skill/assets")" ]; then
+    printf '%s\n' 'launcher-contract: the LASTEXITCODE guard root found no asset at all; refusing to report a pass on an empty enumeration' >&2
+    failures=$((failures + 1))
+fi
+lastexitcode_root_missing_list=$(lastexitcode_root_missing "$root/skill/assets" "$lastexitcode_root_asserted")
+cases=$((cases + 1))
+if [ -n "$lastexitcode_root_missing_list" ]; then
+    printf 'launcher-contract: asset(s) carry the LASTEXITCODE guard but no call above pins their fail-closed token -- add an assert_last_exitcode_guard with the token that file actually uses:\n%s\n' \
+        "$lastexitcode_root_missing_list" >&2
+    failures=$((failures + 1))
+fi
+# The census must be able to FIRE: a subset test that names everything as
+# asserted would read exactly like a complete root.  Two fixture files under a
+# throwaway directory, one named and one not -- the function must return exactly
+# the unnamed one.
+lv_root_probe="$work/lastexitcode-root-probe"
+mkdir -p "$lv_root_probe"
+printf '%s\n' '$x = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue' > "$lv_root_probe/named.ps1"
+printf '%s\n' '$y = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue' > "$lv_root_probe/unnamed.ps1"
+printf '%s\n' '# $z = Get-Variable -Name LASTEXITCODE' > "$lv_root_probe/commented.ps1"
+printf '%s\n' 'exit $LASTEXITCODE' > "$lv_root_probe/bare.ps1"
+cases=$((cases + 1))
+lv_root_probe_answer=$(lastexitcode_root_missing "$lv_root_probe" "$lv_root_probe/named.ps1")
+if [ "$lv_root_probe_answer" != "$lv_root_probe/unnamed.ps1" ]; then
+    printf 'launcher-contract: the LASTEXITCODE root census self-test returned [%s], expected exactly the unnamed fixture; it cannot tell a covered asset from an uncovered one\n' \
+        "$lv_root_probe_answer" >&2
+    failures=$((failures + 1))
+fi
+
+# The blanket scan: EVERY asset, guard or no guard.  This is what the HEAD
+# defect looked like -- `exit $LASTEXITCODE` with no Get-Variable anywhere in the
+# file -- and a root derived from the guard shape cannot see it by construction.
+lastexitcode_blanket_scan() { # <dir> -> "path:line,..." per hit, one per line
+    local asset_file asset_bare
+    while IFS= read -r asset_file; do
+        asset_bare=$(bare_last_exitcode_lines "$asset_file")
+        if [ -n "$asset_bare" ]; then
+            printf '%s:%s\n' "$asset_file" "$(tr '\n' ',' <<< "$asset_bare" | sed 's/,$//')"
+        fi
+    done <<EOF
+$(find "$1" -type f | sort)
+EOF
+}
+lastexitcode_blanket_hits=$(lastexitcode_blanket_scan "$root/skill/assets")
+cases=$((cases + 1))
+if [ -n "$lastexitcode_blanket_hits" ]; then
+    printf 'launcher-contract: asset(s) read $LASTEXITCODE directly, outside any Get-Variable guard; an unset variable is a throw under StrictMode and `exit $null` -- a success -- without it:\n%s\n' \
+        "$lastexitcode_blanket_hits" >&2
+    failures=$((failures + 1))
+fi
+# ... and the blanket scan must fire too.  The probe directory above already
+# holds `bare.ps1` (a bare read with no guard, the HEAD shape) and three files
+# that must NOT be reported: the two guarded ones and the commented one.
+cases=$((cases + 1))
+lv_blanket_probe_answer=$(lastexitcode_blanket_scan "$lv_root_probe")
+if [ "$lv_blanket_probe_answer" != "$lv_root_probe/bare.ps1:1" ]; then
+    printf 'launcher-contract: the blanket LASTEXITCODE scan self-test returned [%s], expected exactly the bare-read fixture; it cannot tell a guarded read from an unguarded one\n' \
+        "$lv_blanket_probe_answer" >&2
+    failures=$((failures + 1))
+fi
 # Counted from the call sites above, not typed: the summary used to claim
 # `lastexitcode-guards=5/5` as a literal, so deleting a call left the coverage
 # claim intact (the same dead-count class this repo fixed elsewhere).
