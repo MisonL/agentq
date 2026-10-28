@@ -926,7 +926,170 @@ else
         failures=$((failures + 1))
     fi
 fi
-twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+config($twin_config_rows/5)+stream($stream_rows/9)"
+# --- the REMOTE COMMAND is one contract too ---------------------------------
+# Everything above compares exit codes and messages.  The remote command the
+# client builds is the other half of the contract, and nothing compared it
+# across the pair: smoke/05 pins the POSIX side against expectations
+# transcribed from the POSIX side, smoke/20 pins the Windows side's encoding
+# survives PowerShell's quoting, and both can be internally consistent while
+# the two clients send DIFFERENT commands.
+#
+# They did.  Measured 2026-10-28 over a real sshd: `wait <id> --timeout N` from
+# the Windows client left one remote `agentq-server wait` (plus its
+# `pueue wait --quiet` child) alive per elapsed-budget poll -- 1,2,3,4,5 across
+# five polls -- because its remote command carried no AGENTQ_WAIT_BUDGET and
+# its wrapper had no `timeout` clause; the POSIX client against the same target
+# left 0.  Both clients returned 6 with the same message, so every exit-code
+# comparison in this file agreed.  The orphan holds no AgentQ lock (the server
+# releases it before `pueue wait`), but it is a process plus a pueued socket
+# that survives until the task ends -- unbounded in poll count.
+#
+# So: same argv, same unix target, the decoded remote command must be the SAME
+# BYTES.  The Windows command rides base64 (`printf %s <b64> | base64 -d | sh`),
+# so it is decoded first; a command that does not match that shape is reported
+# as such rather than compared raw.
+remotecmd_stub="$work/twin-remotecmd-stub"
+cat > "$remotecmd_stub" <<'STUB'
+#!/bin/sh
+last=
+for a in "$@"; do last=$a; done
+printf '%s\n' "$last" > "${TWIN_REMOTE_LOG:?}"
+exit 255
+STUB
+chmod 700 "$remotecmd_stub"
+mkdir -p "$work/remotecmd-tmp"
+# remotecmd_run <posix-copy> <windows-copy> <log-prefix> [args...]
+remotecmd_run() {
+    local posix_copy=$1 windows_copy=$2 prefix=$3
+    shift 3
+    twin_p_status=0
+    twin_w_status=0
+    : > "$prefix-p.cmd"
+    : > "$prefix-w.cmd"
+    TWIN_REMOTE_LOG="$prefix-p.cmd" AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$remotecmd_stub" AGENTQ_CONFIG="$work/absent-config" \
+    TMPDIR="$work/remotecmd-tmp" \
+        /bin/sh "$posix_copy" "$@" >"$work/remotecmd-p.out" 2>"$work/remotecmd-p.err" || twin_p_status=$?
+    TWIN_REMOTE_LOG="$prefix-w.cmd" AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$remotecmd_stub" AGENTQ_CONFIG="$work/absent-config" \
+    TMPDIR="$work/remotecmd-tmp" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$windows_copy" "$@" \
+        >"$work/remotecmd-w.out" 2>"$work/remotecmd-w.err" || twin_w_status=$?
+}
+# remotecmd_decode <file> -> the remote command on stdout, base64 layer removed
+remotecmd_decode() {
+    python3 - "$1" <<'PY'
+import base64, re, sys
+raw = open(sys.argv[1], encoding='utf-8', errors='replace').read().strip()
+m = re.match(r'^printf %s ([A-Za-z0-9+/=]+) \| base64 -d \| sh$', raw)
+sys.stdout.write(base64.b64decode(m.group(1)).decode('utf-8', 'replace') if m else raw)
+PY
+}
+remotecmd_rows=0
+# remotecmd_case <label> [args...]
+remotecmd_case() {
+    local label=$1
+    shift
+    local problems=''
+    local remote_p remote_w
+    remotecmd_rows=$((remotecmd_rows + 1)); cases=$((cases + 1))
+    remotecmd_run "$twin_posix" "$client_arg" "$work/remotecmd" "$@"
+    remote_p=$(remotecmd_decode "$work/remotecmd-p.cmd")
+    remote_w=$(remotecmd_decode "$work/remotecmd-w.cmd")
+    [ -n "$remote_p" ] || problems="$problems posix-command-empty"
+    [ -n "$remote_w" ] || problems="$problems windows-command-empty"
+    if [ "$remote_p" != "$remote_w" ]; then
+        problems="$problems clients-build-different-commands"
+    fi
+    if [ -n "$problems" ]; then
+        printf 'ps-client remote-command [%s]:%s\n  posix  : %s\n  windows: %s\n' \
+            "$label" "$problems" "$remote_p" "$remote_w" >&2
+        failures=$((failures + 1))
+    fi
+}
+remotecmd_case 'status' status
+remotecmd_case 'doctor' doctor
+remotecmd_case 'lookup' lookup abcdefgh12345678
+remotecmd_case 'logs' logs 1
+remotecmd_case 'logs --tail' logs 1 --tail 5
+remotecmd_case 'cancel' cancel 1
+remotecmd_case 'remove' remove 1
+remotecmd_case 'wait' wait 1
+remotecmd_case 'wait --timeout' wait 1 --timeout 5
+remotecmd_case 'submit' submit --workdir /tmp --request-id abcdefgh12345678 -- echo hi
+# Byte-equality alone passes when BOTH clients drop the budget (that is how the
+# defect above would look if it had been written twice), so the budget itself
+# is asserted on each side, in both directions: present with a timed wait, and
+# absent without one.  The assignment is `AGENTQ_WAIT_BUDGET=` -- the bare
+# variable name also appears inside the wrapper's `[ -n ... ]` test, so a
+# name-only grep would stay green with the assignment deleted.
+remotecmd_budget_problems=''
+cases=$((cases + 1))
+remotecmd_run "$twin_posix" "$client_arg" "$work/remotecmd" wait 1 --timeout 5
+remotecmd_budget_p=$(remotecmd_decode "$work/remotecmd-p.cmd")
+remotecmd_budget_w=$(remotecmd_decode "$work/remotecmd-w.cmd")
+for side in posix windows; do
+    if [ "$side" = posix ]; then cmd=$remotecmd_budget_p; else cmd=$remotecmd_budget_w; fi
+    case $cmd in
+        'AGENTQ_WAIT_BUDGET=5s; '*) : ;;
+        *) remotecmd_budget_problems="$remotecmd_budget_problems $side-missing-budget-assignment" ;;
+    esac
+    case $cmd in
+        *'exec timeout "$AGENTQ_WAIT_BUDGET" "$agentq_server" "$@"'*) : ;;
+        *) remotecmd_budget_problems="$remotecmd_budget_problems $side-wrapper-does-not-exec-under-timeout" ;;
+    esac
+done
+cases=$((cases + 1))
+remotecmd_run "$twin_posix" "$client_arg" "$work/remotecmd" wait 1
+remotecmd_plain_p=$(remotecmd_decode "$work/remotecmd-p.cmd")
+remotecmd_plain_w=$(remotecmd_decode "$work/remotecmd-w.cmd")
+for side in posix windows; do
+    if [ "$side" = posix ]; then cmd=$remotecmd_plain_p; else cmd=$remotecmd_plain_w; fi
+    case $cmd in
+        *'AGENTQ_WAIT_BUDGET='*) remotecmd_budget_problems="$remotecmd_budget_problems $side-budget-set-without-timeout" ;;
+    esac
+done
+if [ -n "$remotecmd_budget_problems" ]; then
+    printf 'ps-client remote-command [wait budget]:%s\n' "$remotecmd_budget_problems" >&2
+    failures=$((failures + 1))
+fi
+# A block that stopped enumerating reports green on nothing (the
+# blind-enumerator class), so the executed count has its own floor.
+if [ "$remotecmd_rows" -lt 10 ]; then
+    printf 'ps-client remote-command: only %s row(s) ran (expected 10); the enumeration broke\n' \
+        "$remotecmd_rows" >&2
+    failures=$((failures + 1))
+fi
+# And the comparator must be provably able to go red.  Disable the budget arm
+# in a copy of the Windows client (the exact fix this round landed) and require
+# the wait --timeout row to disagree; if the anchor cannot be found the
+# mutation never happened, and saying so beats passing on nothing.
+remotecmd_mutant="$work/twin-windows-nobudget"
+remotecmd_mutant_ok=1
+python3 - "$client" "$remotecmd_mutant" <<'PY' || remotecmd_mutant_ok=0
+import io, sys
+src = io.open(sys.argv[1], encoding='utf-8').read()
+needle = 'if ($WaitBudgetSeconds -gt 0) {'
+if needle not in src:
+    sys.exit(1)
+src = src.replace(needle, 'if ($false -and ($WaitBudgetSeconds -gt 0)) {', 1)
+io.open(sys.argv[2], 'w', encoding='utf-8', newline='').write(src)
+PY
+if [ "$remotecmd_mutant_ok" -ne 1 ]; then
+    printf '%s\n' 'ps-client remote-command self-test: the budget arm was not found; the comparator cannot be proven able to fail' >&2
+    failures=$((failures + 1))
+else
+    remotecmd_run "$twin_posix" "$remotecmd_mutant" "$work/remotecmd" wait 1 --timeout 5
+    mutant_p=$(remotecmd_decode "$work/remotecmd-p.cmd")
+    mutant_w=$(remotecmd_decode "$work/remotecmd-w.cmd")
+    if [ "$mutant_p" = "$mutant_w" ]; then
+        printf 'ps-client remote-command self-test: a Windows client with the budget arm disabled still built the same command as the POSIX side; the comparator cannot see the defect it was written for\n' >&2
+        failures=$((failures + 1))
+    fi
+fi
+twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+config($twin_config_rows/5)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
 else
 twin_state=$twin_platform_state
 fi
