@@ -726,7 +726,7 @@ function Resolve-RemoteUserEnvironment {
 $remoteUserEnvironment = Resolve-RemoteUserEnvironment
 
 function Resolve-RemoteZellij {
-    $candidates = New-Object "System.Collections.Generic.List[string]"
+    $candidates = [System.Collections.Generic.List[string]]::new()
     if (![string]::IsNullOrWhiteSpace($remoteUserEnvironment.LocalAppData)) {
         [void]$candidates.Add((Join-Path $remoteUserEnvironment.LocalAppData "Microsoft\WinGet\Links\zellij.exe"))
         $packageRoot = Join-Path $remoteUserEnvironment.LocalAppData "Microsoft\WinGet\Packages"
@@ -746,7 +746,7 @@ function Resolve-RemoteZellij {
 }
 
 function Resolve-RemoteInstaller {
-    $candidates = New-Object "System.Collections.Generic.List[string]"
+    $candidates = [System.Collections.Generic.List[string]]::new()
     if (![string]::IsNullOrWhiteSpace($remoteUserEnvironment.LocalAppData)) {
         [void]$candidates.Add((Join-Path $remoteUserEnvironment.LocalAppData "Microsoft\WindowsApps\winget.exe"))
     }
@@ -782,6 +782,7 @@ $ErrorActionPreference = "Stop"
 $zellij = Resolve-RemoteZellij
 if ($null -ne $zellij) {
     [Console]::Out.Write("__SSHP_READY__:Windows")
+    [Console]::Out.Write("`n__SSHP_ZELLIJ__:" + $zellij)
     exit 0
 }
 $installer = Resolve-RemoteInstaller
@@ -798,7 +799,8 @@ exit 127
 # shellcheck disable=SC2016
 windows_install_script=$windows_common_script'
 $ErrorActionPreference = "Stop"
-if ($null -ne (Resolve-RemoteZellij)) {
+$zellij = Resolve-RemoteZellij
+if ($null -ne $zellij) {
     exit 0
 }
 $installer = Resolve-RemoteInstaller
@@ -821,7 +823,19 @@ switch ($installer.Kind) {
         exit 127
     }
 }
-exit $LASTEXITCODE
+# NOT $lastExitCode: PowerShell identifiers are case-insensitive, so that name
+# IS the automatic $LASTEXITCODE; at script scope the assignment replaces the
+# integer with a PSVariable and the .Value read throws (measured 2026-10-18).
+# The payload carries no Set-StrictMode, so an unset variable is $null rather
+# than a throw -- and `exit $null` is exit 0, i.e. a FAILED install reported as
+# success.  A CreateProcess failure (AV or a policy blocking the binary) is a
+# non-terminating error that never sets the variable (measured 2026-10-17), so
+# the fail-closed branch is reachable, not decorative.
+$installerProbe = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
+if ($null -eq $installerProbe) {
+    exit 1
+}
+exit ([int]$installerProbe.Value)
 '
 
 windows_remote_command() {

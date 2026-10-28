@@ -847,7 +847,7 @@ if ($null -ne $zellij) {
 }
 $installer = Resolve-RemoteInstaller
 if ($null -eq $installer) {
-    Write-Error "sshp: no supported Windows installer found for Zellij."
+    [Console]::Error.WriteLine("sshp: no supported Windows installer found for Zellij.")
     exit 127
 }
 switch ($installer.Kind) {
@@ -861,12 +861,18 @@ switch ($installer.Kind) {
         & $installer.Path install zellij --yes --no-progress
     }
     default {
-        throw "sshp: unsupported Windows installer: $($installer.Kind)"
+        [Console]::Error.WriteLine("sshp: unsupported Windows installer: $($installer.Kind)")
+        exit 127
     }
 }
 # NOT $lastExitCode: PowerShell identifiers are case-insensitive, so that name
 # IS the automatic $LASTEXITCODE; at script scope the assignment replaces the
 # integer with a PSVariable and the .Value read throws (measured 2026-10-18).
+# The payload carries no Set-StrictMode, so an unset variable is $null rather
+# than a throw -- and `exit $null` is exit 0, i.e. a FAILED install reported as
+# success.  A CreateProcess failure (AV or a policy blocking the binary) is a
+# non-terminating error that never sets the variable (measured 2026-10-17), so
+# the fail-closed branch is reachable, not decorative.
 $installerProbe = Get-Variable -Name LASTEXITCODE -ErrorAction SilentlyContinue
 if ($null -eq $installerProbe) {
     exit 1
