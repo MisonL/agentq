@@ -437,9 +437,19 @@ case "$host" in
         ;;
 esac
 
+# Split the way the Windows twin splits: charset first, leading hyphen second,
+# each with the message that actually describes it.  The single lumped pattern
+# used to report "must contain only letters, numbers, dots, underscores, or
+# hyphens" for `-s` -- a name that satisfies exactly that charset -- while the
+# twin said "must not begin with a hyphen" (measured 2026-10-28).  The empty
+# alternative stays in the charset branch to mirror the twin's `+` quantifier;
+# it is unreachable here because ${2:-ghostty} substitutes for an empty name.
 case "$session" in
-    ''|-*|*[!A-Za-z0-9_.-]*)
+    ''|*[!A-Za-z0-9_.-]*)
         fail 'session name must contain only letters, numbers, dots, underscores, or hyphens'
+        ;;
+    -*)
+        fail 'session name must not begin with a hyphen'
         ;;
 esac
 

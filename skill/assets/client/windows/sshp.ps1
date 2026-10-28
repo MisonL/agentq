@@ -16,7 +16,13 @@ $script:PreparationResult = $null
 $script:ResolvedZellijPath = ""
 
 function Show-Usage {
-    [Console]::Out.WriteLine(@"
+    param([switch]$ToStandardError)
+    # stdout is the DATA channel, stderr the DIAGNOSTIC one; the POSIX twin
+    # writes usage to stderr for an argument error and to stdout for --help.
+    # Measured 2026-10-28: this client's error path gave stdout 305 B / stderr
+    # 0 B where the POSIX client gave stdout 0 B / stderr 379 B.
+    $writer = if ($ToStandardError) { [Console]::Error } else { [Console]::Out }
+    $writer.WriteLine(@"
 Usage: $($script:Program) [--check] <ssh-host-or-alias> [session-name]
 
 Attach to a persistent tmux, GNU screen, or Zellij session on an SSH host.
@@ -1246,7 +1252,7 @@ if (($arguments.Count -ge 1) -and (($arguments[0] -eq "-h") -or ($arguments[0] -
     exit 0
 }
 if (($arguments.Count -lt 1) -or ($arguments.Count -gt 2)) {
-    Show-Usage
+    Show-Usage -ToStandardError
     exit 2
 }
 

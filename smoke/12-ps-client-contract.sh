@@ -752,6 +752,97 @@ if [ "$twin_config_rows" -lt 5 ]; then
         "$twin_config_rows" >&2
     failures=$((failures + 1))
 fi
+# --- which STREAM a diagnostic belongs on -----------------------------------
+# stdout is the DATA channel and stderr the DIAGNOSTIC one -- SKILL.md's whole
+# redaction policy is built on that split, and the POSIX clients honour it:
+# usage goes to stdout for --help and to stderr (`usage >&2`) for a bad
+# invocation.  BOTH Windows clients printed the banner on STDOUT on the ERROR
+# path and left stderr EMPTY -- measured 2026-10-28: agentq.ps1 with no
+# arguments gave stdout 2673 B / stderr 0 B where the POSIX client gave
+# stdout 0 B / stderr 2596 B; sshp.ps1 no-args gave 305 B / 0 B against
+# 0 B / 379 B.  A caller doing `out=$(client ...)` captured the banner as data
+# and saw nothing on stderr.
+#
+# The twin differential ABOVE cannot see this: its fragment check reads stdout
+# and stderr together, so a message on the wrong stream still matches.  These
+# rows therefore assert the stream, and the sshp side is exercised here because
+# no other check ever ran both sshp implementations on the same argv.
+stream_rows=0
+stream_home="$work/stream-home"
+stream_tmp="$work/stream-tmp"
+mkdir -p "$stream_home" "$stream_tmp"
+# stream_case <posix-client> <ps-client> <expected-exit> <out|err> <fragment> [args...]
+# `where` is the stream the usage/fragment MUST land on; the other stream must
+# be EMPTY (that is the assertion the merged fragment check cannot make).
+stream_case() {
+    local posix_client=$1 ps_client=$2 want=$3 where=$4 fragment=$5
+    shift 5
+    # Name the client in the label: `<no args>` alone does not say WHICH pair
+    # failed, and this block covers two.
+    local label
+    label=$(basename "$ps_client")${*:+ $*}
+    [ "$*" = "$label" ] || label="$label"
+    problems=''
+    stream_rows=$((stream_rows + 1)); cases=$((cases + 1))
+    local p=0 w=0
+    AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+    AGENTQ_REMOTE_PLATFORM=unix AGENTQ_SSH="$twin_stub_posix" \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    SSHP_SSH="$twin_stub_posix" HOME="$stream_home" TMPDIR="$stream_tmp" \
+        /bin/sh "$posix_client" "$@" >"$work/stream-p.out" 2>"$work/stream-p.err" || p=$?
+    AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+    AGENTQ_REMOTE_PLATFORM=unix AGENTQ_SSH="$twin_stub_arg" \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    SSHP_SSH="$twin_stub_arg" HOME="$stream_home" TMPDIR="$stream_tmp" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$ps_client" "$@" \
+        >"$work/stream-w.out" 2>"$work/stream-w.err" || w=$?
+    [ "$p" -eq "$want" ] || problems="$problems posix-exit=$p"
+    [ "$w" -eq "$want" ] || problems="$problems windows-exit=$w"
+    if [ "$where" = err ]; then
+        [ -s "$work/stream-p.out" ] && problems="$problems posix-stdout-not-empty($(wc -c <"$work/stream-p.out" | tr -d ' ')B)"
+        [ -s "$work/stream-w.out" ] && problems="$problems windows-stdout-not-empty($(wc -c <"$work/stream-w.out" | tr -d ' ')B)"
+        grep -qF -- "$fragment" "$work/stream-p.err" || problems="$problems posix-missing-on-stderr"
+        { flatten_err "$work/stream-w.err"; cat "$work/stream-w.out"; } > "$work/stream-w.combined"
+        grep -qF -- "$fragment" "$work/stream-w.combined" || problems="$problems windows-missing-message"
+        grep -qF -- "$fragment" "$work/stream-w.err" || problems="$problems windows-missing-on-stderr"
+    else
+        [ -s "$work/stream-p.err" ] && problems="$problems posix-stderr-not-empty($(wc -c <"$work/stream-p.err" | tr -d ' ')B)"
+        [ -s "$work/stream-w.err" ] && problems="$problems windows-stderr-not-empty($(wc -c <"$work/stream-w.err" | tr -d ' ')B)"
+        grep -qF -- "$fragment" "$work/stream-p.out" || problems="$problems posix-missing-on-stdout"
+        grep -qF -- "$fragment" "$work/stream-w.out" || problems="$problems windows-missing-on-stdout"
+    fi
+    if [ -n "$problems" ]; then
+        printf 'ps-client stream [%s] (%s):%s\n' "$label" "$where" "$problems" >&2
+        failures=$((failures + 1))
+    fi
+}
+# Override hooks, same pattern as AGENTQ_SMOKE_CLIENT / AGENTQ_SMOKE_PS_CLIENT:
+# a mutation proof points these at modified copies instead of swapping the real
+# asset under a running check.
+sshp_posix_client=${AGENTQ_SMOKE_SSHP_CLIENT:-$root/skill/assets/client/unix/sshp}
+sshp_ps_client=${AGENTQ_SMOKE_SSHP_PS_CLIENT:-$root/skill/assets/client/windows/sshp.ps1}
+if [ -n "${AGENTQ_SMOKE_PWSH:-}" ] && command -v cygpath >/dev/null 2>&1; then
+    sshp_ps_client_arg=$(cygpath -w "$sshp_ps_client")
+else
+    sshp_ps_client_arg=$sshp_ps_client
+fi
+# agentq: no command is an argument error; --help is a success path.
+stream_case "$twin_posix" "$client_arg" 2 err 'Usage:'
+stream_case "$twin_posix" "$client_arg" 0 out 'Usage:' --help
+# sshp: the same split, plus the two session-name reasons the POSIX client used
+# to report with one (wrong) message.
+stream_case "$sshp_posix_client" "$sshp_ps_client_arg" 2 err 'Usage:'
+stream_case "$sshp_posix_client" "$sshp_ps_client_arg" 2 err 'Usage:' h s x
+stream_case "$sshp_posix_client" "$sshp_ps_client_arg" 2 err 'Usage:' --check
+stream_case "$sshp_posix_client" "$sshp_ps_client_arg" 0 out 'Usage:' -h
+stream_case "$sshp_posix_client" "$sshp_ps_client_arg" 2 err 'session name must not begin with a hyphen' h -s
+stream_case "$sshp_posix_client" "$sshp_ps_client_arg" 2 err 'session name must contain only' h a:b
+stream_case "$sshp_posix_client" "$sshp_ps_client_arg" 2 err 'begin with a hyphen' -x
+if [ "$stream_rows" -lt 9 ]; then
+    printf 'ps-client stream: only %s row(s) ran (expected 9); the enumeration broke\n' \
+        "$stream_rows" >&2
+    failures=$((failures + 1))
+fi
 # And the comparator must be provably able to go RED, or the section is a
 # rubber stamp.  Revert the POSIX client's global-token fold in a copy and
 # require the same row to disagree; if the fold line cannot be found the
@@ -835,7 +926,7 @@ else
         failures=$((failures + 1))
     fi
 fi
-twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+config($twin_config_rows/5)"
+twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+config($twin_config_rows/5)+stream($stream_rows/9)"
 else
 twin_state=$twin_platform_state
 fi
