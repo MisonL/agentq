@@ -109,6 +109,79 @@ function Resolve-SshPath {
         if (!(Test-NonReparseWindowsFilePath -Path $env:SSHP_SSH)) {
             Stop-Sshp "SSHP_SSH is not a regular non-reparse file: $env:SSHP_SSH"
         }
+        # Windows has no execute bit, so there is nothing to test here the way
+        # the POSIX twin's `[ -x ]` does.  What CAN be answered is whether
+        # launching the file will work at all -- and until 2026-10-30 this file
+        # did not ask, nine days after its own sibling did.  `agentq.ps1`'s
+        # Resolve-SshPath gained exactly this probe on 2026-10-21 (see the long
+        # comment there); sshp.ps1, which resolves the SAME kind of value from
+        # the same kind of environment variable, never did.  Measured
+        # 2026-10-30 on macOS pwsh with SSHP_SSH pointing at an existing 0644
+        # regular file: this client exited **1** and printed "remote dependency
+        # probe failed for both Unix and Windows shells" -- a LOCAL
+        # misconfiguration reported as a REMOTE failure, pointing the operator
+        # at the wrong machine -- while the POSIX twin refused the same input
+        # with exit 2 naming the file.
+        #
+        # The launch that failed was `& $script:SshPath` (below), and on macOS
+        # that operator reaches LaunchServices: it OPENED the file in whatever
+        # app the machine associates with it (measured: TextEdit went from not
+        # running to running).  This probe cannot do that -- it uses
+        # ProcessStartInfo with UseShellExecute = $false, which calls fork/exec
+        # and throws on a non-executable file instead of asking the window
+        # server -- which is why the sibling's probe was measured to open no
+        # window at all.
+        #
+        # The probe is a real launch with an argument ssh rejects immediately
+        # (`-V` is a version request; any code it returns is IGNORED -- the only
+        # question is whether the process starts and exits), so it costs no
+        # connection and touches no remote host.
+        $probeError = $null
+        # Declared before the try: the catch block inspects it, and under
+        # StrictMode reading an unassigned variable throws -- which would turn
+        # a controlled refusal into an uncaught throw.
+        $probe = $null
+        try {
+            $probeInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $probeInfo.FileName = [System.IO.Path]::GetFullPath($env:SSHP_SSH)
+            $probeInfo.Arguments = "-V"
+            $probeInfo.UseShellExecute = $false
+            $probeInfo.CreateNoWindow = $true
+            $probeInfo.RedirectStandardOutput = $true
+            $probeInfo.RedirectStandardError = $true
+            # stdin must be a CLOSED pipe, not this process's stdin.  A wrapper
+            # that reads stdin to EOF before doing anything (a common shape for
+            # ssh shims: `cat > /dev/null`) otherwise blocks forever, because a
+            # redirected-from console stdin never reaches EOF -- the 10s budget
+            # then fires and a perfectly launchable SSHP_SSH is refused.
+            $probeInfo.RedirectStandardInput = $true
+            $probe = [System.Diagnostics.Process]::Start($probeInfo)
+            # Asynchronous reads, THEN a bounded wait.  Reading both streams
+            # with ReadToEnd() before WaitForExit would let a file that ignores
+            # -V and never exits (a GUI program, a wrapper waiting on input)
+            # hang the client forever, so the 10s budget would never apply.
+            # The tasks themselves are never awaited: after Kill() GetResult()
+            # could throw on a dead pipe, and the only question asked here is
+            # whether the process starts and exits.
+            [void]$probe.StandardOutput.ReadToEndAsync()
+            [void]$probe.StandardError.ReadToEndAsync()
+            # Closing the write end gives the child EOF on stdin.
+            $probe.StandardInput.Close()
+            if (!$probe.WaitForExit(10000)) {
+                try { $probe.Kill() } catch { }
+                throw [System.TimeoutException]::new("did not exit within 10s of -V")
+            }
+        } catch {
+            # A process that was started but overran its budget must not be
+            # left running behind us.
+            if (($null -ne $probe) -and (!$probe.HasExited)) {
+                try { $probe.Kill() } catch { }
+            }
+            $probeError = $_.Exception.Message
+        }
+        if ($null -ne $probeError) {
+            Stop-Sshp "SSHP_SSH cannot be launched: $($env:SSHP_SSH): $probeError"
+        }
         return [System.IO.Path]::GetFullPath($env:SSHP_SSH)
     }
 
