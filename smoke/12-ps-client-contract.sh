@@ -843,6 +843,89 @@ if [ "$stream_rows" -lt 9 ]; then
         "$stream_rows" >&2
     failures=$((failures + 1))
 fi
+# --- SSHP_SSH: the same "cannot be launched" question, for the OTHER client ---
+# The case above fixes AGENTQ_SSH in `agentq.ps1`, whose Resolve-SshPath gained
+# the launch probe on 2026-10-21.  `sshp.ps1` resolves the SAME kind of value
+# from the same kind of variable and never got the probe -- measured 2026-10-30
+# on macOS pwsh with SSHP_SSH pointing at an existing 0644 regular file: the
+# Windows client exited **1** and printed "remote dependency probe failed for
+# both Unix and Windows shells", blaming the REMOTE for a LOCAL misconfiguration,
+# while the POSIX twin refused the same input with exit 2 naming the file.  On
+# macOS the failed `& $script:SshPath` also reached LaunchServices and OPENED
+# the file (TextEdit went from not running to running).
+#
+# The fixture is an existing 0644 REGULAR file, the same shape the AGENTQ_SSH
+# case above uses.  Measured alternatives, and why each was rejected:
+#   - a DANGLING SYMLINK looks like the launch-safe choice and is NOT: it is
+#     refused by this client's own `Test-NonReparseWindowsFilePath` guard, so it
+#     never reaches Resolve-SshPath's launch probe at all (measured 2026-10-30:
+#     exit 2, "not a regular non-reparse file").  The case would fail AFTER the
+#     fix and pass before it -- backwards.
+#   - mode 000 and 0755-with-an-invalid-interpreter DO discriminate, and were
+#     measured (2026-10-30): pre-fix exit 1 with a raw `Exception:` at the `&`
+#     line, post-fix exit 2 with the controlled message.  0644 is kept anyway
+#     because it is the misconfiguration a person actually creates and the one
+#     the sibling case models.
+# The cost is disclosed rather than hidden: on macOS the PRE-FIX client reaches
+# LaunchServices with a 0644 file and OPENS it (measured 2026-10-30: TextEdit
+# went from not running to running), so a red proof against the pre-fix asset
+# opens one window.  A GREEN run does not -- the probe refuses before `&` is
+# reached -- which is the state the suite spends its life in.
+sshp_unlaunchable_dir="$work/unlaunchable-sshp"
+mkdir -p "$sshp_unlaunchable_dir"
+sshp_unlaunchable="$sshp_unlaunchable_dir/ssh-not-executable"
+printf 'not an executable\n' >"$sshp_unlaunchable"
+chmod 644 "$sshp_unlaunchable"
+if [ "$client_arg" != "$client" ]; then
+    sshp_unlaunchable_arg=$(cygpath -w "$sshp_unlaunchable")
+else
+    sshp_unlaunchable_arg="$sshp_unlaunchable"
+fi
+mkdir -p "$work/sshp-home" "$work/sshp-tmp"
+# The POSIX half is gated the way the twin table is: under Git Bash the
+# exec bit is a mount-option artifact, so what `[ -x ]` answers for a `chmod
+# 644` file there is UNMEASURED -- and this project does not assert what it
+# has not measured.  The Windows half is the one this case exists for and it
+# runs on both platforms.
+if [ "$twin_platform_state" = checked ]; then
+sshp_posix_status=0
+SSHP_SSH="$sshp_unlaunchable" HOME="$work/sshp-home" TMPDIR="$work/sshp-tmp" \
+    /bin/sh "$sshp_posix_client" --check smoke-host \
+    >"$work/sshp-p.out" 2>"$work/sshp-p.err" || sshp_posix_status=$?
+cases=$((cases + 1))
+if [ "$sshp_posix_status" -ne 2 ] || ! grep -qF 'SSHP_SSH is not executable' "$work/sshp-p.err"; then
+    printf 'ps-client sshp: an unusable SSHP_SSH gave the POSIX twin exit %s without the executable message: %s\n' \
+        "$sshp_posix_status" "$(head -1 "$work/sshp-p.err")" >&2
+    failures=$((failures + 1))
+fi
+fi
+sshp_ps_status=0
+SSHP_SSH="$sshp_unlaunchable_arg" HOME="$work/sshp-home" TMPDIR="$work/sshp-tmp" \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_ps_client_arg" --check smoke-host \
+    >"$work/sshp-w.out" 2>"$work/sshp-w.err" || sshp_ps_status=$?
+cases=$((cases + 1))
+if [ "$sshp_ps_status" -ne 2 ]; then
+    printf 'ps-client sshp: an unusable SSHP_SSH exited %s, expected 2 (the POSIX twin answers 2 and names the file)\n' \
+        "$sshp_ps_status" >&2
+    head -3 "$work/sshp-w.err" >&2 || true
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if ! grep -qF 'SSHP_SSH cannot be launched' "$work/sshp-w.err"; then
+    printf 'ps-client sshp: an unusable SSHP_SSH lacked the controlled message: %s\n' \
+        "$(head -2 "$work/sshp-w.err" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+fi
+# The message must not blame the remote.  Asserted separately because a client
+# that answers 2 while still printing "remote dependency probe failed" has
+# fixed the code and not the diagnosis -- and that text is the exact thing an
+# operator would chase onto the wrong machine.
+cases=$((cases + 1))
+if grep -qF 'remote dependency probe failed' "$work/sshp-w.err"; then
+    printf '%s\n' 'ps-client sshp: an unusable SSHP_SSH was reported as a REMOTE failure' >&2
+    failures=$((failures + 1))
+fi
+
 # And the comparator must be provably able to go RED, or the section is a
 # rubber stamp.  Revert the POSIX client's global-token fold in a copy and
 # require the same row to disagree; if the fold line cannot be found the

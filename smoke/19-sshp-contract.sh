@@ -5,7 +5,7 @@
 # Why this check exists: `assets/client/unix/sshp` is 1,487 lines and, before
 # this file, NOTHING in the suite had ever executed it.  `01` parses it
 # (`sh -n`), `10` asserts a couple of installer invariants about other files,
-# and that was the whole of it.  Together with `sshp.ps1` (1,367 lines) it is
+# and that was the whole of it.  Together with `sshp.ps1` (1,440 lines) it is
 # the largest zero-coverage asset in the repo -- and unlike the installers it is
 # not a one-shot tool: it is the interactive session path a human uses every
 # day.
