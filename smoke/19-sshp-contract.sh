@@ -2,10 +2,10 @@
 # Smoke: the POSIX `sshp` client's LOCAL contract.  No remote is contacted -- a
 # stub `SSHP_SSH` answers the platform probe and records the argv it was given.
 #
-# Why this check exists: `assets/client/unix/sshp` is 1,346 lines and, before
+# Why this check exists: `assets/client/unix/sshp` is 1,487 lines and, before
 # this file, NOTHING in the suite had ever executed it.  `01` parses it
 # (`sh -n`), `10` asserts a couple of installer invariants about other files,
-# and that was the whole of it.  Together with `sshp.ps1` (1,361 lines) it is
+# and that was the whole of it.  Together with `sshp.ps1` (1,367 lines) it is
 # the largest zero-coverage asset in the repo -- and unlike the installers it is
 # not a one-shot tool: it is the interactive session path a human uses every
 # day.
@@ -29,8 +29,14 @@
 #     needs a remote that answers the probe as READY; the stub can fake the
 #     probe, but the session then blocks on a terminal.  The argv it WOULD use
 #     is asserted instead, by reading it out of the probe/session option sets.
-#   - the Windows path (`run_windows_remote_command`, the expect script, the
-#     mkfifo fallback).  It needs a Windows target; only the MINGW routing
+#     **2026-10-29: the WINDOWS session command is now an exception** -- it is a
+#     single ssh argv element (not a pty line), so the stub captures it exactly
+#     and the section at the end of this file drives the real client end to end.
+#   - the Windows session's RUNTIME: whether a real sshd with each of the three
+#     DefaultShell values accepts that command line.  Only its construction is
+#     proven here, and construction is precisely what this round could measure.
+#   - the Windows probe/install path (`run_windows_remote_command`) and the
+#     expect wrapper.  They need a Windows target; only the MINGW routing
 #     decision is asserted here.
 #   - the remote install path.  It runs a package manager on the remote host.
 set -euo pipefail
@@ -116,7 +122,16 @@ if [ -z "$line" ]; then
 fi
 status=${line%%	*}
 stdout=${line#*	}
-[ -n "$stdout" ] && printf '%s\n' "$stdout"
+# A stdout field starting with `@` names a FILE whose contents are the answer.
+# Needed because the Windows READY answer is TWO lines (`__SSHP_READY__:Windows`
+# plus `__SSHP_ZELLIJ__:<path>`) and the plan format is one line per call.
+# No existing plan begins with `@`, so this is additive, not a re-reading of the
+# format -- and unlike `printf '%b'` it cannot reinterpret a backslash that is
+# part of a Windows path.
+case "$stdout" in
+    @*) cat "${stdout#@}" ;;
+    *) [ -n "$stdout" ] && printf '%s\n' "$stdout" ;;
+esac
 exit "${status:-0}"
 STUB
 chmod 700 "$work/bin/ssh"
@@ -803,14 +818,16 @@ remote_script_state="identical(2/2) matrix=$((probe_rows + install_rows))/$((pro
 #     the fail-closed guard, POSIX **0**: a FAILED install reported as SUCCESS
 #     (`exit $LASTEXITCODE` with the variable unset is `exit $null`).
 # The probe tails differed too: only the Windows copy emitted
-# `__SSHP_ZELLIJ__:<path>`.  The POSIX client never consumes that line (its
-# Windows session command is `exec zellij attach --create` with a bare name --
-# checked, not assumed), so this one was inert THERE; it is still a divergence
-# of the same contract, and the Windows twin parses it into the path its session
-# command embeds (`& '<path>' attach --create`), so a body that stopped emitting
-# it would break that client alone.  The resolver also spelled one constructor
-# two ways (`New-Object "…List[string]"` vs `[…]::new()`; pwsh 7.5 answers
-# identically, measured).
+# `__SSHP_ZELLIJ__:<path>`.  At the time the POSIX client did not consume that
+# line (its Windows session command was `exec zellij attach --create` with a
+# bare name -- checked, not assumed), so the missing line was inert THERE; it
+# was still a divergence of the same contract, because the Windows twin parsed
+# it into the path its session command embeds.  **2026-10-29: that bare-name
+# session line was itself the defect** -- see the session-command section at the
+# end of this file, which now drives this client end to end and compares the
+# command it emits with the twin's own builder, byte for byte.  The resolver
+# also spelled one constructor two ways (`New-Object "…List[string]"` vs
+# `[…]::new()`; pwsh 7.5 answers identically, measured).
 #
 # The rule is the round-45 rule applied to the Windows pair, and it is asserted
 # the same two-sided way: the three parts are byte-identical, AND each body
@@ -910,6 +927,9 @@ windows_script_state='identical(3/3)'
 # ENVIRONMENT fault rather than reported as an asset defect.
 pwsh_binary=${AGENTQ_SMOKE_PWSH:-$(command -v pwsh || true)}
 windows_matrix_state='not-run'
+# A separate flag because `windows_matrix_state` is later overwritten with the
+# row counts; a boolean that changes meaning mid-file is a boolean that lies.
+pwsh_usable=false
 if [ -z "$pwsh_binary" ] || ! command -v "$pwsh_binary" >/dev/null 2>&1; then
     printf '%s\n' 'sshp-contract: the Windows-target scripts were extracted and compared byte-for-byte, but NOT executed: no pwsh is available (skipped(pwsh-absent))'
     windows_matrix_state='skipped(pwsh-absent)'
@@ -923,10 +943,11 @@ else
         failures=$((failures + 1))
     else
         windows_matrix_state='run'
+        pwsh_usable=true
     fi
 fi
 
-if [ "$windows_matrix_state" = 'run' ]; then
+if [ "$pwsh_usable" = true ]; then
     # The stub stands in for the resolver prelude.  Its SHAPE is the contract the
     # tails consume -- `Resolve-RemoteZellij` returns a path or $null,
     # `Resolve-RemoteInstaller` returns Kind+Path or $null -- and it is driven by
@@ -947,17 +968,54 @@ function Resolve-RemoteInstaller {
 POWERSHELL
 
     # Installer fixtures.  `zero`/`five` are native children that exit with that
-    # status; `noexec` is a file the OS refuses to START (mode 0644), which is
-    # this fixture's model of the CreateProcess failure a Windows AV or policy
-    # would cause -- the call returns, a non-terminating error is recorded, and
+    # status; `noexec` is a path the OS refuses to START, which is this
+    # fixture's model of the CreateProcess failure a Windows AV or policy would
+    # cause -- the call returns, a non-terminating error is recorded, and
     # $LASTEXITCODE is never set (measured 2026-10-17, and again here: success=
     # False, lastExitPresent=False).  `noop.ps1` is the same state reached
     # in-process, which needs no exec bit and is therefore portable.
+    #
+    # `noexec` IS A DANGLING SYMLINK, AND THAT IS THE WHOLE POINT.  On the test
+    # host, `& '<path>'` for an EXISTING non-executable file does not fail -- it
+    # calls macOS LaunchServices, which OPENS the file in whatever app the
+    # machine associates with that type.  Measured 2026-10-29 on one machine:
+    # no extension -> TextEdit, `.exe` -> Parallels Desktop, `.dat` -> IINA; one
+    # window per row, per run, piling up on the desktop.  The extension is NOT
+    # a safety property -- it only chooses WHICH app opens the file, so any
+    # suffix-based "fix" is one user's file associations away from being wrong
+    # again (an earlier `.exe` suffix passed a TextEdit-only window count and
+    # still opened Parallels).  A DANGLING SYMLINK never reaches LaunchServices
+    # at all: there is no target to open, so `&` fails with "The file ... does
+    # not exist", a NON-TERMINATING error that leaves $LASTEXITCODE unset --
+    # exactly the state this row models, and measured to still discriminate
+    # (fixed body 1, round-46 tail 0).  This is a property of the TEST HOST, not
+    # of the code under test: a real Windows target fails in CreateProcess and
+    # never consults LaunchServices.
+    #
+    # Measured alternatives, all rejected: mode 0644/000 regular file -> opens
+    # (or attempts to open) via LaunchServices; 0755 with an invalid
+    # interpreter, a directory, or an absent path -> a TERMINATING error, so
+    # the fail-closed guard never runs and the row would pass for the wrong
+    # reason.  The guard below pins the dangling-symlink property in BOTH
+    # directions, because a predicate that cannot fire is decoration.
+    win_installer_noexec="$work/win-installer-noexec"
+    ln -s "$work/win-installer-noexec-target-that-does-not-exist" "$win_installer_noexec"
+    # True only for a symlink whose target does not resolve.  This is the
+    # predicate that keeps macOS LaunchServices away from the fixture.
+    fixture_is_launch_safe() { [ -L "$1" ] && [ ! -e "$1" ]; }
+    guard_regular="$work/win-installer-guard-probe"
+    : > "$guard_regular"
+    if fixture_is_launch_safe "$guard_regular"; then
+        printf '%s\n' 'sshp-contract: the launch-safety guard accepted a regular file -- the guard is broken, not the fixture' >&2
+        failures=$((failures + 1))
+    fi
+    if ! fixture_is_launch_safe "$win_installer_noexec"; then
+        printf '%s\n' 'sshp-contract: the cannot-start fixture is not a dangling symlink; macOS LaunchServices opens any existing non-executable file in a GUI app (measured: no extension -> TextEdit, .exe -> Parallels Desktop, .dat -> IINA), one window per row per run' >&2
+        failures=$((failures + 1))
+    fi
     printf '#!/bin/sh\nexit 0\n' > "$work/win-installer-zero"
     printf '#!/bin/sh\nexit 5\n' > "$work/win-installer-five"
-    printf '#!/bin/sh\nexit 7\n' > "$work/win-installer-noexec"
     chmod 700 "$work/win-installer-zero" "$work/win-installer-five"
-    chmod 644 "$work/win-installer-noexec"
     printf '%s\n' '# no-op installer: an in-process call that never sets $LASTEXITCODE' > "$work/win-installer-noop.ps1"
 
     # run_windows_target_body <body> <zellij> <kind> <path> -> "<status>\t<stdout>\t<stderr>"
@@ -1157,6 +1215,593 @@ unavailable||||127|__SSHP_INSTALL_UNAVAILABLE__:Windows|"
 fi
 
 # ---------------------------------------------------------------------------
+# The Windows SESSION command (2026-10-29, 第四十七类).
+#
+# Rounds 45 and 46 compared what the two sshp clients EMBED -- the unix-target
+# and Windows-target script bodies.  This is the layer below that: the command
+# each client puts on the wire to START the session.  Comparing the bodies had
+# just made the POSIX probe report `__SSHP_ZELLIJ__:<path>` like the twin's, and
+# the POSIX client still threw that path away: it wrote
+#
+#     exec zellij attach --create '<name>'\r\n
+#
+# into a FIFO feeding `ssh -tt` with NO remote command, so the line was parsed by
+# whatever the target's DefaultShell is.  This file's own header (round 46) had
+# recorded that line as "checked, not assumed" and moved on.  It was wrong, in
+# two independent ways, both reachable on configurations this repo has measured
+# on real hosts:
+#
+#   * `exec` is a POSIX builtin.  SKILL.md documents `cmd.exe`, `powershell.exe`
+#     and Git Bash as the three DefaultShell values, all three real-host measured
+#     -- and the FIRST is the OpenSSH default when the key is unset.  Measured
+#     2026-10-29: under PowerShell the line dies as `Switch-Process:`; cmd.exe
+#     has no such command at all.  sshp.ps1 sends `powershell.exe ...`, which
+#     every one of the three shells can run.
+#   * the BARE NAME is a PATH lookup, performed by the very session whose probe
+#     had just resolved an absolute path to dodge a stale PATH.  The line above
+#     this probe call in the asset says the probe uses native PowerShell
+#     "because WinGet, Scoop, or Chocolatey installs" leave the SSH-server PATH
+#     stale.  Measured 2026-10-29 with zellij present only at the resolver's
+#     absolute path: `exec zellij ...` -> `sh: line 0: exec: zellij: not found`,
+#     `exec '<abs>' ...` -> starts.  The client's OWN install flow produces that
+#     state: install via winget, re-probe -> READY with the path, start the
+#     session -> dead.  `--check` on the same host had already printed
+#     "persistent remote session: Zellij (Windows)".
+#
+# The fix makes this client send the twin's command, and the lock proves that in
+# two directions: the emitted payload is decoded against an absolute expectation
+# (a comparison of the two clients to each other would pass if both drifted the
+# same way), AND the twin's own builder is run through pwsh on the same inputs
+# and required to agree byte for byte.
+# ---------------------------------------------------------------------------
+win_session_dir="$work/win-session"
+mkdir -p "$win_session_dir"
+
+# One Windows READY answer per fixture.  `@` makes the stub answer with a FILE so
+# the probe can reply on two lines, as the real body does.  An empty path means
+# the answer has no `__SSHP_ZELLIJ__` line at all -- the state the round-46 probe
+# could produce and the old client silently ignored.
+win_ready() { # $1 = name, $2 = the __SSHP_ZELLIJ__ value (empty => no marker line)
+    if [ -n "$2" ]; then
+        printf '%s\n%s\n' '__SSHP_READY__:Windows' "__SSHP_ZELLIJ__:$2" > "$win_session_dir/$1"
+    else
+        printf '%s\n' '__SSHP_READY__:Windows' > "$win_session_dir/$1"
+    fi
+}
+win_path_normal='C:\Program Files\zellij\zellij.exe'
+win_path_hostile="C:\Users\O'Brien\zellij.exe"
+win_path_control=$(printf 'C:\\a\tb.exe')
+win_path_long=$(awk 'BEGIN { for (i = 0; i < 1100; i++) printf "p" }')
+win_ready ready-good "$win_path_normal"
+win_ready ready-hostile "$win_path_hostile"
+win_ready ready-control "$win_path_control"
+win_ready ready-long "$win_path_long"
+win_ready ready-nomarker ''
+
+# run_windows_session <fixture> [client] -> sets ws_status, ws_calls, ws_command
+run_windows_session() {
+    local fixture=$1 runner=${2:-$client}
+    plan_stub "43	__SSHP_WINDOWS_SHELL__:MINGW64_NT-10.0-19045
+0	@$fixture
+0	"
+    local status=0
+    SSHP_STUB_DIR="$stub_dir" SSHP_SSH="$work/bin/ssh" HOME="$home" TMPDIR="$work/tmp" \
+        PATH="$work/bin:/usr/bin:/bin" \
+        /bin/sh "$runner" smoke-host work >"$win_session_dir/out" 2>"$win_session_dir/err" || status=$?
+    ws_status=$status
+    ws_calls=$(cat "$work/count" 2>/dev/null || printf '0')
+    ws_calls=${ws_calls:-0}
+    ws_command=''
+    if [ -f "$work/argv.3" ]; then
+        ws_command=$(tr '\0' '\n' < "$work/argv.3" | LC_ALL=C sed -n '$p')
+    fi
+    ws_stderr=$(cat "$win_session_dir/err")
+}
+
+# decode_session_command <command> -> the UTF-16LE payload as UTF-8 on stdout
+decode_session_command() {
+    printf '%s' "${1##* }" | base64 -d 2>/dev/null | iconv -f UTF-16LE -t UTF-8 2>/dev/null || true
+}
+
+# The absolute oracle, not a cross-client comparison: this is the exact script
+# sshp.ps1's here-string is written to produce (LF between the two lines, no
+# trailing newline -- measured against [Convert]::ToBase64String on the asset).
+ws_expected=$(printf '%s\n%s' \
+    "\$ErrorActionPreference = 'Stop'" \
+    "& '$win_path_normal' attach --create 'work'")
+
+# payload_invokes_bare_name <decoded script> -> 0 when the payload names Zellij
+# with a bare name instead of an absolute path.
+#
+# The detector is the contract: "the session runs the path the PROBE resolved".
+# Written as a predicate so the self-test below can feed it a bare-name payload
+# directly and require it to fire -- a detector exercised only by the asset it
+# was written against is a detector nobody has seen say yes.
+#
+# `grep -c` + arithmetic, NOT `grep -q`: this file runs under `set -o pipefail`,
+# where a quiet grep exits at its first match, `printf` takes SIGPIPE, and a
+# FOUND pattern reads as ABSENT -- `smoke/01`'s quiet-grep lock caught exactly
+# that shape here on the first run.  `-c` must read every line to count.
+payload_invokes_bare_name() {
+    local bare_matches
+    bare_matches=$(printf '%s' "$1" | grep -E -c "& '[^']*[\\\\/][^']*' attach --create") || bare_matches=0
+    [ "${bare_matches:-0}" -eq 0 ]
+}
+
+# assert_good_session <label> -> six assertions on the CURRENT ws_* values.
+assert_good_session() {
+    local label=$1 decoded
+    decoded=$(decode_session_command "$ws_command")
+    cases=$((cases + 1))
+    if [ "$ws_status" -ne 0 ]; then
+        printf 'sshp-contract: Windows session [%s]: exit %s on a well-formed resolved path; expected 0. stderr: %s\n' \
+            "$label" "$ws_status" "$ws_stderr" >&2
+        failures=$((failures + 1))
+    fi
+    cases=$((cases + 1))
+    if [ "$ws_calls" -ne 3 ]; then
+        printf 'sshp-contract: Windows session [%s]: %s ssh call(s), expected 3 (unix probe, Windows probe, session)\n' \
+            "$label" "$ws_calls" >&2
+        failures=$((failures + 1))
+    fi
+    cases=$((cases + 1))
+    case "$ws_command" in
+        'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand '*) ;;
+        *)
+            printf 'sshp-contract: Windows session [%s]: the third call is not the twin''s encoded remote command: [%s]\n' \
+                "$label" "$ws_command" >&2
+            failures=$((failures + 1))
+            ;;
+    esac
+    cases=$((cases + 1))
+    if [ "$decoded" != "$ws_expected" ]; then
+        printf 'sshp-contract: Windows session [%s]: the decoded payload is not the expected script\n  got      [%s]\n  expected [%s]\n' \
+            "$label" "$decoded" "$ws_expected" >&2
+        failures=$((failures + 1))
+    fi
+    # The whole point of the change: the path the PROBE resolved is the path the
+    # session runs, and the bare name is gone.  `grep -c` for the same pipefail
+    # reason as payload_invokes_bare_name.
+    cases=$((cases + 1))
+    path_matches=$(printf '%s' "$decoded" | grep -F -c -- "& '$win_path_normal'") || path_matches=0
+    if [ "${path_matches:-0}" -eq 0 ]; then
+        printf 'sshp-contract: Windows session [%s]: the resolved path was not embedded verbatim: %s\n' \
+            "$label" "$decoded" >&2
+        failures=$((failures + 1))
+    fi
+    cases=$((cases + 1))
+    if payload_invokes_bare_name "$decoded"; then
+        printf 'sshp-contract: Windows session [%s]: the payload invokes Zellij by BARE NAME instead of an absolute path, so a stale SSH PATH kills the session: %s\n' \
+            "$label" "$decoded" >&2
+        failures=$((failures + 1))
+    fi
+}
+
+# --- The happy path: an encoded remote command carrying the resolved path ----
+run_windows_session "$win_session_dir/ready-good"
+assert_good_session happy-path
+
+# --- The guards: refuse, and emit NOTHING. --------------------------------
+# Each message is the twin's, verbatim: the refusal is part of the answer two
+# clients must agree on.  Zero ssh calls past the probe is the other half -- a
+# guard that fires after the command was sent guards nothing.
+win_guard() { # $1 = label, $2 = fixture, $3 = expected message
+    cases=$((cases + 1))
+    run_windows_session "$2"
+    if [ "$ws_status" -ne 2 ]; then
+        printf 'sshp-contract: Windows session %s: expected refusal exit 2, got %s\n' "$1" "$ws_status" >&2
+        failures=$((failures + 1))
+    fi
+    cases=$((cases + 1))
+    # Count over the FILE, not a pipe into `grep -q`: this file runs under
+    # `set -o pipefail`, where a quiet grep's early exit makes the writer take
+    # SIGPIPE and a FOUND message read as absent.
+    stderr_matches=$(grep -F -c -- "$3" "$win_session_dir/err") || stderr_matches=0
+    if [ "${stderr_matches:-0}" -eq 0 ]; then
+        printf 'sshp-contract: Windows session %s: stderr lacks %s\n  got: %s\n' "$1" "$3" "$ws_stderr" >&2
+        failures=$((failures + 1))
+    fi
+    cases=$((cases + 1))
+    if [ "$ws_calls" -ne 2 ]; then
+        printf 'sshp-contract: Windows session %s: %s ssh call(s); a refusal must not send a session command\n' "$1" "$ws_calls" >&2
+        failures=$((failures + 1))
+    fi
+}
+win_guard hostile-path "$win_session_dir/ready-hostile" 'the resolved Zellij path contains a quote or line break'
+win_guard control-path "$win_session_dir/ready-control" 'the resolved Zellij path contains a control character'
+win_guard over-long-path "$win_session_dir/ready-long" 'the resolved Zellij path is longer than'
+win_guard missing-marker "$win_session_dir/ready-nomarker" 'no resolved Zellij path from the probe'
+
+# --- The bound's UNIT: UTF-16 code units, under EVERY shell and locale. ----
+# The bound exists so the two clients refuse the same answers, and the twin's
+# answer is `String.Length -gt 1024` -- UTF-16 CODE UNITS.  `${#var}` is not
+# that number, and it is not even a stable number: measured 2026-10-29 on this
+# machine, one 1220-byte CJK path counted 420 under bash+UTF-8, 1220 under
+# bash+LC_ALL=C, and 1220 under dash -- so bash and dash gave OPPOSITE verdicts
+# on the same path, and only the bash+UTF-8 number agreed with the twin.
+# 600 emoji invert it: 620 code points but 1220 UTF-16 units, so a code-point
+# counter ACCEPTS what the twin refuses.  That is why this is asserted across a
+# shell x locale matrix instead of in one run: any single cell can be right by
+# accident, and the client must not answer a question about its CALLER.
+#
+# The fixtures are built by repetition so the three units separate by
+# construction, and the expected verdict is computed here from iconv -- an
+# oracle independent of the client's own arithmetic.  `| wc -c` on a PIPE, not
+# `>/dev/null`: measured 2026-10-29, macOS iconv fails with ENOTTY ("Inappropriate
+# ioctl for device") writing a large enough conversion to /dev/null (340 CJK
+# chars fine, 360 fail, while ASCII of twice the byte count is fine), so a
+# /dev/null-based probe reports a valid path as invalid.
+win_repeat() { # $1 = unit, $2 = count
+    local out='' i=0
+    while [ "$i" -lt "$2" ]; do out="$out$1"; i=$((i + 1)); done
+    printf '%s' "$out"
+}
+win_units_of() { # $1 = text -> UTF-16 code units (the twin's unit)
+    local bytes
+    bytes=$(printf '%s' "$1" | iconv -f UTF-8 -t UTF-16LE | wc -c) || return 1
+    printf '%s' "$(( ${bytes//[[:space:]]/} / 2 ))"
+}
+# 400 CJK chars: 420 units (<= 1024), 1220 bytes (> 1024).  The twin accepts;
+# a byte counter refuses.
+win_path_units_accept="C:\\Users\\$(win_repeat 中 400)\\zellij.exe"
+# 600 emoji: 620 code points (<= 1024), 1220 units (> 1024).  The twin refuses;
+# a code-point counter accepts.
+win_path_units_refuse="C:\\Users\\$(win_repeat 😀 600)\\zellij.exe"
+win_ready ready-units-accept "$win_path_units_accept"
+win_ready ready-units-refuse "$win_path_units_refuse"
+
+# run_windows_session_in <fixture> <shell> <locale> -> ws_* like run_windows_session
+run_windows_session_in() {
+    local fixture=$1 shell=$2 locale=$3
+    plan_stub "43	__SSHP_WINDOWS_SHELL__:MINGW64_NT-10.0-19045
+0	@$fixture
+0	"
+    local status=0
+    LC_ALL="$locale" SSHP_STUB_DIR="$stub_dir" SSHP_SSH="$work/bin/ssh" HOME="$home" TMPDIR="$work/tmp" \
+        PATH="$work/bin:/usr/bin:/bin" \
+        "$shell" "$client" smoke-host work >"$win_session_dir/out" 2>"$win_session_dir/err" || status=$?
+    ws_status=$status
+    ws_calls=$(cat "$work/count" 2>/dev/null || printf '0')
+    ws_calls=${ws_calls:-0}
+    ws_command=''
+    if [ -f "$work/argv.3" ]; then
+        ws_command=$(tr '\0' '\n' < "$work/argv.3" | LC_ALL=C sed -n '$p')
+    fi
+    ws_stderr=$(cat "$win_session_dir/err")
+}
+
+# The matrix.  bash and zsh count CODE POINTS in a UTF-8 locale and BYTES under
+# LC_ALL=C; dash counts BYTES always.  A shell that is absent is not counted as
+# a pass -- it is reported, exactly like the pwsh gate above, because "the check
+# could not run here" and "the check ran and passed" are different facts.
+#
+# Each cell's UNIT is measured, not assumed.  A locale name that does not exist
+# on this host SILENTLY falls back to C (measured), so a hard-coded
+# `en_US.UTF-8` cell that counted bytes would be a cell that never tested what
+# its label claims.  The probe reports what each cell actually measured and the
+# summary says whether the matrix spanned both units -- a host whose only shell
+# counts bytes still runs every assertion, but it is not called a bytes+chars
+# matrix.
+win_units_cells=''
+win_units_skipped=''
+win_units_units=''
+win_units_state='not-run'
+# The locale is PICKED, not assumed: a name that does not exist silently falls
+# back to C (measured), so hard-coding `en_US.UTF-8` would give a cell labelled
+# utf8 that counts bytes -- never testing what the label claims.  Try the usual
+# UTF-8 names and keep the first one where a shell really counts code points;
+# if none does, say so (the note below) rather than pretend.
+win_units_utf8_locale=''
+win_units_pick_locale() {
+    local candidate probe_shell
+    # Probe with EACH shell, not just one: on Debian/Ubuntu /bin/sh is dash,
+    # which counts bytes under every locale, so probing with /bin/sh alone would
+    # conclude "no UTF-8 locale here" on a host where bash would count code
+    # points perfectly well.  A locale counts as usable for this matrix if ANY
+    # shell present turns 中 into 1 under it.
+    for candidate in C.UTF-8 en_US.UTF-8 en_US.utf8; do
+        for probe_shell in bash zsh /bin/sh; do
+            command -v "$probe_shell" >/dev/null 2>&1 || continue
+            if [ "$(LC_ALL="$candidate" "$probe_shell" -c 'x=中; printf "%s" "${#x}"' 2>/dev/null)" = 1 ]; then
+                win_units_utf8_locale=$candidate
+                return 0
+            fi
+        done
+    done
+    # No UTF-8 locale here: keep a name so the cells still run, and let each
+    # cell's measured unit (which will read `bytes`) plus the note say so.
+    win_units_utf8_locale=en_US.UTF-8
+}
+win_units_pick_locale
+win_units_unit() { # $1 = shell, $2 = locale -> chars|bytes|unknown
+    local measured
+    # 中 is three UTF-8 bytes and one code point.  LC_ALL=C forces bytes in
+    # every shell; no shell turns bytes into code points.
+    measured=$(LC_ALL="$2" "$1" -c 'x=中; printf "%s" "${#x}"' 2>/dev/null) || measured=''
+    case "$measured" in
+        1) printf 'chars' ;;
+        3) printf 'bytes' ;;
+        *) printf 'unknown' ;;
+    esac
+}
+win_units_run() { # $1 = label, $2 = shell, $3 = locale
+    local label=$1 shell=$2 locale=$3 unit
+    if ! command -v "$shell" >/dev/null 2>&1; then
+        win_units_skipped="$win_units_skipped $label"
+        return 0
+    fi
+    unit=$(win_units_unit "$shell" "$locale")
+    win_units_cells="$win_units_cells $label"
+    case "$win_units_units" in
+        *"$unit"*) ;;
+        *) win_units_units="$win_units_units $unit" ;;
+    esac
+
+    # The accept fixture must be ACCEPTED: exit 0, and the path embedded.
+    cases=$((cases + 1))
+    run_windows_session_in "$win_session_dir/ready-units-accept" "$shell" "$locale"
+    if [ "$ws_status" -ne 0 ]; then
+        printf 'sshp-contract: unit matrix [%s, %s]: a %s-unit path (bound %s) was refused with exit %s; the twin ACCEPTS it. stderr: %s\n' \
+            "$label" "$unit" "$(win_units_of "$win_path_units_accept")" "$windows_path_limit_expected" "$ws_status" "$ws_stderr" >&2
+        failures=$((failures + 1))
+    fi
+    cases=$((cases + 1))
+    accept_decoded=$(decode_session_command "$ws_command")
+    accept_matches=$(printf '%s' "$accept_decoded" | grep -F -c -- "& '$win_path_units_accept'") || accept_matches=0
+    if [ "${accept_matches:-0}" -eq 0 ]; then
+        printf 'sshp-contract: unit matrix [%s, %s]: the accepted session does not carry the multibyte path verbatim\n' \
+            "$label" "$unit" >&2
+        failures=$((failures + 1))
+    fi
+
+    # The refuse fixture must be REFUSED: 1220 units > 1024 even though its
+    # code-point count is 620.
+    cases=$((cases + 1))
+    run_windows_session_in "$win_session_dir/ready-units-refuse" "$shell" "$locale"
+    if [ "$ws_status" -ne 2 ]; then
+        printf 'sshp-contract: unit matrix [%s, %s]: a %s-unit path (bound %s) was NOT refused (exit %s); the twin REFUSES it -- a code-point counter would accept it\n' \
+            "$label" "$unit" "$(win_units_of "$win_path_units_refuse")" "$windows_path_limit_expected" "$ws_status" >&2
+        failures=$((failures + 1))
+    fi
+}
+
+# Say so when the matrix could not span both units.  Not a failure -- a host
+# whose every shell counts bytes is legal -- but a host where the CODE-POINT
+# direction was never exercised is not the same evidence, and silence would let
+# it read as if it were.
+win_units_matrix_note() {
+    case " $win_units_units " in
+        *' chars '*) ;;
+        *)
+            printf 'sshp-contract: note: no cell counted code points here (units:%s); the code-point half of the matrix is untested on this host\n' \
+                "$win_units_units" >&2
+            ;;
+    esac
+    case " $win_units_units " in
+        *' bytes '*) ;;
+        *)
+            printf 'sshp-contract: note: no cell counted bytes here (units:%s); the byte half of the matrix is untested on this host\n' \
+                "$win_units_units" >&2
+            ;;
+    esac
+}
+
+# The expected bound is the twin's, read below into twin_limit; an empty value
+# is already a failure, and the cells must not silently pass on it.
+
+# --- --check must never build one.  It is read-only and must not acquire a
+# dependency on iconv/base64 or on a well-formed path.                      ---
+plan_stub '43	__SSHP_WINDOWS_SHELL__:MINGW64_NT-10.0-19045
+0	@'"$win_session_dir/ready-nomarker"'
+'
+check_status=0
+SSHP_STUB_DIR="$stub_dir" SSHP_SSH="$work/bin/ssh" HOME="$home" TMPDIR="$work/tmp" \
+    PATH="$work/bin:/usr/bin:/bin" \
+    /bin/sh "$client" --check smoke-host >"$win_session_dir/co" 2>"$win_session_dir/ce" || check_status=$?
+cases=$((cases + 1))
+if [ "$check_status" -ne 0 ] || [ "$(cat "$work/count")" != '2' ] ||
+    ! grep -qF 'persistent remote session: Zellij (Windows)' "$win_session_dir/co"; then
+    printf 'sshp-contract: Windows --check on a host with NO resolved path: exit %s, %s ssh call(s) -- it must still report READY and build no session command\n' \
+        "$check_status" "$(cat "$work/count" 2>/dev/null || printf '?')" >&2
+    failures=$((failures + 1))
+fi
+
+# --- The bound is the twin's, and read from the twin. ----------------------
+# A restated 1024 is a constant that drifts; this is the same rule smoke/14
+# learned when a mutation raising the limit left the length site green because
+# the extractor had hard-coded the number it was checking.
+twin_limit=$(LC_ALL=C sed -n 's/.*ResolvedZellijPath\.Length -gt \([0-9][0-9]*\).*/\1/p' "$sshp_ps_client" | LC_ALL=C sed -n '1p')
+our_limit=$(LC_ALL=C sed -n 's/^windows_zellij_path_limit=\([0-9][0-9]*\)$/\1/p' "$client" | LC_ALL=C sed -n '1p')
+cases=$((cases + 1))
+if [ -z "$twin_limit" ] || [ "$our_limit" != "$twin_limit" ]; then
+    printf 'sshp-contract: the path-length bound is %s here but %s in sshp.ps1 (the bound is shared contract, not a local taste)\n' \
+        "${our_limit:-<none>}" "${twin_limit:-<none>}" >&2
+    failures=$((failures + 1))
+fi
+
+windows_path_limit_expected=${twin_limit:-?}
+
+# A static pin beside the behavioural matrix: `${#windows_zellij_path}` is the
+# exact construct that made the bound shell- and locale-dependent, and no
+# fixture arrangement can see it if the fixtures ever drift.  Asserted in BOTH
+# directions -- the unit must come from a UTF-16 conversion AND the shell's own
+# `${#...}` must not be used on this value -- so a rewrite that measures some
+# OTHER way has to say what it is doing here.
+#
+# It reads CODE LINES only.  The asset's comment explains why `${#...}` is
+# wrong and therefore contains it; a detector that matches its own explanation
+# reports a correct asset as broken, which is the false-red class smoke/16's
+# self-masking detector already taught.
+client_code_only="$work/sshp-code-only"
+LC_ALL=C grep -v '^[[:space:]]*#' "$client" > "$client_code_only"
+cases=$((cases + 1))
+if LC_ALL=C grep -q '\${#windows_zellij_path}' "$client_code_only"; then
+    printf '%s\n' 'sshp-contract: the client measures the Zellij path with ${#windows_zellij_path}; that is bytes under dash and any C locale and code points under bash+UTF-8, not the twin'"'"'s UTF-16 code units' >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if ! LC_ALL=C grep -q "iconv -f UTF-8 -t UTF-16LE | wc -c" "$client_code_only"; then
+    printf '%s\n' 'sshp-contract: the client no longer measures the Zellij path through a UTF-8 to UTF-16LE conversion; the bound is no longer in the twin'"'"'s unit' >&2
+    failures=$((failures + 1))
+fi
+
+win_units_run 'sh+C' /bin/sh C
+win_units_run 'sh+utf8' /bin/sh "$win_units_utf8_locale"
+win_units_run 'bash+C' bash C
+win_units_run 'bash+utf8' bash "$win_units_utf8_locale"
+win_units_run 'dash+C' dash C
+win_units_run 'dash+utf8' dash "$win_units_utf8_locale"
+win_units_run 'zsh+C' zsh C
+win_units_run 'zsh+utf8' zsh "$win_units_utf8_locale"
+if [ -n "$win_units_cells" ]; then
+    win_units_state="matrix(${win_units_cells# } units:${win_units_units# })"
+fi
+if [ -n "$win_units_skipped" ]; then
+    win_units_state="$win_units_state skipped(${win_units_skipped# })"
+fi
+win_units_matrix_note
+
+# --- The differential: run the TWIN's own builder, same inputs. ------------
+# Only when pwsh actually works, and reported as such -- `windows_matrix_state`
+# above already refuses to call an unusable interpreter an asset result.
+win_session_state='not-run(pwsh)'
+if [ "$pwsh_usable" = true ]; then
+    # Pull Get-WindowsSessionCommand out of the asset by BRACE DEPTH.  A line
+    # window cannot do this: the function contains a here-string and comments,
+    # and smoke/10 rule J settled years ago that "near" is not "inside".
+    twin_builder="$work/twin-session-builder.ps1"
+    LC_ALL=C awk '
+        !have && /^function Get-WindowsSessionCommand[ \t]*\{/ { have = 1; depth = 0 }
+        have {
+            print
+            line = $0
+            for (i = 1; i <= length(line); i++) {
+                c = substr(line, i, 1)
+                if (c == "{") depth++
+                else if (c == "}") depth--
+            }
+            if (depth == 0) exit
+        }
+    ' "$sshp_ps_client" > "$twin_builder"
+    cases=$((cases + 1))
+    twin_lines=$(wc -l < "$twin_builder" | tr -d '[:space:]')
+    if ! grep -q '^function Get-WindowsSessionCommand {' "$twin_builder" ||
+        [ "$(LC_ALL=C sed -n '$p' "$twin_builder")" != '}' ]; then
+        printf 'sshp-contract: could not extract Get-WindowsSessionCommand from sshp.ps1 by brace depth (%s line(s)); the differential would compare nothing\n' "$twin_lines" >&2
+        failures=$((failures + 1))
+    else
+        {
+            printf '%s\n' 'function Stop-Sshp { param([string]$Message) [Console]::Error.WriteLine("sshp: $Message"); exit 2 }'
+            printf '%s\n' '$script:ResolvedZellijPath = $env:SMOKE_TWIN_PATH'
+            printf '%s\n' '$script:SessionName = $env:SMOKE_TWIN_SESSION'
+            cat "$twin_builder"
+            printf '%s\n' '$c = Get-WindowsSessionCommand'
+            printf '%s\n' '[Console]::Out.Write($c)'
+        } > "$work/twin-session-run.ps1"
+        # The guard cases above overwrite ws_*; re-capture the happy path so the
+        # comparison below is against a live POSIX command, not a stale one.
+        run_windows_session "$win_session_dir/ready-good"
+        twin_out="$work/twin-session.out"; twin_err="$work/twin-session.err"
+        twin_status=0
+        SMOKE_TWIN_PATH="$win_path_normal" SMOKE_TWIN_SESSION='work' \
+            "$pwsh_binary" -NoProfile -NonInteractive -File "$work/twin-session-run.ps1" \
+            >"$twin_out" 2>"$twin_err" || twin_status=$?
+        twin_command=$(cat "$twin_out")
+        cases=$((cases + 1))
+        if [ "$twin_status" -ne 0 ] || [ -z "$twin_command" ]; then
+            printf 'sshp-contract: the twin session builder did not run (exit %s): %s\n' \
+                "$twin_status" "$(head -1 "$twin_err")" >&2
+            failures=$((failures + 1))
+        fi
+        cases=$((cases + 1))
+        if [ "$twin_command" != "$ws_command" ]; then
+            printf 'sshp-contract: the two clients build DIFFERENT Windows session commands for the same path and session\n  posix: %s\n  twin : %s\n' \
+                "$ws_command" "$twin_command" >&2
+            failures=$((failures + 1))
+        fi
+        # And the twin's guard must fire on the same input the POSIX guard fires
+        # on, with the same message -- otherwise the two clients still answer
+        # differently, just in a place that no longer builds a command.
+        SMOKE_TWIN_PATH="$win_path_hostile" SMOKE_TWIN_SESSION='work' \
+            "$pwsh_binary" -NoProfile -NonInteractive -File "$work/twin-session-run.ps1" \
+            >"$work/twin-hostile.out" 2>"$twin_err" || twin_hostile_status=$?
+        twin_hostile_status=${twin_hostile_status:-0}
+        cases=$((cases + 1))
+        if [ "$twin_hostile_status" -ne 2 ] ||
+            ! grep -qF 'the resolved Zellij path contains a quote or line break' "$twin_err"; then
+            printf 'sshp-contract: the twin did not refuse the hostile path the way this client does (exit %s)\n' "$twin_hostile_status" >&2
+            failures=$((failures + 1))
+        fi
+        # The builder must be the thing being compared, not a pair of empty
+        # strings: a mutation that makes the POSIX client emit nothing would
+        # otherwise satisfy `[ "$twin_command" != "$ws_command" ]` only if this
+        # check were absent.
+        cases=$((cases + 1))
+        if [ -z "$ws_command" ]; then
+            printf 'sshp-contract: the differential compared an empty POSIX session command\n' >&2
+            failures=$((failures + 1))
+        fi
+        win_session_state='compared'
+    fi
+fi
+
+# --- Self-test: the payload detector must be able to fire. -----------------
+# The detector is exercised on a hand-written bare-name payload FIRST, so its
+# ability to say yes does not depend on the asset under test -- this runs
+# unchanged against the pre-fix client too, where the mutation below cannot be
+# applied at all (there is no `$windows_zellij_path` line to mutate).
+cases=$((cases + 1))
+if ! payload_invokes_bare_name "&\$ErrorActionPreference = 'Stop'
+& 'zellij' attach --create 'work'"; then
+    printf '%s\n' 'sshp-contract: the bare-name detector did not fire on a hand-written bare-name payload; it cannot be proving anything about the asset' >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if payload_invokes_bare_name "& 'C:\Program Files\zellij\zellij.exe' attach --create 'work'"; then
+    printf '%s\n' 'sshp-contract: the bare-name detector fired on a legitimate absolute path; it would reject a correct asset' >&2
+    failures=$((failures + 1))
+fi
+
+# Then mutate a COPY of the asset back to the old bare-name shape and require
+# the same detector to reject what the client actually emits.  The asset itself
+# is never touched.
+bare_name_copy="$work/sshp-bare-name"
+mutate_status=0
+LC_ALL=C awk '
+    /& '\''\$windows_zellij_path'\'' attach --create/ {
+        sub(/\$windows_zellij_path/, "zellij")
+        seen = 1
+    }
+    { print }
+    END { if (!seen) exit 3 }
+' "$client" > "$bare_name_copy" || mutate_status=$?
+cases=$((cases + 1))
+if [ "$mutate_status" -ne 0 ] || ! grep -qF "& 'zellij' attach --create" "$bare_name_copy"; then
+    # Reaching here means the asset has no `$windows_zellij_path` session line,
+    # i.e. this round's fix is absent.  That is the pre-fix state, and the
+    # assertions above have already failed loudly; record it, do not double-count
+    # it as an un-mutable self-test.
+    printf 'sshp-contract: the payload lock could not be exercised against the asset (no `$windows_zellij_path` session line to mutate -- either this round''s fix is absent or something already removed that line)\n' >&2
+    failures=$((failures + 1))
+else
+    run_windows_session "$win_session_dir/ready-good" "$bare_name_copy"
+    mutated_decoded=$(decode_session_command "$ws_command")
+    cases=$((cases + 1))
+    if ! payload_invokes_bare_name "$mutated_decoded"; then
+        printf 'sshp-contract: the bare-name detector did not fire on the asset mutated back to the old shape [%s]\n' \
+            "$mutated_decoded" >&2
+        failures=$((failures + 1))
+    fi
+    # The oracle must also reject it: the mutation must change what is emitted,
+    # not merely pass through.
+    cases=$((cases + 1))
+    if [ "$mutated_decoded" = "$ws_expected" ]; then
+        printf '%s\n' 'sshp-contract: the mutated client emitted the SAME payload as the fixed one; the mutation did not reproduce the old shape' >&2
+        failures=$((failures + 1))
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # No residue.  sshp creates a private runtime directory under TMPDIR and removes
 # it in the EXIT trap.  A leak here is invisible in every other check and would
 # accumulate one directory per invocation on a long-lived machine.
@@ -1213,5 +1858,5 @@ if [ "$failures" -ne 0 ]; then
     printf 'sshp-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'sshp-contract checks passed: cases=%s stub-ssh=yes reconnect=covered argv=checked residue=none trap-window=pinned remote-scripts=%s windows-scripts=%s windows-matrix=%s\n' \
-    "$cases" "$remote_script_state" "$windows_script_state" "$windows_matrix_state"
+printf 'sshp-contract checks passed: cases=%s stub-ssh=yes reconnect=covered argv=checked residue=none trap-window=pinned remote-scripts=%s windows-scripts=%s windows-matrix=%s windows-session=%s windows-units=%s\n' \
+    "$cases" "$remote_script_state" "$windows_script_state" "$windows_matrix_state" "$win_session_state" "$win_units_state"
