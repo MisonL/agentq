@@ -15,6 +15,16 @@ sshp_noninteractive_output_limit=65536
 ssh_runtime_directory=''
 remote_platform=''
 windows_input_pid=''
+# The absolute Zellij path the Windows probe reported in `__SSHP_ZELLIJ__:`.
+# Set by prepare_remote on the READY branch, consumed by
+# build_windows_session_command.  Empty means "the probe never told us", which
+# refuses the session -- it is never a licence to fall back to a bare name.
+windows_zellij_path=''
+windows_session_command=''
+# The twin's bound, in sshp.ps1's Get-WindowsSessionCommand.  Named here rather
+# than inlined so smoke/19 can read BOTH values out of the two assets and refuse
+# to pass if they ever disagree -- a restated constant is a constant that drifts.
+windows_zellij_path_limit=1024
 
 usage() {
     cat <<EOF
@@ -941,7 +951,7 @@ run_windows_interactive_session_with_expect() {
 
     # shellcheck disable=SC2016
     if SSHP_EXPECT_HOST="$host" \
-        SSHP_EXPECT_SESSION="$session" \
+        SSHP_EXPECT_COMMAND="$windows_session_command" \
         SSHP_EXPECT_SSH="$ssh_binary" \
         SSHP_EXPECT_LOG="$windows_diagnostic_file" \
         SSHP_EXPECT_TRANSCRIPT="$windows_transcript_file" \
@@ -956,10 +966,7 @@ spawn $env(SSHP_EXPECT_SSH) \
     -o ServerAliveCountMax=6 \
     -o TCPKeepAlive=yes \
     -E $env(SSHP_EXPECT_LOG) \
-    -- $env(SSHP_EXPECT_HOST)
-after 2000
-# Replace the Git Bash shell with Zellij so a normal detach closes the SSH PTY.
-send -- "exec zellij attach --create $env(SSHP_EXPECT_SESSION)\r"
+    -- $env(SSHP_EXPECT_HOST) $env(SSHP_EXPECT_COMMAND)
 set detached 0
 set interact_status [catch {
     interact -o -re {(?:Bye from Zellij!|Connection to [^[:space:]]+ closed(?: by remote host)?\.?)} {
@@ -1026,6 +1033,109 @@ exit [lindex $result 3]
     return "$windows_status"
 }
 
+# The Windows session command, byte-for-byte the shape sshp.ps1's
+# Get-WindowsSessionCommand emits: a short `powershell.exe -EncodedCommand`
+# remote command whose script runs the Zellij the PROBE resolved.  Built once,
+# after --check has exited, so --check never depends on it.
+build_windows_session_command() {
+    if [ -z "$windows_zellij_path" ]; then
+        fail 'internal error: no resolved Zellij path from the probe; refusing to start a Windows session'
+    fi
+    # The path is remote-supplied text that becomes a single-quoted PowerShell
+    # literal.  Refuse rather than escape, like the twin: a well-formed resolved
+    # path contains none of these, so a value that does is a resolver defect or a
+    # hostile probe answer, and neither may reshape the command.  CR and LF are
+    # already impossible here -- probe_marker_value strips CR and reads one line
+    # -- so this branch is the twin's guard mirrored for defence in depth, not a
+    # fourth reachable state.
+    case "$windows_zellij_path" in
+        *"'"*)
+            fail 'the resolved Zellij path contains a quote or line break; refusing to build the session command'
+            ;;
+    esac
+    # NOT `[[:cntrl:]]`: in the C locale that class also contains DEL (0x7F),
+    # which the twin's `[\x00-\x1f]` does not -- an over-strict guard is its own
+    # one-sided divergence.  The class is built with printf so the range is the
+    # bytes themselves rather than an escape the local grep may or may not
+    # understand (measured: macOS grep accepts this, `\x` is not portable).
+    windows_path_control_class=$(printf '[\001-\037]')
+    path_control_matches=$(printf '%s\n' "$windows_zellij_path" | LC_ALL=C grep -E -c "$windows_path_control_class") || path_control_matches=0
+    if [ "${path_control_matches:-0}" -gt 0 ]; then
+        fail 'the resolved Zellij path contains a control character; refusing to build the session command'
+    fi
+    # 1024, not a round number of our own choosing: it is the twin's bound, and
+    # the two clients must refuse the same answer.  smoke/19 reads it out of
+    # sshp.ps1 rather than restating it.  The bound is the command-line budget:
+    # this value rides a base64 payload inside a command line sshd TRUNCATES past
+    # the DefaultShell limit (measured 8,125 for powershell.exe).
+    #
+    # The UNIT is the twin's too, and `${#windows_zellij_path}` is not it.  That
+    # counts BYTES under dash (the /bin/sh on Debian/Ubuntu) and under any C
+    # locale, and CODE POINTS under bash with a UTF-8 locale -- one path, three
+    # answers (measured 2026-10-29: a 420-unit CJK path is 1220 bytes; bash
+    # accepted it, dash and LC_ALL=C refused it, the twin accepted it.  600
+    # emoji are 620 code points but 1220 units, so bash ACCEPTED what the twin
+    # refuses).  .NET's String.Length counts UTF-16 CODE UNITS, so this counts
+    # the UTF-16LE bytes and halves them -- the same number, and the unit the
+    # command line actually spends, since the payload is base64 over UTF-16LE at
+    # two bytes per unit.
+    #
+    # NOT `iconv ... >/dev/null` as a validity probe: on macOS that fails with
+    # ENOTTY ("Inappropriate ioctl for device") once the conversion output is
+    # large enough, so a perfectly valid long path reads as invalid (measured
+    # 2026-10-29: 340 CJK chars fine, 360 fail, ASCII of twice the byte count
+    # fine -- the trigger is not simply size).  A pipe or a regular file is
+    # reliable.  Validity is a round trip instead, the same idiom the payload
+    # check below uses: a truncated conversion cannot round-trip, and `wc -c`
+    # on a failed pipeline would otherwise count a PREFIX -- an undercount that
+    # only the payload check would catch, after a raw `iconv:` line had already
+    # reached the user's terminal.
+    command -v iconv >/dev/null 2>&1 || fail 'cannot encode the Windows session command; iconv is required'
+    command -v base64 >/dev/null 2>&1 || fail 'cannot encode the Windows session command; base64 is required'
+    windows_zellij_path_roundtrip=$(printf '%s' "$windows_zellij_path" |
+        iconv -f UTF-8 -t UTF-16LE 2>/dev/null |
+        iconv -f UTF-16LE -t UTF-8 2>/dev/null) || windows_zellij_path_roundtrip=''
+    if [ "$windows_zellij_path_roundtrip" != "$windows_zellij_path" ]; then
+        fail 'the resolved Zellij path is not valid UTF-8; refusing to build the session command'
+    fi
+    windows_zellij_path_utf16_bytes=$(printf '%s' "$windows_zellij_path" | iconv -f UTF-8 -t UTF-16LE | wc -c) ||
+        windows_zellij_path_utf16_bytes=''
+    windows_zellij_path_utf16_bytes=$(printf '%s' "$windows_zellij_path_utf16_bytes" | tr -d '[:space:]')
+    case "$windows_zellij_path_utf16_bytes" in
+        ''|*[!0-9]*)
+            fail 'cannot measure the resolved Zellij path; refusing to build the session command'
+            ;;
+    esac
+    if [ "$((windows_zellij_path_utf16_bytes / 2))" -gt "$windows_zellij_path_limit" ]; then
+        fail "the resolved Zellij path is longer than $windows_zellij_path_limit characters; refusing to build the session command"
+    fi
+
+    # `-Command` would put single quotes on a command line that cmd.exe must
+    # parse; `-EncodedCommand` keeps the whole line to the base64 alphabet, so
+    # the command survives any DefaultShell.  That is the twin's reasoning and
+    # the reason this is not a plain `powershell.exe -Command`.
+    # LF, not CRLF, between the two lines and no trailing newline: measured
+    # 2026-10-29 against `[Convert]::ToBase64String` on the same asset -- the
+    # PowerShell here-string in sshp.ps1 produces exactly this byte string.
+    windows_session_script=$(printf '%s\n%s' \
+        "\$ErrorActionPreference = 'Stop'" \
+        "& '$windows_zellij_path' attach --create '$session'") ||
+        fail 'cannot build the Windows session command'
+    windows_session_payload=$(printf '%s' "$windows_session_script" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n') ||
+        fail 'cannot encode the Windows session command'
+    # An interrupted encode yields SHORTER valid base64, which PowerShell then
+    # runs as a truncated script -- so verify the round trip rather than trust
+    # the exit status.  This is the same reason agentq's POSIX client verifies
+    # UTF-16LE identity before sending (see the 23,210-char truncation in
+    # docs/PLAN.md A21); here the corruption source is the pipeline, not sshd.
+    windows_session_check=$(printf '%s' "$windows_session_payload" | base64 -d 2>/dev/null | iconv -f UTF-16LE -t UTF-8 2>/dev/null) ||
+        windows_session_check=''
+    if [ "$windows_session_check" != "$windows_session_script" ]; then
+        fail 'the encoded Windows session command did not round-trip; refusing to start a Windows session'
+    fi
+    windows_session_command="powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $windows_session_payload"
+}
+
 run_windows_interactive_session() {
     windows_diagnostic_file=$1
 
@@ -1034,39 +1144,28 @@ run_windows_interactive_session() {
         return $?
     fi
 
-    windows_input_pipe="$ssh_runtime_directory/windows-session-input"
-    command -v mkfifo >/dev/null 2>&1 || fail 'mkfifo is required for interactive Windows sessions'
-    runtime_fifo_is_safe "$windows_input_pipe" || fail 'cannot use an unsafe Windows session input pipe'
-    mkfifo "$windows_input_pipe" || fail 'cannot create the Windows session input pipe'
-    require_runtime_fifo "$windows_input_pipe"
-
-    # The Windows SSH server starts Git Bash as its default shell. Send only a
-    # short, validated shell command before forwarding the user's terminal
-    # input; a PowerShell script on a TTY is parsed as interactive input.
-    {
-        # Windows ConPTY accepts the command reliably only when the initial
-        # interactive line uses a Windows-style CRLF terminator.
-        # Replacing Git Bash prevents a detached Zellij client from returning to its shell.
-        printf "exec zellij attach --create '%s'\r\n" "$session"
-        cat
-    } > "$windows_input_pipe" &
-    windows_input_pid=$!
-    require_runtime_fifo "$windows_input_pipe"
+    # The command travels as ssh's REMOTE command, not as a line typed into the
+    # remote shell.  It used to be a FIFO-fed `exec zellij attach --create
+    # '<name>'` on the assumption that the Windows SSH server starts Git Bash as
+    # its default shell -- but SKILL.md records three DefaultShell values, all
+    # three measured on real hosts, and sshd's own default is `cmd.exe`.  That
+    # line asked those shells to run a POSIX builtin (`exec` is not a cmd.exe
+    # command and not a PowerShell one), and asked PATH for `zellij` at the very
+    # moment the probe had just resolved it by absolute path -- the stale
+    # SSH-server PATH the probe's own comment (see prepare_remote) exists to
+    # avoid.  The twin sends an encoded command instead and is not exposed to
+    # either.  Measured 2026-10-29.
     if run_ssh_logged "$windows_diagnostic_file" \
             -tt \
             -o ConnectTimeout=10 \
             -o ServerAliveInterval=10 \
             -o ServerAliveCountMax=6 \
             -o TCPKeepAlive=yes \
-            -- "$host" < "$windows_input_pipe"; then
+            -- "$host" "$windows_session_command"; then
         windows_status=0
     else
         windows_status=$?
     fi
-    kill "$windows_input_pid" 2>/dev/null || true
-    wait "$windows_input_pid" 2>/dev/null || true
-    windows_input_pid=''
-    remove_runtime_fifo "$windows_input_pipe" || true
     return "$windows_status"
 }
 
@@ -1138,6 +1237,27 @@ probe_reports_marker() {
     # pipe, but this file is #!/bin/sh and dash has none.)
     marker_matches=$(printf '%s\n' "$1" | LC_ALL=C tr -d '\r' | LC_ALL=C grep -E -c "$2") || marker_matches=0
     [ "${marker_matches:-0}" -gt 0 ]
+}
+
+probe_marker_value() {
+    # $1 = probe output, $2 = the marker's literal line prefix.  Prints the
+    # FIRST matching line's remainder with surrounding whitespace trimmed, or
+    # nothing -- the twin's `(?m)^<prefix>(.+)$` + `.Trim()`.
+    #
+    # Same CR normalisation as probe_reports_marker (the twin runs
+    # ConvertTo-MarkerText before matching, and a PowerShell answer can arrive
+    # with CRLF through sshd).  Every stage reads to EOF on purpose: `head -n 1`
+    # would exit at the first match and SIGPIPE the writer, which is exactly how
+    # smoke/19 once reported a FOUND marker as absent.
+    #
+    # $2 is a literal prefix (no BRE metacharacters), so it is safe to
+    # interpolate; the VALUE -- which may contain slashes and quotes -- only
+    # ever appears in the pattern space, never in the expression.
+    marker_value_all=$(printf '%s\n' "$1" | LC_ALL=C tr -d '\r' | LC_ALL=C sed -n "s/^$2//p") || marker_value_all=''
+    marker_value_first=$(printf '%s\n' "$marker_value_all" |
+        LC_ALL=C sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' |
+        LC_ALL=C sed -n '1p') || marker_value_first=''
+    printf '%s' "$marker_value_first"
 }
 
 prepare_remote() {
@@ -1220,6 +1340,7 @@ prepare_remote() {
         if probe_output=$(run_windows_remote_command "$probe_diagnostic_file" false "$windows_probe_script"); then
             if probe_reports_marker "$probe_output" '^__SSHP_READY__:Windows$'; then
                 remote_platform=windows
+                windows_zellij_path=$(probe_marker_value "$probe_output" '__SSHP_ZELLIJ__:')
                 return 0
             fi
             printf '%s\n' "$program: remote dependency probe returned an unexpected Windows response." >&2
@@ -1319,6 +1440,12 @@ if [ "$check_only" = true ]; then
         *) fail 'internal error: remote platform was not set by the dependency probe' ;;
     esac
     exit 0
+fi
+
+# Built here, after --check has exited: --check is a read-only probe and must
+# not acquire a dependency on iconv/base64 or on a well-formed resolved path.
+if [ "$remote_platform" = windows ]; then
+    build_windows_session_command
 fi
 
 while :; do

@@ -27,7 +27,8 @@ Git Bash 8,176），且
 固定 76 字符），退出码由 stdout 末尾的 `agentq-exit:<code>` 带外传递；`sshp.ps1` 的 Windows
 探针/安装同型（0.1.16 起，此前 23,210/23,882 字符的 `-EncodedCommand` 会被 sshd **截断**而非
 拒绝，表现为误导性的「probe failed」；它的**会话**因 `-tt` 下 stdin 归多路复用器，走的是探针
-预解析路径 + 短 attach 命令的两段式，见下文 `sshp` 一节）；**操作路径**
+预解析路径 + 短 attach 命令的两段式，见下文 `sshp` 一节——**两份 `sshp` 客户端的会话命令形态
+在 2026-10-29 之前不同，现已统一为同一条 `-EncodedCommand`**）；**操作路径**
 （launcher wrapper）把同一个 token 写到 **stderr**——客户端本就捕获远端 stderr（服务端
 `reason=` 同路），所以无需在 stdin（被 base64 payload 占）与 stdout（是 JSON 响应本身）
 之间取舍。两份客户端各自在**仅限 windows 目标**时以该 token 覆盖 ssh 退出码；unix 目标不发它。
@@ -148,7 +149,7 @@ POSIX 客户端的探针都是单行、不受影响，所以**只有「Windows �
 - Windows 安装器 `Test-PueueConnection` 在允许缺失的路径链校验后再次强制读取 client/config；真正缺失仍返回不可连接，已观察到的 reparse 路径会显式拒绝，不会被 `Test-Path` 误判为缺失后静默跳过。
 - Windows 安装器 `Require-Path` 使用强制项读取区分真正缺失和已存在的 reparse 路径；缺失仍报告缺失，已存在但不安全的路径进入完整路径链校验并显式拒绝。
 - Windows 服务实例由执行安装的 Windows 登录用户持有：其计划任务与私有 ACL 都绑定该身份，启动时还会重新按 SID 注入该用户环境。当前 `C:\ProgramData\AgentQ` 部署一次只支持一个服务身份；另一 Windows SSH 用户不得直接重装或覆盖它。需要切换服务身份时，先确认队列为空、停止原服务并显式迁移或重新部署；这不是客户端的自动动作。
-- 人类交互会话使用 `sshp <ssh-host> [session-name]`；先用 `sshp --check <ssh-host>` 只读检查可用的会话工具。Unix 目标优先使用 `tmux`，随后是 GNU screen 或 Zellij；Windows 目标只使用原生 `zellij.exe`。**Unix 目标的就绪判定只看多路复用器是否存在，不看 `uname -s`**：会话命令是 `exec tmux new-session -A -s '<name>'` 这类可移植 shell，一个有 tmux 的 FreeBSD/SunOS 主机同样可用（实测 2026-10-28：旧实现的白名单排在就绪判断之前，`FreeBSD + tmux` 被报成 127「去装 tmux」而该机已经装了）。两份客户端内嵌的探针与安装脚本**逐字节相同**——Unix 目标那一对与 Windows 目标那一对（解析器前奏、探针尾、安装尾三段）各自都是如此，由 `smoke/19` 逐字节 `cmp` 钉住；漂移是**检测**出来的，不是靠共享机制消除的（两份副本仍各自内嵌）。首个连接发现依赖缺失时才询问是否通过受支持的包管理器安装，`--check` 永不安装，安装期间的 SSH 中断也绝不自动重放。Windows 目标的会话是**两段式**：`--check`/连接时的探针在 `__SSHP_READY__` 之后额外上报解析到的 `zellij.exe` 路径，会话命令只携带 `attach --create`（命令行因此很短——远端 `DefaultShell` 的截断上限见上文）。该路径来自远端应答，含引号、换行、控制字符或超过 1024 字符时客户端**拒绝启动会话**而不是转义拼接。
+- 人类交互会话使用 `sshp <ssh-host> [session-name]`；先用 `sshp --check <ssh-host>` 只读检查可用的会话工具。Unix 目标优先使用 `tmux`，随后是 GNU screen 或 Zellij；Windows 目标只使用原生 `zellij.exe`。**Unix 目标的就绪判定只看多路复用器是否存在，不看 `uname -s`**：会话命令是 `exec tmux new-session -A -s '<name>'` 这类可移植 shell，一个有 tmux 的 FreeBSD/SunOS 主机同样可用（实测 2026-10-28：旧实现的白名单排在就绪判断之前，`FreeBSD + tmux` 被报成 127「去装 tmux」而该机已经装了）。两份客户端内嵌的探针与安装脚本**逐字节相同**——Unix 目标那一对与 Windows 目标那一对（解析器前奏、探针尾、安装尾三段）各自都是如此，由 `smoke/19` 逐字节 `cmp` 钉住；漂移是**检测**出来的，不是靠共享机制消除的（两份副本仍各自内嵌）。首个连接发现依赖缺失时才询问是否通过受支持的包管理器安装，`--check` 永不安装，安装期间的 SSH 中断也绝不自动重放。Windows 目标的会话是**两段式**：`--check`/连接时的探针在 `__SSHP_READY__` 之后额外上报解析到的 `zellij.exe` 路径，会话命令只携带 `attach --create`（命令行因此很短——远端 `DefaultShell` 的截断上限见上文）。该路径来自远端应答，含引号、换行、控制字符或超过 **1024 个 UTF-16 码元**时客户端**拒绝启动会话**而不是转义拼接（上界按码元计，与 Windows 侧的 `String.Length` 同一个数；**不是**字符数也不是字节数——同一个路径在不同 shell/locale 下这两个数都不同，实测 1220 字节的 CJK 路径是 420 码元）。**两份客户端的会话命令现在是同一条**（2026-10-29 修）：都以探针报回的**绝对路径**构造 `powershell.exe … -EncodedCommand <UTF-16LE base64>` 作为 ssh 的**远端命令**发送，`smoke/19` 把两侧对同一输入的产物逐字节互比，并把该函数从 `sshp.ps1` 里按花括号深度抽出后用 pwsh 真跑一次作独立判据。此前 POSIX 侧是把 `exec zellij attach --create '<名字>'` 写进 FIFO 交给远端 shell——**它假定 `DefaultShell` 是 Git Bash**，而 OpenSSH 的默认是 `cmd.exe`（`exec` 不是它的命令），且**裸名字**会在探针刚用绝对路径绕开的陈旧 PATH 上再查一次（客户端自己的 winget 安装流程正好制造这个状态）。**会话本身的运行时从未在真机上验证过**（`-tt` 下该命令行是否被三种 `DefaultShell` 各自接受）——改的是构造，验的也是构造。
 
 ## 协议
 
