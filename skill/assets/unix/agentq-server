@@ -5804,16 +5804,40 @@ doctor() {
     # the historical full queue JSON for callers that inspect per-task agentq
     # metadata.  The version diagnostic lines on stderr are unchanged.
     local doctor_mode=${1:-}
+    local pueue_version_output pueued_version_output
     printf 'agentq=' >&2
     printf '%s\n' "$agentq_version" >&2
-    printf 'pueue=' >&2
-    # `|| printf`: a binary that exists but cannot execute (corrupt, wrong ABI)
-    # must not leak its own status as the server's exit code -- doctor is the
-    # documented first call on a new host, and the contract says this program
-    # only ever exits 0-6.  require_executable checks -x, not runnability.
-    "$pueue_bin" --version >&2 || printf '%s\n' 'unavailable' >&2
-    printf 'pueued=' >&2
-    "$pueued_bin" --version >&2 || printf '%s\n' 'unavailable' >&2
+    # These two lines write the machine-readable `key=value` pairs this check
+    # exists to publish, so each must be EXACTLY `pueue=<value>` -- one line,
+    # nothing else.  The value is the probe's STDOUT when it answers (measured:
+    # real pueue 4.0.4 and pueued 4.0.4 both write to stdout and nothing to
+    # stderr), and the literal `unavailable` otherwise.
+    #
+    # `-x` is a PERMISSION, not a promise, and an earlier form learned that the
+    # hard way.  `"$pueue_bin" --version >&2 || printf '%s\n' 'unavailable' >&2`
+    # assumed a failing probe prints nothing; when the file is 0755 but cannot
+    # be launched -- plain text, a shebang naming a missing interpreter, a
+    # shebang ending in CR -- the SHELL prints its own diagnostic on STDERR,
+    # which is the very stream these lines write to.  Measured 2026-10-30,
+    # doctor emitted
+    #   pueue=<path>/pueue: line 1: not: command not found
+    #   unavailable
+    # so a parser reading `^pueue=` got shell noise, and `unavailable` -- the
+    # value the contract reserves for this case -- was orphaned one line below,
+    # prefixed by nothing.  Capturing into a variable and printing it once fixes
+    # the whole class rather than the observed shapes: whatever the probe does,
+    # exactly one `key=value` line is written.  `|| true` keeps a non-zero probe
+    # from tripping `set -e`; the probe's own exit code is not part of this
+    # contract.  `2>/dev/null` on the probe is safe for the reason above: the
+    # answer comes on stdout, so discarding stderr discards only the shell's
+    # exec complaint, which the `unavailable` fallback already reports.
+    # Do NOT solve this by probing runnability in require_executable instead: it
+    # runs on EVERY server call, and `status` is the hot path -- see
+    # docs/performance.md.
+    pueue_version_output=$("$pueue_bin" --version 2>/dev/null) || true
+    printf 'pueue=%s\n' "${pueue_version_output:-unavailable}" >&2
+    pueued_version_output=$("$pueued_bin" --version 2>/dev/null) || true
+    printf 'pueued=%s\n' "${pueued_version_output:-unavailable}" >&2
 
     case "$platform_kind" in
         windows)
