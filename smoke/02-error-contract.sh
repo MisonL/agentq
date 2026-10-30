@@ -164,6 +164,87 @@ for pueue_shape in text missing-interpreter crlf-shebang; do
     esac
 done
 
+# The SAME class in the Linux arm of the same version block.  `platform` is
+# `uname -s` at the top of the file, so this arm is reachable on any host by
+# shadowing `uname`; the probes (systemctl/loginctl) are shadowed the same way, so no real
+# service is ever consulted and nothing is started.  Pre-fix the block had the
+# pueue= shape again -- `printf 'systemd_user_service=' >&2; systemctl ... >&2
+# || true` -- which appended the probe's STDERR onto the key line.  Measured
+# 2026-10-30 (this host, uname shadowed to Linux, no systemctl on PATH):
+#   systemd_user_service=<path>/agentq-server: line N: systemctl: command not found
+# and with a present-but-unusable systemctl:
+#   systemd_user_service=Failed to connect to bus: No such file or directory
+# A non-zero exit is NOT "no answer" here: `systemctl --user is-active` writes
+# active/inactive/failed to STDOUT and exits 3 for an inactive unit, so the
+# stdout answer must survive whatever the status -- the `unavailable` fallback
+# is for "no stdout", not for "non-zero".  Assert both directions.
+linux_shim="$work/linux-shim"
+mkdir -p "$linux_shim"
+printf '#!/bin/sh\nprintf "Linux\\n"\n' > "$linux_shim/uname"
+chmod 700 "$linux_shim/uname"
+
+# systemd_case <shape> <expected-user-service> <expected-linger>
+systemd_case() {
+    local shape=$1 expected_user=$2 expected_linger=$3
+    case "$shape" in
+        healthy)
+            printf '#!/bin/sh\nprintf "active\\n"\n' > "$linux_shim/systemctl"
+            printf '#!/bin/sh\nprintf "yes\\n"\n' > "$linux_shim/loginctl" ;;
+        inactive-stdout)
+            # Non-zero exit WITH the answer on stdout (systemd's is-active
+            # returns 3 for an inactive unit): the value must still be taken.
+            printf '#!/bin/sh\nprintf "inactive\\n"\nexit 3\n' > "$linux_shim/systemctl"
+            printf '#!/bin/sh\nprintf "no\\n"\n' > "$linux_shim/loginctl" ;;
+        bus-error)
+            printf '#!/bin/sh\nprintf "Failed to connect to bus: No such file or directory\\n" >&2\nexit 1\n' > "$linux_shim/systemctl"
+            printf '#!/bin/sh\nprintf "Failed to connect to bus: No such file or directory\\n" >&2\nexit 1\n' > "$linux_shim/loginctl" ;;
+        unlaunchable)
+            # 0755 regular file of plain text: `-x` says yes, exec fails, and
+            # the SHELL writes the diagnostic.  Same shape as the pueue= loop.
+            printf 'not a binary\n' > "$linux_shim/systemctl"
+            printf 'not a binary\n' > "$linux_shim/loginctl" ;;
+    esac
+    chmod 700 "$linux_shim/systemctl" "$linux_shim/loginctl"
+    cases=$((cases + 1))
+    server_status=0
+    PATH="$linux_shim:$PATH" "$server" doctor \
+        >"$work/systemd-$shape.stdout" 2>"$work/systemd-$shape.stderr" || server_status=$?
+    local pair key expected count actual
+    for pair in "systemd_user_service=$expected_user" "systemd_linger=$expected_linger"; do
+        key=${pair%%=*}
+        expected=${pair#*=}
+        count=$(grep -c "^$key=" "$work/systemd-$shape.stderr" || true)
+        if [ "$count" -ne 1 ]; then
+            printf 'systemd-version-block [%s]: expected exactly one %s= line, found %s\n' \
+                "$shape" "$key" "$count" >&2
+            failures=$((failures + 1))
+            continue
+        fi
+        if ! grep -qxF "$key=$expected" "$work/systemd-$shape.stderr"; then
+            actual=$(grep "^$key=" "$work/systemd-$shape.stderr" | head -1)
+            printf 'systemd-version-block [%s]: %s is `%s`, expected `%s=%s`\n' \
+                "$shape" "$key" "$actual" "$key" "$expected" >&2
+            failures=$((failures + 1))
+        fi
+    done
+    if grep -qE ': line [0-9]+:|bad interpreter|cannot execute|command not found|Failed to connect to bus' \
+        "$work/systemd-$shape.stderr"; then
+        printf 'systemd-version-block [%s]: a raw probe diagnostic reached doctor stderr: %s\n' \
+            "$shape" "$(head -3 "$work/systemd-$shape.stderr" | tr '\n' '|')" >&2
+        failures=$((failures + 1))
+    fi
+    case "$server_status" in
+        0|2) ;;
+        *)  printf 'systemd-version-block [%s]: doctor exited %s, outside the documented 0-6 contract\n' \
+                "$shape" "$server_status" >&2
+            failures=$((failures + 1)) ;;
+    esac
+}
+systemd_case healthy          active   yes
+systemd_case inactive-stdout  inactive no
+systemd_case bus-error        unavailable unavailable
+systemd_case unlaunchable     unavailable unavailable
+
 # A malformed Pueue status must NOT surface as exit 5.  The contract reserves 5
 # for a REMOVED task; but compact_status's jq filter ends in
 # error("invalid visible Pueue task metadata"), and jq exits 5 on error() -- so
