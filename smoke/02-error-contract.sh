@@ -245,6 +245,147 @@ systemd_case inactive-stdout  inactive no
 systemd_case bus-error        unavailable unavailable
 systemd_case unlaunchable     unavailable unavailable
 
+# The SAME class in the WINDOWS arm of the same version block -- the third and
+# last of the three, and the one PLAN.md had recorded as "no platform to
+# measure".  That was right about the FAILURE mode being unmeasurable (macOS
+# has no Get-ScheduledTask) but wrong about reachability: the arm is entered by
+# shadowing `uname -s` (-> MINGW64) AND `cygpath` AND `powershell.exe`, exactly
+# as the Linux arm is entered by shadowing `uname`.  No real service is
+# consulted and nothing is started -- every probe is a stub.  Pre-fix the block
+# wrote the KEY (`printf 'scheduled_task=' >&2`, no newline) and the probe's
+# stdout to the SAME stream, so a failing probe's own text landed ON the key
+# line, and a quietly-failing probe made the human advisory the value.  Measured
+# 2026-10-31 (this host, arm reached by the three shadows above):
+#   scheduled_task=Get-ScheduledTask : No MSFT_ScheduledTask objects found ...
+#   scheduled_task=<program>: scheduled startup task is unavailable; ...
+# Assert one `scheduled_task=` line: the JSON on success, `unavailable` on any
+# failure, never raw probe text, exit inside 0-6.
+windows_shim="$work/windows-shim"
+mkdir -p "$windows_shim"
+printf '#!/bin/sh\nprintf "MINGW64_NT-10.0\\n"\n' > "$windows_shim/uname"
+# The two cygpath shapes the server uses before doctor: -u (profile -> POSIX
+# home at resolve time) and -aw (path -> windows form at dispatch time).
+printf '#!/bin/sh\ncase "$1" in\n  -u) printf "/c/stub/aquser\\n" ;;\n  *) printf "%%s\\n" "${2:-$1}" ;;\nesac\n' > "$windows_shim/cygpath"
+chmod 700 "$windows_shim/uname" "$windows_shim/cygpath"
+# The Windows arm also needs the two launcher binaries and the durable-move
+# helper, plus the v2 request-layout marker -- all reached before doctor's
+# version block.  pueue/pueued are the same stub shape the pueue= cases use.
+printf '#!/bin/sh\nprintf "pueue 4.0.4\\n"\n' > "$work/pueue.exe"
+printf '#!/bin/sh\nprintf "pueued 4.0.4\\n"\n' > "$work/pueued.exe"
+chmod 700 "$work/pueue.exe" "$work/pueued.exe"
+# The layout marker the server writes on first unix doctor run.
+printf 'v2\n' > "$work/runtime/agentq-request-tombstones-v2"
+chmod 700 "$work/runtime/agentq-request-tombstones-v2"
+printf 'placeholder\n' > "$work/agentq-durable-move.ps1"
+
+# scheduled_task_case <shape> <expected-value-or-JSON>
+#
+# Shapes ok / err-stderr / quiet-fail assert the fixed line's contract.  Shape
+# unlaunchable asserts the GATE: a powershell.exe that `-x` accepts but the
+# kernel cannot exec makes the server exit 2 during profile resolution, BEFORE
+# any version-block line exists -- there is no scheduled_task= line to leak on.
+scheduled_task_case() {
+    local shape=$1 expected=$2
+    # The stub must answer BOTH powershell.exe calls the Windows branch makes:
+    # resolve_windows_user_environment (-Command '<big script>') and doctor's
+    # version block (-Command "Get-ScheduledTask ...").  A stub that answers
+    # only the second dies on the first, before doctor runs at all.
+    local resolve_json='{"identity":"STUB\\aquser","user_name":"aquser","profile":"C:\\Users\\aquser","app_data":"C:\\Users\\aquser\\AppData\\Roaming","local_app_data":"C:\\Users\\aquser\\AppData\\Local","temp":"C:\\Users\\aquser\\AppData\\Local\\Temp","path":"C:\\Windows\\System32;C:\\Program Files\\Git\\cmd","pathext":".COM;.EXE;.BAT;.CMD","comspec":"C:\\Windows\\System32\\cmd.exe","system_root":"C:\\Windows","system_drive":"C:","windir":"C:\\Windows","home_drive":"C:","home_path":"\\Users\\aquser"}'
+    local task_json='{"TaskName":"AgentQ Pueued","State":3}'
+    local scheduled_line
+    case "$shape" in
+        ok)
+            # The success answer is GENERATED, not hand-quoted: writing it as
+            # 'printf ''<json>''\n' does not embed quotes -- bash treats `''`
+            # as two empty strings, so the stub gets the JSON unquoted and its
+            # shell brace-expands `{a,b}` into garbage before printf runs.
+            scheduled_line=$(printf "  *Get-ScheduledTask*) printf '%%s\\\\n' %s ;;" "'$task_json'")
+            ;;
+        err-stderr)
+            # Failure WITH text on the ERROR stream -- what a real failing
+            # cmdlet does (measured on pwsh 7.5: stderr 94 B, stdout 0).
+            scheduled_line='  *Get-ScheduledTask*) printf "Get-ScheduledTask : No MSFT_ScheduledTask objects found\n" >&2; exit 1 ;;'
+            ;;
+        quiet-fail)
+            # Failure with NO output at all: the old form made the advisory
+            # itself the value.
+            scheduled_line='  *Get-ScheduledTask*) exit 1 ;;'
+            ;;
+        unlaunchable)
+            # 0755 regular file of plain text: `-x` says yes, exec fails, the
+            # SHELL writes the diagnostic.  This is the WHOLE stub -- neither
+            # call can be answered, so the profile resolution must fail first.
+            printf 'not a binary\n' > "$windows_shim/powershell.exe"
+            chmod 700 "$windows_shim/powershell.exe"
+            cases=$((cases + 1))
+            server_status=0
+            MSYSTEM=MINGW64 PATH="$windows_shim:$PATH" "$server" doctor \
+                >"$work/schtask-$shape.stdout" 2>"$work/schtask-$shape.stderr" || server_status=$?
+            if [ "$server_status" -ne 2 ]; then
+                printf 'scheduled-task-block [%s]: expected exit 2 (profile resolution fails first), got %s\n' \
+                    "$shape" "$server_status" >&2
+                failures=$((failures + 1))
+            fi
+            if ! grep -qF 'unable to resolve the current Windows user profile' "$work/schtask-$shape.stderr"; then
+                printf 'scheduled-task-block [%s]: stderr does not carry the profile-resolution diagnosis\n' "$shape" >&2
+                failures=$((failures + 1))
+            fi
+            if [ "$(grep -c '^scheduled_task=' "$work/schtask-$shape.stderr" || true)" -ne 0 ]; then
+                printf 'scheduled-task-block [%s]: a scheduled_task= line exists although doctor never reached the version block\n' "$shape" >&2
+                failures=$((failures + 1))
+            fi
+            return 0
+            ;;
+    esac
+    {
+        printf '#!/bin/sh\n'
+        printf 'case "$*" in\n'
+        printf '%s\n' "$scheduled_line"
+        # The resolve format string must be quoted INSIDE the stub: unquoted
+        # `%s\n` loses the backslash to the stub shell's quote removal, so
+        # printf sees `%sn` -- the JSON gains a stray trailing `n` and loses
+        # its newline, and the server's jq parse fails before doctor runs.
+        printf "  *) printf '%%s\\\\n' %s ;;\n" "'$resolve_json'"
+        printf 'esac\n'
+    } > "$windows_shim/powershell.exe"
+    chmod 700 "$windows_shim/powershell.exe"
+    scheduled_task_assert "$shape" "$expected"
+}
+
+scheduled_task_assert() {
+    local shape=$1 expected=$2
+    cases=$((cases + 1))
+    server_status=0
+    MSYSTEM=MINGW64 PATH="$windows_shim:$PATH" "$server" doctor \
+        >"$work/schtask-$shape.stdout" 2>"$work/schtask-$shape.stderr" || server_status=$?
+    local count
+    count=$(grep -c '^scheduled_task=' "$work/schtask-$shape.stderr" || true)
+    if [ "$count" -ne 1 ]; then
+        printf 'scheduled-task-block [%s]: expected exactly one scheduled_task= line, found %s\n' \
+            "$shape" "$count" >&2
+        failures=$((failures + 1))
+    elif ! grep -qxF "scheduled_task=$expected" "$work/schtask-$shape.stderr"; then
+        printf 'scheduled-task-block [%s]: scheduled_task is `%s`, expected `scheduled_task=%s`\n' \
+            "$shape" "$(grep '^scheduled_task=' "$work/schtask-$shape.stderr" | head -1)" "$expected" >&2
+        failures=$((failures + 1))
+    fi
+    if grep -qE 'MSFT_ScheduledTask|Get-ScheduledTask :|: line [0-9]+:|command not found' "$work/schtask-$shape.stderr"; then
+        printf 'scheduled-task-block [%s]: a raw probe diagnostic reached doctor stderr: %s\n' \
+            "$shape" "$(head -3 "$work/schtask-$shape.stderr" | tr '\n' '|')" >&2
+        failures=$((failures + 1))
+    fi
+    case "$server_status" in
+        0|2) ;;
+        *)  printf 'scheduled-task-block [%s]: doctor exited %s, outside the documented 0-6 contract\n' \
+                "$shape" "$server_status" >&2
+            failures=$((failures + 1)) ;;
+    esac
+}
+scheduled_task_case ok          '{"TaskName":"AgentQ Pueued","State":3}'
+scheduled_task_case err-stderr  unavailable
+scheduled_task_case quiet-fail  unavailable
+scheduled_task_case unlaunchable unavailable
+
 # A malformed Pueue status must NOT surface as exit 5.  The contract reserves 5
 # for a REMOVED task; but compact_status's jq filter ends in
 # error("invalid visible Pueue task metadata"), and jq exits 5 on error() -- so
