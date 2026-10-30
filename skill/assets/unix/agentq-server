@@ -5805,6 +5805,7 @@ doctor() {
     # metadata.  The version diagnostic lines on stderr are unchanged.
     local doctor_mode=${1:-}
     local pueue_version_output pueued_version_output
+    local systemd_user_service_output systemd_linger_output
     printf 'agentq=' >&2
     printf '%s\n' "$agentq_version" >&2
     # These two lines write the machine-readable `key=value` pairs this check
@@ -5851,10 +5852,26 @@ doctor() {
         unix)
             case "$platform" in
                 Linux*)
-                    printf 'systemd_user_service=' >&2
-                    systemctl --user is-active agentq-pueued.service >&2 || true
-                    printf 'systemd_linger=' >&2
-                    loginctl show-user "$(id -un)" -p Linger --value >&2 || true
+                    # Same class as pueue=/pueued= above, and the same fix: these
+                    # are machine-readable `key=value` lines, so the value must
+                    # never be a probe's raw stream.  The original form --
+                    # `printf 'systemd_user_service=' >&2; systemctl ... >&2 ||
+                    # true` -- appended whatever the probe wrote to stderr onto
+                    # the key line.  Measured 2026-10-30 on the Linux branch
+                    # (reached by shadowing `uname -s`; see smoke/02):
+                    #   systemd_user_service=<path>: line N: systemctl: command not found
+                    #   systemd_user_service=Failed to connect to bus: No such file or directory
+                    # A non-zero exit does NOT mean "no answer" here:
+                    # `systemctl --user is-active` writes active/inactive/failed
+                    # to STDOUT and exits 3 for an inactive unit, so the stdout
+                    # answer must be kept whatever the status.  Capture stdout,
+                    # drop stderr (the shell's exec complaint or systemd's bus
+                    # error -- `unavailable` already reports that), and print
+                    # exactly one key=value line.
+                    systemd_user_service_output=$(systemctl --user is-active agentq-pueued.service 2>/dev/null) || true
+                    printf 'systemd_user_service=%s\n' "${systemd_user_service_output:-unavailable}" >&2
+                    systemd_linger_output=$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null) || true
+                    printf 'systemd_linger=%s\n' "${systemd_linger_output:-unavailable}" >&2
                     ;;
                 Darwin*)
                     printf 'launchd_service=' >&2
