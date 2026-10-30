@@ -5806,6 +5806,7 @@ doctor() {
     local doctor_mode=${1:-}
     local pueue_version_output pueued_version_output
     local systemd_user_service_output systemd_linger_output
+    local scheduled_task_output scheduled_task_status
     printf 'agentq=' >&2
     printf '%s\n' "$agentq_version" >&2
     # These two lines write the machine-readable `key=value` pairs this check
@@ -5842,10 +5843,33 @@ doctor() {
 
     case "$platform_kind" in
         windows)
-            printf 'scheduled_task=' >&2
-            if powershell.exe -NoProfile -NonInteractive -Command "Get-ScheduledTask -TaskName 'AgentQ Pueued' -ErrorAction Stop | Select-Object TaskName,State | ConvertTo-Json -Compress" >&2; then
-                :
-            else
+            # Same class as pueue=/pueued= and the systemd lines: this is a
+            # machine-readable key=value line, yet the old form wrote the KEY
+            # with a bare `printf 'scheduled_task=' >&2` (no newline), sent the
+            # probe's stdout to the SAME stream (`... >&2`), and on failure
+            # appended a human advisory there too.  Three writers, one stream,
+            # one unterminated key -- so a failing probe's raw error text landed
+            # ON the key line.  Measured (this host, Windows arm reached by
+            # shadowing `uname`/`cygpath`/`powershell.exe`; see smoke/02):
+            #   scheduled_task=Get-ScheduledTask : No MSFT_ScheduledTask objects found ...
+            # and, when the probe failed quietly, the advisory itself became the
+            # value: `scheduled_task=<program>: scheduled startup task is
+            # unavailable; ...`.  Unlike `systemctl --user is-active` this probe
+            # has no documented "answer on stdout with a non-zero exit" contract
+            # - `-ErrorAction Stop` means success exits 0 - so the value is the
+            # probe's stdout ONLY when it succeeded.  Capture stdout, drop stderr
+            # (a failing cmdlet writes its records to the ERROR stream --
+            # measured on pwsh 7.5: 94 bytes on stderr, 0 on stdout), and print
+            # exactly one line.  The advisory stays on STDERR as its own line
+            # so a `2>/dev/null` caller never reads a human sentence as a value.
+            scheduled_task_output=''
+            scheduled_task_status=0
+            scheduled_task_output=$(powershell.exe -NoProfile -NonInteractive -Command "Get-ScheduledTask -TaskName 'AgentQ Pueued' -ErrorAction Stop | Select-Object TaskName,State | ConvertTo-Json -Compress" 2>/dev/null) || scheduled_task_status=$?
+            if [ "$scheduled_task_status" -ne 0 ]; then
+                scheduled_task_output=''
+            fi
+            printf 'scheduled_task=%s\n' "${scheduled_task_output:-unavailable}" >&2
+            if [ -z "$scheduled_task_output" ]; then
                 printf '%s: scheduled startup task is unavailable; on-demand daemon startup remains available\n' "$program" >&2
             fi
             ;;
