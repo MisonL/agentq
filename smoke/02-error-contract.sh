@@ -109,6 +109,61 @@ if grep -qE 'is a directory|: line [0-9]+:' "$work/pueue-dir.stderr"; then
     failures=$((failures + 1))
 fi
 
+# The guard above catches a DIRECTORY, because `-f` rejects it before anything
+# execs.  It does not catch the three shapes where `-x` says yes and exec still
+# fails -- a 0755 regular file of plain text, a script whose interpreter is
+# missing, and a shebang ending in CR -- because those pass both `-f` and `-x`.
+# Measured 2026-10-30 (before the fix): doctor printed the SHELL's diagnostic
+# inside the machine-readable version block --
+#   pueue=/tmp/x/pueue: line 1: not: command not found
+#   unavailable
+# -- so the `pueue=` line carried shell noise instead of a value, and
+# `unavailable` (the documented marker for exactly this case) was orphaned on
+# the next line.  Same for `pueued=`.  The guard is in doctor's version block;
+# assert all three shapes and both binaries, and require the fallback to land on
+# the `key=` line where a parser will find it.
+for pueue_shape in text missing-interpreter crlf-shebang; do
+    case "$pueue_shape" in
+        text)                printf 'not a binary\n' > "$work/pueue" ;;
+        missing-interpreter) printf '#!/nonexistent/interpreter\nexit 0\n' > "$work/pueue" ;;
+        crlf-shebang)        printf '#!/bin/sh\r\nexit 0\r\n' > "$work/pueue" ;;
+    esac
+    chmod 700 "$work/pueue"
+    cp "$work/pueue" "$work/pueued"
+    cases=$((cases + 1))
+    server_status=0
+    "$server" doctor >"$work/pueue-$pueue_shape.stdout" 2>"$work/pueue-$pueue_shape.stderr" || server_status=$?
+    # Restore a working stub before the assertions, so a failure here cannot
+    # cascade into every later case that needs a launcher.
+    printf '#!/bin/sh\nprintf "pueue 4.0.4\\n"\n' > "$work/pueue"
+    printf '#!/bin/sh\nprintf "pueued 4.0.4\\n"\n' > "$work/pueued"
+    chmod 700 "$work/pueue" "$work/pueued"
+    if ! grep -qxF 'pueue=unavailable' "$work/pueue-$pueue_shape.stderr"; then
+        printf 'pueue-unlaunchable [%s]: the pueue= line is not the documented fallback: %s\n' \
+            "$pueue_shape" "$(sed -n '/^pueue=/p' "$work/pueue-$pueue_shape.stderr" | head -1)" >&2
+        failures=$((failures + 1))
+    fi
+    if ! grep -qxF 'pueued=unavailable' "$work/pueue-$pueue_shape.stderr"; then
+        printf 'pueue-unlaunchable [%s]: the pueued= line is not the documented fallback: %s\n' \
+            "$pueue_shape" "$(sed -n '/^pueued=/p' "$work/pueue-$pueue_shape.stderr" | head -1)" >&2
+        failures=$((failures + 1))
+    fi
+    if grep -qE ': line [0-9]+:|bad interpreter|cannot execute|command not found' "$work/pueue-$pueue_shape.stderr"; then
+        printf 'pueue-unlaunchable [%s]: a raw shell diagnostic reached doctor stderr: %s\n' \
+            "$pueue_shape" "$(head -2 "$work/pueue-$pueue_shape.stderr" | tr '\n' '|')" >&2
+        failures=$((failures + 1))
+    fi
+    # The exit code must still be inside the documented contract: doctor may
+    # legitimately fail (no real daemon here), but it must fail as 2, never as
+    # the shell's own 126/127.
+    case "$server_status" in
+        0|2) ;;
+        *)  printf 'pueue-unlaunchable [%s]: doctor exited %s, outside the documented 0-6 contract\n' \
+                "$pueue_shape" "$server_status" >&2
+            failures=$((failures + 1)) ;;
+    esac
+done
+
 # A malformed Pueue status must NOT surface as exit 5.  The contract reserves 5
 # for a REMOVED task; but compact_status's jq filter ends in
 # error("invalid visible Pueue task metadata"), and jq exits 5 on error() -- so
