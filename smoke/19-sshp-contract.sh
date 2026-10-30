@@ -250,6 +250,77 @@ if grep -qF 'remote dependency probe failed' "$work/err"; then
     failures=$((failures + 1))
 fi
 
+# `[ -x ]` is a PERMISSION, not a promise: it says the file MAY be executed, not
+# that it CAN be.  The directory above was only the first shape of that gap.
+# Three ordinary files pass the regular-file rule AND `-x` and then make the
+# SHELL -- not the tool -- report a failure on every call: a 0755 file of plain
+# text, a script whose interpreter does not exist, and a script whose shebang
+# line ends in CR.  Before 2026-10-30 all three surfaced as exit 126/127 with
+# "remote dependency probe failed for both Unix and Windows shells" -- outside
+# the documented contract, and blaming the REMOTE host for a LOCAL
+# misconfiguration.  The Windows twin refuses the same configuration with exit 2
+# and "SSHP_SSH cannot be launched" (smoke/12).
+#
+# POSIX has no "would exec(2) succeed" primitive, so the client probes by
+# RUNNING the file (`-V`, no connection) and refuses only when the shell's own
+# 126/127 comes back.  The three shapes are generated here, not committed.
+launch_shape_cases=0
+for launch_shape in text missing-interpreter crlf-shebang; do
+    case "$launch_shape" in
+        text)                printf 'not an executable\n' > "$work/ssh-$launch_shape" ;;
+        missing-interpreter) printf '#!/nonexistent/interpreter\nexec /usr/bin/ssh "$@"\n' > "$work/ssh-$launch_shape" ;;
+        crlf-shebang)        printf '#!/bin/sh\r\nexec /usr/bin/ssh "$@"\r\n' > "$work/ssh-$launch_shape" ;;
+    esac
+    chmod 755 "$work/ssh-$launch_shape"
+    cases=$((cases + 1)); launch_shape_cases=$((launch_shape_cases + 1))
+    if SSHP_STUB_DIR="$stub_dir" SSHP_SSH="$work/ssh-$launch_shape" HOME="$home" TMPDIR="$work/tmp" \
+            PATH="$work/bin:/usr/bin:/bin" \
+            /bin/sh "$client" --check smoke-host >"$work/out" 2>"$work/err"; then status=0; else status=$?; fi
+    if [ "$status" -ne 2 ] || ! grep -qF 'SSHP_SSH cannot be launched' "$work/err"; then
+        printf 'sshp-contract: SSHP_SSH=%s: expected exit 2 naming the launch failure, got %s [%s]\n' \
+            "$launch_shape" "$status" "$(head -1 "$work/err")" >&2
+        failures=$((failures + 1))
+    fi
+    if grep -qF 'remote dependency probe failed' "$work/err"; then
+        printf 'sshp-contract: SSHP_SSH=%s: the failure was blamed on the remote host\n' "$launch_shape" >&2
+        failures=$((failures + 1))
+    fi
+done
+
+# The other direction, and the load-bearing one: a file that DOES run must never
+# be refused, even when the remote command fails with the same 126/127 the shell
+# uses for its own exec failures.  The fixture is a working script that answers
+# `-V` the way real OpenSSH does (exit 0) and every other call with 127, which is
+# exactly what a missing remote dependency looks like.  A refusal keyed on the
+# status alone -- "anything 126/127 is a local launch failure" -- passes every
+# case above and fails here.
+cat > "$work/ssh-remote-127" <<'STUB'
+#!/bin/sh
+case "$1" in
+    -V) printf '%s\n' 'OpenSSH_9.9p1, LibreSSL 3.3.6' >&2; exit 0 ;;
+esac
+exit 127
+STUB
+chmod 755 "$work/ssh-remote-127"
+cases=$((cases + 1)); launch_shape_cases=$((launch_shape_cases + 1))
+if SSHP_STUB_DIR="$stub_dir" SSHP_SSH="$work/ssh-remote-127" HOME="$home" TMPDIR="$work/tmp" \
+        PATH="$work/bin:/usr/bin:/bin" \
+        /bin/sh "$client" --check smoke-host >"$work/out" 2>"$work/err"; then status=0; else status=$?; fi
+if [ "$status" -ne 127 ] || ! grep -qF 'remote dependency probe failed' "$work/err"; then
+    printf 'sshp-contract: a working ssh whose remote probe exits 127: expected the remote-blame verdict at exit 127, got %s [%s]\n' \
+        "$status" "$(head -1 "$work/err")" >&2
+    failures=$((failures + 1))
+fi
+if grep -qF 'cannot be launched' "$work/err"; then
+    printf '%s\n' 'sshp-contract: a working ssh whose remote probe exits 127 was refused as a local launch failure' >&2
+    failures=$((failures + 1))
+fi
+if [ "$launch_shape_cases" -lt 4 ]; then
+    printf 'sshp-contract: the launch-shape block ran only %s case(s) (expected 4)\n' \
+        "$launch_shape_cases" >&2
+    failures=$((failures + 1))
+fi
+
 # ---------------------------------------------------------------------------
 # --help is a success path and must not touch ssh.
 # ---------------------------------------------------------------------------

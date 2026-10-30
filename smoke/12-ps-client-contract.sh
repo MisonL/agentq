@@ -977,19 +977,35 @@ else
 fi
 # Same for the regular-file guard this round added: widen `! -f` to `! -e` in a
 # copy (a directory IS `-e`) and require the executable row to disagree.
+#
+# 2026-10-30: that mutation ALONE stopped being able to change the answer, and
+# the way it failed is the point.  The launch-probe fix (0.1.19, the same round)
+# added a SECOND independent guard for the same input -- `[ -x ]` passes a
+# directory, so the client runs it and the shell answers 126, which the probe
+# turns into `cannot be launched` + exit 2 -- so a copy with only the
+# regular-file guard removed still exits 2 and still agrees with the Windows
+# twin.  Measured: single mutant posix=2 windows=2 (the self-test as it stood);
+# BOTH guards removed posix=126 windows=2.  Two guards, one of which alone
+# covers the row, is defence in depth working -- not a rubber stamp.  The
+# mutation therefore reproduces the whole PRE-FIX client: no regular-file guard
+# AND no launch probe.  What the row asserts (both sides answer 2) is unchanged.
 twin_exec_mutant="$work/twin-posix-noregular"
-sed 's/\[ ! -f "\$ssh_binary" \]/[ ! -e "$ssh_binary" ]/' \
+sed -e 's/\[ ! -f "\$ssh_binary" \]/[ ! -e "$ssh_binary" ]/' \
+    -e 's/^refuse_unlaunchable_ssh_binary() {$/refuse_unlaunchable_ssh_binary() { return 0;/' \
     "$twin_posix" > "$twin_exec_mutant"
 if cmp -s "$twin_posix" "$twin_exec_mutant"; then
-    printf '%s\n' 'ps-client twin self-test: the POSIX regular-file guard was not found; the executable row cannot be proven able to fail' >&2
+    printf '%s\n' 'ps-client twin self-test: the POSIX regular-file guard or the launch probe was not found; the executable row cannot be proven able to fail' >&2
     failures=$((failures + 1))
-else
+elif grep -q 'refuse_unlaunchable_ssh_binary() { return 0;' "$twin_exec_mutant"; then
     twin_exec_run "$twin_exec_mutant" "$work/twin-exec-dir"
     if [ "$twin_p_status" -eq "$twin_w_status" ]; then
-        printf 'ps-client twin self-test: a POSIX client without the regular-file guard still agreed with the twin on a directory (posix=%s windows=%s)\n' \
+        printf 'ps-client twin self-test: a POSIX client with NEITHER the regular-file guard NOR the launch probe still agreed with the twin on a directory (posix=%s windows=%s)\n' \
             "$twin_p_status" "$twin_w_status" >&2
         failures=$((failures + 1))
     fi
+else
+    printf '%s\n' 'ps-client twin self-test: the launch-probe line was not neutralised in the mutant; the mutation did not reproduce the pre-fix client' >&2
+    failures=$((failures + 1))
 fi
 # Same for the config grammar this round aligned: put the `+` back in a copy of
 # the WINDOWS client and require the empty-last row to disagree.  The sed anchor
