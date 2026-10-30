@@ -1603,6 +1603,67 @@ resolve_json_parser() {
     [ -n "$json_parser" ] || fail 'jq is required to validate AgentQ JSON responses; install jq or set AGENTQ_JQ'
 }
 
+# The two guards above test the SEARCH BIT: they say a file MAY be executed, not
+# that it CAN be.  Measured 2026-10-30 -- three ordinary shapes pass both the
+# regular-file rule and `-x` and then make the SHELL (not the tool) report 126
+# ("found but cannot be executed") or 127 ("not found", which is how a missing
+# interpreter comes back) on every call: a 0755 file of plain text, a script
+# whose interpreter does not exist, and a script whose shebang line ends in CR
+# (a file last edited on Windows).  Before this helper, AGENTQ_SSH in that state
+# produced "unable to detect the remote platform; set AGENTQ_REMOTE_PLATFORM to
+# unix or windows" -- advice that cannot help, since the platform was never the
+# problem -- and, with AGENTQ_REMOTE_PLATFORM already set, exit 126/127 with NO
+# stderr at all.  The Windows twin refuses the same configuration with exit 2
+# and "<variable> cannot be launched" (smoke/12).
+#
+# POSIX has no primitive that answers "would exec(2) succeed"; the cheap
+# discriminators were measured and every one of them lies.  An EXIT-trap
+# sentinel runs after a failed exec under dash but not under sh, bash or zsh;
+# `set -e` plus a sentinel cannot tell a launch failure from a wrapper that
+# legitimately exits 255; and the shell's own exec diagnostic cannot be
+# separated from the child's, because redirections apply BEFORE the exec
+# attempt.  So the question is settled the only way that is a measurement
+# rather than a model: run the file.  `-V` is the argument the twin probes
+# with; for ssh it opens no connection and for jq it prints the version.  Only
+# the shell's own two codes count -- any other status means the file DID run,
+# and a file that runs is never refused here.  That last part is what keeps a
+# REMOTE 126/127 (a working ssh whose remote command failed) reported as a
+# remote failure.
+#
+# Called only from branches that are already failing, so a working
+# configuration pays nothing and no fixture's call plan shifts.  Only an
+# explicit variable is probed: a PATH-resolved binary is the twin's unprobed
+# branch too.  Residual boundary: a wrapper that answers 126/127 to `-V` yet
+# works for real calls is refused -- on a call that had already failed -- and
+# named; real OpenSSH and jq both exit 0.
+refuse_unlaunchable_ssh_binary() {
+    case "${1:-}" in
+        126|127) ;;
+        *) return 0 ;;
+    esac
+    [ -n "${AGENTQ_SSH:-}" ] || return 0
+    ssh_launch_probe_status=0
+    "$ssh_binary" -V </dev/null >/dev/null 2>&1 || ssh_launch_probe_status=$?
+    case "$ssh_launch_probe_status" in
+        126|127) fail "AGENTQ_SSH cannot be launched: $ssh_binary" ;;
+    esac
+    return 0
+}
+
+refuse_unlaunchable_json_parser() {
+    case "${1:-}" in
+        126|127) ;;
+        *) return 0 ;;
+    esac
+    [ -n "${AGENTQ_JQ:-}" ] || return 0
+    json_parser_launch_probe_status=0
+    "$json_parser" -V </dev/null >/dev/null 2>&1 || json_parser_launch_probe_status=$?
+    case "$json_parser_launch_probe_status" in
+        126|127) fail "AGENTQ_JQ cannot be launched: $json_parser" ;;
+    esac
+    return 0
+}
+
 write_response_metadata() {
     response_file=$1
     response_metadata_require_file "$response_file" || return $?
@@ -1795,13 +1856,22 @@ validate_json_response() {
     esac
 
     response_require_existing_file "$response_file" || return $?
-    if "$json_parser" -e -s --arg expected_request_id "$response_expected_request_id" \
+    # stderr is NOT redirected: jq's own "parse error: ... at line L, column C"
+    # is the only description of WHY a response failed validation, and the body
+    # is withheld -- both clients' messages below say the response was bad,
+    # none says where.  smoke/18 makes the same call for the SERVER's jq
+    # diagnostics (a "did the fold print each error twice" count); the client's
+    # copy is the operator's only pointer into a malformed response.
+    response_parser_launch_status=0
+    "$json_parser" -e -s --arg expected_request_id "$response_expected_request_id" \
         --arg expected_task_id "$response_expected_task_id" \
         --argjson expected_task_id_present "$(if [ -n "$response_expected_task_id" ]; then printf true; else printf false; fi)" \
         --argjson expected_request_id_present "$(if [ -n "$response_expected_request_id" ]; then printf true; else printf false; fi)" \
-        "$response_filter" "$response_file" >/dev/null; then
+        "$response_filter" "$response_file" >/dev/null || response_parser_launch_status=$?
+    if [ "$response_parser_launch_status" -eq 0 ]; then
         return 0
     fi
+    refuse_unlaunchable_json_parser "$response_parser_launch_status"
 
     response_require_existing_file "$response_file" || return $?
     if [ -s "$response_file" ]; then
@@ -3025,6 +3095,12 @@ probe_windows_agentq_protocol() {
     if [ "$windows_protocol_status" -eq 0 ]; then
         windows_protocol_status=2
     fi
+    # The launcher probe is the FIRST ssh call when AGENTQ_REMOTE_PLATFORM=windows
+    # is set explicitly, so a launch failure surfaces here rather than at the
+    # platform-probe branch -- measured 2026-10-30: exit 126/127 with "native
+    # Windows AgentQ service protocol probe failed on <host>", which points the
+    # operator at the remote deployment for a local misconfiguration.
+    refuse_unlaunchable_ssh_binary "$windows_protocol_status"
     printf '%s: native Windows AgentQ service protocol probe failed on %s\n' "$program" "$host" >&2
     return "$windows_protocol_status"
 }
@@ -3211,6 +3287,7 @@ initialize_remote_platform_by_probe() {
         platform_cache_write
         return 0
     elif [ "$local_platform_status" -ne 0 ] && [ "$windows_platform_status" -ne 0 ]; then
+        refuse_unlaunchable_ssh_binary "$local_platform_status"
         printf '%s: unable to detect the remote platform; set AGENTQ_REMOTE_PLATFORM to unix or windows only when the target is known\n' "$program" >&2
         return "$local_platform_status"
     else
@@ -3531,6 +3608,15 @@ run_ssh_logged() {
         agentq_ssh_log_require_file "$ssh_log_file" || return $?
         write_ssh_diagnostic_metadata "$ssh_log_file"
     fi
+    # This is the single funnel every operation, submit and mutation call goes
+    # through, so the launch refusal is placed here rather than at each caller's
+    # diagnostic branch: measured 2026-10-30, `submit`/`cancel`/`remove` exited
+    # 126/127 with NO stderr at all while `status` printed the misleading
+    # platform advice.  It only fires on a status that is already 126/127 AND
+    # when the local probe agrees, so a remote command that exits 127 (the
+    # remote agentq-server is missing) is untouched.  See
+    # refuse_unlaunchable_ssh_binary for the measurement and the boundary.
+    refuse_unlaunchable_ssh_binary "$ssh_status"
     return "$ssh_status"
 }
 
@@ -4062,6 +4148,7 @@ run_safe_operation_with_recovery() {
         fi
 
         if [ "$agentq_operation_status" -ne 255 ] || ! ssh_transport_error "$agentq_operation_log_file"; then
+            refuse_unlaunchable_ssh_binary "$agentq_operation_status"
             if [ "$agentq_operation_name" = wait ] && {
                 [ "$agentq_operation_status" -eq 1 ] ||
                 [ "$agentq_operation_status" -eq 5 ] ||

@@ -633,6 +633,156 @@ if [ "$executable_shape_cases" -lt 5 ]; then
     failures=$((failures + 1))
 fi
 
+# --- a file that passes `-x` and still cannot be EXECUTED --------------------
+# `[ -x ]` is a PERMISSION, not a promise.  The directory cases above were only
+# the first shape of that gap: three ordinary files pass the regular-file rule
+# AND `-x`, then make the SHELL (not ssh, not jq) report 126/127 on every call.
+# Measured 2026-10-30, all against HEAD:
+#   AGENTQ_SSH=<such a file>  -> exit 126/127 with ZERO stderr on every
+#                               operation (submit/cancel/remove too), and
+#                               "unable to detect the remote platform; set
+#                               AGENTQ_REMOTE_PLATFORM..." on the platform path
+#                               -- advice that cannot help, since the platform
+#                               was never the problem
+#   AGENTQ_JQ=<such a file>   -> a VALID response reported as "invalid JSON
+#                               response" (the SERVER blamed for a local
+#                               misconfiguration) plus the shell's own line on
+#                               stderr
+# The Windows twin refuses both with exit 2 and "<variable> cannot be launched".
+#
+# The fix probes by RUNNING the file (`-V`: no connection for ssh, the version
+# for jq) and refuses only when the shell's own 126/127 comes back, so the
+# shapes are generated here rather than committed.
+launch_shape_cases=0
+for launch_shape in text missing-interpreter crlf-shebang; do
+    case "$launch_shape" in
+        text)                printf 'not an executable\n' > "$work/launch-$launch_shape" ;;
+        missing-interpreter) printf '#!/nonexistent/interpreter\nexec /bin/true\n' > "$work/launch-$launch_shape" ;;
+        crlf-shebang)        printf '#!/bin/sh\r\nexec /bin/true\r\n' > "$work/launch-$launch_shape" ;;
+    esac
+    chmod 755 "$work/launch-$launch_shape"
+    # Both variables, same fixtures, same assertions: the ssh face runs against
+    # a working stub so the failure cannot come from the transport, and the jq
+    # face runs against a stub that returns a VALID response so a pass cannot
+    # come from the validator never running.
+    for launch_variable in AGENTQ_SSH AGENTQ_JQ; do
+        cases=$((cases + 1)); launch_shape_cases=$((launch_shape_cases + 1))
+        host_status=0
+        if [ "$launch_variable" = AGENTQ_SSH ]; then
+            env AGENTQ_SSH="$work/launch-$launch_shape" AGENTQ_HOST=smoke-host \
+                AGENTQ_CONFIG="$work/absent-config" AGENTQ_REMOTE_PLATFORM=unix \
+                AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+                "$client" status >"$work/out" 2>"$work/err" || host_status=$?
+        else
+            env AGENTQ_JQ="$work/launch-$launch_shape" AGENTQ_SSH="$work/bin/ssh-modes" \
+                AGENTQ_ARGV_CAPTURE="$work/launch-jq.argv" \
+                AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+                AGENTQ_REMOTE_PLATFORM=unix AGENTQ_OPERATION_RETRY_ATTEMPTS=1 \
+                AGENTQ_OPERATION_RETRY_DELAY=1 \
+                "$client" status >"$work/out" 2>"$work/err" || host_status=$?
+        fi
+        if [ "$host_status" -ne 2 ] || ! grep -qF "$launch_variable cannot be launched" "$work/err"; then
+            printf 'client executable [%s=%s]: expected exit 2 naming the launch failure, got %s: %s\n' \
+                "$launch_variable" "$launch_shape" "$host_status" \
+                "$(head -2 "$work/err" | tr '\n' '|')" >&2
+            failures=$((failures + 1))
+        fi
+        if grep -qF 'invalid JSON response' "$work/err"; then
+            printf 'client executable [%s=%s]: the REMOTE response was blamed for a local misconfiguration\n' \
+                "$launch_variable" "$launch_shape" >&2
+            failures=$((failures + 1))
+        fi
+        if grep -qF 'unable to detect the remote platform' "$work/err"; then
+            printf 'client executable [%s=%s]: the platform was blamed for a local misconfiguration\n' \
+                "$launch_variable" "$launch_shape" >&2
+            failures=$((failures + 1))
+        fi
+        if grep -qE 'is a directory|bad interpreter|: line [0-9]+:' "$work/err" &&
+            [ "$launch_variable" = AGENTQ_SSH ]; then
+            # Only for the ssh face: its stderr goes into the client's capture
+            # file, so nothing about a LOCAL path may reach the caller.  The jq
+            # face deliberately keeps jq's stderr -- that line is the ONLY
+            # description of why a response failed validation (smoke/18 counts
+            # the server's copies as a contract), and the shell's own line about
+            # a local file is the price of it.  Asserting it absent there would
+            # force the client to discard a diagnostic worth more than the
+            # noise it removes.
+            printf 'client executable [%s=%s]: a raw shell diagnostic reached stderr: %s\n' \
+                "$launch_variable" "$launch_shape" \
+                "$(head -2 "$work/err" | tr '\n' '|')" >&2
+            failures=$((failures + 1))
+        fi
+    done
+done
+
+# The other direction, and the load-bearing one: a file that DOES run must never
+# be refused, even when the remote command fails with the same 126/127 the shell
+# uses for its own exec failures.  This fixture answers `-V` the way real
+# OpenSSH does (exit 0) and every real call with 127 -- a missing remote
+# dependency.  A refusal keyed on the status alone ("anything 126/127 is a local
+# launch failure") passes every case above and fails here.
+cat > "$work/ssh-remote-127" <<'STUB'
+#!/bin/sh
+case "$1" in
+    -V) printf '%s\n' 'OpenSSH_9.9p1, LibreSSL 3.3.6' >&2; exit 0 ;;
+esac
+exit 127
+STUB
+chmod 755 "$work/ssh-remote-127"
+cases=$((cases + 1)); launch_shape_cases=$((launch_shape_cases + 1))
+host_status=0
+env AGENTQ_SSH="$work/ssh-remote-127" AGENTQ_HOST=smoke-host \
+    AGENTQ_CONFIG="$work/absent-config" AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    "$client" status >"$work/out" 2>"$work/err" || host_status=$?
+if [ "$host_status" -ne 127 ]; then
+    printf 'client executable [working ssh, remote exit 127]: expected exit 127, got %s: %s\n' \
+        "$host_status" "$(head -2 "$work/err" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+fi
+if grep -qF 'cannot be launched' "$work/err"; then
+    printf '%s\n' 'client executable [working ssh, remote exit 127]: a working ssh was refused as a local launch failure' >&2
+    failures=$((failures + 1))
+fi
+
+# EVERY operation, not just `status`.  The refusal lives in `run_ssh_logged`,
+# the funnel every operation, submit and mutation call goes through -- but that
+# is a claim about the code, and the measurement that produced it was: HEAD
+# exits 126/127 with NO stderr at all for submit, cancel and remove, while
+# status at least printed the (misleading) platform advice.  A fix wired into
+# one caller's diagnostic branch would pass the case above and leave the other
+# seven silent, so the surface is enumerated and each one must answer the same
+# way.  `wait --timeout` is included because it invokes ssh through
+# run_wait_ssh_with_timeout, NOT through run_ssh_logged -- a second funnel.
+launch_operation_cases=0
+for launch_operation in 'status' 'lookup Abcdefghij1234567' 'logs 1' 'wait 1' \
+        'wait 1 --timeout 5' 'cancel 1' 'remove 1' 'doctor' 'submit --workdir /tmp --request-id Abcdefghij1234567 -- true'; do
+    cases=$((cases + 1)); launch_operation_cases=$((launch_operation_cases + 1))
+    host_status=0
+    # shellcheck disable=SC2086 # the fixture IS the argv list; each value is
+    # a literal here, never user input.
+    env AGENTQ_SSH="$work/launch-text" AGENTQ_HOST=smoke-host \
+        AGENTQ_CONFIG="$work/absent-config" AGENTQ_REMOTE_PLATFORM=unix \
+        AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+        AGENTQ_PLATFORM_PROBE_CACHE=off \
+        "$client" $launch_operation >"$work/out" 2>"$work/err" || host_status=$?
+    if [ "$host_status" -ne 2 ] || ! grep -qF 'AGENTQ_SSH cannot be launched' "$work/err"; then
+        printf 'client executable [AGENTQ_SSH=text, operation %s]: expected exit 2 naming the launch failure, got %s: %s\n' \
+            "$launch_operation" "$host_status" "$(head -2 "$work/err" | tr '\n' '|')" >&2
+        failures=$((failures + 1))
+    fi
+done
+if [ "$launch_operation_cases" -lt 9 ]; then
+    printf 'client executable launch shape: only %s operation case(s) ran (expected 9); the enumeration broke\n' \
+        "$launch_operation_cases" >&2
+    failures=$((failures + 1))
+fi
+if [ "$launch_shape_cases" -lt 7 ]; then
+    printf 'client executable launch shape: only %s case(s) ran (expected at least 7); the enumeration broke\n' \
+        "$launch_shape_cases" >&2
+    failures=$((failures + 1))
+fi
+
 # --- mode forwarding and response validation ---------------------------------
 # Each case runs against ssh-modes and asserts BOTH that the run succeeds (the
 # response passed the client's validation for that mode) and that the mode

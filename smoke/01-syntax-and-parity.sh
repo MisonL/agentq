@@ -2860,6 +2860,182 @@ if ! grep -q 'zz_scoped: -x on \$zz_shared' "$executable_shape_selftest.report";
 fi
 rm -f "$executable_shape_selftest" "$executable_shape_selftest.report"
 
+# --- shell assets: `-x` says MAY run, not CAN run ---------------------------
+# The rule above fixes the first half of this (a directory passes `-x`).  The
+# second half is not a shape at all: a 0755 REGULAR file can still be
+# unexecutable -- plain text, a shebang naming an interpreter that does not
+# exist, or a shebang line ending in CR.  Measured 2026-10-30 on both POSIX
+# clients: the shell (not the tool) then reports 126/127 on every call, and the
+# clients reported that as a REMOTE failure (or exited 126/127 with no stderr at
+# all, outside the documented contract).  The fix is a real launch probe: run
+# the file with `-V` and refuse only on the shell's own 126/127.
+#
+# The rule: in any shell asset that configures an executable through an
+# ENVIRONMENT VARIABLE -- recognised by its own guard message, `<NAME> is not
+# executable` -- every variable that passes `-x "$VAR"` AND is invoked as a
+# command must also appear in a `"$VAR" -V` probe.  The trigger is deliberately
+# the asset's own message rather than a list of file names: a new asset that
+# resolves an executable from the environment is covered the day it is added,
+# and the installer/server helpers (which take `$1` and are not user
+# configuration) are out of scope by construction, not by an allowlist.
+#
+# The site counter is the second half of the lock.  Deleting the trigger message
+# would silence the rule entirely, so the number of (asset, variable) pairs
+# examined is printed and gated -- a rule that stopped seeing anything must not
+# read as a clean tree.
+#
+# `AGENTQ_ASKPASS` is deliberately OUT of the rule, and it stays out because it
+# is never invoked as a command: the client only assigns it into ssh's
+# environment (`SSH_ASKPASS=<path>`), and ssh execs it later.  Do not "fix" that
+# by writing `"$agentq_askpass_program" ...` anywhere -- this rule would then
+# demand a `-V` probe, and probing a credential helper means RUNNING it.
+#
+# Assigned with `read -d ''`, not `$(cat <<'AWK' ... )` like the other programs
+# in this file.  Measured 2026-10-30: bash's `$( )` scanner lexes the heredoc
+# BODY as shell text instead of treating it as opaque, so the body must look
+# balanced to a shell lexer even though awk is the reader.  Both halves were
+# measured in isolation: an unbalanced `)` gives "syntax error near unexpected
+# token `)'", and an ODD total number of `"` gives "unexpected EOF while
+# looking for matching `"' -- parity, not per-line balance.  This program has 45
+# quotes and one more `)` than `(` (awk regexes and `printf` format strings),
+# so it cannot go through `$( )` at all; the failure would surface hundreds of
+# lines later as a syntax error in an unrelated `case ... ;;`.  The other four
+# programs in this file happen to be balanced -- that is luck, not a rule.
+IFS= read -r -d '' launch_probe_prog <<'AWK' || true
+# One file's worth of state is flushed at the NEXT file's first line and again
+# in END.  Measured 2026-10-30: reporting straight from END read the LAST
+# asset's `envguard` for every file, and since the alphabetically last asset
+# does not carry the trigger message the rule reported 0 sites over the real
+# nine-file list while reporting 2 over the one file it was tested against.
+function flush(   v) {
+    if (!envguard) return
+    for (v in guarded) {
+        if (!(v in invoked)) continue
+        sites++
+        if (!(v in probed))
+            printf "%s: $%s passes -x and is invoked, but nothing probes whether it can LAUNCH\n", \
+                curfile, v
+    }
+}
+# `split("", arr)` rather than `delete arr`: whole-array delete is a common
+# extension, not POSIX awk, and the Linux CI job's awk is a different
+# implementation from this machine's.
+FNR == 1 { flush(); split("", guarded); split("", invoked); split("", probed); envguard = 0; curfile = FILENAME }
+/^[[:space:]]*#/ { next }
+{
+    if ($0 ~ /[A-Z][A-Z0-9_]+ is not executable/) envguard = 1
+    tmp = $0
+    while (match(tmp, /-x "[$][A-Za-z_0-9]+"/)) {
+        v = substr(tmp, RSTART, RLENGTH); sub(/^-x "\$/, "", v); sub(/"$/, "", v)
+        guarded[v] = 1
+        tmp = substr(tmp, RSTART + RLENGTH)
+    }
+    tmp = $0
+    while (match(tmp, /"[$][A-Za-z_0-9]+" -V([[:space:]]|$)/)) {
+        v = substr(tmp, RSTART + 2, RLENGTH - 2); sub(/" -V.*$/, "", v)
+        probed[v] = 1
+        tmp = substr(tmp, RSTART + RLENGTH)
+    }
+    # Invoked as a command: `"$var"` followed by whitespace and then a word.
+    # The next character is tested with index() against the separators and the
+    # test's closing bracket -- `"$var"` alone, `"$var" ]`, `"$var" )`,
+    # `"$var" &`, `"$var" |` and `"$var" ;` reach no command, everything else
+    # does (including the line-continuation `"$ssh_binary" \` that BOTH clients
+    # write their ssh call with -- measured 2026-10-30, the first version's
+    # character class missed it and so missed a real invocation site in each).
+    # A plain string passed to index() rather than a bracket expression on
+    # purpose: a class would need `]` first and an escaped backslash, and
+    # backslash handling inside brackets is the one part of POSIX awk's regex
+    # grammar that implementations disagree about (this suite runs under BSD
+    # awk on macOS and gawk/mawk on the Linux CI job, and only the BSD one is
+    # measurable here).
+    tmp = $0
+    while (match(tmp, /"[$][A-Za-z_0-9]+"[[:space:]]+/)) {
+        v = substr(tmp, RSTART, RLENGTH)
+        sub(/^"\$/, "", v)
+        sub(/".*$/, "", v)
+        rest = substr(tmp, RSTART + RLENGTH)
+        c = substr(rest, 1, 1)
+        if (c != "" && index("]&|;)", c) == 0) invoked[v] = 1
+        tmp = substr(tmp, RSTART + RLENGTH - 1)
+    }
+}
+END { flush(); printf "__SITES__%d\n", sites }
+AWK
+launch_probe_report=$(awk "$launch_probe_prog" $shell_assets)
+# Summed rather than read off one line: the program is invoked once over every
+# asset and reports one total, but a future edit that runs it per file would
+# print one `__SITES__n` per file, and `sed -n 's/^__SITES__//p'` would then
+# hand the numeric test a multi-line value that reads as the first file's count.
+launch_probe_sites=$(printf '%s\n' "$launch_probe_report" |
+    awk -F'__SITES__' '/^__SITES__/ { s += $2 } END { printf "%d", s }')
+launch_probe_hits=$(printf '%s\n' "$launch_probe_report" | grep -v '^__SITES__' || true)
+launch_probe_count=0
+if [ -n "$launch_probe_hits" ]; then
+    while IFS= read -r hit; do
+        [ -n "$hit" ] || continue
+        printf 'shell FAILED (an executable taken from the environment is run without a launch probe: `-x` is a permission, not a promise -- add a `"$VAR" -V` probe and refuse on the shell'"'"'s own 126/127): %s\n' \
+            "$hit" >&2
+        launch_probe_count=$((launch_probe_count + 1))
+    done <<EOF
+$launch_probe_hits
+EOF
+    failures=$((failures + 1))
+fi
+# Today the tree has 3 (agentq ssh_binary + json_parser, sshp ssh_binary).  A
+# floor, not an equality: a new client with a fourth env-configured executable
+# should raise it, and a tree that lost the guards should fail here rather than
+# pass the rule vacuously.
+if [ "${launch_probe_sites:-0}" -lt 3 ]; then
+    printf 'shell FAILED (the launch-probe rule examined only %s env-configured executable(s); it is no longer reading the assets)\n' \
+        "${launch_probe_sites:-0}" >&2
+    failures=$((failures + 1))
+    launch_probe_count=$((launch_probe_count + 1))
+fi
+# Self-check, both directions, on a self-contained fixture: a rule that never
+# fires reads exactly like a clean tree, and a rule that fires on everything
+# would be "fixed" by deleting it.
+launch_probe_selftest=$(mktemp)
+cat > "$launch_probe_selftest" <<'FIXTURE'
+#!/bin/sh
+zz_resolve() {
+    [ -x "$zz_unprobed" ] || fail "ZZ_UNPROBED is not executable: $zz_unprobed"
+    [ -x "$zz_probed" ] || fail "ZZ_PROBED is not executable: $zz_probed"
+    [ -x "$zz_not_invoked" ] || fail "a guard with no call site"
+}
+zz_unprobed_run() {
+    "$zz_unprobed" -E "$zz_log" -- "$zz_host" true
+}
+zz_probed_run() {
+    "$zz_probed" -V </dev/null >/dev/null 2>&1 || zz_status=$?
+    "$zz_probed" -E "$zz_log" -- "$zz_host" true
+}
+FIXTURE
+launch_probe_selftest_report=$(awk "$launch_probe_prog" "$launch_probe_selftest")
+printf '%s\n' "$launch_probe_selftest_report" > "$launch_probe_selftest.report"
+if ! grep -q 'zz_unprobed passes -x and is invoked' "$launch_probe_selftest.report"; then
+    printf '%s\n' 'shell FAILED (the launch-probe rule is silent on a planted unprobed executable: the detector itself is broken)' >&2
+    failures=$((failures + 1))
+    launch_probe_count=$((launch_probe_count + 1))
+fi
+if grep -q 'zz_probed' "$launch_probe_selftest.report"; then
+    printf '%s\n' 'shell FAILED (the launch-probe rule reports a variable that DOES have a -V probe)' >&2
+    failures=$((failures + 1))
+    launch_probe_count=$((launch_probe_count + 1))
+fi
+if grep -q 'zz_not_invoked' "$launch_probe_selftest.report"; then
+    printf '%s\n' 'shell FAILED (the launch-probe rule reports a guarded variable that is never invoked)' >&2
+    failures=$((failures + 1))
+    launch_probe_count=$((launch_probe_count + 1))
+fi
+if [ "$(sed -n 's/^__SITES__//p' "$launch_probe_selftest.report")" != 2 ]; then
+    printf 'shell FAILED (the launch-probe rule counted %s site(s) in its own fixture, expected 2)\n' \
+        "$(sed -n 's/^__SITES__//p' "$launch_probe_selftest.report")" >&2
+    failures=$((failures + 1))
+    launch_probe_count=$((launch_probe_count + 1))
+fi
+rm -f "$launch_probe_selftest" "$launch_probe_selftest.report"
+
 # --- shell assets: a defined function nobody calls ---------------------------
 # A function with zero call sites is not automatically a defect -- an API surface
 # kept for a future caller is a legitimate choice.  What is NOT legitimate is a
@@ -3140,8 +3316,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s executable_shape=%s exec_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$executable_shape_count" "$executable_shape_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
@@ -3153,7 +3329,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files executable_shape exec_sites uncalled unclassified farm_writes python3_users entrypoints workflows ci_pin gitattr gitignore skill_modes kinds summary_census'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows ci_pin gitattr gitignore skill_modes kinds summary_census'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned

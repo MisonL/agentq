@@ -65,6 +65,52 @@ resolve_ssh_binary() {
     [ -n "$ssh_binary" ] || fail 'OpenSSH client is required; install ssh or set SSHP_SSH'
 }
 
+# The guard above tests the SEARCH BIT: it says the file MAY be executed, not
+# that it CAN be.  Measured 2026-10-30 -- three ordinary shapes pass both the
+# regular-file rule and `-x` and then make the SHELL (not the tool) report 126
+# ("found but cannot be executed") or 127 ("not found", which is how a missing
+# interpreter comes back) on every call: a 0755 file of plain text, a script
+# whose interpreter does not exist, and a script whose shebang line ends in CR
+# (a file last edited on Windows).  All three used to surface here as
+# "remote dependency probe failed for both Unix and Windows shells" with exit
+# 126/127 -- outside the documented contract, and blaming the REMOTE host for a
+# LOCAL misconfiguration.  The Windows twin refuses the same configuration with
+# exit 2 and "SSHP_SSH cannot be launched" (smoke/12).
+#
+# POSIX has no primitive that answers "would exec(2) succeed"; the cheap
+# discriminators were measured and every one of them lies.  An EXIT-trap
+# sentinel runs after a failed exec under dash but not under sh, bash or zsh;
+# `set -e` plus a sentinel cannot tell a launch failure from a wrapper that
+# legitimately exits 255; and the shell's own exec diagnostic cannot be
+# separated from the child's, because redirections apply BEFORE the exec
+# attempt.  So the question is settled the only way that is a measurement
+# rather than a model: run the file.  `-V` is the argument the twin probes
+# with; it opens no connection.  Only the shell's own two codes count -- 0 from
+# real OpenSSH, 255 from a wrapper that rejects the flag, anything else: the
+# file DID run, and a file that runs is never refused here.  That last part is
+# what keeps a REMOTE 126/127 (a working ssh whose remote command failed)
+# reported as a remote failure.
+#
+# Called only from a branch that is already failing, so a working configuration
+# pays nothing and no fixture's call plan shifts.  Only an explicit SSHP_SSH is
+# probed: a PATH-resolved ssh is the twin's unprobed branch too.  Residual
+# boundary: a wrapper that answers 126/127 to `-V` yet works for real calls is
+# refused -- on a call that had already failed -- and named; real OpenSSH exits
+# 0.
+refuse_unlaunchable_ssh_binary() {
+    case "${1:-}" in
+        126|127) ;;
+        *) return 0 ;;
+    esac
+    [ -n "${SSHP_SSH:-}" ] || return 0
+    ssh_launch_probe_status=0
+    "$ssh_binary" -V </dev/null >/dev/null 2>&1 || ssh_launch_probe_status=$?
+    case "$ssh_launch_probe_status" in
+        126|127) fail "SSHP_SSH cannot be launched: $ssh_binary" ;;
+    esac
+    return 0
+}
+
 is_nonnegative_integer() {
     case "$1" in
         ''|*[!0-9]*) return 1 ;;
@@ -1378,6 +1424,7 @@ prepare_remote() {
                 printf '%s\n' "$program: persistent remote session unavailable: native Zellij is required on Windows and no supported installer was found." >&2
                 return 127
             else
+                refuse_unlaunchable_ssh_binary "$windows_probe_status"
                 if [ "$windows_probe_required" = true ]; then
                     printf '%s\n' "$program: remote dependency probe failed for the Windows shell." >&2
                 else
