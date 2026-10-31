@@ -1972,10 +1972,17 @@ run_pueue() {
                 "$pueue_bin" --config "$pueue_config_path" "$@"
             ;;
         unix)
+            # `id -un` is only a fallback for USER/LOGNAME, which ssh command
+            # execution, cron and containers can leave unset.  Its stderr must
+            # not escape: it lands on the server's OWN stderr as a stray
+            # `id: cannot find name for user ID N` line (measured 2026-10-31 on
+            # Linux and macOS with both variables unset), which is noise for a
+            # caller reading stderr for `reason=`.  stdout is untouched, so the
+            # value Pueue receives is identical.
             env -i \
                 HOME="$HOME" \
-                USER="${USER:-$(id -un)}" \
-                LOGNAME="${LOGNAME:-${USER:-$(id -un)}}" \
+                USER="${USER:-$(id -un 2>/dev/null)}" \
+                LOGNAME="${LOGNAME:-${USER:-$(id -un 2>/dev/null)}}" \
                 PATH="$PATH" \
                 SHELL="${SHELL:-/bin/sh}" \
                 LANG="${LANG:-C.UTF-8}" \
