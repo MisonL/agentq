@@ -368,7 +368,8 @@ fi
 # invocation below additionally passes -SkipPathUpdate as defence in depth --
 # a valid call that still reached the install path could then write files, but
 # could never edit the user's PATH.
-host_kind=$(uname -s 2>/dev/null || printf 'unknown')
+# (`host_kind` is the single detection, taken once at the top where the `-?`
+# case needs it first; this block only consumes it.)
 case $host_kind in
     MINGW*|MSYS*|CYGWIN*) host_is_windows=true ;;
     *) host_is_windows=false ;;
