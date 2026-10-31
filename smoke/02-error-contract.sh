@@ -258,17 +258,55 @@ systemd_case bus-error        unavailable unavailable
 systemd_case unlaunchable     unavailable unavailable
 systemd_case uid-unresolved   inactive no
 
-# The SAME class in the DARWIN arm of the same version block.  Unlike the
-# Linux and Windows arms this one needs no platform shadowing -- smoke runs on
-# macOS -- but its probes answer for the HOST (`id` for the caller, the real
-# `launchctl` for the service).  `id` is stubbed because it is the probe under
-# test; `launchctl` is left real so the case manages no service.  Pre-fix, an
-# `id` that fails or cannot start made doctor print
+# The OTHER `$(id -un)` fallback, and a different consumer: run_pueue builds
+# Pueue's environment with `env -i USER="${USER:-$(id -un)}" ...`.  ssh command
+# execution, cron and containers leave USER and LOGNAME unset, and the
+# fallback's stderr is NOT covered by any redirect on that line (the `env -i`
+# argument list has no redirection of its own), so it lands on the server's own
+# stderr as a stray `id: cannot find name for user ID N` line -- noise for a
+# caller that reads stderr for `reason=`.  Measured 2026-10-31 on Linux and
+# macOS: two such lines (one per `$(id -un)`, since the two expansions do not
+# see each other's assignment) with both variables unset and an `id` that
+# fails; zero with USER set.  run_pueue's unix branch is chosen by
+# platform_kind, not by the doctor arm, so this case needs no platform gate.
+pueue_env_id="$work/pueue-env-id"
+mkdir -p "$pueue_env_id"
+printf '#!/bin/sh\ncase "$*" in\n  *-un*) printf "id: cannot find name for user ID 501\\n" >&2; exit 1 ;;\n  *) printf "501\\n" ;;\nesac\n' > "$pueue_env_id/id"
+chmod 700 "$pueue_env_id/id"
+cases=$((cases + 1))
+env_status=0
+env -u USER -u LOGNAME PATH="$pueue_env_id:$PATH" "$server" status \
+    >"$work/pueue-env-id.stdout" 2>"$work/pueue-env-id.stderr" || env_status=$?
+if grep -qE '(^|[^a-z_])id: ' "$work/pueue-env-id.stderr"; then
+    printf 'pueue-env-id: the USER/LOGNAME fallback leaked its stderr: %s\n' \
+        "$(head -3 "$work/pueue-env-id.stderr" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+fi
+case "$env_status" in
+    0|1|2|3|4|5|6) ;;
+    *)  printf 'pueue-env-id: server exited %s, outside the documented 0-6 contract\n' \
+            "$env_status" >&2
+        failures=$((failures + 1)) ;;
+esac
+
+# The SAME class in the DARWIN arm of the same version block.  `platform` is
+# `uname -s` at the top of the file, so this arm is reachable on ANY host by
+# shadowing `uname`, exactly as the Linux arm above is -- it does NOT need a
+# macOS machine.  (An earlier draft of these cases gated them behind a `uname -s
+# = Darwin` host check and declared the rest a NOT-covered platform gap; that
+# claim is false.  Measured 2026-10-31 on this macOS host running the SERVER
+# SHADOWED TO Linux, and on a real ubuntu:24.04 container shadowing `uname` to
+# Darwin: both entered the arm and printed their `launchd_` lines.)  The probes
+# differ only in that `id` answers for the caller and `launchctl` for the
+# service; on a Linux host launchctl is simply absent, which the arm already
+# tolerates, and on macOS nothing of AgentQ's is installed here, so both hosts
+# take the same fall-through and the assertions below match a SHAPE, not a
+# host-specific value.
+# Pre-fix, an `id` that fails or cannot start made doctor print
 #   launchd_service=<path>/id: line 1: not: command not found
 # and exit 127, outside the documented 0-6 range, with NO `launchd_domain=`
-# line and no reason line at all.  Both user-domain cases below therefore
-# assert a SHAPE (`active`/`inactive`, and a domain naming one of launchd's
-# three real scopes) rather than a host-specific value; a host where the
+# line and no reason line at all.  `launchd_domain` is asserted to name one of
+# launchd's three real scopes rather than a specific one: a host where the
 # service is installed as a LaunchDaemon answers `system` and still passes.
 darwin_assert() {
     local label=$1 stderr_file=$2 status=$3
@@ -308,8 +346,9 @@ darwin_assert() {
 darwin_stub_uid='aq-smoke-noninteger'
 darwin_shim="$work/darwin-shim"
 mkdir -p "$darwin_shim"
+printf '#!/bin/sh\nprintf "Darwin\\n"\n' > "$darwin_shim/uname"
 printf '#!/bin/sh\nprintf "%s\\n" "$AGENTQ_SMOKE_UID"\n' > "$darwin_shim/id"
-chmod 700 "$darwin_shim/id"
+chmod 700 "$darwin_shim/uname" "$darwin_shim/id"
 cases=$((cases + 1))
 darwin_status=0
 PATH="$darwin_shim:$PATH" AGENTQ_SMOKE_UID="$darwin_stub_uid" "$server" doctor \
@@ -322,21 +361,34 @@ darwin_assert answers "$work/darwin.stderr" "$darwin_status"
 # with the documented `unavailable` sentinel rather than a fabricated `user/`.
 darwin_broken="$work/darwin-broken"
 mkdir -p "$darwin_broken"
+printf '#!/bin/sh\nprintf "Darwin\\n"\n' > "$darwin_broken/uname"
 printf 'not a binary\n' > "$darwin_broken/id"
-chmod 700 "$darwin_broken/id"
+# A launchctl that is present but reports every target absent: this is the state
+# on any host with no AgentQ launchd service, and it keeps a Linux host (which
+# has no launchctl at all) from stopping at the earlier `launchctl is required`
+# guard, so BOTH hosts reach the same target resolution the assertions cover.
+printf '#!/bin/sh\nexit 1\n' > "$darwin_broken/launchctl"
+chmod 700 "$darwin_broken/uname" "$darwin_broken/id" "$darwin_broken/launchctl"
 cases=$((cases + 1))
 darwin_status=0
 PATH="$darwin_broken:$PATH" "$server" doctor \
     >"$work/darwin-broken.stdout" 2>"$work/darwin-broken.stderr" || darwin_status=$?
 darwin_assert cannot-start "$work/darwin-broken.stderr" "$darwin_status"
-grep -qxF 'launchd_service=unavailable' "$work/darwin-broken.stderr" || {
-    printf 'darwin-version-block [cannot-start]: launchd_service must be `unavailable` when no uid can be read\n' >&2
-    failures=$((failures + 1))
-}
-grep -qxF 'launchd_domain=unavailable' "$work/darwin-broken.stderr" || {
-    printf 'darwin-version-block [cannot-start]: launchd_domain must be `unavailable` when no uid can be read\n' >&2
-    failures=$((failures + 1))
-}
+# The `unavailable` sentinel is the FIX for the fabricated `user/` the old code
+# rendered with no uid.  It is only the right answer when the system LaunchDaemon
+# is absent: on a host where AgentQ IS installed as a LaunchDaemon the target
+# resolves to `system` before `id` is ever consulted, and `system` is a
+# legitimate answer.  Assert `unavailable` only in the case this host can reach.
+if ! grep -qxF 'launchd_domain=system' "$work/darwin-broken.stderr"; then
+    grep -qxF 'launchd_service=unavailable' "$work/darwin-broken.stderr" || {
+        printf 'darwin-version-block [cannot-start]: launchd_service must be `unavailable` when no uid can be read\n' >&2
+        failures=$((failures + 1))
+    }
+    grep -qxF 'launchd_domain=unavailable' "$work/darwin-broken.stderr" || {
+        printf 'darwin-version-block [cannot-start]: launchd_domain must be `unavailable` when no uid can be read\n' >&2
+        failures=$((failures + 1))
+    }
+fi
 
 # The guard that keeps an empty target away from `launchctl kickstart`.  Tolerating a
 # failing `id` made a previously-unreachable state reachable: with no uid the
@@ -363,9 +415,19 @@ if [ "$darwin_start_status" -ne 2 ]; then
     printf 'darwin-start-guard: expected exit 2, got %s\n' "$darwin_start_status" >&2
     failures=$((failures + 1))
 fi
-if ! grep -qxF -- 'agentq-server: cannot determine the launchd service target: no user id could be read' \
+# Two legitimate refusals reach here, and which one depends only on whether this
+# host has AgentQ installed as a system LaunchDaemon: with the plist present the
+# target resolves to `system` and the guard refuses THAT; otherwise the target is
+# empty and the guard refuses the missing uid.  Both must be controlled, both
+# must carry the reason line, and neither may be the shell's own diagnostic.
+if grep -qxF -- 'agentq-server: cannot determine the launchd service target: no user id could be read' \
     "$work/darwin-start.stderr"; then
-    printf 'darwin-start-guard: the controlled message for an empty target is missing\n' >&2
+    :
+elif grep -qxF -- 'agentq-server: system LaunchDaemon com.agentq.pueued is inactive; rerun the AgentQ installer in an interactive sudo session' \
+    "$work/darwin-start.stderr"; then
+    :
+else
+    printf 'darwin-start-guard: neither controlled refusal is present\n' >&2
     head -3 "$work/darwin-start.stderr" >&2 || true
     failures=$((failures + 1))
 fi
@@ -375,6 +437,7 @@ if ! grep -qxF -- 'agentq-server: reason=protocol_error' "$work/darwin-start.std
 fi
 # The flood guard: an empty target must never reach launchctl, whose refusal is
 # tens of kilobytes.  A byte ceiling is the measurable form of "it did not".
+# 1024 is far below the 55238-byte flood and far above these controlled lines.
 darwin_start_bytes=$(wc -c < "$work/darwin-start.stderr" | tr -d ' ')
 if [ "$darwin_start_bytes" -gt 1024 ]; then
     printf 'darwin-start-guard: stderr was %s bytes; an empty target reached launchctl\n' \
