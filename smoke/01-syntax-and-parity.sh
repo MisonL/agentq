@@ -2388,7 +2388,7 @@ fi
 # guards THAT check, and this keeps the same shape from reappearing in a check
 # nobody re-measures.  A ban may legitimately have 0 hits, so the vacuity guard
 # here is the script census, not a hit count.
-ps_help_re='-File[^|;&]*[[:space:]]-\?([[:space:]]|$)'
+ps_help_re='-File[^|;&]*-\?([^[:alnum:]_]|$)'
 ps_help_count=0
 while IFS= read -r ps_help_script; do
     # `-e`: the pattern BEGINS with `-File`, and without it grep parses the
@@ -2425,6 +2425,7 @@ ps_help_fixture=$(mktemp "${TMPDIR:-/tmp}/agentq-pshelp.XXXXXX")
 ps_help_param='-?'
 {
     printf 'pwsh -NoProfile -File "$asset" %s\n' "$ps_help_param"
+    printf 'x=$("$pwsh" -File "$asset" %s) 2>/dev/null\n' "$ps_help_param"
     printf 'pwsh -NoProfile -File "$asset" -Check\n'
     printf 'pwsh -NoProfile -Command "& '"'"'$asset'"'"' %s"\n' "$ps_help_param"
     printf '# pwsh -NoProfile -File "$asset" %s\n' "$ps_help_param"
@@ -2433,9 +2434,9 @@ ps_help_selftest=$(repo_pipe_scan "$ps_help_fixture" \
     | grep -E -e "$ps_help_re" \
     | grep -vE '^[0-9]+:[[:space:]]*#' | cut -d: -f1 | tr '\n' ' ')
 rm -f "$ps_help_fixture"
-if [ "$ps_help_selftest" != '1 ' ]; then
-    printf 'syntax-and-parity FAILED (the -File/-? help-probe ban failed its self-test: expected only fixture line 1, got [%s])\n' \
-        "$ps_help_selftest" >&2
+if [ "$ps_help_selftest" != '1 2 ' ]; then
+    printf 'syntax-and-parity FAILED (the -File/%s help-probe ban failed its self-test: expected fixture lines 1 and 2 -- the switch at end of line AND before a close-paren -- got [%s])\n' \
+        "$ps_help_param" "$ps_help_selftest" >&2
     failures=$((failures + 1))
 fi
 
