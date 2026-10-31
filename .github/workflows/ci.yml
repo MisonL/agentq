@@ -106,7 +106,7 @@ jobs:
             done
             exit 1
           fi
-          expected_count=$(printf '%s\n' $expected_checks | grep -c .)
+          expected_count=$(printf '%s\n' $expected_checks | grep -c . || true)
           reported_count=$(grep -cE '^(ok|SKIP|PART|NCOV|FAIL) +[0-9]{2}-' smoke.log || true)
           if [ "$reported_count" != "$expected_count" ]; then
             echo "reported $reported_count check lines, pinned list has $expected_count" >&2
@@ -259,8 +259,17 @@ jobs:
             # unverifiable (the gate cannot fire on Windows); a run that
             # claimed `platform-gate=covered` here would be asserting a case it
             # did not execute.
-            occurrences=$(grep -o 'NOT-covered' "$log" | wc -l | tr -d ' ')
-            named=$(grep -o 'NOT-covered([^)]*)' "$log" | wc -l | tr -d ' ')
+            # `|| true` is load-bearing: this step declares `shell: bash`, which
+            # Actions runs as `bash --noprofile --norc -e -o pipefail`, so an
+            # UNMATCHED grep makes the whole substitution fail and `set -e`
+            # aborts the step.  Measured 2026-10-31 on windows-latest: smoke/20
+            # prints no NOT-covered token at all (its normal, healthy output),
+            # so `grep -o` answered 1, the step died at this line, and checks
+            # 22/23/25 never ran -- their logs did not even exist for the
+            # ps51= assertion below.  smoke/12 and smoke/13 kept the step alive
+            # only because their own summaries happen to carry tokens.
+            occurrences=$( (grep -o 'NOT-covered' "$log" || true) | wc -l | tr -d ' ')
+            named=$( (grep -o 'NOT-covered([^)]*)' "$log" || true) | wc -l | tr -d ' ')
             if [ "$occurrences" -ne "$named" ]; then
               echo "$check printed a NOT-covered token with no parenthesised reason" >&2
               fail=1
