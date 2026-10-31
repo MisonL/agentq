@@ -2056,6 +2056,14 @@ start_managed_daemon() {
                 Darwin*)
                     command -v launchctl >/dev/null 2>&1 || fail 'launchctl is required to start AgentQ on macOS'
                     macos_launch_service_target
+                    # An empty target means no uid could be read (see that
+                    # function).  `launchctl kickstart ""` is not a harmless
+                    # no-op: macOS answers with its full "Unrecognized target
+                    # specifier" service listing on STDERR -- 50KB of it,
+                    # measured 2026-10-31 -- which would drown this command's
+                    # diagnostics.  Refuse with a controlled message instead.
+                    [ -n "$macos_launch_service" ] ||
+                        fail 'cannot determine the launchd service target: no user id could be read'
                     case "$macos_launch_service" in
                         system/*)
                             fail 'system LaunchDaemon com.agentq.pueued is inactive; rerun the AgentQ installer in an interactive sudo session'
@@ -2073,9 +2081,29 @@ start_managed_daemon() {
 macos_launch_service_target() {
     local macos_uid
 
-    macos_uid=$(id -u)
+    # A subprocess feeding doctor's `launchd_service=` line must not leak its
+    # stderr onto that line, and must not abort the caller under set -e when it
+    # is missing or unrunnable.  The caller used to write the KEY with a bare
+    # `printf 'launchd_service=' >&2` (no newline) and only then call this
+    # function, so `id`'s diagnostic landed ON the key line and a failing `id`
+    # killed doctor before the value was ever printed; see the Darwin arm of
+    # doctor for the measurement.
+    #
+    # The return contract is unchanged -- every `return` below is the one that
+    # was already there.  "No uid, so no per-user domain can be named" is
+    # signalled by leaving `$macos_launch_service` EMPTY rather than by a new
+    # non-zero return, because two callers invoke this as a plain statement
+    # under `set -e`: a new failure exit would turn a diagnostic gap into a
+    # crash.  Those two already treat a non-matching target as "not active",
+    # and an empty target matches nothing, so they behave as before.
+    macos_uid=$(id -u 2>/dev/null) || macos_uid=''
     macos_launch_service="system/com.agentq.pueued"
     if [ -f /Library/LaunchDaemons/com.agentq.pueued.plist ] || launchctl print "$macos_launch_service" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [ -z "$macos_uid" ]; then
+        macos_launch_service=''
         return 0
     fi
 
@@ -5807,6 +5835,7 @@ doctor() {
     local pueue_version_output pueued_version_output
     local systemd_user_service_output systemd_linger_output
     local scheduled_task_output scheduled_task_status
+    local launchd_output
     printf 'agentq=' >&2
     printf '%s\n' "$agentq_version" >&2
     # These two lines write the machine-readable `key=value` pairs this check
@@ -5894,14 +5923,45 @@ doctor() {
                     # exactly one key=value line.
                     systemd_user_service_output=$(systemctl --user is-active agentq-pueued.service 2>/dev/null) || true
                     printf 'systemd_user_service=%s\n' "${systemd_user_service_output:-unavailable}" >&2
-                    systemd_linger_output=$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null) || true
+                    # The inner `$(id -un)` feeds loginctl's argument, but its
+                    # own stderr is NOT covered by the outer `2>/dev/null` -- an
+                    # inner command substitution's stderr escapes to doctor's
+                    # stderr (measured: `id: cannot find name for user ID N`
+                    # rendered between the two systemd lines).  Redirect it too.
+                    systemd_linger_output=$(loginctl show-user "$(id -un 2>/dev/null)" -p Linger --value 2>/dev/null) || true
                     printf 'systemd_linger=%s\n' "${systemd_linger_output:-unavailable}" >&2
                     ;;
                 Darwin*)
-                    printf 'launchd_service=' >&2
+                    # Same class as pueue=/pueued= and the Linux systemd lines:
+                    # a machine-readable key=value line must be written whole.
+                    # The old form wrote the KEY with a bare `printf
+                    # 'launchd_service=' >&2` (no newline) and only then called
+                    # macos_launch_service_target, whose `id -u` probe could
+                    # write its stderr ONTO that unterminated key line -- and a
+                    # failing id aborted doctor under set -e before the value
+                    # was ever printed.  Measured 2026-10-31 on this host (real
+                    # Darwin branch, no platform shadowing needed), with `id`
+                    # present but a 0755 plain-text file:
+                    #   launchd_service=<path>/id: line 1: not: command not found
+                    # and `doctor` exited 127 -- outside the documented 0-6
+                    # range -- with no `launchd_domain=` line and no reason
+                    # line at all.  Capture the whole answer first, then print
+                    # each key=value line exactly once; when no per-user domain
+                    # can be named, both lines take the documented `unavailable`
+                    # sentinel rather than a fabricated `user/`.
                     macos_launch_service_target
-                    launchctl print "$macos_launch_service" >/dev/null 2>&1 && printf '%s\n' active >&2 || printf '%s\n' inactive >&2
-                    printf 'launchd_domain=%s\n' "${macos_launch_service%/com.agentq.pueued}" >&2
+                    if [ -n "$macos_launch_service" ]; then
+                        if launchctl print "$macos_launch_service" >/dev/null 2>&1; then
+                            launchd_output='active'
+                        else
+                            launchd_output='inactive'
+                        fi
+                        printf 'launchd_service=%s\n' "$launchd_output" >&2
+                        printf 'launchd_domain=%s\n' "${macos_launch_service%/com.agentq.pueued}" >&2
+                    else
+                        printf 'launchd_service=%s\n' unavailable >&2
+                        printf 'launchd_domain=%s\n' unavailable >&2
+                    fi
                     ;;
             esac
             ;;

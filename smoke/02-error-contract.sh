@@ -203,8 +203,20 @@ systemd_case() {
             # the SHELL writes the diagnostic.  Same shape as the pueue= loop.
             printf 'not a binary\n' > "$linux_shim/systemctl"
             printf 'not a binary\n' > "$linux_shim/loginctl" ;;
+        uid-unresolved)
+            # `id -un` -- the INNER command substitution feeding loginctl --
+            # fails.  Its stderr is not covered by the OUTER `2>/dev/null` of
+            # the capture line (a subshell's stderr is the server's stderr
+            # unless that subshell redirects it itself), so pre-fix the
+            # diagnostic rendered BETWEEN the two systemd lines.  The outer
+            # probes answer normally: only the inner leak is under test.
+            printf '#!/bin/sh\nprintf "inactive\\n"\nexit 3\n' > "$linux_shim/systemctl"
+            printf '#!/bin/sh\nprintf "no\\n"\n' > "$linux_shim/loginctl"
+            printf '#!/bin/sh\ncase "$*" in\n  *-un*) printf "id: cannot find name for user ID 501\\n" >&2; exit 1 ;;\n  *) printf "501\\n" ;;\nesac\n' > "$linux_shim/id" ;;
     esac
     chmod 700 "$linux_shim/systemctl" "$linux_shim/loginctl"
+    [ -f "$linux_shim/id" ] || printf '#!/bin/sh\nprintf "501\\n"\n' > "$linux_shim/id"
+    chmod 700 "$linux_shim/id"
     cases=$((cases + 1))
     server_status=0
     PATH="$linux_shim:$PATH" "$server" doctor \
@@ -227,7 +239,7 @@ systemd_case() {
             failures=$((failures + 1))
         fi
     done
-    if grep -qE ': line [0-9]+:|bad interpreter|cannot execute|command not found|Failed to connect to bus' \
+    if grep -qE ': line [0-9]+:|bad interpreter|cannot execute|command not found|Failed to connect to bus|(^|[^a-z_])id: ' \
         "$work/systemd-$shape.stderr"; then
         printf 'systemd-version-block [%s]: a raw probe diagnostic reached doctor stderr: %s\n' \
             "$shape" "$(head -3 "$work/systemd-$shape.stderr" | tr '\n' '|')" >&2
@@ -244,6 +256,132 @@ systemd_case healthy          active   yes
 systemd_case inactive-stdout  inactive no
 systemd_case bus-error        unavailable unavailable
 systemd_case unlaunchable     unavailable unavailable
+systemd_case uid-unresolved   inactive no
+
+# The SAME class in the DARWIN arm of the same version block.  Unlike the
+# Linux and Windows arms this one needs no platform shadowing -- smoke runs on
+# macOS -- but its probes answer for the HOST (`id` for the caller, the real
+# `launchctl` for the service).  `id` is stubbed because it is the probe under
+# test; `launchctl` is left real so the case manages no service.  Pre-fix, an
+# `id` that fails or cannot start made doctor print
+#   launchd_service=<path>/id: line 1: not: command not found
+# and exit 127, outside the documented 0-6 range, with NO `launchd_domain=`
+# line and no reason line at all.  Both user-domain cases below therefore
+# assert a SHAPE (`active`/`inactive`, and a domain naming one of launchd's
+# three real scopes) rather than a host-specific value; a host where the
+# service is installed as a LaunchDaemon answers `system` and still passes.
+darwin_assert() {
+    local label=$1 stderr_file=$2 status=$3
+    local key count actual
+    for key in launchd_service launchd_domain; do
+        count=$(grep -c "^$key=" "$stderr_file" || true)
+        if [ "$count" -ne 1 ]; then
+            printf 'darwin-version-block [%s]: expected exactly one %s= line, found %s\n' \
+                "$label" "$key" "$count" >&2
+            failures=$((failures + 1))
+            continue
+        fi
+        actual=$(grep "^$key=" "$stderr_file" | head -1)
+        case "$key:$actual" in
+            launchd_service:launchd_service=active|launchd_service:launchd_service=inactive|launchd_service:launchd_service=unavailable) ;;
+            launchd_domain:launchd_domain=system|launchd_domain:launchd_domain=gui/*|launchd_domain:launchd_domain=user/*|launchd_domain:launchd_domain=unavailable) ;;
+            *)  printf 'darwin-version-block [%s]: %s is `%s`, outside the documented shape\n' \
+                    "$label" "$key" "$actual" >&2
+                failures=$((failures + 1)) ;;
+        esac
+    done
+    if grep -qE '(^|[^a-z_])id: |: line [0-9]+:|command not found|bad interpreter|cannot execute' "$stderr_file"; then
+        printf 'darwin-version-block [%s]: a raw probe diagnostic reached doctor stderr: %s\n' \
+            "$label" "$(head -6 "$stderr_file" | tr '\n' '|')" >&2
+        failures=$((failures + 1))
+    fi
+    case "$status" in
+        0|2) ;;
+        *)  printf 'darwin-version-block [%s]: doctor exited %s, outside the documented 0-6 contract\n' \
+                "$label" "$status" >&2
+            failures=$((failures + 1)) ;;
+    esac
+}
+
+# Shape A: `id` runs and answers, but nothing it can print is a uid.  The
+# domain falls through to the user-scope fallback and both lines stay whole.
+darwin_stub_uid='aq-smoke-noninteger'
+darwin_shim="$work/darwin-shim"
+mkdir -p "$darwin_shim"
+printf '#!/bin/sh\nprintf "%s\\n" "$AGENTQ_SMOKE_UID"\n' > "$darwin_shim/id"
+chmod 700 "$darwin_shim/id"
+cases=$((cases + 1))
+darwin_status=0
+PATH="$darwin_shim:$PATH" AGENTQ_SMOKE_UID="$darwin_stub_uid" "$server" doctor \
+    >"$work/darwin.stdout" 2>"$work/darwin.stderr" || darwin_status=$?
+darwin_assert answers "$work/darwin.stderr" "$darwin_status"
+
+# Shape B: `id` is on PATH but cannot start -- 0755 regular file of plain text,
+# the same "permission is not a promise" shape the pueue= and systemctl cases
+# use.  The shell writes the diagnostic; the arm must still report both lines,
+# with the documented `unavailable` sentinel rather than a fabricated `user/`.
+darwin_broken="$work/darwin-broken"
+mkdir -p "$darwin_broken"
+printf 'not a binary\n' > "$darwin_broken/id"
+chmod 700 "$darwin_broken/id"
+cases=$((cases + 1))
+darwin_status=0
+PATH="$darwin_broken:$PATH" "$server" doctor \
+    >"$work/darwin-broken.stdout" 2>"$work/darwin-broken.stderr" || darwin_status=$?
+darwin_assert cannot-start "$work/darwin-broken.stderr" "$darwin_status"
+grep -qxF 'launchd_service=unavailable' "$work/darwin-broken.stderr" || {
+    printf 'darwin-version-block [cannot-start]: launchd_service must be `unavailable` when no uid can be read\n' >&2
+    failures=$((failures + 1))
+}
+grep -qxF 'launchd_domain=unavailable' "$work/darwin-broken.stderr" || {
+    printf 'darwin-version-block [cannot-start]: launchd_domain must be `unavailable` when no uid can be read\n' >&2
+    failures=$((failures + 1))
+}
+
+# The guard that keeps an empty target away from `launchctl kickstart`.  Tolerating a
+# failing `id` made a previously-unreachable state reachable: with no uid the
+# target is empty, and `launchctl kickstart ""` is not a no-op -- macOS answers
+# by listing every service in the domain, 55238 bytes on stderr measured
+# 2026-10-31, which would bury this command's own diagnostics.  Reaching the
+# start path needs `run_pueue status --json` to fail, so the pueue stub is
+# swapped the same way bad_status_run does it, and restored immediately.
+cases=$((cases + 1))
+cp "$work/pueue" "$work/pueue.real"
+cat > "$work/pueue" <<'STUB'
+#!/bin/sh
+case "$*" in
+    *"status --json"*) printf 'pueue status is unavailable\n' >&2; exit 1 ;;
+    *) printf 'pueue 4.0.4\n' ;;
+esac
+STUB
+chmod 700 "$work/pueue"
+darwin_start_status=0
+PATH="$darwin_broken:$PATH" "$server" status \
+    >"$work/darwin-start.stdout" 2>"$work/darwin-start.stderr" || darwin_start_status=$?
+mv "$work/pueue.real" "$work/pueue"
+if [ "$darwin_start_status" -ne 2 ]; then
+    printf 'darwin-start-guard: expected exit 2, got %s\n' "$darwin_start_status" >&2
+    failures=$((failures + 1))
+fi
+if ! grep -qxF -- 'agentq-server: cannot determine the launchd service target: no user id could be read' \
+    "$work/darwin-start.stderr"; then
+    printf 'darwin-start-guard: the controlled message for an empty target is missing\n' >&2
+    head -3 "$work/darwin-start.stderr" >&2 || true
+    failures=$((failures + 1))
+fi
+if ! grep -qxF -- 'agentq-server: reason=protocol_error' "$work/darwin-start.stderr"; then
+    printf 'darwin-start-guard: the reason line is missing\n' >&2
+    failures=$((failures + 1))
+fi
+# The flood guard: an empty target must never reach launchctl, whose refusal is
+# tens of kilobytes.  A byte ceiling is the measurable form of "it did not".
+darwin_start_bytes=$(wc -c < "$work/darwin-start.stderr" | tr -d ' ')
+if [ "$darwin_start_bytes" -gt 1024 ]; then
+    printf 'darwin-start-guard: stderr was %s bytes; an empty target reached launchctl\n' \
+        "$darwin_start_bytes" >&2
+    failures=$((failures + 1))
+fi
+
 
 # The SAME class in the WINDOWS arm of the same version block -- the third and
 # last of the three, and the one PLAN.md had recorded as "no platform to
