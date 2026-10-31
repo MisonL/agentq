@@ -2364,6 +2364,81 @@ if [ "$repo_script_count" -eq 0 ]; then
     failures=$((failures + 1))
 fi
 
+# --- repo scripts: a help probe must not go through -File ---------------------
+# Found 2026-11-01 by smoke/25's FIRST Windows CI run.  smoke/25 asserted the
+# client installer's `-?` synopsis with `pwsh -File <asset> -?`.  Measured on the
+# real Windows runner (PS 5.1.26100.33648): that form prints NOTHING on either
+# stream and still exits 0 -- 5.1 swallows the help switch when the script is
+# launched with -File.  The same form on pwsh 7 DOES print the synopsis, so the
+# check was green locally and in every prior run; the first English Windows host
+# reported the correct asset as broken.  The check was asserting a HOST RENDERING
+# as if it were the ASSET's contract, and it had only ever passed on a zh-CN host
+# because the en-US wrapper happened to reach the script through the call
+# operator instead.
+#
+# The form measured to render on BOTH engines is the call operator:
+# `-Command "& '<script>' -?"`.  So a line that asks a .ps1 for its synopsis must
+# not also pass it on a -File launch.  The rule fires on the SHAPE (both tokens on
+# one logical line, continuations joined), not on one spelling: `-File x.ps1 '-?'`
+# and `-File x.ps1 -?` are the same mistake, and the `-?` may sit anywhere after
+# -File on that line.
+#
+# Nothing in the repo does this today (measured: 0 sites), which is exactly why a
+# static ban is the right instrument -- the behavioural self-test inside smoke/25
+# guards THAT check, and this keeps the same shape from reappearing in a check
+# nobody re-measures.  A ban may legitimately have 0 hits, so the vacuity guard
+# here is the script census, not a hit count.
+ps_help_re='-File[^|;&]*[[:space:]]-\?([[:space:]]|$)'
+ps_help_count=0
+while IFS= read -r ps_help_script; do
+    # `-e`: the pattern BEGINS with `-File`, and without it grep parses the
+    # pattern as options (`-F -i -l -e`) -- measured 2026-11-01: the rule then
+    # reported the literal string `(standard input)` instead of a line number.
+    ps_help_hits=$(repo_pipe_scan "$ps_help_script" 2>/dev/null \
+        | grep -E -e "$ps_help_re" \
+        | grep -vE '^[0-9]+:[[:space:]]*#' || true)
+    if [ -n "$ps_help_hits" ]; then
+        while IFS= read -r ps_help_hit; do
+            printf 'repo script FAILED (a .ps1 help probe launched on the -File path: measured 2026-11-01, PS 5.1 swallows the help switch there and prints NOTHING on either stream while still exiting 0, so the assertion reads a correct asset as broken; reach the synopsis through the call operator -- a -Command that starts with & -- which was measured to render on both engines): %s: %s\n' \
+                "${ps_help_script#"$root"/}" "$ps_help_hit" >&2
+            ps_help_count=$((ps_help_count + 1))
+        done <<EOF
+$ps_help_hits
+EOF
+        failures=$((failures + 1))
+    fi
+done <<EOF
+$(find "$root/smoke" -type f -name '*.sh' | sort)
+$root/run-tests.sh
+$root/sandbox.sh
+$shell_assets
+EOF
+# Bidirectional calibration: the ban must fire on the -File shape and stay silent
+# on the call-operator shape and on a comment.  Without this the regex could be
+# dead (an unescaped `-?` is a valid ERE quantifier and silently matches nothing).
+ps_help_fixture=$(mktemp "${TMPDIR:-/tmp}/agentq-pshelp.XXXXXX")
+# The shapes are BUILT, not written literally: this file is itself scanned by the
+# rule, and a literal fixture line would be its own first violation (measured
+# 2026-11-01 -- the first draft reported smoke/01 twice, once for the fixture and
+# once for the diagnostic text).  `%s` carries the help sigil so neither the
+# source nor the message above spells `-File <path> -?` on one line.
+ps_help_param='-?'
+{
+    printf 'pwsh -NoProfile -File "$asset" %s\n' "$ps_help_param"
+    printf 'pwsh -NoProfile -File "$asset" -Check\n'
+    printf 'pwsh -NoProfile -Command "& '"'"'$asset'"'"' %s"\n' "$ps_help_param"
+    printf '# pwsh -NoProfile -File "$asset" %s\n' "$ps_help_param"
+} > "$ps_help_fixture"
+ps_help_selftest=$(repo_pipe_scan "$ps_help_fixture" \
+    | grep -E -e "$ps_help_re" \
+    | grep -vE '^[0-9]+:[[:space:]]*#' | cut -d: -f1 | tr '\n' ' ')
+rm -f "$ps_help_fixture"
+if [ "$ps_help_selftest" != '1 ' ]; then
+    printf 'syntax-and-parity FAILED (the -File/-? help-probe ban failed its self-test: expected only fixture line 1, got [%s])\n' \
+        "$ps_help_selftest" >&2
+    failures=$((failures + 1))
+fi
+
 # A `2>/dev/null` written ON a redirection does not suppress the shell's own
 # open error: `cmd < "$f" 2>/dev/null` still prints `bash: <f>: No such file or
 # directory`, because that message is written BEFORE the redirect applies.
@@ -3597,8 +3672,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
@@ -3610,7 +3685,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned
