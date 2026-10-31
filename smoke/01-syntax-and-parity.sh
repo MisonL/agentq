@@ -1143,6 +1143,287 @@ assert (True in data) or ("on" in data), "a workflow needs an on/trigger key"
     workflow_summary=$workflow_count
 fi
 
+# --- workflow substitutions: a pipeline whose grep is not `|| true`-guarded --
+# The workflow files are the enforcement layer, and they are shell steps -- so
+# the pipefail hazard (see the repo_pipes rule above) lives here too, in a
+# worse shape: a silent abort of the whole job.  Actions runs a step that
+# declares `shell: bash` as `bash --noprofile --norc -e -o pipefail`, so an
+# unmatched `grep` inside a `$( )` substitution makes the pipeline non-zero,
+# the assignment fails, and `set -e` kills the STEP -- every later check in
+# that job simply never runs.  Measured 2026-10-31 on windows-latest: ci.yml's
+# windows job had
+#   occurrences=$(grep -o 'NOT-covered' "$log" | wc -l | tr -d ' ')
+# `grep -o` found nothing in smoke/20's (healthy, token-free) output, set -e
+# killed the step, and checks 22/23/25 never ran -- their logs did not even
+# exist for the job's ps51-assertion step, which then failed too.
+# That is why the fix is `( grep ... || true )` and not a bare `|| true` at the
+# end of the pipeline: `wc -l | tr -d ' '` always succeeds, so a trailing `||`
+# would never see the failing grep.
+# The scanner only READS the workflow source (pyyaml, `run:` blocks as
+# strings); it does not execute anything.  `$( )` is matched bracket-wise with
+# quote awareness, the way bash slices a substitution, and `||` is not treated
+# as a pipeline separator.  Judgement has two arms: in a `shell: bash` step ANY
+# grep stage without `||` is a violation (pipefail makes any stage's failure
+# fatal); in a default-shell step only a grep in the LAST stage is flagged,
+# because `bash -e` alone takes the pipeline's status from its last command and
+# an earlier grep's 1 is masked.
+workflow_pipe_rc=0
+workflow_pipe_summary='skipped(no pyyaml)'
+if python3 -c 'import yaml' >/dev/null 2>&1; then
+    workflow_pipe_out=$(python3 -I - "$root" <<'PY'
+import glob
+import os
+import re
+import sys
+
+import yaml
+
+root = sys.argv[1]
+files = sorted(glob.glob(os.path.join(root, ".github", "workflows", "*.yml")))
+if not files:
+    print("no workflow files were enumerated; refusing to report a pass", file=sys.stderr)
+    sys.exit(2)
+
+grep_re = re.compile(r"(?<![A-Za-z0-9_.-])(?:grep|egrep|fgrep)(?![A-Za-z0-9_.-])")
+
+
+def substitutions(text):
+    """Every `$( ... )` body, outermost first, quote-aware.
+
+    Parens inside a single-quoted region are literal; a `$(` inside a
+    double-quoted region still starts one (that is how
+    `known_ncov=" $(grep ... || true)"` is written).  Backslash-escaped
+    characters are skipped.  This mirrors how bash slices the substitution
+    well enough for the shapes in these files.
+    """
+    out = []
+    depth = 0
+    start = None
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "'":
+            j = text.find("'", i + 1)
+            if j < 0:
+                break
+            i = j + 1
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                c = text[j]
+                if c == "\\":
+                    j += 2
+                    continue
+                if c == '"':
+                    break
+                if c == "$" and j + 1 < n and text[j + 1] == "(":
+                    if depth == 0:
+                        start = j + 2
+                    depth += 1
+                    j += 2
+                    continue
+                j += 1
+            i = j + 1
+            continue
+        if ch == "$" and i + 1 < n and text[i + 1] == "(":
+            if depth == 0:
+                start = i + 2
+            depth += 1
+            i += 2
+            continue
+        if ch == ")" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                out.append(text[start:i])
+                start = None
+        i += 1
+    return out
+
+
+def split_pipes(s):
+    """Pipeline stages, `||` treated as an operator, quotes respected."""
+    parts = []
+    cur = ""
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "\\":
+            cur += ch
+            if i + 1 < n:
+                cur += s[i + 1]
+            i += 2
+            continue
+        if ch == "'":
+            j = s.find("'", i + 1)
+            if j < 0:
+                cur += s[i:]
+                break
+            cur += s[i : j + 1]
+            i = j + 1
+            continue
+        if ch == '"':
+            j = i + 1
+            cur += ch
+            while j < n:
+                c = s[j]
+                cur += c
+                if c == "\\" and j + 1 < n:
+                    cur += s[j + 1]
+                    j += 2
+                    continue
+                if c == '"':
+                    j += 1
+                    break
+                j += 1
+            i = j
+            continue
+        if ch == "|":
+            if i + 1 < n and s[i + 1] == "|":
+                cur += "||"
+                i += 2
+                continue
+            parts.append(cur)
+            cur = ""
+            i += 1
+            continue
+        cur += ch
+        i += 1
+    parts.append(cur)
+    return parts
+
+
+def guarded(stage):
+    return "||" in split_pipes(stage) or "||" in stage
+
+
+def scan(data):
+    """(strict_checked, masked_checked, violations) for one parsed workflow."""
+    strict = 0
+    masked = 0
+    violations = []
+    for job_name, job in (data.get("jobs") or {}).items():
+        for index, step in enumerate(((job or {}).get("steps")) or []):
+            if not isinstance(step, dict):
+                continue
+            run = step.get("run")
+            if not isinstance(run, str):
+                continue
+            pipefail = (step.get("shell") or "").strip() == "bash"
+            for body in substitutions(run):
+                stages = split_pipes(body)
+                if pipefail:
+                    strict += 1
+                else:
+                    masked += 1
+                nstages = len(stages)
+                for si, stage in enumerate(stages):
+                    if not grep_re.search(stage):
+                        continue
+                    if not pipefail and si != nstages - 1:
+                        continue
+                    tail = "|".join(stages[si:])
+                    if "||" in tail:
+                        continue
+                    violations.append(
+                        (job_name, index, pipefail, stage.strip()[:110])
+                    )
+    return strict, masked, violations
+
+
+def calibrate():
+    """Prove the detector distinguishes each arm it claims to cover."""
+    cases = [
+        ("pipefail, unguarded trailing grep",
+         {"jobs": {"j": {"steps": [{"shell": "bash",
+                                    "run": "x=$(grep -o t f | wc -l)\n"}]}}}, 1),
+        ("pipefail, guarded (( ) || true)",
+         {"jobs": {"j": {"steps": [{"shell": "bash",
+                                    "run": "x=$( (grep -o t f || true) | wc -l)\n"}]}}}, 0),
+        ("pipefail, guarded mid-pipeline grep",
+         {"jobs": {"j": {"steps": [{"shell": "bash",
+                                    "run": "x=$(grep -o t f | grep -v q || true)\n"}]}}}, 0),
+        ("default shell, grep masked by later stage",
+         {"jobs": {"j": {"steps": [{"run": "x=$(grep -o t f | wc -l)\n"}]}}}, 0),
+        ("default shell, grep is the last stage",
+         {"jobs": {"j": {"steps": [{"run": "x=$(printf z | grep -c .)\n"}]}}}, 1),
+        ("pipefail, bare subshell grep no pipe",
+         {"jobs": {"j": {"steps": [{"shell": "bash",
+                                    "run": "x=$(grep a f)\n"}]}}}, 1),
+        ("pipefail, outer grep guarded but quotes still parsed",
+         {"jobs": {"j": {"steps": [{"shell": "bash",
+                                    "run": "x=$(grep -o 'q([^)]*)' f | wc -l)\n"}]}}}, 1),
+        ("default shell, grep -v is not quiet and is last",
+         {"jobs": {"j": {"steps": [{"run": "x=$(grep -v x f)\n"}]}}}, 1),
+    ]
+    bad = []
+    for label, doc, want in cases:
+        _, _, got = scan(doc)
+        if len(got) != want:
+            bad.append("%s: expected %d violation(s), got %d" % (label, want, len(got)))
+    return bad
+
+
+calibration = calibrate()
+if calibration:
+    for line in calibration:
+        print("calibration FAILED: %s" % line, file=sys.stderr)
+    print("refusing to report a pass on an uncalibrated detector", file=sys.stderr)
+    sys.exit(2)
+
+strict_total = 0
+masked_total = 0
+violations = []
+for path in files:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh.read())
+    except Exception as exc:
+        print("%s is unreadable: %s" % (path, exc), file=sys.stderr)
+        sys.exit(2)
+    if not isinstance(data, dict):
+        print("%s did not parse to a mapping" % path, file=sys.stderr)
+        sys.exit(2)
+    strict, masked, found = scan(data)
+    strict_total += strict
+    masked_total += masked
+    for job_name, index, pipefail, text in found:
+        violations.append(
+            "%s job=%s step=%s shell=%s: %s"
+            % (os.path.basename(path), job_name, index,
+               "bash(pipefail)" if pipefail else "default", text)
+        )
+
+if strict_total == 0:
+    print("no shell:bash substitution was inspected; refusing to report a pass",
+          file=sys.stderr)
+    sys.exit(2)
+
+if violations:
+    for line in violations:
+        print(line)
+    sys.exit(1)
+
+print("%d/%d" % (strict_total, strict_total + masked_total))
+PY
+    ) || workflow_pipe_rc=$?
+    case $workflow_pipe_rc in
+    0) workflow_pipe_summary="workflow_pipes=$workflow_pipe_out" ;;
+    *)
+        printf 'workflow pipe-fail pipeline FAILED (a substitution in a workflow step pipes into an unguarded grep; under pipefail+set -e it silently aborts that step and every later job):\n' >&2
+        sed 's/^/      /' >&2 <<EOF
+$workflow_pipe_out
+EOF
+        failures=$((failures + 1))
+        ;;
+    esac
+fi
+
 # --- ci.yml's pinned check list vs smoke/*.sh --------------------------------
 # ci.yml pins the exact set of check names that must report (`expected_checks`),
 # so a new or renamed check turns CI red.  Locally nothing noticed: a new
@@ -3316,8 +3597,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
@@ -3329,7 +3610,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows ci_pin gitattr gitignore skill_modes kinds summary_census'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes redir_noop mktemp_suffix local_hazards local_hazard_files executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned
