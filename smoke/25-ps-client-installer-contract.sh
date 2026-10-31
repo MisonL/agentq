@@ -231,19 +231,126 @@ expect_rejected 'unknown parameter' \
 expect_rejected 'unknown parameter with -Check' \
     "A parameter cannot be found that matches parameter name 'Bogus'." -Check -Bogus x
 
+host_kind=$(uname -s 2>/dev/null || printf 'unknown')
+
 # `-?` is PowerShell's own help switch (not the script's): it prints the usage
-# synopsis to stdout and exits 0.  This is the ONLY reachable zero-exit path, and
-# it must not be confused with the installer doing work -- assert nothing is
-# written and the synopsis names the three real parameters.
+# synopsis and exits 0.  That is the only reachable zero-exit path here, and it
+# must not be confused with the installer doing work.
+#
+# MEASURED 2026-11-01 on the real Windows CI runner (PS 5.1.26100.33648), because
+# the first Windows run of this check failed with "the synopsis does not list the
+# three parameters" while printing ZERO bytes.  How `-?` renders depends on how
+# the script is REACHED, and that is an ENGINE split, not an asset one:
+#
+#   `-File <asset> -?`    -> exit 0, stdout 0 bytes, stderr 0 bytes (swallowed)
+#   `& '<asset>' -?`      -> exit 0, 105 bytes, the synopsis (all three names)
+#   `Get-Help '<asset>'`  -> exit 0, 105 bytes, the synopsis (all three names)
+#
+# pwsh 7 renders the synopsis for `-File` too (measured locally: 101 bytes), so
+# on a macOS/Linux host the forms agree and the difference is invisible.  The old
+# case called run_installer, i.e. `-File` on an English host; it had only ever
+# passed on a zh-CN host, where the en-US wrapper reassembles the call as
+# `& $target ...` -- that green was the WRAPPER's doing, not the asset's, and the
+# first English host reported the correct asset as broken.
+#
+# So `-?` is reached through the call operator, the form measured to render on
+# BOTH engines, and what is asserted is the asset's contract: exit 0 and a
+# synopsis NAMING THE SCRIPT with the three real parameter names.  The script
+# name is what makes the arm below discriminating -- without [CmdletBinding()] a
+# script prints NO synopsis at all (measured here), so "no synopsis naming
+# install-client.ps1" is a real asset defect, and a synopsis without the names is
+# another one.
+#
+# The self-test runs the SAME assertion over a fixture and requires it to go RED,
+# and to go red WITH a synopsis present.  That pair is what separates the three
+# ways this case can be wrong: an assertion that cannot fail (vacuous), an engine
+# that never rendered the help switch (the PS 5.1 `-File` behaviour, which is how
+# this case once produced a false verdict), and a correct assertion.
+#
+# The path must be a WINDOWS path before it goes inside the -Command string:
+# MSYS rewrites bare path ARGUMENTS (which is why `-File "$asset_path"` works)
+# but not a path embedded in a command string, and PS 5.1 cannot open a POSIX
+# path (the cygpath -w rule smoke/12 already lives by).
+#
+# run_help <path> <out-file> <err-file> -- the operator form, in the sandbox
+# HOME; prints the exit status.
+run_help() {
+    local status=0 target
+    target=$1
+    case $host_kind in
+        MINGW*|MSYS*|CYGWIN*) target=$(cygpath -w "$target") ;;
+    esac
+    # PowerShell single-quote escaping: a path with ' would end the string early.
+    target=$(printf '%s' "$target" | sed "s/'/''/g")
+    (cd "$work" && HOME="$work/home" "$pwsh_binary" -NoProfile -NonInteractive \
+        -Command "& '$target' -?") >"$2" 2>"$3" || status=$?
+    printf '%s' "$status"
+}
+
+# synopsis_problem <out-file> <status> <script-name> [name...] -- prints what is
+# wrong with the synopsis, or nothing when it is right.  Always returns 0: it is
+# called under `$( )`, where a non-zero return would be a fail-open.
+synopsis_problem() {
+    local flat name out=$1 status=$2 script=$3 bytes
+    if [ "$status" -ne 0 ]; then
+        printf 'expected exit 0, got %s' "$status"
+        return 0
+    fi
+    bytes=$(wc -c <"$out" | tr -d ' ')
+    flat=$(flatten_err "$out")
+    case "$flat" in
+        *"$script"*) : ;;
+        *) printf 'no synopsis naming %s (stdout %s bytes)' "$script" "$bytes"; return 0 ;;
+    esac
+    shift 3
+    for name in "$@"; do
+        case "$flat" in
+            *"$name"*) : ;;
+            *) printf 'the synopsis does not list %s (stdout %s bytes)' "$name" "$bytes"; return 0 ;;
+        esac
+    done
+    return 0
+}
+
 cases=$((cases + 1))
-help_status=$(run_installer '-?')
-if [ "$help_status" -ne 0 ]; then
-    printf 'ps-client-installer -?: expected 0, got %s\n' "$help_status" >&2
+help_status=$(run_help "$installer" "$work/help.out" "$work/help.err")
+help_problem=$(synopsis_problem "$work/help.out" "$help_status" \
+    'install-client.ps1' -DestinationDirectory -SkipPathUpdate -Check)
+if [ -n "$help_problem" ]; then
+    printf 'ps-client-installer -?: %s\n' "$help_problem" >&2
+    strip_ansi "$work/help.out" | head -3 >&2 || true
     failures=$((failures + 1))
-elif ! grep -qF -- '-DestinationDirectory' "$work/out" \
-   || ! grep -qF -- '-SkipPathUpdate' "$work/out" \
-   || ! grep -qF -- '-Check' "$work/out"; then
-    printf '%s\n' 'ps-client-installer -?: the synopsis does not list the three parameters' >&2
+fi
+
+# The self-test.  The fixture has [CmdletBinding()] and an EMPTY param block, so
+# its synopsis must name the fixture and list no parameters.  Two verdicts are
+# asserted in order, and together they attribute the red arm: arm 1 proves the
+# synopsis RENDERED (the fixture's name is in it), so a rejection in arm 2 cannot
+# have come from the script-name branch and must come from a parameter name --
+# i.e. the assertion is not vacuous, and it did not go red because the engine
+# printed nothing.  ([CmdletBinding()] is load-bearing: measured here, a script
+# without it prints no synopsis at all, and a bare attribute with no param block
+# is itself a parse error.)
+help_fixture="$work/help-fixture.ps1"
+printf '%s\n' '[CmdletBinding()]' 'param()' > "$help_fixture"
+cases=$((cases + 1))
+help_fixture_status=$(run_help "$help_fixture" "$work/help-fixture.out" "$work/help-fixture.err")
+help_fixture_flat=$(flatten_err "$work/help-fixture.out")
+help_fixture_synopsis=false
+case $help_fixture_flat in
+    *help-fixture.ps1*) help_fixture_synopsis=true ;;
+esac
+if [ "$help_fixture_status" -ne 0 ]; then
+    printf 'ps-client-installer -? self-test: the fixture run exited %s instead of 0\n' \
+        "$help_fixture_status" >&2
+    failures=$((failures + 1))
+elif [ "$help_fixture_synopsis" != true ]; then
+    printf 'ps-client-installer -? self-test: a [CmdletBinding()] fixture printed no synopsis (stdout %s bytes) -- the help switch was swallowed by this engine, which is an ENGINE fault, not an asset defect\n' \
+        "$(wc -c <"$work/help-fixture.out" | tr -d ' ')" >&2
+    failures=$((failures + 1))
+elif [ -z "$(synopsis_problem "$work/help-fixture.out" "$help_fixture_status" \
+        'help-fixture.ps1' -DestinationDirectory -SkipPathUpdate -Check)" ]; then
+    printf '%s\n' 'ps-client-installer -? self-test: the assertion ACCEPTED a synopsis naming no expected parameter -- the arm is vacuous' >&2
     failures=$((failures + 1))
 fi
 
