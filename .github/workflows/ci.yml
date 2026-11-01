@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install check dependencies
         # smoke/01 parses the .yml assets (pyyaml), re-parses the shell assets
         # under zsh, and lints the plists (xmllint); 07 and 17 start their own
@@ -171,7 +171,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Ensure pyyaml for the .yml assets
         # smoke/01's tool inventory reports skipped(tool-pyaml) without it and
         # the summary assertion below turns red -- which is the point of the
@@ -227,7 +227,7 @@ jobs:
       # meet the interpreter whose behaviours they exist to pin down.
       AGENTQ_SMOKE_PWSH: powershell.exe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: PowerShell 5.1 client contracts
         shell: bash
         run: |
