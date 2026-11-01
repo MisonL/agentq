@@ -90,54 +90,84 @@ chmod 700 "$work/ssh"
 # an asynchronous command without job control begins with SIGINT/SIGQUIT
 # ignored), and an IGNORED disposition cannot be trapped -- so plain `... &`
 # made the INT case structurally untestable: the client survived and the old
-# assertion passed for the wrong reason.  This wrapper is exec'd AFTER
-# restoring SIG_DFL, so the client really can receive INT.
-cat > "$work/int-launcher.pl" <<'EOF'
-$SIG{INT} = 'DEFAULT';
-exec @ARGV or exit 127;
-EOF
-int_launcher=''
-if command -v perl >/dev/null 2>&1; then
-    int_launcher="perl $work/int-launcher.pl"
-fi
+# assertion passed for the wrong reason.
+#
+# The fix is JOB CONTROL, and it is MEASURED before it is relied on: with `set
+# -m` around the launch the asynchronous command starts with the DEFAULT
+# disposition.  The calibration victim below (six lines, no relation to the
+# asset) uses the same trap and the same stub, so "this shell's job control does
+# not deliver SIGINT" is reported as an ENVIRONMENT fault instead of being read
+# as a client defect -- and instead of being hidden behind a NOT-covered token.
+# Measured 2026-11-01 on bash 3.2.57 (macOS) and bash 5.2.21 (ubuntu:24.04):
+# with job control the victim dies 130; without it, 9 (it ran to completion).
+# (The earlier form needed `perl` to reset SIG_DFL in a wrapper; that made the
+# INT arm depend on a tool no shell requires -- ubuntu:24.04 has perl but a slim
+# image need not, and a check that gates its own coverage on an unrelated
+# interpreter is the false-green shape this repo keeps hunting.)
+#
+# The notification channel must be silenced: with job control on, bash reports
+# "Done"/"Terminated" for a finished job on stderr, and run-tests.sh reports a
+# check by the LAST LINE of its output -- a late notice would replace the
+# summary line the suite prints and the gates grep.  Turning job control back
+# off right after the launch is what keeps bash from printing it at all.
 
 # One run per signal.  All three are asserted separately: a fix that covered only
 # INT (the common one) would pass a single-case check and is exactly the shape of
 # the defect being guarded.
+#
+# Calibrate the INT mechanism FIRST (see the comment above): a six-line victim
+# with the SAME trap and the SAME stub must die 130 under the same job-control
+# launch.  Anything else is an environment fault, and the INT case is then not
+# run -- the failure is already counted, so nothing reads green.
+cat > "$work/int-victim" <<'EOF'
+#!/bin/sh
+trap 'exit 130' INT
+"$INT_STUB" &
+wait $!
+exit 9
+EOF
+chmod 700 "$work/int-victim"
+int_calibration=0
+( set -m
+  SMOKE_SIGNAL=INT INT_STUB="$work/ssh" "$work/int-victim" >/dev/null 2>&1 &
+  victim_pid=$!
+  set +m
+  wait "$victim_pid"
+) 2>/dev/null || int_calibration=$?
+int_ready=true
+if [ "$int_calibration" -ne 130 ]; then
+    int_ready=false
+    printf 'client-interrupt: this shell does not give a background job the default SIGINT disposition even under job control (calibration victim exited %s, expected 130) -- an ENVIRONMENT fault, so the INT case was not run; the TERM/HUP cases below are unaffected\n' \
+        "$int_calibration" >&2
+    failures=$((failures + 1))
+fi
 for signal_name in TERM INT HUP; do
     cases=$((cases + 1))
     : > "$work/ssh-invoked"
     before=$(find "$client_tmp" -mindepth 1 | wc -l | tr -d ' ')
 
-    if [ "$signal_name" = INT ] && [ -z "$int_launcher" ]; then
-        printf 'client-interrupt: SIGINT case NOT-covered (perl is required to restore SIG_DFL in a background job)\n' >&2
+    if [ "$signal_name" = INT ] && [ "$int_ready" = false ]; then
         continue
     fi
 
     status=0
-    if [ "$signal_name" = INT ]; then
-        env -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD_PROMPT \
-            SMOKE_SIGNAL="$signal_name" \
-            TMPDIR="$client_tmp" \
-            AGENTQ_SSH="$work/ssh" \
-            AGENTQ_HOST=127.0.0.1 \
-            AGENTQ_REMOTE_PLATFORM=unix \
-            AGENTQ_CONFIG="$work/absent-config" \
-            AGENTQ_PASSWORD='agentq-smoke-interrupt-secret' \
-            perl "$work/int-launcher.pl" "$client" status >"$work/out.$signal_name" 2>"$work/err.$signal_name" &
-        client_pid=$!
-    else
-        env -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD_PROMPT \
-            SMOKE_SIGNAL="$signal_name" \
-            TMPDIR="$client_tmp" \
-            AGENTQ_SSH="$work/ssh" \
-            AGENTQ_HOST=127.0.0.1 \
-            AGENTQ_REMOTE_PLATFORM=unix \
-            AGENTQ_CONFIG="$work/absent-config" \
-            AGENTQ_PASSWORD='agentq-smoke-interrupt-secret' \
-            "$client" status >"$work/out.$signal_name" 2>"$work/err.$signal_name" &
-        client_pid=$!
-    fi
+    # Job control only where it is needed (the INT case) and only for as long as
+    # the launch takes: the child keeps the default dispositions, and turning it
+    # back off before the job finishes means bash never gets to print a job
+    # notice.  `set -m` in a non-interactive shell is the whole mechanism -- no
+    # helper process, so the pid below is still the client's own.
+    [ "$signal_name" = INT ] && set -m
+    env -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD_PROMPT \
+        SMOKE_SIGNAL="$signal_name" \
+        TMPDIR="$client_tmp" \
+        AGENTQ_SSH="$work/ssh" \
+        AGENTQ_HOST=127.0.0.1 \
+        AGENTQ_REMOTE_PLATFORM=unix \
+        AGENTQ_CONFIG="$work/absent-config" \
+        AGENTQ_PASSWORD='agentq-smoke-interrupt-secret' \
+        "$client" status >"$work/out.$signal_name" 2>"$work/err.$signal_name" &
+    client_pid=$!
+    [ "$signal_name" = INT ] && set +m
 
     # Wait for the stub to prove the client reached an SSH call, then let the
     # signal land.  Bounded so a client that never calls ssh fails instead of
