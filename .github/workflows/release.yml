@@ -8,9 +8,13 @@ on:
   push:
     tags: ['v*']
 
+# Least privilege: no job writes to the repository or calls the API.
+permissions:
+  contents: read
+
 jobs:
   tag-matches-recorded-version:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5

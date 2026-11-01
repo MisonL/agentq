@@ -40,6 +40,8 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 
 **格式约定（2026-10-15 起）**：新条目用**短格式**——一行说清改了什么与对行为的影响，验证只留退出码与关键计数；排查过程、变异证明、教训写进 `docs/PLAN.md`，不进这里。2026-10-14 及之前的长条目按当时约定写成，保留原样。
 
+2026-11-01  CI 两个 workflow 加顶层 `permissions: contents: read`（GITHUB_TOKEN 收窄为只读，原先继承仓库默认权限）；linux 与 release 的 runner 由 `ubuntu-latest` 钉到 `ubuntu-24.04`（该标签正迁往 Ubuntu 26，钉住后环境变化须显式升级而非静默漂移）（并入 0.1.19）  |  ./run-tests.sh --quick → exit 0
+
 2026-11-01  CI 两个 workflow 的 `actions/checkout` 由 v4 升到 v5：v4 声明 Node.js 20 运行时，GitHub 已将其弃用并强制改跑 Node.js 24，每个 job 都挂一条 deprecation 警告；v5 声明 node24，警告消失（不影响资产与检查行为）（并入 0.1.19）  |  ./run-tests.sh --quick → exit 0；CI run 41284051066 三平台绿、Node.js 20 弃用注解 0 条
 
 2026-11-01  **第五十七类：`smoke/28` 的 INT 用例依赖 `perl`（用 perl 恢复 SIG_DFL），无 perl 的主机打 `NOT-covered` 而 `28` 不在 `not-covered-known.txt` 里——本地闸门因此把**整条套件**判 FAIL（fixture 实测 exit 1）。改用**作业控制**：只在启动那一刻 `set -m`（子进程获得默认 SIGINT 处置）、随后 `set +m`（bash 连 job 通知都不打），并先跑一个六行校准受害者——不是 130 就报**环境故障**并跳过 INT，不再有 NOT-covered、也不再依赖任何解释器**（并入 0.1.19）| `./run-tests.sh` → exit 0（29 例；`smoke/28` cases=9 不变；红证：删掉 `set -m` → INT 报 exit 255、改 handler 不退出 → TERM/INT/HUP 三条红）
