@@ -40,6 +40,8 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 
 **格式约定（2026-10-15 起）**：新条目用**短格式**——一行说清改了什么与对行为的影响，验证只留退出码与关键计数；排查过程、变异证明、教训写进 `docs/PLAN.md`，不进这里。2026-10-14 及之前的长条目按当时约定写成，保留原样。
 
+2026-11-01  版本索引里 8 个链接是 404：`v0.1.11`–`v0.1.18` 的 tag 只建在本地、从未推上去（远端只有 `v0.1.0`–`v0.1.10` 与 `v0.1.19`）。补推 8 个 tag（每个触发一次 release.yml 的门禁，逐一核对 tag 与版本常量一致）；`v0.1.18` 由轻量 tag 重建为注记 tag（与其余 19 个一致，指向同一提交）；顺带删除 PLAN 第五节里最后一处已失真的行数陈述（「5,561 行」，0.1.18 已把同类删除）与空目录 `x/`  |  `git ls-remote --tags` 20/20；8 次 release 全 success；`smoke/16` → violations=0
+
 2026-11-01  CI 两个 workflow 加顶层 `permissions: contents: read`（GITHUB_TOKEN 收窄为只读，原先继承仓库默认权限）；linux 与 release 的 runner 由 `ubuntu-latest` 钉到 `ubuntu-24.04`（该标签正迁往 Ubuntu 26，钉住后环境变化须显式升级而非静默漂移）（并入 0.1.19）  |  ./run-tests.sh --quick → exit 0
 
 2026-11-01  CI 两个 workflow 的 `actions/checkout` 由 v4 升到 v5：v4 声明 Node.js 20 运行时，GitHub 已将其弃用并强制改跑 Node.js 24，每个 job 都挂一条 deprecation 警告；v5 声明 node24，警告消失（不影响资产与检查行为）（并入 0.1.19）  |  ./run-tests.sh --quick → exit 0；CI run 41284051066 三平台绿、Node.js 20 弃用注解 0 条
