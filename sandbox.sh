@@ -47,18 +47,46 @@ cleanup_partial() {
     fi
 }
 
-# The pueued we started, located by the pid file the config names -- NOT by
-# `pgrep -f <pattern>`, which does not match a sandboxed pueued on this host
-# (measured), so it reports "not running" while the daemon is up.
+# Pids of every pueued running against THIS sandbox's config.
+#
+# Located by the --config path the process was started with, read from the
+# process table -- NOT by the pid file.  Two measured reasons (2026-11-02):
+#
+#   * a daemon can outlive its pid file.  `down` used to reap only the pid the
+#     file named, so when the file was gone (or the tree had been removed
+#     underneath the daemon) it printed "removed <root>" and exited 0 while the
+#     daemon kept running: an orphan started 2026-10-26 was still up six days
+#     later, and a decoy reproduced the same shape here.
+#   * the pid file holds a NUMBER, and `kill -0 <number>` cannot tell the
+#     daemon from an unrelated process that later REUSED that number.  The old
+#     form would `kill -9` a stranger.  Matching the config path fixes this by
+#     construction: only a process actually running our config matches.
+#
+# `$2 ~ /pueued$/` requires argv[0] to be pueued, so a shell or editor whose
+# command line merely MENTIONS the path is not matched.  Verified on macOS and
+# ubuntu:24.04 with forged-argv decoys, including one on a DIFFERENT config
+# path (not returned).  Boundary: the match reads `ps`'s command column, so a
+# sandbox root long enough for ps to truncate it would not match; sandbox.sh
+# keeps the root short for SUN_LEN anyway (see below).
+#
+# `-ww` is load-bearing on Linux: procps `ps` caps the command column at
+# $COLUMNS even when stdout is a pipe, so an inherited narrow COLUMNS would
+# truncate the line before config path and reboot the orphan this function
+# exists to prevent.  Measured 2026-11-02 on procps-ng 4.0.4: with COLUMNS=20,
+# `ps -axo pid=,command=` printed 20 chars and the predicate matched nothing,
+# while `ps -ww ...` printed the full 108 and matched.  BSD ps (macOS) does not
+# truncate the same way, but -ww is accepted there too, so one spelling covers
+# both.
+sandbox_daemon_pids() {
+    ps -ww -axo pid=,command= 2>/dev/null |
+        awk -v cfg="$config" 'index($0, cfg) > 0 && $2 ~ /pueued$/ { print $1 }'
+}
+
+# The one daemon this sandbox owns, for the status and ready displays.
 daemon_pid() {
-    local pid_file="$agentq_home/runtime/pueued.pid"
-    [ -f "$pid_file" ] || return 1
     local pid
-    pid=$(cat "$pid_file" 2>/dev/null) || return 1
-    case $pid in
-    '' | *[!0-9]*) return 1 ;;
-    esac
-    kill -0 "$pid" 2>/dev/null || return 1
+    pid=$(sandbox_daemon_pids | sed -n '1p')
+    [ -n "$pid" ] || return 1
     printf '%s' "$pid"
 }
 
@@ -140,10 +168,32 @@ cmd_up() {
         printf 'sandbox already running.\n\n  AGENTQ_SMOKE_HOME=%s ./run-tests.sh\n\n' "$agentq_home"
         return 0
     fi
+    # A tree may only be reaped if THIS script created it, and the marker is what
+    # says so.  `down` already refuses an unmarked tree, but `up` printed a note
+    # and carried on -- so the refusal was swallowed, `mkdir -p` found the
+    # directory already there, and the next line wrote the marker into somebody
+    # else's tree.  Measured 2026-11-02: with AGENTQ_SANDBOX_ROOT pointing at a
+    # directory holding precious/keep.txt, `up` exited 0 and planted the marker,
+    # and the following `down` printed "removed <root>" and deleted the file.
+    # Refuse BEFORE the daemon reap, so nothing at all is touched: an unmarked
+    # tree is not ours, and a `down` that declines to delete it does not license
+    # `up` to adopt it.
+    if [ -e "$sandbox_root" ] && [ ! -f "$marker" ]; then
+        die "$sandbox_root exists but carries no $(basename "$marker") marker; refusing to touch a tree this script did not create -- move it aside, or pick another AGENTQ_SANDBOX_ROOT"
+    fi
     if [ -e "$sandbox_root" ]; then
         printf 'sandbox: removing a stale sandbox at %s\n' "$sandbox_root" >&2
-        cmd_down >/dev/null 2>&1 || true
     fi
+    # Reap unconditionally, not only when the tree is still there.  A daemon can
+    # outlive its tree: if `down` runs after the pid file is gone it reports
+    # success and leaves the daemon behind, and if the tree was then deleted the
+    # daemon keeps running on a config path that no longer exists.  A later `up`
+    # used to skip `down` in exactly that state (tree absent, daemon not
+    # answering, since its socket went with the tree) and start a SECOND pueued
+    # on the same config -- measured 2026-11-02: two live pueueds, one of them
+    # unreachable.  We already know none responds, so any match here is useless
+    # and must go before a new one binds.
+    cmd_down >/dev/null 2>&1 || true
 
     installer_hashes
     mkdir -p "$home" "$agentq_home/config" "$agentq_home/data/task_logs" "$agentq_home/runtime"
@@ -222,8 +272,27 @@ YML
 }
 
 cmd_down() {
-    local pid
-    if pid=$(daemon_pid); then
+    local pid pids
+    # Ownership is decided FIRST, before anything is killed or deleted.  The
+    # marker is the only proof this tree is ours, and a tree we refuse to delete
+    # is a tree we must not modify either: the pid-file removal below used to run
+    # BEFORE this check, so `down` on a foreign/unmarked tree printed "refusing to
+    # delete it", exited 1, and had already deleted a file inside it.  Measured
+    # 2026-11-02: a foreign tree holding runtime/pueued.pid came back missing that
+    # file -- and a pueued whose pid file vanishes is exactly the orphan this
+    # round exists to prevent, so the refusal was manufacturing the failure mode.
+    #
+    # A tree that does not exist is NOT a refusal case: the daemon can outlive its
+    # tree, and that orphan is ours to reap (there is nothing else to protect).
+    if [ -e "$sandbox_root" ] && [ ! -f "$marker" ]; then
+        printf 'sandbox: %s has no marker file; refusing to delete it\n' "$sandbox_root" >&2
+        return 1
+    fi
+    # Reap EVERY matching daemon, not just one: a second sandbox started after
+    # the first lost its pid file leaves two pueueds on one config, and hunting
+    # down the extra one by hand is what the pid-file-only form forced.
+    pids=$(sandbox_daemon_pids)
+    for pid in $pids; do
         kill "$pid" 2>/dev/null || true
         local waited=0
         while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 10 ]; do
@@ -231,18 +300,16 @@ cmd_down() {
             waited=$((waited + 1))
         done
         kill -9 "$pid" 2>/dev/null || true
-        printf 'stopped pueued (%s)\n' "$pid"
-    fi
-    # Only remove a tree this script created.  The marker keeps `down` from
-    # deleting anything that happens to sit at the configured path.
+    done
+    [ -n "$pids" ] && printf 'stopped pueued (%s)\n' "$(printf '%s' "$pids" | tr '\n' ' ' | sed 's/ $//')"
+    # The pid file is written by pueued; drop it too so a later `up` does not
+    # read a stale number and mistake it for a live daemon.
+    rm -f -- "$agentq_home/runtime/pueued.pid" 2>/dev/null || true
+    # Only remove a tree this script created.  Ownership was already established
+    # above, so this is the removal itself, not a second decision point.
     if [ -e "$sandbox_root" ]; then
-        if [ -f "$marker" ]; then
-            rm -rf -- "$sandbox_root"
-            printf 'removed %s\n' "$sandbox_root"
-        else
-            printf 'sandbox: %s has no marker file; refusing to delete it\n' "$sandbox_root" >&2
-            return 1
-        fi
+        rm -rf -- "$sandbox_root"
+        printf 'removed %s\n' "$sandbox_root"
     fi
     printf 'cache kept at %s (delete it to force a re-download)\n' "$cache"
 }
