@@ -3,7 +3,7 @@
 # process was started with -- never by the pid file alone, and never by a bare
 # pid number.
 #
-# Four measured defects (2026-11-02).  The first three share one root:
+# Five measured defects (2026-11-02/03).  The first three share one root:
 #   * `down` located the daemon only through $agentq_home/runtime/pueued.pid.
 #     With that file gone it printed "removed <root>" and exited 0 while pueued
 #     kept running.  An orphan started 2026-10-26 was still alive six days
@@ -25,19 +25,31 @@
 #     orphan above.
 #   * `up` validated that it could rebuild the sandbox (`installer_hashes`) only
 #     AFTER it had destroyed the existing one.
+# The fifth is about the READER of the process table, not the table itself: the
+# locator had ONE ps spelling, and on a host whose ps is BusyBox (alpine's
+# default, and alpine is in this project's own matrix) that spelling is
+# rejected -- which turned "I cannot look" into "nothing is running", with the
+# consequences listed under the ps-flavour cases below.
 #
 # What this proves: `down` reaps every pueued whose argv names THIS config, and
 # nothing else -- a pueued on a different config path and an unrelated process
 # whose pid the stale file happens to name both survive.  `up` reaps a
 # tree-less stale daemon before it starts one of its own, refuses a tree it did
-# not create, and leaves a sandbox intact when it is going to fail anyway.
+# not create, and leaves a sandbox intact when it is going to fail anyway; on a
+# host whose ps only speaks the BusyBox spelling it still reaps, and on a host
+# whose ps it cannot use at all it stops and says so instead of guessing.
 # What it does NOT prove: anything about a real remote host; and nothing about
 # a sandbox root long enough for `ps` to truncate the command column.  The
 # `-ww` in the locator is what removes the COLUMNS cap, measured on procps-ng
 # 4.0.4: `COLUMNS=20 ps -axo pid=,command=` printed 20 chars and matched
 # nothing, while `-ww` printed the full 108 and matched.  BSD ps does not cap
 # the column that way, but `-ww` is accepted there too, so one spelling covers
-# both.
+# both.  The fallback spelling for BusyBox, `ps -o pid=,args=`, is measured to
+# list every process there (BusyBox ps has no session filter); the ORDER of the
+# two spellings is load-bearing, because BSD ps answers `-o pid=,args=` with a
+# session-scoped 6 KB listing against 298 KB for the wide form -- a fallback
+# that ran unconditionally would hide every daemon that is not in the caller's
+# own session.
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -76,29 +88,68 @@ config_for() { # $1 = sandbox root -> the pueue.yml path sandbox.sh would use
 # ./pueued and the config path is its own word, which is what the locator
 # matches.  `exec -a` is how bash rewrites argv[0]; the ( ) subshell returns as
 # soon as the pid is printed, so the recorded pid IS the process under test.
+#
+# The exec target is a COPY of bash NAMED pueued, running a `while` loop.  Three
+# measured reasons, each from a host where the obvious form lied:
+#   * BusyBox's `sleep` is an APPLET and re-derives argv[0]: on alpine
+#     `exec -a './pueued ...' sleep 30` reaches ps as `sleep 30`.
+#   * `bash -c 'sleep 300'` is worse in a different way: bash's final-command
+#     optimization execs the child, so argv[0] comes back as `sleep 300` on
+#     macOS too.  A `while` loop cannot be replaced that way, so the process
+#     keeps the argv[0] `exec -a` gave it.
+#   * BusyBox ps prints the kernel comm in braces as the first args word when
+#     argv[0] differs from it -- measured `{bash} ./pueued --config ...`, which
+#     the predicate `$2 ~ /pueued$/` does not match.  A REAL pueued is an ELF
+#     whose comm IS pueued, so the fixture's comm must be too, and the copy's
+#     BASENAME is what gives it one.  That basename is therefore load-bearing:
+#     a copy called `forge-pueued` produced `{forge-pueued} ./pueued ...` and
+#     the predicate missed (measured).
+forge_setup() {
+    mkdir -p "$work/forge-bin"
+    FORGE_BIN="$work/forge-bin/pueued"
+    cp "$(command -v bash)" "$FORGE_BIN"
+    chmod 700 "$FORGE_BIN"
+}
 forge() { # $1 = forged argv -> prints the pid
-    ( bash -c "exec -a '$1' sleep 300" >/dev/null 2>&1 & printf '%s\n' "$!" )
+    ( bash -c "exec -a '$1' '$FORGE_BIN' -c 'while :; do sleep 1; done'" >/dev/null 2>&1 & printf '%s\n' "$!" )
 }
 alive() { kill -0 "$1" >/dev/null 2>&1; }
 
+# The reading this check does for itself must use the SAME spellings the locator
+# does, or the check would be a one-spelling observer of a two-spelling asset --
+# and would declare the very hosts the fallback exists for to be an environment
+# fault.  Prints the listing, or nothing when no spelling is accepted.
+table_dump() {
+    local spelling
+    for spelling in '-ww -axo pid=,command=' '-o pid=,args='; do
+        # shellcheck disable=SC2086
+        if ps $spelling 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # --- the premise: a forged argv really does reach `ps` ----------------------
 # Every "must be reaped" case below is only meaningful if the forged command
-# line is visible in the shape the locator reads.  If `exec -a` or `ps -ww`
-# behaved differently here, the positive cases would fail loudly -- but the
-# NEGATIVE cases would pass for no reason at all, which is why the calibration
-# runs first and gates the rest.
+# line is visible in the shape the locator reads.  If `exec -a` or the process
+# table behaved differently here, the positive cases would fail loudly -- but
+# the NEGATIVE cases would pass for no reason at all, which is why the
+# calibration runs first and gates the rest.
+forge_setup
+
 cases=$((cases + 1))
 probe_cfg=$(config_for "$work/probe")
 probe_pid=$(forge "./pueued --config $probe_cfg")
 decoys="$decoys $probe_pid"
 sleep 0.3
-probe_line=$(ps -ww -axo pid=,command= 2>/dev/null | awk -v wanted="$probe_pid" '$1 == wanted')
+probe_line=$(table_dump | awk -v wanted="$probe_pid" '$1 == wanted')
 premise_ok=true
 case $probe_line in
 *"pueued --config $probe_cfg"*) : ;;
 *)
     premise_ok=false
-    printf 'sandbox-daemon-reaper: this host does not expose a forged argv through ps -ww -axo (line was [%s]) -- an ENVIRONMENT fault, so the reaper cases were not run\n' \
+    printf "sandbox-daemon-reaper: this host shows a forged argv through neither of the locator's spellings (line was [%s]) -- an ENVIRONMENT fault, so the reaper cases were not run\n" \
         "$probe_line" >&2
     failures=$((failures + 1))
     ;;
@@ -310,10 +361,187 @@ STUB
         printf '%s\n' 'sandbox-daemon-reaper: could not rewrite the checkout root in the copy, so the doomed-up case did not run' >&2
         failures=$((failures + 1))
     fi
+
+    # --- "I cannot look" must not read as "nothing is running" ---------------
+    # The locator read the process table with one spelling only:
+    # `ps -ww -axo pid=,command=`.  BusyBox ps (alpine's default) rejects both
+    # flags (`ps: unrecognized option: w`) and does not know `command` at all,
+    # so on such a host the locator failed -- and failed SILENTLY.  With
+    # pipefail the failing `ps` masked awk's 0, `set -e` killed the script at
+    # `pids=$(sandbox_daemon_pids)`, and `down` exited 1 having printed nothing
+    # at all.  Measured 2026-11-02 on alpine:3.20 and with a faithful stub:
+    #   * `down`: exit 1, stdout 0 bytes, stderr 0 bytes, tree kept, daemon alive.
+    #   * `status`: printed "pueued: not running" about a daemon it could not see.
+    #   * `up`: `cmd_down || true` swallowed the failure, then deleted the tree
+    #     and left the daemon running -- the orphan plus "destroyed for nothing",
+    #     the two shapes the earlier cases in this file exist to prevent.
+    #
+    # Two fixtures, because they prove different things:
+    #   A. a BusyBox-shaped ps: accepts ONLY `-o pid=,args=` (and implements it
+    #      by delegating to the real ps, so the output shape is honest).  The
+    #      fixed locator must fall back to it and do the job properly.
+    #   B. a ps that rejects every spelling: the locator must SAY it cannot
+    #      look and must touch nothing -- never answer "nothing running".
+    mk_ps() { # $1 = dir, $2 = busybox|reject
+        mkdir -p "$1"
+        if [ "$2" = busybox ]; then
+            # Delegating with a FIXED spelling made this stub wrong twice over,
+            # both measured: `-ww -axo` fails on the very host it emulates
+            # (alpine: BusyBox rejects -ww), and a bare `-o pid=,args=` is
+            # session-scoped on macOS (6 KB against 298 KB) so it hid the
+            # process under test.  What the stub must produce is a FULL listing
+            # in `pid args` shape, so it asks the real ps for one with the same
+            # preference order the locator uses.
+            cat >"$1/ps" <<'STUB'
+#!/usr/bin/env bash
+if [ "$#" -ne 2 ] || [ "$1" != "-o" ] || [ "$2" != "pid=,args=" ]; then
+    printf 'ps: unrecognized option: %s\n' "${1#-}" >&2
+    exit 1
+fi
+for cand in '-ww -axo pid=,command=' '-axo pid=,args=' '-o pid=,args='; do
+    if out=$(/bin/ps $cand 2>/dev/null); then
+        printf '%s\n' "$out"
+        exit 0
+    fi
+done
+exit 1
+STUB
+        else
+            cat >"$1/ps" <<'STUB'
+#!/usr/bin/env bash
+printf 'ps: unrecognized option: %s\n' "${1#-}" >&2
+exit 1
+STUB
+        fi
+        chmod 700 "$1/ps"
+    }
+
+    # --- A: a BusyBox-shaped ps is handled, not merely survived ---------------
+    cases=$((cases + 1))
+    bb_bin="$work/ps-busybox-bin"
+    mk_ps "$bb_bin" busybox
+    bb_cal="$work/ps-busybox-cal"
+    mkdir -p "$bb_cal/home/.agentq/config"
+    : >"$bb_cal/.agentq-sandbox"
+    bb_cal_pid=$(forge "./pueued --config $(config_for "$bb_cal")")
+    decoys="$decoys $bb_cal_pid"
+    sleep 0.3
+    bb_cal_hits=$(PATH="$bb_bin:$PATH" ps -o pid=,args= 2>/dev/null |
+        awk -v c="$(config_for "$bb_cal")" 'index($0, c) > 0' | wc -l | tr -d ' ')
+    if [ "$bb_cal_hits" -lt 1 ]; then
+        printf '%s\n' 'sandbox-daemon-reaper: the BusyBox-shaped ps stub does not show a forged argv through -o pid=,args= -- an ENVIRONMENT fault, so the ps-flavour cases were not run' >&2
+        failures=$((failures + 1))
+    else
+        # `down` must find and reap the daemon through the fallback spelling.
+        cases=$((cases + 1))
+        sb_bb="$work/ps-busybox-down"
+        mkdir -p "$sb_bb/home/.agentq/config"
+        : >"$sb_bb/.agentq-sandbox"
+        bb_pid=$(forge "./pueued --config $(config_for "$sb_bb")")
+        decoys="$decoys $bb_pid"
+        sleep 0.3
+        bb_rc=0
+        PATH="$bb_bin:$PATH" AGENTQ_SANDBOX_ROOT="$sb_bb" "$sandbox" down \
+            >"$work/down-busybox.out" 2>&1 || bb_rc=$?
+        if [ "$bb_rc" -ne 0 ]; then
+            printf 'sandbox-daemon-reaper: down exited %s on a host whose ps only speaks the BusyBox spelling: %s\n' \
+                "$bb_rc" "$(tr '\n' '|' <"$work/down-busybox.out")" >&2
+            failures=$((failures + 1))
+        fi
+        if alive "$bb_pid"; then
+            printf '%s\n' 'sandbox-daemon-reaper: down could not find the daemon because its ps is BusyBox -- the locator has no fallback spelling' >&2
+            failures=$((failures + 1))
+        fi
+    fi
+
+    # --- B: a ps that answers nothing must produce a verdict, not a guess -----
+    cases=$((cases + 1))
+    rej_bin="$work/ps-reject-bin"
+    mk_ps "$rej_bin" reject
+    rej_ok=true
+    for cand in '-ww -axo pid=,command=' '-ww -o pid=,args=' '-o pid=,args=' '-axo pid=,args='; do
+        # shellcheck disable=SC2086
+        if PATH="$rej_bin:$PATH" ps $cand >/dev/null 2>&1; then rej_ok=false; fi
+    done
+    if [ "$rej_ok" = false ]; then
+        printf '%s\n' 'sandbox-daemon-reaper: the rejecting ps stub accepted a spelling, so the unusable-ps cases would prove nothing' >&2
+        failures=$((failures + 1))
+    else
+        # `down`: nonzero, tells the user, and touches nothing.
+        cases=$((cases + 1))
+        sb_blind="$work/ps-unusable-down"
+        mkdir -p "$sb_blind/home/.agentq/config"
+        : >"$sb_blind/.agentq-sandbox"
+        blind_pid=$(forge "./pueued --config $(config_for "$sb_blind")")
+        decoys="$decoys $blind_pid"
+        sleep 0.3
+        down_blind_rc=0
+        PATH="$rej_bin:$PATH" AGENTQ_SANDBOX_ROOT="$sb_blind" "$sandbox" down \
+            >"$work/down-blind.out" 2>&1 || down_blind_rc=$?
+        if [ "$down_blind_rc" -eq 0 ]; then
+            printf '%s\n' 'sandbox-daemon-reaper: down claimed success while it could not inspect the process table' >&2
+            failures=$((failures + 1))
+        fi
+        if [ ! -s "$work/down-blind.out" ]; then
+            printf '%s\n' 'sandbox-daemon-reaper: down failed on an unreadable process table with ZERO bytes of output -- measured as exit 1 with no message, which is the shape that hid this defect' >&2
+            failures=$((failures + 1))
+        fi
+        if [ ! -d "$sb_blind" ]; then
+            printf '%s\n' 'sandbox-daemon-reaper: down deleted the tree although it could not tell whether a daemon was running' >&2
+            failures=$((failures + 1))
+        fi
+        if ! alive "$blind_pid"; then
+            printf '%s\n' 'sandbox-daemon-reaper: down killed a process it could not identify' >&2
+            failures=$((failures + 1))
+        fi
+
+        # `up` in the same state must stop before it destroys anything.
+        cases=$((cases + 1))
+        sb_blind_up="$work/ps-unusable-up"
+        mkdir -p "$sb_blind_up/home/.agentq/config"
+        : >"$sb_blind_up/.agentq-sandbox"
+        up_blind_pid=$(forge "./pueued --config $(config_for "$sb_blind_up")")
+        decoys="$decoys $up_blind_pid"
+        sleep 0.3
+        up_blind_rc=0
+        # The download stub from the tree-less case keeps this hermetic: without
+        # it `up` would really fetch pueue and start a daemon for the fixture.
+        PATH="$rej_bin:$work/stub-bin:$PATH" AGENTQ_SANDBOX_ROOT="$sb_blind_up" "$sandbox" up \
+            >"$work/up-blind.out" 2>&1 || up_blind_rc=$?
+        if [ ! -d "$sb_blind_up" ]; then
+            printf '%s\n' 'sandbox-daemon-reaper: up deleted the sandbox although it could not list processes -- "could not look" was treated as "nothing running"' >&2
+            failures=$((failures + 1))
+        fi
+        if ! alive "$up_blind_pid"; then
+            printf '%s\n' 'sandbox-daemon-reaper: up killed a process it could not identify' >&2
+            failures=$((failures + 1))
+        fi
+        if [ "$up_blind_rc" -eq 0 ] || [ ! -s "$work/up-blind.out" ]; then
+            printf 'sandbox-daemon-reaper: up could not inspect the process table and said so nowhere (exit %s, %s bytes)\n' \
+                "$up_blind_rc" "$(wc -c <"$work/up-blind.out" | tr -d ' ')" >&2
+            failures=$((failures + 1))
+        fi
+
+        # `status`: an unknown verdict must not read as a negative one.
+        cases=$((cases + 1))
+        sb_st="$work/ps-unusable-status"
+        mkdir -p "$sb_st/home/.agentq/config"
+        : >"$sb_st/.agentq-sandbox"
+        st_pid=$(forge "./pueued --config $(config_for "$sb_st")")
+        decoys="$decoys $st_pid"
+        sleep 0.3
+        PATH="$rej_bin:$PATH" AGENTQ_SANDBOX_ROOT="$sb_st" "$sandbox" status \
+            >"$work/status-blind.out" 2>&1 || true
+        if grep -qi 'pueued: *not running' "$work/status-blind.out"; then
+            printf '%s\n' 'sandbox-daemon-reaper: status printed "pueued: not running" about a daemon it could not see -- an unknown verdict must not read as a negative one' >&2
+            failures=$((failures + 1))
+        fi
+    fi
+
 fi
 
 if [ "$failures" -ne 0 ]; then
     printf 'sandbox-daemon-reaper: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'sandbox-daemon-reaper checks passed: cases=%s locator=config-path pidfile=not-authoritative innocent=spared sibling=spared orphan=reaped tree-less=reaped foreign-tree=rejected refusal=read-only doomed-up=non-destructive\n' "$cases"
+printf 'sandbox-daemon-reaper checks passed: cases=%s locator=config-path pidfile=not-authoritative innocent=spared sibling=spared orphan=reaped tree-less=reaped foreign-tree=rejected refusal=read-only doomed-up=non-destructive ps-blind=reported\n' "$cases"

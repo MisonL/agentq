@@ -77,15 +77,54 @@ cleanup_partial() {
 # while `ps -ww ...` printed the full 108 and matched.  BSD ps (macOS) does not
 # truncate the same way, but -ww is accepted there too, so one spelling covers
 # both.
+#
+# TWO spellings, and the second one is not optional.  BusyBox ps -- alpine's
+# default, and alpine is in this project's own platform matrix -- rejects BOTH
+# `-w` and `-x` (`ps: unrecognized option: w`) and has no `command` column, so
+# the single spelling this function used to have matched NOTHING there.  It did
+# not fail loudly either: with pipefail the failing ps masked awk's 0, `set -e`
+# killed the script at the assignment in cmd_down, and `down` exited 1 having
+# printed nothing at all -- while `status` answered "not running" and `up`
+# deleted the tree and left the daemon running.  Measured 2026-11-02 on
+# alpine:3.20 and reproduced with a stub.  BusyBox accepts `-o pid=,args=`, and
+# its ps lists every process by default, so that spelling is a faithful
+# fallback THERE -- but it is used only when the first one is REJECTED, never
+# as a second opinion: BSD ps answers `-ww -axo pid=,command=` correctly and
+# its `-o pid=,args=` form silently lists only the current session (measured:
+# 6 KB against 298 KB), so a fallback that ran unconditionally would hide every
+# daemon that is not ours.
+#
+# `ps -ww -o pid=,args=` is deliberately NOT a candidate: procps accepts it and
+# needs the -ww, but BSD ps accepts it and silently returns the session-scoped
+# listing, so it is the one spelling that is wrong in both possible ways.
+#
+# Every caller must treat a nonzero return as "I could not look", never as "no
+# daemons": the two are the difference between deleting a tree and leaving an
+# orphan, and getting it wrong is what made the orphan this function exists for.
 sandbox_daemon_pids() {
-    ps -ww -axo pid=,command= 2>/dev/null |
-        awk -v cfg="$config" 'index($0, cfg) > 0 && $2 ~ /pueued$/ { print $1 }'
+    local spelling out
+    for spelling in '-ww -axo pid=,command=' '-o pid=,args='; do
+        # shellcheck disable=SC2086 # the spelling is an argument LIST
+        if out=$(ps $spelling 2>/dev/null); then
+            printf '%s\n' "$out" |
+                awk -v cfg="$config" 'index($0, cfg) > 0 && $2 ~ /pueued$/ { print $1 }'
+            return 0
+        fi
+    done
+    printf "sandbox: cannot read the process table: this host's ps accepted neither 'ps -ww -axo pid=,command=' nor 'ps -o pid=,args='\n" >&2
+    return 1
 }
 
 # The one daemon this sandbox owns, for the status and ready displays.
+# 0 = pid printed; 1 = the table was read and no daemon matches; 2 = the table
+# could not be read -- callers must not read 2 as "not running".
 daemon_pid() {
-    local pid
-    pid=$(sandbox_daemon_pids | sed -n '1p')
+    local pids pid rc=0
+    pids=$(sandbox_daemon_pids) || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        return 2
+    fi
+    pid=$(printf '%s\n' "$pids" | sed -n '1p')
     [ -n "$pid" ] || return 1
     printf '%s' "$pid"
 }
@@ -202,7 +241,17 @@ cmd_up() {
     # on the same config -- measured 2026-11-02: two live pueueds, one of them
     # unreachable.  We already know none responds, so any match here is useless
     # and must go before a new one binds.
-    cmd_down >/dev/null 2>&1 || true
+    # The failure mode this must never recreate: `|| true` here swallowed
+    # cmd_down's "cannot read the process table" refusal on a BusyBox-ps host,
+    # after which up deleted the tree and left the daemon running (measured
+    # 2026-11-02).  cmd_down's stderr is allowed through so the reason is on
+    # screen, and a nonzero return stops the rebuild -- an unknown process
+    # table is not a clean slate, it is an unexamined one.
+    local down_rc=0
+    cmd_down >/dev/null || down_rc=$?
+    if [ "$down_rc" -ne 0 ]; then
+        die "could not stop the previous sandbox (reason above); refusing to delete or rebuild over an unexamined state"
+    fi
 
     mkdir -p "$home" "$agentq_home/config" "$agentq_home/data/task_logs" "$agentq_home/runtime"
     : >"$marker"
@@ -299,7 +348,13 @@ cmd_down() {
     # Reap EVERY matching daemon, not just one: a second sandbox started after
     # the first lost its pid file leaves two pueueds on one config, and hunting
     # down the extra one by hand is what the pid-file-only form forced.
-    pids=$(sandbox_daemon_pids)
+    # If the process table cannot be read we do not know whether a daemon is
+    # running, and everything below kills processes and deletes the tree.
+    # A bare `pids=$(...)` here once let `set -e` kill the script on that
+    # failure: exit 1, zero bytes printed, tree kept, daemon alive -- silence
+    # that `up`'s `|| true` then converted into an orphan.  A refusal must have
+    # a voice, so the failure is caught and reported, and NOTHING below runs.
+    pids=$(sandbox_daemon_pids) || return 1
     for pid in $pids; do
         kill "$pid" 2>/dev/null || true
         local waited=0
@@ -323,11 +378,13 @@ cmd_down() {
 }
 
 cmd_status() {
-    if pid=$(daemon_pid); then
-        printf 'pueued:  running (pid %s)\n' "$pid"
-    else
-        printf 'pueued:  not running\n'
-    fi
+    local pid rc=0
+    pid=$(daemon_pid) || rc=$?
+    case $rc in
+    0) printf 'pueued:  running (pid %s)\n' "$pid" ;;
+    1) printf 'pueued:  not running\n' ;;
+    *) printf 'pueued:  unknown (this host'\''s ps cannot be read; NOT a verified "not running")\n' ;;
+    esac
     if daemon_responds; then
         printf 'queue:   responding\n'
         printf 'env:     AGENTQ_SMOKE_HOME=%s ./run-tests.sh\n' "$agentq_home"
