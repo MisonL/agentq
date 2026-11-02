@@ -3,7 +3,7 @@
 # process was started with -- never by the pid file alone, and never by a bare
 # pid number.
 #
-# Three measured defects (2026-11-02), one root:
+# Four measured defects (2026-11-02).  The first three share one root:
 #   * `down` located the daemon only through $agentq_home/runtime/pueued.pid.
 #     With that file gone it printed "removed <root>" and exited 0 while pueued
 #     kept running.  An orphan started 2026-10-26 was still alive six days
@@ -16,11 +16,21 @@
 #     `[ -e "$sandbox_root" ]`, so with the tree gone it started a SECOND pueued
 #     on the same config.  Measured: two live daemons, one of them unreachable
 #     because its socket died with the tree.
+# Two more are about ownership and ORDER rather than identity:
+#   * `up` adopted a tree it did not create (swallowed `down`'s refusal, then
+#     planted the ownership marker), and the following `down` deleted the user's
+#     files.
+#   * `down` said "I refuse to delete this tree" after it had already deleted a
+#     file inside it -- and that file was the pid file whose loss creates the
+#     orphan above.
+#   * `up` validated that it could rebuild the sandbox (`installer_hashes`) only
+#     AFTER it had destroyed the existing one.
 #
 # What this proves: `down` reaps every pueued whose argv names THIS config, and
 # nothing else -- a pueued on a different config path and an unrelated process
 # whose pid the stale file happens to name both survive.  `up` reaps a
-# tree-less stale daemon before it starts one of its own.
+# tree-less stale daemon before it starts one of its own, refuses a tree it did
+# not create, and leaves a sandbox intact when it is going to fail anyway.
 # What it does NOT prove: anything about a real remote host; and nothing about
 # a sandbox root long enough for `ps` to truncate the command column.  The
 # `-ww` in the locator is what removes the COLUMNS cap, measured on procps-ng
@@ -203,6 +213,13 @@ STUB
     # 2026-11-02 against a directory holding precious/keep.txt: up exited 0,
     # planted the marker, and the following `down` printed "removed <root>" and
     # deleted the file.  A refusal has to stop the caller, not just the callee.
+    #
+    # The download stub (created for the tree-less case above) makes `up` fail
+    # after it has taken ownership, so in the mutant world the tree is destroyed
+    # by `up`'s own partial-cleanup trap rather than by the later `down`.  Each
+    # message below names only what was observed at that point in the sequence:
+    # attributing a deletion to the wrong command is exactly the kind of
+    # "evidence" this project keeps having to correct.
     cases=$((cases + 1))
     sb_foreign="$work/not-ours"
     mkdir -p "$sb_foreign/precious"
@@ -218,10 +235,15 @@ STUB
         printf '%s\n' 'sandbox-daemon-reaper: up planted its ownership marker into a foreign tree -- every later down will delete it' >&2
         failures=$((failures + 1))
     fi
-    AGENTQ_SANDBOX_ROOT="$sb_foreign" "$sandbox" down >"$work/down-foreign.out" 2>&1 || true
     if [ ! -f "$sb_foreign/precious/keep.txt" ]; then
-        printf '%s\n' 'sandbox-daemon-reaper: down DELETED a directory this script did not create (precious/keep.txt is gone)' >&2
+        printf '%s\n' 'sandbox-daemon-reaper: up destroyed a tree it did not create (precious/keep.txt is gone after up alone)' >&2
         failures=$((failures + 1))
+    else
+        AGENTQ_SANDBOX_ROOT="$sb_foreign" "$sandbox" down >"$work/down-foreign.out" 2>&1 || true
+        if [ ! -f "$sb_foreign/precious/keep.txt" ]; then
+            printf '%s\n' 'sandbox-daemon-reaper: down DELETED a directory this script did not create (precious/keep.txt is gone)' >&2
+            failures=$((failures + 1))
+        fi
     fi
 
     # --- `down` must not MUTATE a tree it refuses to delete -------------------
@@ -246,10 +268,52 @@ STUB
         printf '%s\n' 'sandbox-daemon-reaper: down touched a foreign tree beyond the ownership decision' >&2
         failures=$((failures + 1))
     fi
+
+    # --- a doomed `up` must not destroy the sandbox it cannot rebuild ---------
+    # `installer_hashes` reads a file in the checkout and dies if it is missing.
+    # It ran AFTER the reap, so with a healthy sandbox running and the repo
+    # temporarily broken, `up` tore the sandbox down and only then died: the user
+    # has neither a working sandbox nor the means to rebuild one, and a valid
+    # tree was destroyed for nothing.  Measured 2026-11-02 with the installer
+    # moved aside -- "removing a stale sandbox", tree gone, then "installer not
+    # found".  A destructive step must follow the cheap checks that can abort it.
+    #
+    # The fixture is a sandbox this script builds itself (a marked tree), made to
+    # look stale by deleting its socket; the repo is broken by pointing the
+    # checkout root at a copy with no installer.
+    cases=$((cases + 1))
+    sb_doomed="$work/doomed-rebuild"
+    fake_root="$work/doomed-repo"
+    mkdir -p "$fake_root/skill/assets/unix" "$sb_doomed/home/.agentq/config" "$sb_doomed/home/.agentq/runtime"
+    : >"$sb_doomed/.agentq-sandbox"
+    printf 'shared:\n  pueue_directory: x\n' >"$sb_doomed/home/.agentq/config/pueue.yml"
+    # A copy of the script whose $root resolves to the installer-less tree, so the
+    # case is hermetic: it never touches this repo.
+    sed "s#^root=\$(unset CDPATH.*#root=$fake_root#" "$sandbox" >"$fake_root/sandbox.sh"
+    chmod 700 "$fake_root/sandbox.sh"
+    if grep -q "root=$fake_root" "$fake_root/sandbox.sh"; then
+        up_doomed_rc=0
+        PATH="$work/stub-bin:$PATH" AGENTQ_SANDBOX_ROOT="$sb_doomed" "$fake_root/sandbox.sh" up \
+            >"$work/up-doomed.out" 2>&1 || up_doomed_rc=$?
+        # Positive control first: the run must fail ON THE INSTALLER.  Without
+        # this, a copy that dies for some earlier reason leaves the tree alone
+        # and the assertion below goes green for the wrong reason.
+        if [ "$up_doomed_rc" -eq 0 ] || ! grep -q 'installer not found' "$work/up-doomed.out"; then
+            printf 'sandbox-daemon-reaper: the doomed-up case did not fail on the missing installer (exit %s), so it proves nothing\n' "$up_doomed_rc" >&2
+            failures=$((failures + 1))
+        fi
+        if [ ! -d "$sb_doomed" ]; then
+            printf '%s\n' 'sandbox-daemon-reaper: up destroyed a healthy sandbox and only then failed on a missing installer -- nothing was left to rebuild from' >&2
+            failures=$((failures + 1))
+        fi
+    else
+        printf '%s\n' 'sandbox-daemon-reaper: could not rewrite the checkout root in the copy, so the doomed-up case did not run' >&2
+        failures=$((failures + 1))
+    fi
 fi
 
 if [ "$failures" -ne 0 ]; then
     printf 'sandbox-daemon-reaper: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'sandbox-daemon-reaper checks passed: cases=%s locator=config-path pidfile=not-authoritative innocent=spared sibling=spared orphan=reaped tree-less=reaped foreign-tree=rejected refusal=read-only\n' "$cases"
+printf 'sandbox-daemon-reaper checks passed: cases=%s locator=config-path pidfile=not-authoritative innocent=spared sibling=spared orphan=reaped tree-less=reaped foreign-tree=rejected refusal=read-only doomed-up=non-destructive\n' "$cases"

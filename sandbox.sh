@@ -168,6 +168,15 @@ cmd_up() {
         printf 'sandbox already running.\n\n  AGENTQ_SMOKE_HOME=%s ./run-tests.sh\n\n' "$agentq_home"
         return 0
     fi
+    # Validate the repo BEFORE anything is torn down.  `installer_hashes` reads
+    # the installer and dies if it is missing or its hash block is incomplete --
+    # a cheap local check, but it used to run AFTER the reap below.  Measured
+    # 2026-11-02: with a healthy sandbox running and the installer temporarily
+    # moved aside, `up` printed "removing a stale sandbox", deleted the tree,
+    # killed the daemon, and only then died on the missing installer -- leaving
+    # neither a working sandbox nor the ability to rebuild one.  A destructive
+    # step must come after the cheap checks that can abort it, not before.
+    installer_hashes
     # A tree may only be reaped if THIS script created it, and the marker is what
     # says so.  `down` already refuses an unmarked tree, but `up` printed a note
     # and carried on -- so the refusal was swallowed, `mkdir -p` found the
@@ -195,7 +204,6 @@ cmd_up() {
     # and must go before a new one binds.
     cmd_down >/dev/null 2>&1 || true
 
-    installer_hashes
     mkdir -p "$home" "$agentq_home/config" "$agentq_home/data/task_logs" "$agentq_home/runtime"
     : >"$marker"
     # From here the tree exists; clear it if anything below fails.
