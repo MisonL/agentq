@@ -31,6 +31,14 @@
 # rejected -- which turned "I cannot look" into "nothing is running", with the
 # consequences listed under the ps-flavour cases below.
 #
+# A sixth site is the fifth fix's own blind spot: that round hardened ONE of
+# cmd_up's two cmd_down call sites and left the other swallowing both the
+# status and the reason, right before the EXIT trap that deletes the tree.  Its
+# behavioural state is not schedulable in one `up` run (both sites read the
+# same ps, so a uniformly unreadable table dies at the first), so it is pinned
+# structurally at the end of this file: no cmd_down call may discard its own
+# failure, and the kept-tree flag must be wired into the cleanup trap.
+#
 # What this proves: `down` reaps every pueued whose argv names THIS config, and
 # nothing else -- a pueued on a different config path and an unrelated process
 # whose pid the stale file happens to name both survive.  `up` reaps a
@@ -540,8 +548,64 @@ STUB
 
 fi
 
+# --- no cmd_down call site may swallow its own failure ----------------------
+# The fifth fix rewrote the REAP call site in cmd_up from `cmd_down || true` to
+# a checked status whose stderr is allowed through.  cmd_up had a SECOND
+# cmd_down call site -- the "pueued did not come up" cleanup -- and it still
+# read `cmd_down >/dev/null 2>&1 || true`, throwing away both the status and
+# the reason, immediately before an `exit 1` whose EXIT trap deletes the tree:
+# a daemon that started but never answered, on a host whose process table could
+# not be read, would be left running with its config deleted.  The behaviour is
+# a LATENT shape rather than a measured one -- a host whose ps is uniformly
+# unusable dies at the reap above and never reaches the second site -- so it is
+# pinned structurally, the same way smoke/02 pins reason-gaps and smoke/28 pins
+# trap shapes for windows that cannot be scheduled.  What the rule asserts:
+# every cmd_down invocation must be able to observe whether it failed.  `||true`
+# hides the status; a `2>&1` redirect hides the reason the callers print.
+cases=$((cases + 1))
+swallow_rule() { # $1 = file -> prints offending lines
+    grep -nE '(^|[[:space:]]|\))[[:space:]]*cmd_down([[:space:]]|$)' "$1" 2>/dev/null |
+        grep -vE ':[[:space:]]*#' |
+        grep -E '\|\|[[:space:]]*true|2>&1' || true
+}
+# Self-calibration: a rule that can never fire is not a lock.  Prove the exact
+# predicate flags a swallowing site and accepts a checked one -- the two forms
+# differ only in whether the status/reason survives.
+cal_clean=$(mktemp "$work/swallow-clean.XXXXXX")
+cal_dirty=$(mktemp "$work/swallow-dirty.XXXXXX")
+printf '%s\n' 'x' 'cmd_down >/dev/null || rc=$?' >"$cal_clean"
+printf '%s\n' 'x' 'cmd_down >/dev/null 2>&1 || true' >"$cal_dirty"
+if [ -n "$(swallow_rule "$cal_clean")" ] || [ -z "$(swallow_rule "$cal_dirty")" ]; then
+    printf '%s\n' 'sandbox-daemon-reaper: the cmd_down swallow rule failed its self-calibration (it must accept a checked site and flag a swallowing one)' >&2
+    failures=$((failures + 1))
+fi
+rm -f "$cal_clean" "$cal_dirty"
+swallow_sites=$(swallow_rule "$sandbox")
+if [ -n "$swallow_sites" ]; then
+    printf '%s\n' 'sandbox-daemon-reaper: a cmd_down call site swallows its own failure -- "could not look" would read as "nothing to do", and the callers exist precisely to print that reason:' >&2
+    printf '%s\n' "$swallow_sites" | sed 's/^/      /' >&2
+    failures=$((failures + 1))
+fi
+
+# --- the kept-tree escape hatch must disarm the partial-cleanup trap --------
+# The second call site keeps the tree when it cannot reap (up_keep_tree), so
+# the tree must NOT be deleted by the EXIT trap in that state.  Two halves of
+# one mechanism in two places -- a flag set in cmd_up and a trap that reads it
+# -- so pin the binding: the flag must be initialised false, the trap must test
+# it, and the failure branch must set it true.  Without the trap arm the flag
+# would be write-only and the tree would still be deleted.
+cases=$((cases + 1))
+keep_ok=true
+grep -qE '^[[:space:]]*up_keep_tree=false' "$sandbox" || keep_ok=false
+grep -q 'up_keep_tree" != true' "$sandbox" || keep_ok=false
+grep -qE '^[[:space:]]*up_keep_tree=true' "$sandbox" || keep_ok=false
+if [ "$keep_ok" = false ]; then
+    printf '%s\n' 'sandbox-daemon-reaper: the kept-tree mechanism is not wired (up_keep_tree must be initialised false, tested by the EXIT trap, and set true by the un-reapable failure branch)' >&2
+    failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'sandbox-daemon-reaper: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'sandbox-daemon-reaper checks passed: cases=%s locator=config-path pidfile=not-authoritative innocent=spared sibling=spared orphan=reaped tree-less=reaped foreign-tree=rejected refusal=read-only doomed-up=non-destructive ps-blind=reported\n' "$cases"
+printf 'sandbox-daemon-reaper checks passed: cases=%s locator=config-path pidfile=not-authoritative innocent=spared sibling=spared orphan=reaped tree-less=reaped foreign-tree=rejected refusal=read-only doomed-up=non-destructive ps-blind=reported reap-sites=checked\n' "$cases"
