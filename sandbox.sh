@@ -257,7 +257,12 @@ cmd_up() {
     : >"$marker"
     # From here the tree exists; clear it if anything below fails.
     up_complete=false
-    trap 'if [ "$up_complete" != true ]; then cleanup_partial; fi' EXIT
+    # Set when the tree must survive a failure: the one case is a daemon that
+    # started but never answered AND could not be reaped, where deleting the
+    # tree would also delete the config a later `down`/`up` needs in order to
+    # find that daemon by its argv.  Global on purpose -- the EXIT trap reads it.
+    up_keep_tree=false
+    trap 'if [ "$up_complete" != true ] && [ "$up_keep_tree" != true ]; then cleanup_partial; fi' EXIT
 
     printf 'fetching pueue 4.0.4 for %s\n' "$(uname -s) $(uname -m)"
     fetch_verified "$PUEUE_ASSET" "$PUEUE_SHA" "$agentq_home/pueue"
@@ -318,13 +323,40 @@ YML
     if ! daemon_responds; then
         printf 'sandbox: pueued did not come up; log follows\n' >&2
         cat "$sandbox_root/pueued.log" >&2 || true
-        cmd_down >/dev/null 2>&1 || true
+        # The SAME discipline as the reap above -- this is the second of the two
+        # cmd_down call sites in cmd_up, and it used to be the one that still
+        # read `cmd_down >/dev/null 2>&1 || true`: it discarded the status AND
+        # the reason, then fell through to `exit 1`, whose EXIT trap deletes the
+        # tree.  So a daemon that started but never answered, on a host whose
+        # process table could not be read, was left running with its config
+        # deleted -- the orphan shape this whole file exists to prevent.  A host
+        # whose ps is uniformly unusable dies at the reap above and never gets
+        # here, so this branch is a latent shape rather than a measured one; it
+        # is closed anyway because the documentation of the fifth fix already
+        # claimed `up` never swallows this failure, and a claim must be true at
+        # every call site, not at the one the round happened to be reading.
+        # On failure the tree is KEPT (up_keep_tree disarms cleanup_partial): a
+        # daemon we could not identify is still findable by a later down/up
+        # through the config path in its argv, and removing that config would
+        # recreate exactly the state that made the 2026-10-26 orphan.
+        local reap_rc=0
+        cmd_down >/dev/null || reap_rc=$?
+        if [ "$reap_rc" -ne 0 ]; then
+            printf 'sandbox: could not reap the daemon that failed to come up (reason above); keeping %s so a later down or up can still find it\n' \
+                "$sandbox_root" >&2
+            up_keep_tree=true
+        fi
         exit 1
     fi
 
     up_complete=true
+    # Report the pid when the locator can read it; an unreadable table here is
+    # not an error in itself (up already succeeded), so say so rather than
+    # printing an empty pair of parentheses.
+    local ready_pid
+    ready_pid=$(daemon_pid || printf 'unknown')
     printf '\nsandbox ready (%s).\n\n  AGENTQ_SMOKE_HOME=%s ./run-tests.sh\n\n' \
-        "$(daemon_pid)" "$agentq_home"
+        "$ready_pid" "$agentq_home"
     printf 'tear it down with: ./sandbox.sh down\n'
 }
 
