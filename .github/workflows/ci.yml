@@ -76,8 +76,19 @@ jobs:
           # skipped: 0 when a self-hosted runner happens to have the memory
           # directory, 1 on a hosted runner (where it never exists); either way
           # the line above already pins that no OTHER check skipped.
+          #
+          # Only the `absent` state is tolerated, because that is the ONLY one
+          # that is a property of CI rather than of the content: on a hosted
+          # runner the directory never exists.  Measured 2026-11-03: the memory
+          # half silently reported `scanned` for a directory that was empty or
+          # unreadable, and silently skipped a NUL-bearing file -- so a checkout
+          # whose memory directory HAD content that could not be scanned would
+          # have read as a clean memory half.  Those two states now print a
+          # named skip (`empty(NOT-verified)` / `scanned(N-NOT-TEXT)`); if one
+          # ever appears here it is a real coverage gap and must go red, which
+          # it does -- neither matches the pattern below.
           if grep -E '^(SKIP|PART) ' smoke.log \
-               | grep -vE '^SKIP +16-no-host-identifiers +.*memory directory not present'; then
+               | grep -vE '^SKIP +16-no-host-identifiers +.*reports absent\(NOT-verified\)'; then
             echo 'a check skipped or was only partially verified beyond the one named structural skip' >&2
             exit 1
           fi
