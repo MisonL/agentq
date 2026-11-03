@@ -206,6 +206,40 @@ is_os_junk() {
     esac
 }
 
+# classify_file <path> -- how a walk must treat one file.  Prints exactly one
+# of `scan` (run the rules over it), `not-text` (REPORT it: a non-empty file
+# whose bytes are not text, so an address could hide behind a stray NUL), or
+# `skip` (nothing to scan and nothing to say: an excluded artifact, an empty
+# file, or a file that is neither text nor NUL-bearing).
+#
+# ONE classifier for BOTH walks.  They were written separately, and the memory
+# half -- added later -- reproduced neither the bytecode/OS-junk exclusions nor
+# the empty-file rule, so it diverged in two measured ways (2026-11-04):
+#   * a Finder `.DS_Store` in the memory directory was reported as "binary by
+#     NUL bytes" and turned the whole check into a false PART -- the exact shape
+#     the 第五十九类 round removed from the repo half;
+#   * an EMPTY file was reported the same way, though it holds no bytes at all
+#     and therefore no NUL.  The repo half already guarded this with `[ -s ]`;
+#     the memory half did not.
+# A twin that must agree with another twin is a copy; a copy drifts.  This is
+# the single implementation both walks now call, and the self-test below pins
+# all three outcomes.
+classify_file() {
+    local file=$1
+    if is_derived_bytecode "$file" || is_os_junk "$file"; then
+        printf 'skip\n'; return 0
+    fi
+    if grep -Iq . "$file" 2>/dev/null; then
+        printf 'scan\n'; return 0
+    fi
+    # Not text.  An empty file has nothing to leak; only a NON-EMPTY file that
+    # actually carries a NUL byte is worth reporting.
+    if [ -s "$file" ] && LC_ALL=C grep -q "$(printf '\x00')" "$file" 2>/dev/null; then
+        printf 'not-text\n'; return 0
+    fi
+    printf 'skip\n'
+}
+
 # scan_memory_dir <dir> -- the memory half of the rule, as ONE function so the
 # self-test below can drive the real code on real directories instead of a
 # copy of it.  Sets the global memory_state -- NOT stdout: the violation and
@@ -235,21 +269,28 @@ is_os_junk() {
 #
 # States: scanned | scanned(<n>-NOT-TEXT) | empty(NOT-verified).
 scan_memory_dir() {
-    local file files=0 not_text=0
+    local file scanned_text=0 not_text=0
     while IFS= read -r file; do
         [ -n "$file" ] || continue   # an empty `find` yields one empty line
-        files=$((files + 1))
-        if ! grep -Iq . "$file" 2>/dev/null; then
-            printf 'no-host-identifiers: skipped a memory file that looks binary by NUL bytes (it could hide a text leak): %s\n' "$file" >&2
-            not_text=$((not_text + 1))
-            continue
-        fi
-        scan_file "$file"
+        case $(classify_file "$file") in
+            scan)
+                scanned_text=$((scanned_text + 1))
+                scan_file "$file"
+                ;;
+            not-text)
+                printf 'no-host-identifiers: skipped a memory file that looks binary by NUL bytes (it could hide a text leak): %s\n' "$file" >&2
+                not_text=$((not_text + 1))
+                ;;
+            *) : ;;   # bytecode/junk/empty: nothing to scan, nothing to say
+        esac
     done <<EOF
 $(find "$1" -type f 2>/dev/null | sort)
 EOF
-    if [ "$files" -eq 0 ]; then
-        printf 'no-host-identifiers: skipped the memory scan -- the directory at %s enumerated 0 files (an empty or unreadable directory must not read as a verified one)\n' "$1" >&2
+    # The state describes what was actually VERIFIED, so it is derived from the
+    # counts, not from the directory merely existing: a directory holding only
+    # junk or only empty files verified nothing and says so.
+    if [ "$scanned_text" -eq 0 ] && [ "$not_text" -eq 0 ]; then
+        printf 'no-host-identifiers: skipped the memory scan -- the directory at %s held no text file to scan (empty, unreadable, or only excluded artifacts); that must not read as a verified one\n' "$1" >&2
         memory_state='empty(NOT-verified)'
     elif [ "$not_text" -ne 0 ]; then
         memory_state="scanned($not_text-NOT-TEXT)"
@@ -487,6 +528,31 @@ mj_expect() { # mj_expect <want-state> <want-violations> <dir> <what>
     chmod 700 "$dir" 2>/dev/null || true   # the unreadable case; harmless otherwise
     rm -rf -- "$dir" 2>/dev/null || true
 }
+# The classifier itself, one case per outcome.  Driven on real files (an
+# outcome is a function of the bytes, not of the name alone), and both the
+# bytecode and the OS-junk exclusions get a `skip` case so a widened or removed
+# arm is caught here as well as by expect_bytecode/expect_junk above.
+cf_root=$(mktemp -d "${TMPDIR:-/tmp}/agentq-classify.XXXXXX")
+cf_expect() { # cf_expect <want> <path> <what>
+    local want=$1 path=$2 what=$3 got
+    got=$(classify_file "$path")
+    if [ "$got" != "$want" ]; then
+        printf 'self-test: classify_file(%s) = %s, expected %s (%s)\n' "$path" "$got" "$want" "$what" >&2
+        selftest_failures=$((selftest_failures + 1))
+    fi
+}
+printf 'ordinary text\n' >"$cf_root/text.md"
+printf 'note\x00text\n' >"$cf_root/nul.md"
+: >"$cf_root/empty.md"
+printf '\x00\x00\x00\x01Bud1' >"$cf_root/.DS_Store"
+printf 'anything\n' >"$cf_root/stale.pyc"
+cf_expect scan    "$cf_root/text.md"     'a text file'
+cf_expect not-text "$cf_root/nul.md"     'a non-empty NUL-bearing file'
+cf_expect skip    "$cf_root/empty.md"    'an empty file (no byte, so no NUL to hide behind)'
+cf_expect skip    "$cf_root/.DS_Store"   'Finder junk'
+cf_expect skip    "$cf_root/stale.pyc"   'bytecode'
+rm -rf -- "$cf_root"
+
 mkdir -p "$mj_root/empty"
 mj_expect 'empty(NOT-verified)' 0 "$mj_root/empty" 'an empty directory'
 mkdir -p "$mj_root/text"
@@ -499,6 +565,30 @@ mkdir -p "$mj_root/mixed"
 printf 'plain text, nothing to find here\n' >"$mj_root/mixed/a.md"
 printf 'note\x00text %s here\n' "$mj_dq" >"$mj_root/mixed/b.md"
 mj_expect 'scanned(1-NOT-TEXT)' 0 "$mj_root/mixed" 'a text file beside a NUL-bearing one'
+# The two divergences the memory half was measured to have (2026-11-04), each
+# asserted through the REAL scan_memory_dir.  Before the shared classifier:
+#   * a directory holding only an empty file reported scanned(1-NOT-TEXT) -- an
+#     empty file has no byte, so no NUL; reporting it was simply wrong.
+#   * a Finder .DS_Store beside a real note reported scanned(1-NOT-TEXT), i.e.
+#     the whole check went PART over an artifact every macOS user has.
+mkdir -p "$mj_root/onlyempty"
+: >"$mj_root/onlyempty/note.md"
+mj_expect 'empty(NOT-verified)' 0 "$mj_root/onlyempty" 'a directory holding only an empty file'
+mkdir -p "$mj_root/onlyjunk"
+printf '\x00\x00\x00\x01Bud1' >"$mj_root/onlyjunk/.DS_Store"
+mj_expect 'empty(NOT-verified)' 0 "$mj_root/onlyjunk" 'a directory holding only Finder junk'
+mkdir -p "$mj_root/junkplus"
+printf '\x00\x00\x00\x01Bud1' >"$mj_root/junkplus/.DS_Store"
+printf 'a real memory note, nothing to find\n' >"$mj_root/junkplus/note.md"
+mj_expect scanned 0 "$mj_root/junkplus" 'Finder junk beside a real note'
+mkdir -p "$mj_root/emptyplus"
+: >"$mj_root/emptyplus/note.md"
+printf 'a real memory note, nothing to find\n' >"$mj_root/emptyplus/other.md"
+mj_expect scanned 0 "$mj_root/emptyplus" 'an empty file beside a real note'
+mkdir -p "$mj_root/pycplus"
+printf 'not really bytecode\n' >"$mj_root/pycplus/stale.pyc"
+printf 'a real memory note, nothing to find\n' >"$mj_root/pycplus/note.md"
+mj_expect scanned 0 "$mj_root/pycplus" 'a .pyc beside a real note'
 if mkdir -p "$mj_root/locked" 2>/dev/null && printf 'x\n' >"$mj_root/locked/a.md" &&
     chmod 000 "$mj_root/locked" 2>/dev/null && [ ! -r "$mj_root/locked" ]; then
     mj_expect 'empty(NOT-verified)' 0 "$mj_root/locked" 'an unreadable directory'
@@ -597,15 +687,14 @@ scanned=$((scanned - 1))
 # files= counter still grew (measured 2026-10-13, review round 4).
 tree_scanned=0
 while IFS= read -r file; do
-    if is_derived_bytecode "$file" || is_os_junk "$file"; then
-        continue
-    fi
-    if ! grep -Iq . "$file" 2>/dev/null; then
-        if [ -s "$file" ] && LC_ALL=C grep -q "$(printf '\x00')" "$file" 2>/dev/null; then
+    case $(classify_file "$file") in
+        scan) ;;
+        not-text)
             printf 'no-host-identifiers: skipped a file that looks binary by NUL bytes (it could hide a text leak): %s\n' "$file" >&2
-        fi
-        continue
-    fi
+            continue
+            ;;
+        *) continue ;;
+    esac
     tree_scanned=$((tree_scanned + 1))
     scan_file "$file"
 done <<EOF
