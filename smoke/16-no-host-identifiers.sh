@@ -206,6 +206,58 @@ is_os_junk() {
     esac
 }
 
+# scan_memory_dir <dir> -- the memory half of the rule, as ONE function so the
+# self-test below can drive the real code on real directories instead of a
+# copy of it.  Sets the global memory_state -- NOT stdout: the violation and
+# `scanned` counters live in the caller, and a `$( )` capture would strand the
+# memory files' contribution outside the `files=` total (measured 2026-11-03:
+# the count dropped from 117 to 80 when this returned its state on stdout).
+#
+# Two ways this half could read green while having checked nothing, each
+# MEASURED 2026-11-03.  Both used to end in the literal summary token
+# `memory=scanned`, which run-tests prints for an `ok` check and ci.yml
+# matched by shape -- so neither could ever show up anywhere:
+#
+#   * the directory exists but yields NOTHING.  `find` on an empty directory
+#     prints no error and exits 0, so `scanned` claimed a verification with no
+#     subject -- measured: an empty directory passed with the same words as the
+#     real one.  An UNREADABLE directory read the same way: `find` printed
+#     "Permission denied" and exited 0, the `$( )` kept only its (empty) stdout
+#     and its stderr went to the report, so it too passed as `scanned`.
+#   * a file that is NOT TEXT.  A NUL byte makes `grep -Iq .` fail, and the
+#     old `|| continue` skipped the file SILENTLY -- measured: a memory file
+#     holding a note with one NUL byte and a dotted-quad address passed with
+#     violations=0, while the same text without the NUL was caught (exit 1).
+#     A UTF-16 note is exactly that shape.  The repo walk already REFUSES to
+#     skip such a file silently for the same reason ("a text leak can hide
+#     behind one stray NUL"); the memory half is where the addresses actually
+#     leaked from, so it must not be laxer.
+#
+# States: scanned | scanned(<n>-NOT-TEXT) | empty(NOT-verified).
+scan_memory_dir() {
+    local file files=0 not_text=0
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue   # an empty `find` yields one empty line
+        files=$((files + 1))
+        if ! grep -Iq . "$file" 2>/dev/null; then
+            printf 'no-host-identifiers: skipped a memory file that looks binary by NUL bytes (it could hide a text leak): %s\n' "$file" >&2
+            not_text=$((not_text + 1))
+            continue
+        fi
+        scan_file "$file"
+    done <<EOF
+$(find "$1" -type f 2>/dev/null | sort)
+EOF
+    if [ "$files" -eq 0 ]; then
+        printf 'no-host-identifiers: skipped the memory scan -- the directory at %s enumerated 0 files (an empty or unreadable directory must not read as a verified one)\n' "$1" >&2
+        memory_state='empty(NOT-verified)'
+    elif [ "$not_text" -ne 0 ]; then
+        memory_state="scanned($not_text-NOT-TEXT)"
+    else
+        memory_state=scanned
+    fi
+}
+
 # scan_file <path> -- one `grep -n` per rule, so a file costs one fork per rule
 # instead of one per line.  The per-rule loop is unrolled rather than looped so
 # the rule name and its regex stay adjacent to the code that uses them.
@@ -409,6 +461,63 @@ expect_junk scanned smoke/.DS_Store.txt        'a name that only embeds the junk
 expect_junk scanned logs/notes.tmp             'a temp file outside the declared class'
 expect_junk scanned CHANGELOG.md               'an ordinary repository file'
 
+# The memory-half states, driven through the REAL scan_memory_dir on real
+# directories -- a self-test over a re-implementation would be the fixture
+# testing itself.  Each directory is built here, scanned, then removed.  The
+# catch cases are asserted by the violation COUNT delta, because the report
+# masks the address (by design) and cannot be grepped for it.
+mj_root=$(mktemp -d "${TMPDIR:-/tmp}/agentq-memory-states.XXXXXX")
+mj_dq=$(printf '%s.%s.%s.%s' 10 1 2 3)   # assembled: this file is scanned too
+mj_expect() { # mj_expect <want-state> <want-violations> <dir> <what>
+    local want_state=$1 want_failures=$2 dir=$3 what=$4 got_state delta
+    # Both the state and the violation count must be read from the SAME run,
+    # and that run must not leak fixtures into the real scan: `failures` and
+    # `scanned` would move for a fixture file, so the whole call is captured
+    # in a subshell that prints exactly those two numbers back.
+    read -r got_state delta <<<"$(
+        before=$failures
+        scan_memory_dir "$dir" 2>/dev/null
+        printf '%s %s\n' "$memory_state" "$((failures - before))"
+    )"
+    if [ "$got_state" != "$want_state" ] || [ "$delta" -ne "$want_failures" ]; then
+        printf 'self-test: memory scan of %s (%s): state [%s] violations=%s, expected [%s] violations=%s\n' \
+            "$what" "$dir" "$got_state" "$delta" "$want_state" "$want_failures" >&2
+        selftest_failures=$((selftest_failures + 1))
+    fi
+    chmod 700 "$dir" 2>/dev/null || true   # the unreadable case; harmless otherwise
+    rm -rf -- "$dir" 2>/dev/null || true
+}
+mkdir -p "$mj_root/empty"
+mj_expect 'empty(NOT-verified)' 0 "$mj_root/empty" 'an empty directory'
+mkdir -p "$mj_root/text"
+printf 'host %s here\n' "$mj_dq" >"$mj_root/text/note.md"
+mj_expect scanned 1 "$mj_root/text" 'a text file holding an address'
+mkdir -p "$mj_root/nul"
+printf 'note\x00text %s here\n' "$mj_dq" >"$mj_root/nul/note.md"
+mj_expect 'scanned(1-NOT-TEXT)' 0 "$mj_root/nul" 'a NUL-bearing file'
+mkdir -p "$mj_root/mixed"
+printf 'plain text, nothing to find here\n' >"$mj_root/mixed/a.md"
+printf 'note\x00text %s here\n' "$mj_dq" >"$mj_root/mixed/b.md"
+mj_expect 'scanned(1-NOT-TEXT)' 0 "$mj_root/mixed" 'a text file beside a NUL-bearing one'
+if mkdir -p "$mj_root/locked" 2>/dev/null && printf 'x\n' >"$mj_root/locked/a.md" &&
+    chmod 000 "$mj_root/locked" 2>/dev/null && [ ! -r "$mj_root/locked" ]; then
+    mj_expect 'empty(NOT-verified)' 0 "$mj_root/locked" 'an unreadable directory'
+    chmod 700 "$mj_root/locked" 2>/dev/null || true
+    rm -rf -- "$mj_root/locked"
+else
+    # Running as root: chmod 000 reads as readable, so the state is unreachable
+    # HERE.  Say so rather than letting the case vanish quietly.  Deliberately
+    # `skipped(...)` and not a NOT-covered token: run-tests routes the former
+    # to PART (visible, honest) and the latter to the known-set gate, where a
+    # check name that is not listed would turn the suite RED on a root host --
+    # a whole-suite failure for a self-test sub-case, which is the wrong
+    # severity.  CI runners are unprivileged and never reach this branch.
+    printf '%s\n' 'self-test: skipped(needs-unprivileged-user) -- the unreadable-directory memory state was not exercised; root reads through chmod 000' >&2
+    chmod 700 "$mj_root/locked" 2>/dev/null || true
+    rm -rf -- "$mj_root/locked"
+fi
+rm -rf -- "$mj_root"
+
 # --- the rule set must be wired everywhere it is declared -------------------
 # The summary's `rules=7` was a literal in the final printf (measured
 # 2026-10-27: nothing computed it, so adding a rule or wiring one into only
@@ -514,15 +623,19 @@ fi
 # --- the memory directory --------------------------------------------------
 # Not part of the repo, but the rule covers it, and it is where the address
 # originally came from.  Reported explicitly when absent, so a missing directory
-# cannot read as a clean scan.
+# cannot read as a clean scan.  The scan itself is scan_memory_dir (defined
+# above, next to scan_file) -- one implementation, so the self-test exercises
+# the code that actually runs.
+#
+# `find`'s stderr is discarded INSIDE scan_memory_dir, and that is safe because
+# the function reports the same fact itself: a directory whose enumeration
+# comes back empty (unreadable or genuinely empty) becomes `empty(NOT-verified)`
+# and the SKIPPED line names the path, so the operator learns both that it was
+# not verified and which directory.  A discarded stderr with no state change is
+# the shape this whole class is about; a discarded stderr WITH a named state is
+# not.
 if [ -d "$memory_dir" ]; then
-    memory_state=scanned
-    while IFS= read -r file; do
-        grep -Iq . "$file" 2>/dev/null || continue
-        scan_file "$file"
-    done <<EOF
-$(find "$memory_dir" -type f | sort)
-EOF
+    scan_memory_dir "$memory_dir"
 else
     memory_state='absent(NOT-verified)'
 fi
@@ -537,6 +650,12 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 
+#    Measured 2026-11-03: the old literal `memory=scanned` was printed on the
+# success path, so every OTHER state returned by scan_memory_dir was invisible
+# in the run-tests summary line -- an empty directory or a NUL-bearing file
+# reported "scanned" alongside the same truth.  A derived token makes any new
+# degraded state VISIBLE; whether it must go RED is a gate decision (ci.yml's
+# pinned pattern above), not something a silent fallback gets to choose.
 # A run that could not scan memory is a PARTIAL verification.  Exiting 0 here
 # would be printed by run-tests.sh as `ok`, which is the false green this
 # suite's doctrine calls out ("SKIP is not PASS").  Emitting SKIPPED routes it
@@ -544,8 +663,8 @@ fi
 # without this, dropping the memory scan entirely printed
 # `ok ... memory=absent(NOT-verified)` and the run still exited 0.
 if [ "$memory_state" != scanned ]; then
-    printf 'no-host-identifiers: SKIPPED (memory directory not present at %s; the repo scan ran but the memory half of the rule is NOT verified)\n' \
-        "$memory_dir"
+    printf 'no-host-identifiers: SKIPPED (memory directory at %s reports %s; the repo scan ran but that part of the memory half is NOT verified)\n' \
+        "$memory_dir" "$memory_state"
     exit 0
 fi
 
