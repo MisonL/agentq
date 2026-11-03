@@ -182,6 +182,30 @@ is_derived_bytecode() {
     esac
 }
 
+# is_os_junk <path> -- OS/environment artifacts that are not repository content
+# and cannot be committed.  Finder writes .DS_Store into every directory it
+# displays, so a macOS checkout that has merely been browsed grows one in the
+# repo root (measured 2026-11-03: `.DS_Store`, 6148 bytes, gitignored and
+# untracked).  It is a binary file, so the NUL-byte arm below REPORTED it and
+# run-tests classified the whole check PART -> the full suite printed "NOT A
+# FULL PASS" on macOS while every assertion had passed.  This is the same shape
+# the bytecode exclusion above was added for, and smoke/01 already treats these
+# three basenames as `junk` (asset_kind); this is the same table, in the other
+# check.  `Thumbs.db`/`desktop.ini` are here for symmetry -- they are Windows'
+# equivalents and are what that table already lists; `.DS_Store` is the one
+# measured to appear in the tree (and .gitignore's OS-noise section names it).
+#
+# Deliberately narrow: only these three basenames.  A widened arm (`*.tmp`,
+# `*~`) would also swallow a real file, and the self-test below pins both
+# directions -- a NUL-bearing text file with an ordinary name must still be
+# REPORTED, not skipped.
+is_os_junk() {
+    case ${1##*/} in
+        .DS_Store|Thumbs.db|desktop.ini) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # scan_file <path> -- one `grep -n` per rule, so a file costs one fork per rule
 # instead of one per line.  The per-rule loop is unrolled rather than looped so
 # the rule name and its regex stay adjacent to the code that uses them.
@@ -356,6 +380,35 @@ expect_bytecode scanned smoke/16-no-host-identifiers.sh 'this check'
 expect_bytecode scanned smoke/notes.pyc.txt      'a name that only ends in .pyc.txt'
 expect_bytecode scanned smoke/__pycachex__/a.bin 'a directory that only looks like a cache'
 
+# The OS-junk exclusion's SCOPE, pinned in both directions for the same reason:
+# widened to `*.tmp`/`*~` (or bare `*`) it would still leave every bytecode
+# sample above green while a NUL-bearing text file stopped being REPORTED.  The
+# names are smoke/01's `junk` table verbatim; `.DS_Store` is the one measured
+# to actually appear in the tree, but all three are the same class.
+expect_junk() { # expect_junk <junk|scanned> <path> <what>
+    local want=$1 path=$2 what=$3
+    if is_os_junk "$path"; then
+        [ "$want" = junk ] || {
+            printf 'self-test: the OS-junk exclusion covers %s (%s) but must not\n' "$path" "$what" >&2
+            selftest_failures=$((selftest_failures + 1))
+        }
+    else
+        [ "$want" = scanned ] || {
+            printf 'self-test: the OS-junk exclusion misses %s (%s)\n' "$path" "$what" >&2
+            selftest_failures=$((selftest_failures + 1))
+        }
+    fi
+}
+expect_junk junk .DS_Store                     'Finder junk in the repo root'
+expect_junk junk "$root/.DS_Store"             'the same, by absolute path'
+expect_junk junk sub/dir/.DS_Store             'Finder junk in a subdirectory'
+expect_junk junk notes/Thumbs.db               'Windows thumbnail cache'
+expect_junk junk notes/desktop.ini             'Windows folder settings'
+expect_junk scanned .DS_Store.bak              'a backup of the junk, not the junk'
+expect_junk scanned smoke/.DS_Store.txt        'a name that only embeds the junk name'
+expect_junk scanned logs/notes.tmp             'a temp file outside the declared class'
+expect_junk scanned CHANGELOG.md               'an ordinary repository file'
+
 # --- the rule set must be wired everywhere it is declared -------------------
 # The summary's `rules=7` was a literal in the final printf (measured
 # 2026-10-27: nothing computed it, so adding a rule or wiring one into only
@@ -435,7 +488,7 @@ scanned=$((scanned - 1))
 # files= counter still grew (measured 2026-10-13, review round 4).
 tree_scanned=0
 while IFS= read -r file; do
-    if is_derived_bytecode "$file"; then
+    if is_derived_bytecode "$file" || is_os_junk "$file"; then
         continue
     fi
     if ! grep -Iq . "$file" 2>/dev/null; then

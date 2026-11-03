@@ -563,23 +563,41 @@ fi
 # every cmd_down invocation must be able to observe whether it failed.  `||true`
 # hides the status; a `2>&1` redirect hides the reason the callers print.
 cases=$((cases + 1))
+# The prefix class is [^[:alnum:]_], NOT `(^|[[:space:]]|\))`.  The first version
+# used the narrow form, which anchors only at line start, whitespace or a close
+# paren -- so `out=$(cmd_down 2>&1)` and ``x=`cmd_down 2>&1` `` went UNSEEN: the
+# `(` of `$(` is preceded by `$`, and a backtick is not in the class.  Measured
+# 2026-11-03 on five probe lines; the widened class catches all of them.  The
+# repo has this same defect in smoke/10 RULE G's mv enumerator (same narrow
+# prefix), fixed in the same pass.  Widening a prefix class cannot hide a site:
+# it can only add candidates, and every added candidate is judged by the same
+# `||true`/`2>&1` test below.
 swallow_rule() { # $1 = file -> prints offending lines
-    grep -nE '(^|[[:space:]]|\))[[:space:]]*cmd_down([[:space:]]|$)' "$1" 2>/dev/null |
+    grep -nE '(^|[^[:alnum:]_])cmd_down([^[:alnum:]_]|$)' "$1" 2>/dev/null |
         grep -vE ':[[:space:]]*#' |
         grep -E '\|\|[[:space:]]*true|2>&1' || true
 }
 # Self-calibration: a rule that can never fire is not a lock.  Prove the exact
-# predicate flags a swallowing site and accepts a checked one -- the two forms
-# differ only in whether the status/reason survives.
+# predicate flags swallowing sites -- including the substitution and backtick
+# shapes the narrow class missed -- and accepts a checked one.
 cal_clean=$(mktemp "$work/swallow-clean.XXXXXX")
 cal_dirty=$(mktemp "$work/swallow-dirty.XXXXXX")
+cal_escaped=$(mktemp "$work/swallow-escaped.XXXXXX")
 printf '%s\n' 'x' 'cmd_down >/dev/null || rc=$?' >"$cal_clean"
 printf '%s\n' 'x' 'cmd_down >/dev/null 2>&1 || true' >"$cal_dirty"
-if [ -n "$(swallow_rule "$cal_clean")" ] || [ -z "$(swallow_rule "$cal_dirty")" ]; then
-    printf '%s\n' 'sandbox-daemon-reaper: the cmd_down swallow rule failed its self-calibration (it must accept a checked site and flag a swallowing one)' >&2
+# Heredoc, not single-quoted printf arguments: the fixture must contain the
+# literal text `$(cmd_down 2>&1)`, and a single-quoted argument spelling that
+# trips SC2016 (info) -- measured with `shellcheck --norc -S style`.
+cat >"$cal_escaped" <<'CAL'
+out=$(cmd_down 2>&1)
+y=`cmd_down 2>&1`
+CAL
+if [ -n "$(swallow_rule "$cal_clean")" ] || [ -z "$(swallow_rule "$cal_dirty")" ] ||
+    [ "$(swallow_rule "$cal_escaped" | grep -c . || true)" -ne 2 ]; then
+    printf '%s\n' 'sandbox-daemon-reaper: the cmd_down swallow rule failed its self-calibration (it must accept a checked site, flag a swallowing one, and see the substitution and backtick shapes)' >&2
     failures=$((failures + 1))
 fi
-rm -f "$cal_clean" "$cal_dirty"
+rm -f "$cal_clean" "$cal_dirty" "$cal_escaped"
 swallow_sites=$(swallow_rule "$sandbox")
 if [ -n "$swallow_sites" ]; then
     printf '%s\n' 'sandbox-daemon-reaper: a cmd_down call site swallows its own failure -- "could not look" would read as "nothing to do", and the callers exist precisely to print that reason:' >&2

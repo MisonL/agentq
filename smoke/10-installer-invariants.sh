@@ -584,7 +584,7 @@ for posix_installer in $posix_installers; do
             ;;
         esac
     done <<EOF
-$(grep -nE '(^|[[:space:]])(run_as_root[[:space:]]+)?mv([[:space:]]|$)' "$posix_installer" | grep -vE '^[0-9]+:[[:space:]]*#')
+$(grep -nE '(^|[^[:alnum:]_])(run_as_root[[:space:]]+)?mv([^[:alnum:]_]|$)' "$posix_installer" | grep -vE '^[0-9]+:[[:space:]]*#')
 EOF
     rule_sites "G(${posix_installer##*/})" "$mv_sites" || true
 done
