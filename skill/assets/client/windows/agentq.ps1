@@ -146,27 +146,27 @@ $script:ConfigPath = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_CONFIG)) {
 } else {
     Join-Path $script:UserProfileDirectory ".config\agentq\config"
 }
-$script:SubmitRetryAttempts = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_SUBMIT_RETRY_ATTEMPTS)) {
+$script:SubmitRetryAttempts = if (![string]::IsNullOrEmpty($env:AGENTQ_SUBMIT_RETRY_ATTEMPTS)) {
     $env:AGENTQ_SUBMIT_RETRY_ATTEMPTS
 } else {
     "6"
 }
-$script:SubmitRetryDelay = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_SUBMIT_RETRY_DELAY)) {
+$script:SubmitRetryDelay = if (![string]::IsNullOrEmpty($env:AGENTQ_SUBMIT_RETRY_DELAY)) {
     $env:AGENTQ_SUBMIT_RETRY_DELAY
 } else {
     "2"
 }
-$script:OperationRetryAttempts = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_OPERATION_RETRY_ATTEMPTS)) {
+$script:OperationRetryAttempts = if (![string]::IsNullOrEmpty($env:AGENTQ_OPERATION_RETRY_ATTEMPTS)) {
     $env:AGENTQ_OPERATION_RETRY_ATTEMPTS
 } else {
     "6"
 }
-$script:OperationRetryDelay = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_OPERATION_RETRY_DELAY)) {
+$script:OperationRetryDelay = if (![string]::IsNullOrEmpty($env:AGENTQ_OPERATION_RETRY_DELAY)) {
     $env:AGENTQ_OPERATION_RETRY_DELAY
 } else {
     "2"
 }
-$script:PlatformProbeTimeout = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLATFORM_PROBE_TIMEOUT)) {
+$script:PlatformProbeTimeout = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFORM_PROBE_TIMEOUT)) {
     $env:AGENTQ_PLATFORM_PROBE_TIMEOUT
 } else {
     "30"
@@ -179,7 +179,7 @@ $script:PlatformProbeTimeout = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLA
 # integer); measured 2026-10-21 that the two clients disagreed on exactly this
 # variable, which is the kind of drift a user only notices on the platform they
 # are not testing on.
-$script:PlatformProbeCacheTtl = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLATFORM_PROBE_CACHE_TTL)) {
+$script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFORM_PROBE_CACHE_TTL)) {
     $env:AGENTQ_PLATFORM_PROBE_CACHE_TTL
 } else {
     "604800"
@@ -3502,7 +3502,7 @@ switch ($operation) {
             # with exit 2).  $remoteWaitArgs stays as plain `wait <id>`; the
             # budget reaches the target as the AGENTQ_WAIT_BUDGET assignment
             # the unix wrapper consumes, so the remote wait is bounded too.
-        } elseif (![string]::IsNullOrWhiteSpace($env:AGENTQ_WAIT_TIMEOUT)) {
+        } elseif (![string]::IsNullOrEmpty($env:AGENTQ_WAIT_TIMEOUT)) {
             if ($env:AGENTQ_WAIT_TIMEOUT -notmatch '^[1-9][0-9]*$') {
                 Stop-AgentQ "AGENTQ_WAIT_TIMEOUT must be a positive integer"
             }

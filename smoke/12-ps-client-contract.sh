@@ -752,6 +752,68 @@ if [ "$twin_config_rows" -lt 5 ]; then
         "$twin_config_rows" >&2
     failures=$((failures + 1))
 fi
+# --- a whitespace-only numeric variable is a value, not "unset" --------------
+# Measured 2026-11-04 with the twin differential: `AGENTQ_SUBMIT_RETRY_ATTEMPTS=' '`
+# (and the five other numeric knobs, plus AGENTQ_WAIT_TIMEOUT on a `wait`) exited 2
+# on the POSIX client and 255 here -- this side tested `IsNullOrWhiteSpace`, so a
+# whitespace-only value silently meant "use the default", while the POSIX twin's
+# `${VAR:-default}` treats only EMPTY as unset and hands whitespace to the
+# validator, which refuses it.  An empty value still means the default on both
+# (the positive control below), because that IS how `FOO=` reads in sh.
+twin_ws_rows=0
+twin_ws_run() { # <var> <value> [argv...]
+    local var=$1 value=$2
+    shift 2
+    twin_p_status=0
+    twin_w_status=0
+    env AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$twin_stub_posix" AGENTQ_CONFIG="$work/absent-config" "$var=$value" \
+        /bin/sh "$twin_posix" "$@" >"$work/twin-p.out" 2>"$work/twin-p.err" || twin_p_status=$?
+    env AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$twin_stub_arg" AGENTQ_CONFIG="$work/absent-config" "$var=$value" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" "$@" \
+        >"$work/twin-w.out" 2>"$work/twin-w.err" || twin_w_status=$?
+}
+# twin_ws_case <label> <var> <value> <expected-exit> [argv...]
+twin_ws_case() {
+    local label=$1 var=$2 value=$3 want=$4 problems=''
+    shift 4
+    twin_ws_rows=$((twin_ws_rows + 1)); cases=$((cases + 1))
+    twin_ws_run "$var" "$value" "$@"
+    [ "$twin_p_status" -eq "$want" ] || problems="$problems posix-exit=$twin_p_status"
+    [ "$twin_w_status" -eq "$want" ] || problems="$problems windows-exit=$twin_w_status"
+    if [ -n "$problems" ]; then
+        printf 'ps-client twin whitespace-env [%s]: expected exit %s;%s\n' "$label" "$want" "$problems" >&2
+        head -1 "$work/twin-p.err" "$work/twin-w.err" >&2 || true
+        failures=$((failures + 1))
+    fi
+}
+case "$twin_platform_state" in
+checked)
+    twin_ws_case submit-attempts   AGENTQ_SUBMIT_RETRY_ATTEMPTS    ' ' 2 status
+    twin_ws_case submit-delay      AGENTQ_SUBMIT_RETRY_DELAY       ' ' 2 status
+    twin_ws_case operation-attempts AGENTQ_OPERATION_RETRY_ATTEMPTS ' ' 2 status
+    twin_ws_case operation-delay   AGENTQ_OPERATION_RETRY_DELAY    ' ' 2 status
+    twin_ws_case probe-timeout     AGENTQ_PLATFORM_PROBE_TIMEOUT   ' ' 2 status
+    twin_ws_case cache-ttl         AGENTQ_PLATFORM_PROBE_CACHE_TTL ' ' 2 status
+    twin_ws_case wait-timeout      AGENTQ_WAIT_TIMEOUT             ' ' 2 wait 1
+    twin_ws_case tab-value         AGENTQ_SUBMIT_RETRY_ATTEMPTS    $'\t' 2 status
+    # Positive control: EMPTY is "unset" on both (sh's `FOO=`), so both must
+    # proceed past validation to the stub ssh (255).  Without this row a rule
+    # that refused every set-but-blank variable would look correct above.
+    twin_ws_case empty-means-default AGENTQ_SUBMIT_RETRY_ATTEMPTS  '' 255 status
+    ;;
+*)
+    printf 'ps-client twin whitespace-env=NOT-covered(needs-non-Windows)\n' >&2
+    ;;
+esac
+if [ "$twin_ws_rows" -lt 9 ]; then
+    printf 'ps-client twin whitespace-env: only %s case(s) ran (expected 9); the enumeration broke\n' \
+        "$twin_ws_rows" >&2
+    failures=$((failures + 1))
+fi
 # --- the config PATH's symlink policy must be one rule, not two --------------
 # Measured 2026-11-04 on macOS, where /tmp is a system symlink to private/tmp:
 # `AGENTQ_CONFIG=/tmp/<dir>/config status` exited 2 here and reached ssh (255)
@@ -1268,7 +1330,7 @@ else
         failures=$((failures + 1))
     fi
 fi
-twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+config($twin_config_rows/5)+cfgpath($twin_cfgpath_rows/4)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
+twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+config($twin_config_rows/5)+cfgpath($twin_cfgpath_rows/4)+ws($twin_ws_rows/9)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
 else
 twin_state=$twin_platform_state
 fi
