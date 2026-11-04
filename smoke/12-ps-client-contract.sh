@@ -752,6 +752,86 @@ if [ "$twin_config_rows" -lt 5 ]; then
         "$twin_config_rows" >&2
     failures=$((failures + 1))
 fi
+# --- the config PATH's symlink policy must be one rule, not two --------------
+# Measured 2026-11-04 on macOS, where /tmp is a system symlink to private/tmp:
+# `AGENTQ_CONFIG=/tmp/<dir>/config status` exited 2 here and reached ssh (255)
+# on the Windows twin.  One input, two answers -- the POSIX chain guard refused
+# ANY symlink component while Test-NonReparseTemporaryFilePath rewrites /var
+# and /tmp first.  The POSIX side now applies the same two aliases.  What must
+# stay true on BOTH sides: the config FILE itself may not be a symlink, and any
+# OTHER symlink in the chain is still refused.  The Windows message is asserted
+# too: it used to call a config path an "Invalid AgentQ temporary file path",
+# pointing the operator at TMP/TEMP (measured 2026-11-04).
+twin_cfgpath_rows=0
+twin_cfgpath_dir="$work/twin-cfgpath"
+mkdir -p "$twin_cfgpath_dir/real"
+printf 'AGENTQ_HOST=smoke-host\n' > "$twin_cfgpath_dir/real/config"
+ln -s "$twin_cfgpath_dir/real" "$twin_cfgpath_dir/linkdir"
+ln -s "$twin_cfgpath_dir/real/config" "$twin_cfgpath_dir/linkfile"
+twin_cfgpath_run() { # <config path>
+    local config=$1
+    twin_p_status=0
+    twin_w_status=0
+    AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$twin_stub_posix" AGENTQ_CONFIG="$config" \
+        /bin/sh "$twin_posix" status >"$work/twin-p.out" 2>"$work/twin-p.err" || twin_p_status=$?
+    AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$twin_stub_arg" AGENTQ_CONFIG="$config" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
+        >"$work/twin-w.out" 2>"$work/twin-w.err" || twin_w_status=$?
+}
+# twin_cfgpath_case <label> <expected-exit> <config path>
+twin_cfgpath_case() {
+    local label=$1 want=$2 config=$3 problems=''
+    twin_cfgpath_rows=$((twin_cfgpath_rows + 1)); cases=$((cases + 1))
+    twin_cfgpath_run "$config"
+    [ "$twin_p_status" -eq "$want" ] || problems="$problems posix-exit=$twin_p_status"
+    [ "$twin_w_status" -eq "$want" ] || problems="$problems windows-exit=$twin_w_status"
+    if [ -n "$problems" ]; then
+        printf 'ps-client twin config-path [%s]: expected exit %s;%s\n' "$label" "$want" "$problems" >&2
+        head -1 "$work/twin-p.err" "$work/twin-w.err" >&2 || true
+        failures=$((failures + 1))
+    fi
+}
+case "$twin_platform_state" in
+checked)
+    twin_cfgpath_case regular           255 "$twin_cfgpath_dir/real/config"
+    twin_cfgpath_case symlinked-file      2 "$twin_cfgpath_dir/linkfile"
+    twin_cfgpath_case symlinked-dir       2 "$twin_cfgpath_dir/linkdir/config"
+    # The Windows diagnostic must name the CONFIG it refused.  A message that
+    # says "temporary file" for this input sends the operator to TMP/TEMP.
+    twin_cfgpath_run "$twin_cfgpath_dir/linkdir/config"
+    { flatten_err "$work/twin-w.err"; cat "$work/twin-w.out"; } > "$work/twin-w.combined"
+    cases=$((cases + 1))
+    if ! grep -qi 'config path' "$work/twin-w.combined"; then
+        printf 'ps-client twin config-path [diagnostic]: refusing a config path must say so; the Windows message named something else\n' >&2
+        head -2 "$work/twin-w.combined" >&2 || true
+        failures=$((failures + 1))
+    fi
+    # The two macOS system aliases are the whole reason the two rules differed.
+    # On a host where /tmp is a real directory this row cannot exist; say so by
+    # name instead of reporting a pass for a case that never ran.
+    if [ -L /tmp ]; then
+        twin_cfgpath_tmp=$(mktemp -d /tmp/twin-cfgpath.XXXXXX)
+        printf 'AGENTQ_HOST=smoke-host\n' > "$twin_cfgpath_tmp/config"
+        twin_cfgpath_case system-alias-tmp 255 "$twin_cfgpath_tmp/config"
+        rm -f "$twin_cfgpath_tmp/config"
+        rmdir "$twin_cfgpath_tmp" 2>/dev/null || true
+    else
+        printf 'ps-client twin config-path=NOT-covered(needs-symlinked-tmp)\n' >&2
+    fi
+    ;;
+*)
+    printf 'ps-client twin config-path=NOT-covered(needs-non-Windows)\n' >&2
+    ;;
+esac
+if [ "$twin_cfgpath_rows" -lt 3 ]; then
+    printf 'ps-client twin config-path: only %s case(s) ran (expected at least 3); the enumeration broke\n' \
+        "$twin_cfgpath_rows" >&2
+    failures=$((failures + 1))
+fi
 # --- which STREAM a diagnostic belongs on -----------------------------------
 # stdout is the DATA channel and stderr the DIAGNOSTIC one -- SKILL.md's whole
 # redaction policy is built on that split, and the POSIX clients honour it:
@@ -1188,7 +1268,7 @@ else
         failures=$((failures + 1))
     fi
 fi
-twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+config($twin_config_rows/5)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
+twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+config($twin_config_rows/5)+cfgpath($twin_cfgpath_rows/4)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
 else
 twin_state=$twin_platform_state
 fi
