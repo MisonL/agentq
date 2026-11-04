@@ -637,6 +637,82 @@ if [ "$twin_cfg_p" != cfg-host ] || [ "$twin_cfg_w" != cfg-host ]; then
         "$twin_cfg_p" "$twin_cfg_w" >&2
     failures=$((failures + 1))
 fi
+# --- the config FILE's byte encoding ----------------------------------------
+# Measured 2026-11-04 with both clients and an argv-capturing stub ssh: a
+# config holding a UTF-8 BOM (EF BB BF) followed by AGENTQ_HOST=bom-host was
+# parsed by the Windows twin (which strips the BOM), while the POSIX client's
+# anchored sed saw "\357\273\277AGENTQ_HOST=..." and reported "no SSH host
+# configured" -- an encoding problem described as a missing host.  UTF-16 is a
+# genuine platform boundary (/bin/sh has no decoder), so that row asserts each
+# side's own documented behaviour, not a fake agreement.
+twin_bom_rows=0
+twin_bom_dir="$work/twin-bom"
+mkdir -p "$twin_bom_dir"
+printf 'AGENTQ_HOST=plain-host\n' > "$twin_bom_dir/plain"
+printf '\357\273\277AGENTQ_HOST=bom-host\n' > "$twin_bom_dir/utf8bom"
+printf 'AGENTQ_HOST=u16-host\n' | iconv -f UTF-8 -t UTF-16LE > "$twin_bom_dir/u16body"
+{ printf '\377\376'; cat "$twin_bom_dir/u16body"; } > "$twin_bom_dir/u16le-bom"
+twin_bom_run() { # <config path>
+    local config=$1
+    twin_p_status=0
+    twin_w_status=0
+    : > "$work/twin-cfg-p.argv"
+    : > "$work/twin-cfg-w.argv"
+    TWIN_ARGV_LOG="$work/twin-cfg-p.argv" env -u AGENTQ_HOST \
+    AGENTQ_REMOTE_PLATFORM=unix AGENTQ_OPERATION_RETRY_ATTEMPTS=1 \
+    AGENTQ_OPERATION_RETRY_DELAY=1 AGENTQ_SSH="$twin_capture_stub" \
+    AGENTQ_CONFIG="$config" \
+        /bin/sh "$twin_posix" status >"$work/twin-p.out" 2>"$work/twin-p.err" || twin_p_status=$?
+    TWIN_ARGV_LOG="$work/twin-cfg-w.argv" env -u AGENTQ_HOST \
+    AGENTQ_REMOTE_PLATFORM=unix AGENTQ_OPERATION_RETRY_ATTEMPTS=1 \
+    AGENTQ_OPERATION_RETRY_DELAY=1 AGENTQ_SSH="$twin_capture_stub" \
+    AGENTQ_CONFIG="$config" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
+        >"$work/twin-w.out" 2>"$work/twin-w.err" || twin_w_status=$?
+    twin_cfg_p_host=$(awk 'prev{print; exit} $0=="--"{prev=1}' "$work/twin-cfg-p.argv" 2>/dev/null || true)
+    twin_cfg_w_host=$(awk 'prev{print; exit} $0=="--"{prev=1}' "$work/twin-cfg-w.argv" 2>/dev/null || true)
+}
+# twin_bom_case <label> <config> <expected-posix-exit> <expected-windows-exit> <expected-host>
+twin_bom_case() {
+    local label=$1 config=$2 want_p=$3 want_w=$4 want_host=$5 problems=''
+    twin_bom_rows=$((twin_bom_rows + 1)); cases=$((cases + 1))
+    twin_bom_run "$config"
+    [ "$twin_p_status" -eq "$want_p" ] || problems="$problems posix-exit=$twin_p_status"
+    [ "$twin_w_status" -eq "$want_w" ] || problems="$problems windows-exit=$twin_w_status"
+    if [ "$want_p" -eq 255 ]; then
+        [ "$twin_cfg_p_host" = "$want_host" ] || problems="$problems posix-host=[$twin_cfg_p_host]"
+    fi
+    if [ "$want_w" -eq 255 ]; then
+        [ "$twin_cfg_w_host" = "$want_host" ] || problems="$problems windows-host=[$twin_cfg_w_host]"
+    fi
+    if [ "$label" = utf16le-bom ] && [ "$want_p" -eq 2 ]; then
+        grep -qi 'UTF-16' "$work/twin-p.err" \
+            || problems="$problems posix-missing-UTF16-message"
+    fi
+    if [ -n "$problems" ]; then
+        printf 'ps-client twin config-encoding [%s]:;%s\n' "$label" "$problems" >&2
+        head -1 "$work/twin-p.err" "$work/twin-w.err" >&2 || true
+        failures=$((failures + 1))
+    fi
+}
+case "$twin_platform_state" in
+checked)
+    twin_bom_case plain       "$twin_bom_dir/plain"       255 255 plain-host
+    twin_bom_case utf8-bom    "$twin_bom_dir/utf8bom"     255 255 bom-host
+    # POSIX cannot decode UTF-16 (no decoder in /bin/sh); it must refuse with a
+    # NAMED reason.  Windows decodes it with .NET -- a platform boundary, not a
+    # divergence to "fix" by weakening either side.
+    twin_bom_case utf16le-bom "$twin_bom_dir/u16le-bom"     2 255 u16-host
+    ;;
+*)
+    printf 'ps-client twin config-encoding=NOT-covered(needs-non-Windows)\n' >&2
+    ;;
+esac
+if [ "$twin_bom_rows" -lt 3 ]; then
+    printf 'ps-client twin config-encoding: only %s case(s) ran (expected 3); the enumeration broke\n' \
+        "$twin_bom_rows" >&2
+    failures=$((failures + 1))
+fi
 # --- an executable path must be a REGULAR file -------------------------------
 # `[ -x ]` tests the search bit, which every directory has, so a directory
 # passed the POSIX client's AGENTQ_SSH guard and the failure came back as exit
@@ -1330,7 +1406,7 @@ else
         failures=$((failures + 1))
     fi
 fi
-twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+config($twin_config_rows/5)+cfgpath($twin_cfgpath_rows/4)+ws($twin_ws_rows/9)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
+twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+bom($twin_bom_rows/3)+config($twin_config_rows/5)+cfgpath($twin_cfgpath_rows/4)+ws($twin_ws_rows/9)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
 else
 twin_state=$twin_platform_state
 fi
