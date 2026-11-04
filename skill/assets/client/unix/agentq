@@ -467,6 +467,20 @@ if [ -r "$config_path" ]; then
         printf '%s: AGENTQ_CONFIG could not be inspected\n' "$program" >&2
         exit 2
     fi
+    # A UTF-16 byte-order mark is not text this client can parse, and the
+    # NUL-rule message below ("contains NUL bytes") leaves the operator guessing
+    # at the cause.  Name the encoding instead.  /bin/sh has no UTF-16 decoder
+    # and iconv is not a promised tool, so this client refuses rather than
+    # converting -- a platform boundary recorded in SKILL.md; the Windows twin
+    # decodes it with .NET (measured 2026-11-04: same file, POSIX 2 / Windows
+    # proceeds).
+    config_prefix_hex=$(LC_ALL=C od -An -tx1 -N2 "$config_snapshot_file" 2>/dev/null | tr -d '[:space:]')
+    case "$config_prefix_hex" in
+        fffe|feff)
+            printf '%s: AGENTQ_CONFIG looks like UTF-16 (it starts with a UTF-16 byte-order mark); save it as UTF-8\n' "$program" >&2
+            exit 2
+            ;;
+    esac
     case " $config_hex " in
         *[[:space:]]00[[:space:]]*)
             printf '%s: AGENTQ_CONFIG contains NUL bytes; text syntax is required\n' "$program" >&2
@@ -494,6 +508,17 @@ if [ -r "$config_path" ]; then
         exit 2
     fi
     config_text=${config_probe%"$config_marker"}
+    # A UTF-8 BOM is a legal marker for the same text: Notepad and every
+    # "UTF-8 with BOM" editor writes it, and the Windows twin strips it before
+    # decoding.  Without this the first line read `\357\273\277AGENTQ_HOST=...`,
+    # the anchored sed below matched nothing, and the operator was told "no SSH
+    # host configured" -- pointing at the host instead of the file's encoding
+    # (measured 2026-11-04: identical file, POSIX exit 2 / Windows parsed the
+    # host).  Only a LEADING BOM is stripped, matching the twin's contentOffset.
+    config_bom=$(printf '\357\273\277')
+    case "$config_text" in
+        "$config_bom"*) config_text=${config_text#"$config_bom"} ;;
+    esac
     configured_host=$(printf '%s' "$config_text" | sed -n 's/^AGENTQ_HOST=\([^[:space:]]*\)$/\1/p' | tail -n 1)
     if ! cleanup_config_snapshot; then
         printf '%s: configuration snapshot cleanup was not verified\n' "$program" >&2
