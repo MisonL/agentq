@@ -1,7 +1,17 @@
 # Release gate: a v* tag must carry the version the deployment unit records.
-# smoke/01 already asserts the records agree with each other (the POSIX
-# installer, the Windows installer, and README.md); this adds the one thing a
+# smoke/01 asserts the records agree with each other; this adds the one thing a
 # checkout cannot check against itself -- agreement with the tag being pushed.
+#
+# It must read EVERY record, not one of them.  Measured 2026-11-04 on a
+# fixture: with only the POSIX installer compared, a tree whose two CLIENT
+# constants said 0.1.18 while the installer said 0.1.19 passed this gate green,
+# so a tag could name a version the deployment unit does not carry.  smoke/01
+# catches that where it runs, but this workflow runs on a TAG PUSH, where
+# ci.yml does not, so the gate has to stand on its own.  smoke/01 also asserts
+# that every record it derives from the tree is read here on the same line as
+# its own constant name -- adding a record there turns the suite red until it
+# is added below.  The success line reports the count it actually compared,
+# so the number in the output cannot go stale without a check noticing.
 name: release
 
 on:
@@ -18,20 +28,54 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
-      - name: Compare the tag with the recorded version
+      - name: Compare the tag with every recorded version
         run: |
           set -eu
-          version_line=$(grep -m1 '^agentq_version=' skill/assets/unix/install-agentq.sh || true)
-          recorded=${version_line#agentq_version=}
-          recorded=${recorded#\'}
-          recorded=${recorded%\'}
           tag_version=${GITHUB_REF_NAME#v}
-          printf 'tag=%s recorded=%s\n' "$tag_version" "$recorded"
-          if [ -z "$recorded" ]; then
-            echo 'no agentq_version found in the installer -- refusing to pass' >&2
+          failures=0
+          checked=0
+          unquote() { # strip one layer of surrounding single or double quotes
+            s=$1
+            s=${s#\'}; s=${s%\'}
+            s=${s#\"}; s=${s%\"}
+            printf '%s' "$s"
+          }
+          compare() { # $1=label, $2=file, $3=recorded
+            checked=$((checked + 1))
+            if [ -z "$3" ]; then
+              echo "no AgentQ version recorded in $2 -- refusing to pass" >&2
+              failures=$((failures + 1))
+            elif [ "$tag_version" != "$3" ]; then
+              echo "tag $GITHUB_REF_NAME does not match the version $2 records ($3)" >&2
+              failures=$((failures + 1))
+            fi
+            printf '%-22s %s\n' "$1" "${3:-<absent>}"
+          }
+
+          v=$(grep -m1 '^agentq_version=' skill/assets/unix/install-agentq.sh || true)
+          compare 'POSIX installer' 'skill/assets/unix/install-agentq.sh' "$(unquote "${v#agentq_version=}")"
+
+          v=$(grep -m1 '^\$agentqVersion = ' skill/assets/windows-git-bash/install-agentq.ps1 || true)
+          compare 'Windows installer' 'skill/assets/windows-git-bash/install-agentq.ps1' "$(unquote "${v#* = }")"
+
+          v=$(grep -m1 '^agentq_version=' skill/assets/unix/agentq-server || true)
+          compare 'server' 'skill/assets/unix/agentq-server' "$(unquote "${v#agentq_version=}")"
+
+          v=$(grep -m1 '^agentq_version=' skill/assets/windows-git-bash/agentq || true)
+          compare 'server (canonical twin)' 'skill/assets/windows-git-bash/agentq' "$(unquote "${v#agentq_version=}")"
+
+          v=$(grep -m1 '^\*\*Version:\*\* ' README.md || true)
+          v=${v#\*\*Version:\*\* }
+          compare 'README' 'README.md' "${v%% *}"
+
+          v=$(grep -m1 '^agentq_client_version=' skill/assets/client/unix/agentq || true)
+          compare 'POSIX client' 'skill/assets/client/unix/agentq' "$(unquote "${v#agentq_client_version=}")"
+
+          v=$(grep -m1 '^\$script:ClientVersion = ' skill/assets/client/windows/agentq.ps1 || true)
+          compare 'Windows client' 'skill/assets/client/windows/agentq.ps1' "$(unquote "${v#* = }")"
+
+          if [ "$failures" -ne 0 ]; then
+            echo "$failures of $checked recorded version(s) disagree with tag $GITHUB_REF_NAME" >&2
             exit 1
           fi
-          if [ "$tag_version" != "$recorded" ]; then
-            echo "tag $GITHUB_REF_NAME does not match the recorded version $recorded" >&2
-            exit 1
-          fi
+          echo "tag $GITHUB_REF_NAME matches all $checked recorded versions"

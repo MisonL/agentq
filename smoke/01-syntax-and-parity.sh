@@ -1712,6 +1712,136 @@ case $version_windows_success in
         ;;
 esac
 
+# --- the release gate must read EVERY version record -------------------------
+# release.yml is the only check that compares a pushed tag with what the tree
+# records, and it used to read exactly ONE record (the POSIX installer).
+# Measured 2026-11-04 on a fixture: a tree whose installer said 0.1.19 while
+# both CLIENT constants still said 0.1.18 passed the release gate green -- a
+# tag could name a version the deployment unit does not carry.  smoke/01's own
+# six-record comparison above catches that on a tree where it runs, but the
+# release gate runs on a TAG PUSH, where ci.yml does not, so it must be
+# self-sufficient.
+#
+# The record set is DERIVED from the tree (every file declaring one of the
+# constant shapes), never a hand-written list: a seventh record added anywhere
+# under skill/assets/ must not be able to leave the gate behind.  Each record's
+# path must appear in release.yml on a line that ALSO carries that record's own
+# constant name -- a path mentioned in a comment does not count, and neither
+# does the constant name on some other line.
+release_gate_workflow="$root/.github/workflows/release.yml"
+release_gate_reads() { # $1=workflow file, $2=repo-relative path, $3=marker -> 0 when ONE non-comment line carries both
+    awk -v path="$2" -v marker="$3" '
+        # A COMMENT line naming both things is not a read.  Measured 2026-11-04
+        # while mutating this rule: replacing a read with
+        # `# <path> <constant> is read elsewhere` passed the first version,
+        # because the predicate could not tell prose from code.  Skip lines
+        # whose first non-space character is `#` -- true for both the shell
+        # body and a YAML-level comment.
+        $0 ~ /^[[:space:]]*#/ { next }
+        index($0, path) && index($0, marker) { found = 1 }
+        END { exit(found ? 0 : 1) }
+    ' "$1"
+}
+release_gate_record_marker() { # $1=file -> the constant token its declaration line carries
+    local line
+    line=$(grep -m1 -E '^(agentq_version=|agentq_client_version=|\$agentqVersion = |\$script:ClientVersion = |\*\*Version:\*\* )' "$1" || true)
+    case $line in
+        'agentq_client_version='*) printf 'agentq_client_version=' ;;
+        'agentq_version='*) printf 'agentq_version=' ;;
+        '$agentqVersion = '*) printf 'agentqVersion' ;;
+        '$script:ClientVersion = '*) printf 'ClientVersion' ;;
+        '**Version:** '*) printf 'Version:' ;;
+        *) printf '' ;;
+    esac
+}
+release_gate_records=0
+release_gate_gaps=0
+release_gate_check() { # $1=file, $2=repo-relative path
+    release_gate_records=$((release_gate_records + 1))
+    local marker
+    marker=$(release_gate_record_marker "$1")
+    if [ -z "$marker" ]; then
+        printf 'release-gate FAILED (%s records a version but its constant shape is not recognised; the census is blind to it)\n' "$2" >&2
+        release_gate_gaps=$((release_gate_gaps + 1))
+        return 0
+    fi
+    if [ ! -f "$release_gate_workflow" ]; then
+        printf '%s\n' 'release-gate FAILED (.github/workflows/release.yml is missing; the tag gate cannot be read)' >&2
+        release_gate_gaps=$((release_gate_gaps + 1))
+        return 0
+    fi
+    if ! release_gate_reads "$release_gate_workflow" "$2" "$marker"; then
+        printf 'release-gate FAILED (release.yml never reads %s: a tag pushed at a tree whose %s disagrees with the installer would pass the release gate)\n' "$2" "$marker" >&2
+        release_gate_gaps=$((release_gate_gaps + 1))
+    fi
+}
+while IFS= read -r record_file; do
+    [ -n "$record_file" ] || continue
+    release_gate_check "$record_file" "${record_file#"$root"/}"
+done <<EOF
+$(grep -rlE '^(agentq_version=|agentq_client_version=|\$agentqVersion = |\$script:ClientVersion = )' "$root/skill/assets" 2>/dev/null | sort)
+EOF
+# README records the version too and smoke/01 compares it above, so it is one of
+# the records the gate must read.  It is outside skill/assets/, hence the
+# explicit call (the derivation above covers the deployment unit).
+release_gate_check "$root/README.md" 'README.md'
+# The derived set must COVER the files smoke/01 compares by name above.  Measured
+# 2026-11-04 while mutating this rule: a one-letter typo in the grep -E above
+# made the derivation enumerate zero files, every remaining check passed, and the
+# run exited 0 -- a silently empty census reads exactly like a satisfied one.
+# The `-eq 0`-style guard that followed at first could not catch it, because
+# README.md is checked outside the loop, so the total was never 0.  Those five
+# paths are the independent oracle: the version block above names them
+# explicitly and extracts each one, so a derivation that has lost one is a
+# disagreement between two lists that must agree -- and it is stated as "every
+# explicit path is covered", not as a literal total, so adding a record does not
+# silently change what this asserts.
+release_gate_tree_list=$(grep -rlE '^(agentq_version=|agentq_client_version=|\$agentqVersion = |\$script:ClientVersion = )' "$root/skill/assets" 2>/dev/null | sort || true)
+for release_gate_known in \
+    skill/assets/unix/install-agentq.sh \
+    skill/assets/windows-git-bash/install-agentq.ps1 \
+    skill/assets/unix/agentq-server \
+    skill/assets/client/unix/agentq \
+    skill/assets/client/windows/agentq.ps1; do
+    if ! grep -qxF -- "$root/$release_gate_known" <<<"$release_gate_tree_list"; then
+        printf 'release-gate FAILED (the record census did not enumerate %s, which the version block above compares by name: the derivation has stopped seeing a record shape it must cover)\n' \
+            "$release_gate_known" >&2
+        release_gate_gaps=$((release_gate_gaps + 1))
+    fi
+done
+# Self-calibration: the predicate must accept a complete fixture, flag a record
+# whose path is absent, and flag one whose path appears only in a COMMENT (the
+# shape a well-meaning edit produces: "see X" without actually reading X).
+release_gate_fixture=$(mktemp "${TMPDIR:-/tmp}/agentq-release-gate.XXXXXX")
+trap 'rm -f -- "$release_gate_fixture"' EXIT
+cat >"$release_gate_fixture" <<'FIXTURE'
+          v=$(grep -m1 '^agentq_version=' skill/assets/unix/install-agentq.sh || true)
+          v=$(grep -m1 '^agentq_client_version=' skill/assets/client/unix/agentq || true)
+          # skill/assets/windows-git-bash/agentq agentq_version= is read elsewhere
+FIXTURE
+release_gate_cal=ok
+release_gate_reads "$release_gate_fixture" 'skill/assets/unix/install-agentq.sh' 'agentq_version=' || release_gate_cal=bad
+release_gate_reads "$release_gate_fixture" 'skill/assets/client/unix/agentq' 'agentq_client_version=' || release_gate_cal=bad
+if release_gate_reads "$release_gate_fixture" 'skill/assets/windows-git-bash/agentq' 'agentq_version='; then
+    release_gate_cal=bad   # both names on a COMMENT line: must NOT count as a read
+fi
+if release_gate_reads "$release_gate_fixture" 'skill/assets/unix/agentq-server' 'agentq_version='; then
+    release_gate_cal=bad   # path absent entirely: must NOT count
+fi
+if [ "$release_gate_cal" != ok ]; then
+    printf '%s\n' 'release-gate FAILED (its own matcher failed calibration: it must accept a complete line and reject a comment-only mention and an absent file)' >&2
+    release_gate_gaps=$((release_gate_gaps + 1))
+fi
+if [ "$release_gate_gaps" -ne 0 ]; then
+    failures=$((failures + 1))
+fi
+# The count is computed, and printed, so a reader can see HOW MANY records the
+# gate was checked against -- and so this counter is not a write-only variable
+# (shellcheck does not flag a self-increment; measured 2026-11-04 in this very
+# round: an unused `release_gate_from_tree` was caught by smoke/05's shellcheck
+# lock, which is why the count now has a consumer).
+release_gate_state="checked($release_gate_records)"
+
 # --- config-file path patterns must still point at real files ----------------
 # .gitattributes and .editorconfig name paths in order to protect them, and a
 # pattern that matches nothing is not an error in either format -- it simply
@@ -3673,8 +3803,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
@@ -3686,7 +3816,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census release_gate'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned
