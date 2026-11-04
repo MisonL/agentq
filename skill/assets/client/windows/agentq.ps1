@@ -472,7 +472,7 @@ function Test-RequestId {
 function Read-AgentQConfigFile {
     param([string]$Path)
 
-    Assert-NonReparseTemporaryFilePath -Path $Path
+    Assert-NonReparseConfigFilePath -Path $Path
 
     $maximumConfigBytes = 4096
     $stream = $null
@@ -828,6 +828,19 @@ function Assert-NonReparseTemporaryFilePath {
 
     if (!(Test-NonReparseTemporaryFilePath -Path $Path)) {
         throw "Invalid AgentQ temporary file path; expected a regular non-reparse file: $Path"
+    }
+}
+
+# The config path is not a temporary file, and a rejection must say so.  Using
+# the temporary-file assertion above sent the operator looking at TMP/TEMP:
+# measured 2026-11-04, a config under a symlinked directory printed
+# `invalid AgentQ config: Invalid AgentQ temporary file path; ...` and named no
+# config problem at all.  Same predicate, honest subject.
+function Assert-NonReparseConfigFilePath {
+    param([string]$Path)
+
+    if (!(Test-NonReparseTemporaryFilePath -Path $Path)) {
+        throw "Invalid AgentQ config path; expected a regular non-reparse file: $Path"
     }
 }
 

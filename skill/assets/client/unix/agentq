@@ -207,6 +207,27 @@ config_source_path_chain_identity_for_path() {
         */../*) return 1 ;;
     esac
 
+    # macOS ships /var -> private/var and /tmp -> private/tmp as SYSTEM
+    # symlinks.  The Windows twin rewrites exactly these two before validating
+    # (see Test-NonReparseTemporaryFilePath), so the same AGENTQ_CONFIG under
+    # /tmp is accepted there and was refused here -- measured 2026-11-04:
+    # `AGENTQ_CONFIG=/tmp/x/config` exited 2 on this client and proceeded to
+    # ssh on the Windows one.  A twin divergence on a path shape scripts and
+    # tests use constantly.  Rewrite the same two aliases under the same
+    # condition the twin uses: the alias really is a symlink AND its /private
+    # counterpart is a directory.  Every OTHER symlink in the chain (including
+    # /tmp pointing somewhere else) is still refused.
+    for config_source_chain_alias in /var /tmp; do
+        case "$config_source_chain_guard_path" in
+            "$config_source_chain_alias"|"$config_source_chain_alias"/*)
+                if [ -L "$config_source_chain_alias" ] &&
+                    [ -d "/private$config_source_chain_alias" ]; then
+                    config_source_chain_guard_path="/private$config_source_chain_guard_path"
+                fi
+                ;;
+        esac
+    done
+
     config_source_chain_probe='.'
     config_source_chain_remaining=$config_source_chain_guard_path
     case "$config_source_chain_remaining" in
