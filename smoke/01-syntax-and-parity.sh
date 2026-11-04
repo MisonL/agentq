@@ -1424,6 +1424,235 @@ EOF
     esac
 fi
 
+# --- every workflow must be WIRED: able to fire, and able to fail -----------
+# All the other rules about the workflows read their CONTENT (smoke/01's
+# release-gate block, the workflow-pipe detector, ci.yml's pinned check list).
+# None of them reads the WIRING.  Measured 2026-11-04, after fixing the release
+# gate's record coverage, by mutating each wiring knob in turn:
+#   * release.yml `on: push: tags: ['v*']` -> `branches: [main]`: suite green.
+#     The gate is perfect and never runs, so a tag can be pushed with no version
+#     check at all.  A gate that cannot fire is a comment.
+#   * the same file's job marked `continue-on-error: true`: suite green.  It
+#     runs, reports a failure, and GitHub calls the workflow successful.
+#   * ci.yml `push: branches: [main]` -> `tags: ['never']`: suite green.  No CI
+#     on main, so nothing ever runs the suite that would notice.
+#   * ci.yml's linux job body replaced with `true`: suite green.  The job runs,
+#     the assertion step below it would fail at runtime, but the tree looks
+#     consistent to every static rule.
+#
+# Assertions, on the PARSED YAML for every `.github/workflows/*.yml`:
+#   1. parses to a mapping with a `jobs` mapping;
+#   2. has a non-empty `on:` mapping;
+#   3. no job is `continue-on-error: true`;
+#   4. at least one step runs a non-empty shell command.
+# Plus two named invariants, because these two workflows are the gates:
+#   5. release.yml triggers on a TAG push whose pattern matches a version tag --
+#      GitHub evaluates `tags:` globs, so it is matched with fnmatch against a
+#      synthetic sample tag, not compared to the literal `v*`;
+#   6. ci.yml triggers on push to `main` (or on all branches) AND some step
+#      invokes `run-tests.sh` -- the suite is the gate, and a gate that runs
+#      something else verifies nothing.
+# Calibration drives the same predicate over nine fixtures, one per assertion
+# plus a good one, so a predicate that stopped distinguishing them fails here.
+workflow_wiring_rc=0
+workflow_wiring_summary='skipped(no pyyaml)'
+# The guard must use the SAME interpreter flags as the block below (`-I`).
+# A guard that says "pyyaml is present" while the -I block cannot see it
+# turns a missing module into "workflow wiring FAILED" -- an environment
+# fault reported as an asset fault, the class this repo keeps correcting.
+if python3 -I -c 'import yaml' >/dev/null 2>&1; then
+    # `2>&1`: the problems are printed to stderr by the python block, and the
+    # report below prints what it captured.  Without the merge the detail
+    # appeared ABOVE the FAILED header, leaving an empty indented block.
+    workflow_wiring_out=$(python3 -I - "$root" 2>&1 <<'WIRING_PY'
+import fnmatch
+import glob
+import os
+import sys
+
+import yaml
+
+root = sys.argv[1]
+directory = os.path.join(root, ".github", "workflows")
+files = sorted(glob.glob(os.path.join(directory, "*.yml")))
+if not files:
+    print("no workflow files were enumerated; refusing to report a pass", file=sys.stderr)
+    sys.exit(2)
+
+SAMPLE_TAG = "v0.1.19"
+
+
+def as_list(value):
+    if isinstance(value, str):
+        return [value]
+    return value if isinstance(value, list) else []
+
+
+def wiring_problems(name, data):
+    """Problems that stop this workflow from firing, or from failing the run."""
+    if not isinstance(data, dict):
+        return ["did not parse to a mapping"]
+    problems = []
+    jobs = data.get("jobs")
+    if not isinstance(jobs, dict) or not jobs:
+        return ["has no jobs"]
+    # PyYAML (YAML 1.1) parses a bare `on:` key as boolean True; GitHub parses
+    # it as the string "on".  Accept both spellings.
+    on = data.get("on", data.get(True))
+    if not isinstance(on, dict) or not on:
+        problems.append("has no `on:` events (nothing would ever fire it)")
+        on = {}
+
+    push = on.get("push")
+    if name == "release.yml":
+        if not isinstance(push, dict):
+            problems.append("release gate does not run on push (a tag push would not fire it)")
+        else:
+            tags = as_list(push.get("tags"))
+            if not tags:
+                problems.append("release gate's push trigger has no `tags:` list")
+            elif not any(
+                isinstance(p, str) and fnmatch.fnmatchcase(SAMPLE_TAG, p) for p in tags
+            ):
+                problems.append(
+                    "no `tags:` pattern matches a version tag like %s (patterns: %r)"
+                    % (SAMPLE_TAG, tags)
+                )
+    if name == "ci.yml":
+        if not isinstance(push, dict):
+            problems.append("ci does not run on push (nothing would run the suite)")
+        else:
+            branch_patterns = as_list(push.get("branches"))
+            tag_patterns = as_list(push.get("tags"))
+            # GitHub semantics: `branches` absent means ALL branches -- but only
+            # when `tags` is also absent.  A push trigger that lists ONLY tags
+            # never fires on a branch push, and ci.yml would never run on main.
+            if branch_patterns:
+                covers_main = any(
+                    isinstance(p, str) and fnmatch.fnmatchcase("main", p)
+                    for p in branch_patterns
+                )
+            else:
+                covers_main = not tag_patterns
+            if not covers_main:
+                problems.append(
+                    "ci's push trigger does not cover `main` (branches: %r, tags: %r)"
+                    % (branch_patterns, tag_patterns)
+                )
+
+    advisory = []
+    runs = []
+    for job_name, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        if job.get("continue-on-error") is True:
+            advisory.append(str(job_name))
+        for step in job.get("steps") or []:
+            if isinstance(step, dict) and isinstance(step.get("run"), str):
+                runs.append(step["run"])
+    if advisory:
+        problems.append(
+            "job(s) marked continue-on-error: true -- a failure would not fail the workflow: %s"
+            % ", ".join(sorted(advisory))
+        )
+    if not any(r.strip() for r in runs):
+        problems.append("no job runs a non-empty shell command")
+    if name == "ci.yml":
+        # The suite invocation is the whole point of ci, and it must live in
+        # the LINUX job.  A scan that only asks "does run-tests.sh appear
+        # anywhere" was caught missing a real mutation MEASURED 2026-11-04:
+        # emptying the linux full-suite run step stayed green, because the
+        # macos quick-suite step and the comments still contained the string.
+        # The linux job is the one that runs the FULL suite and asserts its
+        # outcome; the macos/windows jobs are narrower and cannot stand in for
+        # it.  Run-ci full-suite : must exist and call run-tests.sh.
+        linux_job = jobs.get("linux")
+
+        def runs_suite(text):
+            # A COMMENT that names run-tests.sh is not an invocation.  Measured
+            # 2026-11-04: after emptying the linux full-suite step, the next
+            # step's explanatory comment still said "run-tests.sh already
+            # compares ..." and kept this check green.
+            for line in text.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if "run-tests.sh" in stripped:
+                    return True
+            return False
+
+        linux_has_suite = isinstance(linux_job, dict) and any(
+            isinstance(st.get("run"), str) and runs_suite(st["run"])
+            for st in linux_job.get("steps") or []
+        )
+        if not linux_has_suite:
+            problems.append(
+                "ci.yml's linux job never invokes run-tests.sh (a gate that runs something else verifies nothing)"
+            )
+    return problems
+
+
+# --- calibration: one fixture per assertion the rule claims ------------------
+GOOD_STEPS = [{"run": "echo hi\n"}]
+CI_RUN = [{"run": "./run-tests.sh\n"}]
+FIXTURES = [
+    ("good-release", "release.yml", {"on": {"push": {"tags": ["v*"]}}, "jobs": {"g": {"steps": GOOD_STEPS}}}, None),
+    ("good-ci", "ci.yml", {"on": {"push": {"branches": ["main"]}}, "jobs": {"linux": {"steps": CI_RUN}}}, None),
+    ("no-events", "release.yml", {"on": {}, "jobs": {"g": {"steps": GOOD_STEPS}}}, "no `on:` events"),
+    ("branches-only-release", "release.yml", {"on": {"push": {"branches": ["main"]}}, "jobs": {"g": {"steps": GOOD_STEPS}}}, "no `tags:` list"),
+    ("unmatchable-tag-glob", "release.yml", {"on": {"push": {"tags": ["release-*"]}}, "jobs": {"g": {"steps": GOOD_STEPS}}}, "no `tags:` pattern matches"),
+    ("advisory-job", "release.yml", {"on": {"push": {"tags": ["v*"]}}, "jobs": {"g": {"continue-on-error": True, "steps": GOOD_STEPS}}}, "continue-on-error"),
+    ("no-run", "release.yml", {"on": {"push": {"tags": ["v*"]}}, "jobs": {"g": {"steps": [{"name": "nothing"}]}}}, "no job runs a non-empty shell command"),
+    ("ci-tags-only", "ci.yml", {"on": {"push": {"tags": ["never"]}}, "jobs": {"g": {"steps": CI_RUN}}}, "does not cover `main`"),
+    ("ci-no-suite", "ci.yml", {"on": {"push": {"branches": ["main"]}}, "jobs": {"linux": {"steps": GOOD_STEPS}}}, "linux job never invokes run-tests.sh"),
+]
+calibration = []
+for label, fixture_name, fixture, expected in FIXTURES:
+    got = wiring_problems(fixture_name, fixture)
+    if expected is None:
+        if got:
+            calibration.append("%s: expected no problems, got %r" % (label, got))
+    elif not got or not any(expected in g for g in got):
+        calibration.append("%s: expected a problem containing %r, got %r" % (label, expected, got))
+if calibration:
+    for line in calibration:
+        print("calibration FAILED: " + line, file=sys.stderr)
+    print("refusing to report a pass on an uncalibrated wiring check", file=sys.stderr)
+    sys.exit(2)
+
+# --- the real files ---------------------------------------------------------
+problems = []
+for path in files:
+    name = os.path.basename(path)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh.read())
+    except OSError as exc:
+        problems.append("%s is unreadable: %s" % (name, exc))
+        continue
+    for problem in wiring_problems(name, data):
+        problems.append("%s: %s" % (name, problem))
+
+if problems:
+    for problem in problems:
+        print(problem, file=sys.stderr)
+    sys.exit(1)
+
+print("checked(%d)" % len(files))
+WIRING_PY
+    ) || workflow_wiring_rc=$?
+    case $workflow_wiring_rc in
+    0) workflow_wiring_summary="$workflow_wiring_out" ;;
+    *)
+        printf 'workflow wiring FAILED (each workflow must be able to fire and able to fail; the two gates must actually trigger on the events their names claim):\n' >&2
+        sed 's/^/      /' >&2 <<EOF
+$workflow_wiring_out
+EOF
+        failures=$((failures + 1))
+        ;;
+    esac
+fi
+
 # --- ci.yml's pinned check list vs smoke/*.sh --------------------------------
 # ci.yml pins the exact set of check names that must report (`expected_checks`),
 # so a new or renamed check turns CI red.  Locally nothing noticed: a new
@@ -3803,8 +4032,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s workflow_wiring=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state" "$workflow_wiring_summary")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
@@ -3816,7 +4045,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census release_gate'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census release_gate workflow_wiring'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned
