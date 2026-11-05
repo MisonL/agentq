@@ -1178,6 +1178,18 @@ A5b 随之修复并经两列双向验证——见 A5b 正文与本节 A5b 行。
     - **修法**：`shell_assets` 改为**按 shebang 枚举**（与解析臂同一判据），解析臂改吃同一变量——单一来源。再加两道闸门：`shell=` ≠ `local_hazard_files=` 即失败（同一行摘要里 9≠7 曾经全绿，这正是「计数印出来没人看」的形状）；**无归属资产闸门**——skill/assets 里任何不属于已解析类别（`.ps1`/`.cmd`/`.plist`/`.yml`/`.service`/shebang-shell）的文件即失败，堵住「新种类资产静默加入、任何规则都不解析它」这个类（`.DS_Store`/`Thumbs.db`/`desktop.ini` 豁免——Finder 会在任何被显示的目录创建它，而 .gitignore 已挡住它；对它报红是假警报）。闸门刻意**不用**「23 个文件」常数：常数钉死今天的清单，而「这个文件的种类有没有规则解析」才是摘要行真正在说的问题。
     - **红证（四个方向）**：往 `sshp.bash` 植入五类构造（quiet-grep 管道、`< f 2>/dev/null`、mktemp 带后缀模板、动态作用域 hazard、未调用函数）→ **五条锁逐条点名**并退 1（改前同植入零命中）；让解析臂跳过 `.bash` → 漂移闸门点名「7 vs 9」并退 1；种入 `zz-probe.json` → 无归属闸门点名并退 1；把分类器改成永远接受 → 自检报错。还原后全绿。
     - **顺带的实测**：shellcheck `-S warning` 全量（未加 `-i` 白名单）在 9 个资产上只有 3 条——SC3045（POSIX sh 的 `ulimit -c`，本仓已有注释说明 best-effort 且 dash/bash 实测都接受）与 SC2140/SC1078（服务端 jq 双引号 filter 里的注释文本，`bash -n`/`zsh -n`/`dash -n` 全部接受）。两者都判为既有边界、不进锁，如实记录。
+  - **第六十九类（2026-11-05，挨个量配置文件的**形态**——目录、符号链接、不可读、FIFO——时量出来的）：配置**存在但读不了**时，POSIX 报的是「没有配置 SSH 主机」，把权限问题说成了配置缺失。**（资产变更：`client/unix/agentq`。）**
+    - **怎么找到的**：把 `AGENTQ_CONFIG` 指向五种形态（目录、指向目录的符号链接、mode 000 的普通文件、父目录无搜索位的文件、FIFO），两侧逐一对照退出码与首行消息。退出码五种全部一致（都是 2），但**消息**在「存在但不可读」这一格上指向完全不同的东西。
+    - **实测**：`chmod 000` 的配置文件——POSIX 退 2 `no SSH host configured; pass --host or set AGENTQ_HOST`；Windows 退 2 `invalid AgentQ config: AgentQ config file could not be read`。同一份文件、同一个退出码，一个指向主机、一个指向文件。
+    - **根因**：POSIX 的读取块整个由 `[ -r "$config_path" ]` 守着。读不了 → 整段跳过 → `configured_host` 留空 → 落到文件末尾那条「没有配置主机」的通用消息。**守卫本身没错，错的是它失败后沉默**：`-r` 为假这件事没有被任何消息说出来。
+    - **为什么这是缺陷而不是「两种平台各有措辞」**：这条消息是运维唯一能看到的线索。它说的是「没有配置主机」，于是人会去查 `AGENTQ_HOST`、去查主机清单，而真正要查的是那个文件属主是谁、父目录有没有搜索位。本仓对这类「诊断指向错误方向」已有一贯立场（BatchMode 那轮同型）。
+    - **修法**：在既有的「存在且非普通文件」守卫之后加一条：文件存在但不可读 → 具名拒绝，消息点名权限与父目录的搜索位。
+    - **锁（`smoke/12` 新增 `config-unreadable`）**：两侧都必须退 2；POSIX 消息必须含 `cannot be read` 且**不得**出现 `no SSH host configured`；Windows 消息必须含 `could not be read`。**断言消息而不只是退出码**是这一例的全部价值——退出码在修复前后都是 2，只有消息能区分。
+    - **root 宿主的降级**：root 无视 mode 000，这一例在那样的宿主上不可达，因此先探测（`[ -r ]` 为真即跳过）并报 `NOT-covered(needs-unprivileged-user)`，不空跑一场绿。
+    - **红证**：删掉新守卫 → `config-unreadable: posix-does-not-name-the-cause posix-still-points-at-the-host`、退 1；`cp` 还原后 `cmp` 逐字节相同。
+    - **两条实测边界（不修，如实记录）**：
+      ① **父目录没有搜索位**：`[ -e "$config_path" ]` 本身就为假，两侧都把配置当「不存在」、报同一句话。这**是一致的**，而且事实上无法与「确实没有这个文件」区分——要区分必须在每个父目录上逐级探测，代价远大于收益。
+      ② **FIFO**：POSIX 用 `[ ! -f ]` 明确拒绝（`must be a regular file`），PowerShell 侧 `[System.IO.File]::Open` 会**阻塞等待写入者**——实测挂死。但 `UnixMode` 与 `FileAttributes` **都看不出 FIFO**（实测两者与普通文件完全相同），且 Windows 文件系统命名空间里构造不出 FIFO，所以这一格只在「在 Unix 上跑 ps1」时可达，属平台边界而非产品缺陷。
   - **第六十八类（2026-11-05，把「同一份配置喂两个客户端」继续扩到「同一份配置喂两个 locale」时量出来的）：主机解析随环境 locale 变；Windows 还收下一份 POSIX 拒绝的含 NUL 配置。**（资产变更：`client/unix/agentq`、`client/windows/agentq.ps1`。）
     - **① locale 决定连哪台机器（POSIX 侧）**。解析 `AGENTQ_HOST` 的那条 sed 是全文件**唯一**没钉 `LC_ALL=C` 的（同文件的 466/477/499/1750/1772 都钉了）。在 UTF-8 locale 下，BSD sed 遇到非法字节序列立即中止并打 `sed: RE error: illegal byte sequence` 到 stderr；**坏行之前已经打印的匹配仍然进 `tail -n 1`**。实测同一个文件（`AGENTQ_HOST=first-host` 后跟一个含 `\xff` 的值、同一 argv/env/桩 ssh）：`LC_ALL=C` → `bad\xffhost`，`LC_ALL=en_US.UTF-8` → `first-host`。**调用方的 locale 决定了连哪台机器**，且 stderr 混进一条 sed 自己的错误。修法：那条 sed 钉 `LC_ALL=C`，与同文件其他站点一致；两种 locale 下结果一致、stderr 干净。
     - **② 含 NUL 的配置：POSIX 拒绝、Windows 收下（孪生分歧）**。POSIX 有明确的 NUL 规则（`AGENTQ_CONFIG contains NUL bytes; text syntax is required`，理由是 NUL 能从按行读取的解析器面前藏内容）；.NET 则把 U+0000 当合法字符解码，于是 Windows 收下这份文件并用里面的主机（实测：posix=2 / windows=255，主机名正确）。修法：Windows 在 **UTF-8 分支**上先扫 NUL、具名拒绝；UTF-16 分支必须跳过——那里 NUL 是编码构造的一部分，扫了会把所有 UTF-16 文件都拒掉。

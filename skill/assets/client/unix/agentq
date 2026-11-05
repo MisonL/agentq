@@ -410,6 +410,18 @@ if [ -e "$config_path" ] && [ ! -f "$config_path" ]; then
     printf '%s: AGENTQ_CONFIG must be a regular file\n' "$program" >&2
     exit 2
 fi
+# Exists but cannot be read -- a config owned by another user, or one inside a
+# directory without the search bit.  Falling through to the read block's `[ -r ]`
+# test left configured_host empty, so the operator was told "no SSH host
+# configured; pass --host or set AGENTQ_HOST" and went looking at hosts (or at
+# AGENTQ_HOST) while the real cause was permissions on a file that plainly
+# exists.  The Windows twin already says "AgentQ config file could not be read"
+# for the same input (measured 2026-11-05: identical file, POSIX reported a
+# missing host / Windows reported the read failure).  Same subject, same exit.
+if [ -e "$config_path" ] && [ ! -r "$config_path" ]; then
+    printf '%s: AGENTQ_CONFIG exists but cannot be read; check its permissions and the search bit on its parent directories\n' "$program" >&2
+    exit 2
+fi
 if [ -r "$config_path" ]; then
     if ! command -v stat >/dev/null 2>&1; then
         printf '%s: stat is required to protect configuration snapshot identity\n' "$program" >&2

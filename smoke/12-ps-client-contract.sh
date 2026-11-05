@@ -976,6 +976,59 @@ checked)
     fi
     ;;
 esac
+# --- a config that EXISTS but cannot be read --------------------------------
+# Measured 2026-11-05: with a mode-000 config, POSIX fell through the read
+# block (`[ -r ]` false) and reported "no SSH host configured; pass --host or
+# set AGENTQ_HOST" -- sending the operator at hosts while the real cause was
+# permissions on a file that plainly exists.  The Windows twin already said
+# "AgentQ config file could not be read" for the same input.  Same exit code
+# (2), but the diagnostic named the wrong subject; POSIX now says
+# "exists but cannot be read" and points at permissions and the parents'
+# search bit.
+#
+# As root the mode means nothing (root reads it anyway), so that host reports
+# the sub-part by name instead of passing vacuously -- the same treatment
+# smoke/16 gives its unlistable-directory case.
+twin_unreadable_dir="$work/twin-unreadable"
+mkdir -p "$twin_unreadable_dir"
+printf 'AGENTQ_HOST=unreadable-host\n' > "$twin_unreadable_dir/config"
+chmod 000 "$twin_unreadable_dir/config"
+case "$twin_platform_state" in
+checked)
+    if [ -r "$twin_unreadable_dir/config" ]; then
+        printf 'ps-client twin config-unreadable=NOT-covered(needs-unprivileged-user)\n' >&2
+    else
+        cases=$((cases + 1))
+        twin_unreadable_p=0
+        twin_unreadable_w=0
+        env -u AGENTQ_HOST AGENTQ_REMOTE_PLATFORM=unix \
+        AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+        AGENTQ_SSH="$twin_stub_posix" AGENTQ_CONFIG="$twin_unreadable_dir/config" \
+            /bin/sh "$twin_posix" status >"$work/twin-p.out" 2>"$work/twin-p.err" || twin_unreadable_p=$?
+        env -u AGENTQ_HOST AGENTQ_REMOTE_PLATFORM=unix \
+        AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+        AGENTQ_SSH="$twin_stub_arg" AGENTQ_CONFIG="$twin_unreadable_dir/config" \
+            "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
+            >"$work/twin-w.out" 2>"$work/twin-w.err" || twin_unreadable_w=$?
+        twin_unreadable_problems=''
+        [ "$twin_unreadable_p" -eq 2 ] || twin_unreadable_problems="$twin_unreadable_problems posix-exit=$twin_unreadable_p"
+        [ "$twin_unreadable_w" -eq 2 ] || twin_unreadable_problems="$twin_unreadable_problems windows-exit=$twin_unreadable_w"
+        grep -q 'cannot be read' "$work/twin-p.err" \
+            || twin_unreadable_problems="$twin_unreadable_problems posix-does-not-name-the-cause"
+        ! grep -q 'no SSH host configured' "$work/twin-p.err" \
+            || twin_unreadable_problems="$twin_unreadable_problems posix-still-points-at-the-host"
+        { flatten_err "$work/twin-w.err"; cat "$work/twin-w.out"; } > "$work/twin-w.combined"
+        grep -q 'could not be read' "$work/twin-w.combined" \
+            || twin_unreadable_problems="$twin_unreadable_problems windows-does-not-name-the-cause"
+        if [ -n "$twin_unreadable_problems" ]; then
+            printf 'ps-client twin config-unreadable:%s\n' "$twin_unreadable_problems" >&2
+            head -1 "$work/twin-p.err" "$work/twin-w.err" >&2 || true
+            failures=$((failures + 1))
+        fi
+    fi
+    ;;
+esac
+chmod 600 "$twin_unreadable_dir/config"
 # --- the config PATH's symlink policy must be one rule, not two --------------
 # Measured 2026-11-04 on macOS, where /tmp is a system symlink to private/tmp:
 # `AGENTQ_CONFIG=/tmp/<dir>/config status` exited 2 here and reached ssh (255)
