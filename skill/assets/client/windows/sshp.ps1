@@ -2,7 +2,15 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $script:Program = Split-Path -Leaf $PSCommandPath
-$script:ReconnectDelayInput = if (![string]::IsNullOrWhiteSpace($env:SSHP_RECONNECT_DELAY)) {
+# IsNullOrEmpty, NOT IsNullOrWhiteSpace: the POSIX twin resolves SSHP_* with
+# `${VAR:-default}` / `[ -n ]`, which substitute only for EMPTY, so a
+# whitespace-only value is SET there and goes on to validation.  Measured
+# 2026-11-05 on the 0.1.19 assets: SSHP_SSH=' ' and SSHP_RECONNECT_DELAY=' '
+# both exited 2 on POSIX (named refusals) and 255 here (treated as unset ->
+# PATH ssh / default delay).  Same class as the AGENTQ_* variables, where the
+# same one-line change was made; smoke/12's static rule pins it for the agentq
+# pair, and this pair must not drift from it.  Empty still means default.
+$script:ReconnectDelayInput = if (![string]::IsNullOrEmpty($env:SSHP_RECONNECT_DELAY)) {
     $env:SSHP_RECONNECT_DELAY
 } else {
     "2"
@@ -101,7 +109,7 @@ function Test-NonReparseWindowsFilePath {
 }
 
 function Resolve-SshPath {
-    if (![string]::IsNullOrWhiteSpace($env:SSHP_SSH)) {
+    if (![string]::IsNullOrEmpty($env:SSHP_SSH)) {
         $sshItem = Get-Item -LiteralPath $env:SSHP_SSH -Force -ErrorAction SilentlyContinue
         if ($null -eq $sshItem) {
             Stop-Sshp "SSHP_SSH is not an executable file: $env:SSHP_SSH"

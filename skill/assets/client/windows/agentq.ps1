@@ -141,7 +141,20 @@ function Test-NonReparseWindowsFilePath {
 }
 
 $script:UserProfileDirectory = Resolve-CurrentWindowsUserProfile
-$script:ConfigPath = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_CONFIG)) {
+# IsNullOrEmpty, NOT IsNullOrWhiteSpace, for every AGENTQ_* variable that names
+# a value (a path, a program, an enumerated switch).  The POSIX twin resolves
+# these with `[ -n ]` / `${VAR:-default}`, which substitute only for EMPTY: a
+# whitespace-only value is SET there and goes on to its normal validation.  With
+# IsNullOrWhiteSpace the same environment meant "unset, use the default" here
+# and "set, refuse" there -- measured 2026-11-05 on the 0.1.19 assets, and the
+# sharpest row is AGENTQ_CONFIG=' ': POSIX said "no SSH host configured" while
+# this client read the DEFAULT config and connected to the host it named.  Same
+# class as the seven numeric variables fixed 2026-11-04 (IsNullOrEmpty there
+# too); that fix was scoped to the variables in hand, and these were left.
+# AGENTQ_HOST is the one deliberate exception: both clients document a
+# whitespace-only host as UNSET (it falls back to the configured host), which is
+# why its read site below keeps IsNullOrWhiteSpace and smoke/12 locks it.
+$script:ConfigPath = if (![string]::IsNullOrEmpty($env:AGENTQ_CONFIG)) {
     $env:AGENTQ_CONFIG
 } else {
     Join-Path $script:UserProfileDirectory ".config\agentq\config"
@@ -231,7 +244,7 @@ $script:LocalCommandLineLimit = if ([Environment]::OSVersion.Platform -eq [Platf
     131072
 }
 $script:LocalCommandLineFixedOverhead = 734
-$script:RemotePlatform = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_REMOTE_PLATFORM)) {
+$script:RemotePlatform = if (![string]::IsNullOrEmpty($env:AGENTQ_REMOTE_PLATFORM)) {
     $env:AGENTQ_REMOTE_PLATFORM
 } else {
     "auto"
@@ -588,7 +601,7 @@ function Stop-Credential {
 # reaches ssh -- including the platform probe, which is itself an ssh call that
 # runs before operation dispatch.
 function Resolve-CredentialSource {
-    if (![string]::IsNullOrWhiteSpace($env:AGENTQ_ASKPASS)) {
+    if (![string]::IsNullOrEmpty($env:AGENTQ_ASKPASS)) {
         $program = $env:AGENTQ_ASKPASS
         # ssh executes the WHOLE SSH_ASKPASS value as a SINGLE file name.  There
         # is no shell in between and no word splitting, so the value is legal
@@ -618,7 +631,7 @@ function Resolve-CredentialSource {
             Stop-Credential "AGENTQ_ASKPASS is not a regular non-reparse file: $program"
         }
 
-        if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PASSWORD)) {
+        if (![string]::IsNullOrEmpty($env:AGENTQ_PASSWORD)) {
             Stop-Credential "AGENTQ_ASKPASS and AGENTQ_PASSWORD are both set; set only one"
         }
         # Same rule for the prompt source, and for the same reason the POSIX twin
@@ -630,7 +643,7 @@ function Resolve-CredentialSource {
         # on one platform and "fine" on the other.  The refusal has a second,
         # Windows-specific justification: AGENTQ_PASSWORD_PROMPT is not supported
         # here at all, so a user who set it clearly expected it to be used.
-        if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PASSWORD_PROMPT)) {
+        if (![string]::IsNullOrEmpty($env:AGENTQ_PASSWORD_PROMPT)) {
             Stop-Credential "AGENTQ_ASKPASS and AGENTQ_PASSWORD_PROMPT are both set; set only one"
         }
 
@@ -639,7 +652,7 @@ function Resolve-CredentialSource {
         return
     }
 
-    if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PASSWORD)) {
+    if (![string]::IsNullOrEmpty($env:AGENTQ_PASSWORD)) {
         # Deliberately not supported on this platform, while it IS on POSIX.
         # AgentQ would have to write the secret somewhere ssh can read it, and
         # every available shape is worse than letting the user own it: a
@@ -651,7 +664,7 @@ function Resolve-CredentialSource {
         Stop-Credential "AGENTQ_PASSWORD is not supported on Windows; set AGENTQ_ASKPASS to a program that prints the password"
     }
 
-    if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PASSWORD_PROMPT)) {
+    if (![string]::IsNullOrEmpty($env:AGENTQ_PASSWORD_PROMPT)) {
         # Also not supported: Windows ssh reads the password from the console via
         # _getwch(), and with no console it blocks rather than failing -- so an
         # unattended call would hang forever instead of erroring.
@@ -674,7 +687,7 @@ function Get-CredentialSshOptions {
 }
 
 function Resolve-SshPath {
-    if (![string]::IsNullOrWhiteSpace($env:AGENTQ_SSH)) {
+    if (![string]::IsNullOrEmpty($env:AGENTQ_SSH)) {
         $sshItem = Get-Item -LiteralPath $env:AGENTQ_SSH -Force -ErrorAction SilentlyContinue
         if ($null -eq $sshItem) {
             Stop-AgentQ "AGENTQ_SSH is not an executable file: $env:AGENTQ_SSH"
@@ -1796,12 +1809,12 @@ function Get-PlatformProbeCachePath {
     # polluted value redirect the cache -- a second location the same rule was
     # meant to cover.  Measured 2026-10-21: this was the only remaining direct
     # read of USERPROFILE outside the documented non-Windows fallback.
-    $baseDir = if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLATFORM_CACHE_DIR)) { $env:AGENTQ_PLATFORM_CACHE_DIR } else { Join-Path $script:UserProfileDirectory ".config\agentq" }
+    $baseDir = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFORM_CACHE_DIR)) { $env:AGENTQ_PLATFORM_CACHE_DIR } else { Join-Path $script:UserProfileDirectory ".config\agentq" }
     return (Join-Path (Join-Path $baseDir "platform-cache") "$($hash.Substring(0, 16)).json")
 }
 
 function Read-PlatformProbeCache {
-    if (([string]::IsNullOrWhiteSpace($env:AGENTQ_PLATFORM_PROBE_CACHE) -or ($env:AGENTQ_PLATFORM_PROBE_CACHE -ne "off")) -eq $false) {
+    if (([string]::IsNullOrEmpty($env:AGENTQ_PLATFORM_PROBE_CACHE) -or ($env:AGENTQ_PLATFORM_PROBE_CACHE -ne "off")) -eq $false) {
         return $false
     }
     if ($script:RemotePlatform -ne "auto") {
@@ -1864,7 +1877,7 @@ function Read-PlatformProbeCache {
 }
 
 function Write-PlatformProbeCache {
-    if (![string]::IsNullOrWhiteSpace($env:AGENTQ_PLATFORM_PROBE_CACHE) -and ($env:AGENTQ_PLATFORM_PROBE_CACHE -eq "off")) {
+    if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFORM_PROBE_CACHE) -and ($env:AGENTQ_PLATFORM_PROBE_CACHE -eq "off")) {
         return
     }
     # Declared before the try: the catch block below reads $temporary, and an

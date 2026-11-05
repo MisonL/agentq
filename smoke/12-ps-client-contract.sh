@@ -913,6 +913,182 @@ if [ "$twin_ws_rows" -lt 9 ]; then
         "$twin_ws_rows" >&2
     failures=$((failures + 1))
 fi
+# --- whitespace-only STRING environment variables ---------------------------
+# The block above fixed this class for the seven NUMERIC variables on
+# 2026-11-04 (IsNullOrWhiteSpace -> IsNullOrEmpty) -- but that fix was scoped to
+# the variables in hand, and the STRING ones kept it.  Measured 2026-11-05 on
+# the 0.1.19 assets, five rows where the same environment gave opposite answers,
+# because `[ -n ]` / `${VAR:-}` substitute only for EMPTY while the Windows read
+# treated whitespace-only as UNSET:
+#   AGENTQ_REMOTE_PLATFORM=' '  POSIX 2 (must be auto/unix/windows) / Windows 255 (auto)
+#   AGENTQ_SSH=' '              POSIX 2 (not executable)           / Windows 255 (PATH ssh)
+#   AGENTQ_ASKPASS=' '          POSIX 2 (must be a single path)    / Windows 255 (key-only)
+#   AGENTQ_PASSWORD_PROMPT=' '  POSIX 2 (must be 1)                / Windows 255
+#   AGENTQ_CONFIG=' '           POSIX 2 "no SSH host configured"   / Windows 255, connected to
+#                               the host named by the DEFAULT config: different machines
+# The two "both set" rows pin the credential guards: with a valid ASKPASS and a
+# whitespace-only second source, POSIX refuses the ambiguity (2) while Windows
+# used to ignore the whitespace value and run with askpass (255).
+#
+# Every row is a DIFFERENTIAL: the same env goes to both clients, and each row
+# asserts BOTH exit codes, the message each side names, and whether ssh was
+# reached at all (a refusal that still dialled has learned nothing).  The
+# empty-value positive controls pin the other half of the rule -- `VAR=` means
+# "unset" on both -- so an implementation that refused every set-but-blank
+# variable cannot pass this block.
+twin_strblank_rows=0
+twin_strblank_home="$work/twin-sb-home"
+mkdir -p "$twin_strblank_home/.config/agentq"
+printf 'AGENTQ_HOST=cfg-host\n' > "$twin_strblank_home/.config/agentq/config"
+chmod 600 "$twin_strblank_home/.config/agentq/config"
+# A CAPTURING stub, not the plain `exit 255` one: the "did ssh get reached" and
+# "which host was handed to ssh" assertions below read the argv log, and a stub
+# that writes nothing makes both vacuous -- the false-green shape this repo
+# keeps recording.  Same stub (and the same stderr-vs-`-E` reasoning) the
+# host-value block above uses; the whole twin block only runs off-Windows, so a
+# POSIX path is fine for both sides.
+twin_sb_stub="$work/twin-sb-ssh"
+printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "${TWIN_ARGV_LOG:?}"\nexit 255\n' > "$twin_sb_stub"
+chmod 700 "$twin_sb_stub"
+twin_strblank_hosts() {
+    twin_sb_host_p=$(awk 'prev{print; exit} $0=="--"{prev=1}' "$work/twin-sb-p.argv" 2>/dev/null || true)
+    twin_sb_host_w=$(awk 'prev{print; exit} $0=="--"{prev=1}' "$work/twin-sb-w.argv" 2>/dev/null || true)
+}
+# "Did this side contact ssh?" must not count the Windows client's launch probe:
+# an explicitly set AGENTQ_SSH is probed with `-V` on EVERY run (Resolve-SshPath
+# -- the POSIX twin runs that probe only on an already-failed call, so its log
+# has no such line).  A probe line is exactly "-V"; a real invocation carries
+# `--` and the host.  Counting any non-empty log as a contact made the refusal
+# rows report windows-contacted-ssh on a client that refused BEFORE dialling
+# (measured on the first version of this block, green run, 2026-11-05).
+twin_sb_reached() { # <argv log>
+    [ -s "$1" ] && /usr/bin/grep -qvx -- '-V' "$1"
+}
+twin_strblank_run() { # <var> <value> [extra "VAR=value" assignments...]
+    local var=$1 value=$2
+    shift 2
+    twin_p_status=0
+    twin_w_status=0
+    : > "$work/twin-sb-p.argv"; : > "$work/twin-sb-w.argv"
+    TWIN_ARGV_LOG="$work/twin-sb-p.argv" env -u AGENTQ_HOST -u AGENTQ_CONFIG \
+    -u AGENTQ_REMOTE_PLATFORM -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD \
+    -u AGENTQ_PASSWORD_PROMPT -u AGENTQ_SSH -u AGENTQ_PLATFORM_CACHE_DIR \
+    HOME="$twin_strblank_home" USERPROFILE="$twin_strblank_home" \
+    AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$twin_sb_stub" AGENTQ_CONFIG="$work/absent-config" \
+    "$@" "$var=$value" \
+        /bin/sh "$twin_posix" status >"$work/twin-sb-p.out" 2>"$work/twin-sb-p.err" || twin_p_status=$?
+    TWIN_ARGV_LOG="$work/twin-sb-w.argv" env -u AGENTQ_HOST -u AGENTQ_CONFIG \
+    -u AGENTQ_REMOTE_PLATFORM -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD \
+    -u AGENTQ_PASSWORD_PROMPT -u AGENTQ_SSH -u AGENTQ_PLATFORM_CACHE_DIR \
+    HOME="$twin_strblank_home" USERPROFILE="$twin_strblank_home" \
+    AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$twin_sb_stub" AGENTQ_CONFIG="$work/absent-config" \
+    "$@" "$var=$value" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
+        >"$work/twin-sb-w.out" 2>"$work/twin-sb-w.err" || twin_w_status=$?
+    twin_strblank_hosts
+}
+# twin_strblank_case <label> <var> <value> <want-p> <want-w> <token|-> <ssh:yes|no> <host|-> [extra...]
+twin_strblank_case() {
+    local label=$1 var=$2 value=$3 want_p=$4 want_w=$5 token=$6 ssh=$7 want_host=$8 problems=''
+    shift 8
+    twin_strblank_rows=$((twin_strblank_rows + 1)); cases=$((cases + 1))
+    twin_strblank_run "$var" "$value" "$@"
+    [ "$twin_p_status" -eq "$want_p" ] || problems="$problems posix-exit=$twin_p_status"
+    [ "$twin_w_status" -eq "$want_w" ] || problems="$problems windows-exit=$twin_w_status"
+    if [ "$token" != '-' ]; then
+        /usr/bin/grep -qF -- "$token" "$work/twin-sb-p.err" || problems="$problems posix-message"
+        { flatten_err "$work/twin-sb-w.err"; cat "$work/twin-sb-w.out"; } > "$work/twin-sb-w.combined"
+        /usr/bin/grep -qF -- "$token" "$work/twin-sb-w.combined" || problems="$problems windows-message"
+    fi
+    if [ "$want_host" != '-' ]; then
+        [ "$twin_sb_host_p" = "$want_host" ] || problems="$problems posix-host=[$twin_sb_host_p]"
+        [ "$twin_sb_host_w" = "$want_host" ] || problems="$problems windows-host=[$twin_sb_host_w]"
+    fi
+    if [ "$ssh" = no ]; then
+        if twin_sb_reached "$work/twin-sb-p.argv"; then problems="$problems posix-contacted-ssh"; fi
+        if twin_sb_reached "$work/twin-sb-w.argv"; then problems="$problems windows-contacted-ssh"; fi
+    else
+        if ! twin_sb_reached "$work/twin-sb-p.argv"; then problems="$problems posix-never-reached-ssh"; fi
+        if ! twin_sb_reached "$work/twin-sb-w.argv"; then problems="$problems windows-never-reached-ssh"; fi
+    fi
+    if [ -n "$problems" ]; then
+        printf 'ps-client twin whitespace-string [%s]:%s\n' "$label" "$problems" >&2
+        head -1 "$work/twin-sb-p.err" "$work/twin-sb-w.err" >&2 || true
+        failures=$((failures + 1))
+    fi
+}
+# A valid askpass is a DIFFERENT path per side (the Windows client validates it
+# with its own file rules and, when this check runs under Git Bash, needs the
+# Windows form of it), so the pair rows are written out rather than going through
+# the shared env above.
+twin_strblank_pair_case() { # <label> <var> <value> <token>
+    local label=$1 var=$2 value=$3 token=$4 problems=''
+    twin_strblank_rows=$((twin_strblank_rows + 1)); cases=$((cases + 1))
+    twin_p_status=0
+    twin_w_status=0
+    : > "$work/twin-sb-p.argv"; : > "$work/twin-sb-w.argv"
+    TWIN_ARGV_LOG="$work/twin-sb-p.argv" env -u AGENTQ_HOST -u AGENTQ_CONFIG \
+    -u AGENTQ_REMOTE_PLATFORM -u AGENTQ_PASSWORD -u AGENTQ_PASSWORD_PROMPT \
+    -u AGENTQ_SSH -u AGENTQ_PLATFORM_CACHE_DIR \
+    AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$twin_sb_stub" AGENTQ_CONFIG="$work/absent-config" \
+    AGENTQ_ASKPASS="$twin_stub_posix" "$var=$value" \
+        /bin/sh "$twin_posix" status >"$work/twin-sb-p.out" 2>"$work/twin-sb-p.err" || twin_p_status=$?
+    TWIN_ARGV_LOG="$work/twin-sb-w.argv" env -u AGENTQ_HOST -u AGENTQ_CONFIG \
+    -u AGENTQ_REMOTE_PLATFORM -u AGENTQ_PASSWORD -u AGENTQ_PASSWORD_PROMPT \
+    -u AGENTQ_SSH -u AGENTQ_PLATFORM_CACHE_DIR \
+    AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$twin_sb_stub" AGENTQ_CONFIG="$work/absent-config" \
+    AGENTQ_ASKPASS="$twin_stub_arg" "$var=$value" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
+        >"$work/twin-sb-w.out" 2>"$work/twin-sb-w.err" || twin_w_status=$?
+    [ "$twin_p_status" -eq 2 ] || problems="$problems posix-exit=$twin_p_status"
+    [ "$twin_w_status" -eq 2 ] || problems="$problems windows-exit=$twin_w_status"
+    /usr/bin/grep -qF -- "$token" "$work/twin-sb-p.err" || problems="$problems posix-message"
+    { flatten_err "$work/twin-sb-w.err"; cat "$work/twin-sb-w.out"; } > "$work/twin-sb-w.combined"
+    /usr/bin/grep -qF -- "$token" "$work/twin-sb-w.combined" || problems="$problems windows-message"
+    if twin_sb_reached "$work/twin-sb-p.argv"; then problems="$problems posix-contacted-ssh"; fi
+    if twin_sb_reached "$work/twin-sb-w.argv"; then problems="$problems windows-contacted-ssh"; fi
+    if [ -n "$problems" ]; then
+        printf 'ps-client twin whitespace-string [%s]:%s\n' "$label" "$problems" >&2
+        head -1 "$work/twin-sb-p.err" "$work/twin-sb-w.err" >&2 || true
+        failures=$((failures + 1))
+    fi
+}
+case "$twin_platform_state" in
+checked)
+    twin_strblank_case remote-platform-space AGENTQ_REMOTE_PLATFORM ' ' 2 2 \
+        'AGENTQ_REMOTE_PLATFORM must be auto, unix, or windows' no -
+    twin_strblank_case ssh-space AGENTQ_SSH ' ' 2 2 'AGENTQ_SSH' no -
+    twin_strblank_case askpass-space AGENTQ_ASKPASS ' ' 2 2 'AGENTQ_ASKPASS' no -
+    twin_strblank_case password-prompt-space AGENTQ_PASSWORD_PROMPT ' ' 2 2 \
+        'AGENTQ_PASSWORD_PROMPT' no -
+    twin_strblank_case config-space AGENTQ_CONFIG ' ' 2 2 \
+        'no SSH host configured' no - AGENTQ_HOST=
+    twin_strblank_pair_case askpass-plus-password-space AGENTQ_PASSWORD ' ' \
+        'AGENTQ_ASKPASS and AGENTQ_PASSWORD are both set'
+    twin_strblank_pair_case askpass-plus-prompt-space AGENTQ_PASSWORD_PROMPT ' ' \
+        'AGENTQ_ASKPASS and AGENTQ_PASSWORD_PROMPT are both set'
+    # Positive controls: EMPTY means unset on both, so both read the DEFAULT
+    # config and hand the stub ssh the configured host.
+    twin_strblank_case config-empty AGENTQ_CONFIG '' 255 255 - yes cfg-host AGENTQ_HOST=
+    twin_strblank_case askpass-empty AGENTQ_ASKPASS '' 255 255 - yes smoke-host
+    ;;
+*)
+    printf 'ps-client twin whitespace-string=NOT-covered(needs-non-Windows)\n' >&2
+    ;;
+esac
+if [ "$twin_strblank_rows" -lt 9 ]; then
+    printf 'ps-client twin whitespace-string: only %s case(s) ran (expected 9); the enumeration broke\n' \
+        "$twin_strblank_rows" >&2
+    failures=$((failures + 1))
+fi
 # --- the host parse must not depend on the AMBIENT LOCALE -------------------
 # Measured 2026-11-04: the host-parsing sed was the one site in the client that
 # did not pin LC_ALL=C (every other sed/tr/grep there does).  With a UTF-8
@@ -1283,6 +1459,40 @@ if grep -qF 'remote dependency probe failed' "$work/sshp-w.err"; then
     failures=$((failures + 1))
 fi
 
+# Same class as the AGENTQ_* block above, on the SSHP_* pair: measured
+# 2026-11-05, SSHP_SSH=' ' and SSHP_RECONNECT_DELAY=' ' exited 2 on POSIX with
+# named refusals and 255 here -- treated as unset, so PATH ssh / the default
+# delay.  Both sides refuse BEFORE any ssh runs, so no host is contacted: the
+# assertion is the exit code plus the variable name in each side's message.
+sshp_ws_case() { # <label> <var> <value>
+    local label=$1 var=$2 value=$3 problems='' p=0 w=0
+    cases=$((cases + 1))
+    env -u SSHP_SSH -u SSHP_RECONNECT_DELAY HOME="$work/sshp-home" TMPDIR="$work/sshp-tmp" \
+        "$var=$value" \
+        /bin/sh "$sshp_posix_client" --check smoke-host \
+        >"$work/sshp-ws-p.out" 2>"$work/sshp-ws-p.err" || p=$?
+    env -u SSHP_SSH -u SSHP_RECONNECT_DELAY HOME="$work/sshp-home" TMPDIR="$work/sshp-tmp" \
+        "$var=$value" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_ps_client_arg" --check smoke-host \
+        >"$work/sshp-ws-w.out" 2>"$work/sshp-ws-w.err" || w=$?
+    [ "$p" -eq 2 ] || problems="$problems posix-exit=$p"
+    [ "$w" -eq 2 ] || problems="$problems windows-exit=$w"
+    /usr/bin/grep -qF -- "$var" "$work/sshp-ws-p.err" || problems="$problems posix-does-not-name-the-variable"
+    { flatten_err "$work/sshp-ws-w.err"; cat "$work/sshp-ws-w.out"; } > "$work/sshp-ws-w.combined"
+    /usr/bin/grep -qF -- "$var" "$work/sshp-ws-w.combined" || problems="$problems windows-does-not-name-the-variable"
+    if [ -n "$problems" ]; then
+        printf 'ps-client sshp whitespace-env-style [%s]:%s\n' "$label" "$problems" >&2
+        head -1 "$work/sshp-ws-p.err" "$work/sshp-ws-w.err" >&2 || true
+        failures=$((failures + 1))
+    fi
+}
+case "$twin_platform_state" in
+checked)
+    sshp_ws_case ssh-space SSHP_SSH ' '
+    sshp_ws_case reconnect-delay-space SSHP_RECONNECT_DELAY ' '
+    ;;
+esac
+
 # And the comparator must be provably able to go RED, or the section is a
 # rubber stamp.  Revert the POSIX client's global-token fold in a copy and
 # require the same row to disagree; if the fold line cannot be found the
@@ -1545,7 +1755,7 @@ else
         failures=$((failures + 1))
     fi
 fi
-twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+bom($twin_bom_rows/7)+config($twin_config_rows/5)+cfgpath($twin_cfgpath_rows/4)+ws($twin_ws_rows/9)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
+twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+bom($twin_bom_rows/7)+config($twin_config_rows/5)+cfgpath($twin_cfgpath_rows/4)+ws($twin_ws_rows/9)+wsstr($twin_strblank_rows/9)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
 else
 twin_state=$twin_platform_state
 fi
@@ -2704,7 +2914,82 @@ fi
 grep -q -- '--confirm' "$client" || { printf '%s\n' 'ps-client: missing remove --label --confirm handling' >&2; mode_static_failures=$((mode_static_failures + 1)); }
 grep -q -- '--full' "$client" || { printf '%s\n' 'ps-client: missing doctor --full' >&2; mode_static_failures=$((mode_static_failures + 1)); }
 grep -q -- '--summary' "$client" || { printf '%s\n' 'ps-client: missing status --summary' >&2; mode_static_failures=$((mode_static_failures + 1)); }
-failures=$((failures + mode_static_failures))
+# "What counts as set" must be ONE rule across the twin, for every variable.
+# The Windows client asks the question with a "is it null or ..." predicate; the
+# POSIX twin asks it with `[ -n ]` / `${VAR:-}`, which substitute only for EMPTY,
+# so a whitespace-only value is SET there and goes on to its normal validation.
+# Measured 2026-11-05: with IsNullOrWhiteSpace the same environment meant "unset,
+# use the default" here and "set, refuse" there -- AGENTQ_CONFIG was the sharpest
+# (POSIX refused with "no SSH host configured" while this client read the DEFAULT
+# config and connected to a host), plus AGENTQ_REMOTE_PLATFORM / _SSH / _ASKPASS /
+# _PASSWORD_PROMPT / _PASSWORD (both-set guards) / _PLATFORM_CACHE_DIR.  The
+# seven NUMERIC variables had the identical class fixed 2026-11-04; that fix was
+# scoped to the variables in hand.  This rule is the general form, so the NEXT
+# variable cannot repeat it.  AGENTQ_HOST is the one documented exception:
+# whitespace-only means UNSET on BOTH clients (it falls back to the configured
+# host -- smoke/12's twin host-value row pins that), so its read site keeps the
+# whitespace-aware predicate.  Self-calibrated below: a rule that reported every
+# occurrence, or none, fails its own fixture.
+ws_env_offenders() { # <file> -> one variable name per disallowed read site
+    /usr/bin/grep -n 'IsNullOrWhiteSpace(\$env:AGENTQ_' "$1" 2>/dev/null \
+        | sed -E 's/.*IsNullOrWhiteSpace\(\$env:(AGENTQ_[A-Za-z0-9_]*)\).*/\1/' \
+        | /usr/bin/grep -v -x 'AGENTQ_HOST' || true
+}
+ws_env_fixture="$work/twin-ws-env-fixture.ps1"
+{
+    printf '%s\n' 'if (![string]::IsNullOrWhiteSpace($env:AGENTQ_SSH)) { }'
+    printf '%s\n' 'if (![string]::IsNullOrWhiteSpace($env:AGENTQ_HOST)) { }'
+    printf '%s\n' 'if (![string]::IsNullOrEmpty($env:AGENTQ_CONFIG)) { }'
+    printf '%s\n' 'if ([string]::IsNullOrWhiteSpace($env:NOT_AN_AGENTQ_VAR)) { }'
+} > "$ws_env_fixture"
+ws_env_calibration=$(ws_env_offenders "$ws_env_fixture")
+if [ "$ws_env_calibration" != 'AGENTQ_SSH' ]; then
+    printf 'ps-client: the whitespace-env static rule is miscalibrated (fixture reported [%s], expected [AGENTQ_SSH])\n' \
+        "$ws_env_calibration" >&2
+    mode_static_failures=$((mode_static_failures + 1))
+fi
+ws_env_violations=$(ws_env_offenders "$client")
+if [ -n "$ws_env_violations" ]; then
+    printf 'ps-client: these AGENTQ_* reads treat a whitespace-only value as UNSET (%s); the POSIX twin treats it as SET and validates it, so use IsNullOrEmpty:\n' \
+        "$(printf '%s ' $ws_env_violations)" >&2
+    mode_static_failures=$((mode_static_failures + 1))
+fi
+# The same rule for the SSHP_* pair.  There is no allowed exception here: no
+# SSHP_* variable has a documented "whitespace means unset" contract (the
+# AGENTQ_HOST exemption exists because BOTH clients define it that way).  The
+# POSIX sshp resolves both with `${VAR:-default}` / `[ -n ]`, so whitespace is
+# SET there.  Measured 2026-11-05: SSHP_SSH=' ' and SSHP_RECONNECT_DELAY=' '
+# were named refusals (2) on POSIX and fell through to PATH ssh / the default
+# delay (255) here.  Self-calibrated with its own fixture, same as above.
+sshp_ps_client=${AGENTQ_SMOKE_SSHP_PS_CLIENT:-$root/skill/assets/client/windows/sshp.ps1}
+ws_sshp_offenders() { # <file> -> one variable name per disallowed read site
+    /usr/bin/grep -n 'IsNullOrWhiteSpace(\$env:SSHP_' "$1" 2>/dev/null \
+        | sed -E 's/.*IsNullOrWhiteSpace\(\$env:(SSHP_[A-Za-z0-9_]*)\).*/\1/' || true
+}
+ws_sshp_fixture="$work/twin-ws-sshp-fixture.ps1"
+{
+    printf '%s\n' 'if (![string]::IsNullOrWhiteSpace($env:SSHP_SSH)) { }'
+    printf '%s\n' 'if (![string]::IsNullOrEmpty($env:SSHP_RECONNECT_DELAY)) { }'
+    printf '%s\n' 'if ([string]::IsNullOrWhiteSpace($env:NOT_SSHP)) { }'
+} > "$ws_sshp_fixture"
+ws_sshp_calibration=$(ws_sshp_offenders "$ws_sshp_fixture")
+if [ "$ws_sshp_calibration" != 'SSHP_SSH' ]; then
+    printf 'ps-client: the SSHP whitespace-env static rule is miscalibrated (fixture reported [%s], expected [SSHP_SSH])\n' \
+        "$ws_sshp_calibration" >&2
+    mode_static_failures=$((mode_static_failures + 1))
+fi
+ws_sshp_violations=$(ws_sshp_offenders "$sshp_ps_client")
+if [ -n "$ws_sshp_violations" ]; then
+    printf 'ps-client: these SSHP_* reads treat a whitespace-only value as UNSET (%s); the POSIX twin treats it as SET, so use IsNullOrEmpty:\n' \
+        "$(printf '%s ' $ws_sshp_violations)" >&2
+    mode_static_failures=$((mode_static_failures + 1))
+fi
+# NOTE: mode_static_failures is cumulative and is folded into `failures` ONCE,
+# at the end of this section (after the command-line-budget checks below).
+# Folding it here as well made every red run report each static failure TWICE
+# (measured 2026-11-05: 11 real failures printed, summary said 13) -- the count
+# is what the suite's log is read for, so it must not depend on where in the
+# section the fold sits.  Do not add a second fold.
 
 # The LOCAL command-line budget.  The unix-target payload is base64'd twice
 # (submit arm + New-UnixRemoteInvocation) and both copies ride ONE argv
