@@ -538,7 +538,7 @@ if [ -r "$config_path" ]; then
     # `printf '%s\n'` is what keeps the final line terminated for the sed.
     configured_host=$(printf '%s\n' "$config_text" | awk -v cr="$(printf '\r')" '
         { if (substr($0, length($0)) == cr) $0 = substr($0, 1, length($0) - 1); print }
-    ' | sed -n 's/^AGENTQ_HOST=\([^[:space:]]*\)$/\1/p' | tail -n 1)
+    ' | LC_ALL=C sed -n 's/^AGENTQ_HOST=\([^[:space:]]*\)$/\1/p' | tail -n 1)
     if ! cleanup_config_snapshot; then
         printf '%s: configuration snapshot cleanup was not verified\n' "$program" >&2
         exit 2
