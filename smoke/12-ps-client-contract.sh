@@ -650,6 +650,16 @@ twin_bom_dir="$work/twin-bom"
 mkdir -p "$twin_bom_dir"
 printf 'AGENTQ_HOST=plain-host\n' > "$twin_bom_dir/plain"
 printf '\357\273\277AGENTQ_HOST=bom-host\n' > "$twin_bom_dir/utf8bom"
+# CRLF: what every Windows editor writes.  Measured 2026-11-04 -- the POSIX
+# client's anchored sed saw "AGENTQ_HOST=crlf-host\r" (the trailing CR is
+# whitespace, so `[^[:space:]]*$` cannot reach the end) and reported "no SSH
+# host configured", while the twin splits on `\r?\n` and parsed the host.
+printf 'AGENTQ_HOST=crlf-host\r\n' > "$twin_bom_dir/crlf"
+printf '\357\273\277AGENTQ_HOST=bomcrlf-host\r\n' > "$twin_bom_dir/bom-crlf"
+# Negative control for the CR rule: a CR INSIDE the value must disqualify it on
+# BOTH sides (the twin's `[^\s]*`), so stripping CRs everywhere would pass the
+# rows above and then accept this one the twin refuses.
+printf 'AGENTQ_HOST=mid\rcr\n' > "$twin_bom_dir/mid-cr"
 printf 'AGENTQ_HOST=u16-host\n' | iconv -f UTF-8 -t UTF-16LE > "$twin_bom_dir/u16body"
 { printf '\377\376'; cat "$twin_bom_dir/u16body"; } > "$twin_bom_dir/u16le-bom"
 twin_bom_run() { # <config path>
@@ -699,6 +709,9 @@ case "$twin_platform_state" in
 checked)
     twin_bom_case plain       "$twin_bom_dir/plain"       255 255 plain-host
     twin_bom_case utf8-bom    "$twin_bom_dir/utf8bom"     255 255 bom-host
+    twin_bom_case crlf        "$twin_bom_dir/crlf"        255 255 crlf-host
+    twin_bom_case bom-crlf    "$twin_bom_dir/bom-crlf"    255 255 bomcrlf-host
+    twin_bom_case mid-cr      "$twin_bom_dir/mid-cr"        2   2 -
     # POSIX cannot decode UTF-16 (no decoder in /bin/sh); it must refuse with a
     # NAMED reason.  Windows decodes it with .NET -- a platform boundary, not a
     # divergence to "fix" by weakening either side.
@@ -708,8 +721,8 @@ checked)
     printf 'ps-client twin config-encoding=NOT-covered(needs-non-Windows)\n' >&2
     ;;
 esac
-if [ "$twin_bom_rows" -lt 3 ]; then
-    printf 'ps-client twin config-encoding: only %s case(s) ran (expected 3); the enumeration broke\n' \
+if [ "$twin_bom_rows" -lt 6 ]; then
+    printf 'ps-client twin config-encoding: only %s case(s) ran (expected 6); the enumeration broke\n' \
         "$twin_bom_rows" >&2
     failures=$((failures + 1))
 fi
@@ -1406,7 +1419,7 @@ else
         failures=$((failures + 1))
     fi
 fi
-twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+bom($twin_bom_rows/3)+config($twin_config_rows/5)+cfgpath($twin_cfgpath_rows/4)+ws($twin_ws_rows/9)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
+twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+bom($twin_bom_rows/6)+config($twin_config_rows/5)+cfgpath($twin_cfgpath_rows/4)+ws($twin_ws_rows/9)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
 else
 twin_state=$twin_platform_state
 fi

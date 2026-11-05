@@ -519,7 +519,26 @@ if [ -r "$config_path" ]; then
     case "$config_text" in
         "$config_bom"*) config_text=${config_text#"$config_bom"} ;;
     esac
-    configured_host=$(printf '%s' "$config_text" | sed -n 's/^AGENTQ_HOST=\([^[:space:]]*\)$/\1/p' | tail -n 1)
+    # CRLF line endings: a config edited on Windows ends its lines with CR LF,
+    # and the anchored sed below matches `[^[:space:]]*` followed by `$`, so a
+    # trailing CR made the line not match and the operator was told "no SSH host
+    # configured" while the Windows twin (which splits on `\r?\n`) parsed the
+    # host fine (measured 2026-11-04: identical file, POSIX exit 2 / Windows
+    # proceeds).  Strip a CR only where it ends a line, which is exactly the
+    # twin's `\r?\n` rule: a stray CR inside a line still disqualifies the value
+    # on both sides.  `-v cr=` keeps the escape out of the awk source (`\r` is
+    # not portable in a POSIX awk regex).
+    #
+    # It runs INSIDE the same pipeline as the sed, not into an intermediate
+    # `config_text=$( )`: a second command substitution strips the final
+    # newline, and the sed then never sees the LAST line as a line at all --
+    # so a config ending in `AGENTQ_HOST=` (the documented way to unset a host)
+    # silently kept the earlier value.  Measured 2026-11-04: that exact rewrite
+    # turned `smoke/12`'s empty-last twin row red (`posix-exit=255`).  The
+    # `printf '%s\n'` is what keeps the final line terminated for the sed.
+    configured_host=$(printf '%s\n' "$config_text" | awk -v cr="$(printf '\r')" '
+        { if (substr($0, length($0)) == cr) $0 = substr($0, 1, length($0) - 1); print }
+    ' | sed -n 's/^AGENTQ_HOST=\([^[:space:]]*\)$/\1/p' | tail -n 1)
     if ! cleanup_config_snapshot; then
         printf '%s: configuration snapshot cleanup was not verified\n' "$program" >&2
         exit 2
