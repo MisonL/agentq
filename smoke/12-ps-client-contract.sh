@@ -660,6 +660,10 @@ printf '\357\273\277AGENTQ_HOST=bomcrlf-host\r\n' > "$twin_bom_dir/bom-crlf"
 # BOTH sides (the twin's `[^\s]*`), so stripping CRs everywhere would pass the
 # rows above and then accept this one the twin refuses.
 printf 'AGENTQ_HOST=mid\rcr\n' > "$twin_bom_dir/mid-cr"
+# A NUL byte in a UTF-8 config: POSIX refuses it ("text syntax is required")
+# because a NUL can hide content from a line reader, while .NET decodes U+0000
+# happily -- measured 2026-11-04, identical file, POSIX exit 2 / Windows 255.
+printf 'AGENTQ_HOST=nul-host\n\000\n' > "$twin_bom_dir/nul"
 printf 'AGENTQ_HOST=u16-host\n' | iconv -f UTF-8 -t UTF-16LE > "$twin_bom_dir/u16body"
 { printf '\377\376'; cat "$twin_bom_dir/u16body"; } > "$twin_bom_dir/u16le-bom"
 twin_bom_run() { # <config path>
@@ -699,6 +703,11 @@ twin_bom_case() {
         grep -qi 'UTF-16' "$work/twin-p.err" \
             || problems="$problems posix-missing-UTF16-message"
     fi
+    if [ "$label" = nul ]; then
+        grep -qi 'NUL' "$work/twin-p.err" || problems="$problems posix-missing-NUL-message"
+        { flatten_err "$work/twin-w.err"; cat "$work/twin-w.out"; } > "$work/twin-w.combined"
+        grep -qi 'NUL' "$work/twin-w.combined" || problems="$problems windows-missing-NUL-message"
+    fi
     if [ -n "$problems" ]; then
         printf 'ps-client twin config-encoding [%s]:;%s\n' "$label" "$problems" >&2
         head -1 "$work/twin-p.err" "$work/twin-w.err" >&2 || true
@@ -715,14 +724,15 @@ checked)
     # POSIX cannot decode UTF-16 (no decoder in /bin/sh); it must refuse with a
     # NAMED reason.  Windows decodes it with .NET -- a platform boundary, not a
     # divergence to "fix" by weakening either side.
+    twin_bom_case nul         "$twin_bom_dir/nul"           2   2 -
     twin_bom_case utf16le-bom "$twin_bom_dir/u16le-bom"     2 255 u16-host
     ;;
 *)
     printf 'ps-client twin config-encoding=NOT-covered(needs-non-Windows)\n' >&2
     ;;
 esac
-if [ "$twin_bom_rows" -lt 6 ]; then
-    printf 'ps-client twin config-encoding: only %s case(s) ran (expected 6); the enumeration broke\n' \
+if [ "$twin_bom_rows" -lt 7 ]; then
+    printf 'ps-client twin config-encoding: only %s case(s) ran (expected 7); the enumeration broke\n' \
         "$twin_bom_rows" >&2
     failures=$((failures + 1))
 fi
@@ -903,6 +913,69 @@ if [ "$twin_ws_rows" -lt 9 ]; then
         "$twin_ws_rows" >&2
     failures=$((failures + 1))
 fi
+# --- the host parse must not depend on the AMBIENT LOCALE -------------------
+# Measured 2026-11-04: the host-parsing sed was the one site in the client that
+# did not pin LC_ALL=C (every other sed/tr/grep there does).  With a UTF-8
+# locale, BSD sed aborts on an illegal byte sequence and prints
+# `sed: RE error: illegal byte sequence`; the matches printed BEFORE the bad
+# line still reach `tail -n 1`, so the SAME file resolved to a DIFFERENT host
+# depending on the caller's locale -- `AGENTQ_HOST=first-host` followed by a
+# corrupted second line gave `bad\xffhost` under C and `first-host` under
+# en_US.UTF-8.  Determinism is the contract here, not which of the two answers
+# is "right".
+#
+# The arm is CALIBRATED: a UTF-8 locale is only used when an unpinned sed
+# really does reject the bytes under it.  GNU sed is byte-oriented and never
+# errors, so on Linux this is honestly reported as NOT-covered instead of
+# passing vacuously (a locale name that does not exist silently falls back to
+# C -- the failure mode the README of this check already records elsewhere).
+twin_locale_case() {
+    local locale=$1 config=$2 problems=''
+    cases=$((cases + 1))
+    : > "$work/twin-loc-c.argv"; : > "$work/twin-loc-u.argv"
+    TWIN_ARGV_LOG="$work/twin-loc-c.argv" env -u AGENTQ_HOST LC_ALL=C \
+    AGENTQ_REMOTE_PLATFORM=unix AGENTQ_OPERATION_RETRY_ATTEMPTS=1 \
+    AGENTQ_OPERATION_RETRY_DELAY=1 AGENTQ_SSH="$twin_capture_stub" \
+    AGENTQ_CONFIG="$config" \
+        /bin/sh "$twin_posix" status >/dev/null 2>"$work/twin-loc-c.err" || true
+    TWIN_ARGV_LOG="$work/twin-loc-u.argv" env -u AGENTQ_HOST LC_ALL="$locale" \
+    AGENTQ_REMOTE_PLATFORM=unix AGENTQ_OPERATION_RETRY_ATTEMPTS=1 \
+    AGENTQ_OPERATION_RETRY_DELAY=1 AGENTQ_SSH="$twin_capture_stub" \
+    AGENTQ_CONFIG="$config" \
+        /bin/sh "$twin_posix" status >/dev/null 2>"$work/twin-loc-u.err" || true
+    loc_c=$(awk 'prev{print; exit} $0=="--"{prev=1}' "$work/twin-loc-c.argv" 2>/dev/null || true)
+    loc_u=$(awk 'prev{print; exit} $0=="--"{prev=1}' "$work/twin-loc-u.argv" 2>/dev/null || true)
+    [ "$loc_c" = "$loc_u" ] || problems="$problems locale-changes-the-host=[$loc_c]vs[$loc_u]"
+    grep -q 'RE error' "$work/twin-loc-u.err" \
+        && problems="$problems locale-leaks-a-sed-error"
+    if [ -n "$problems" ]; then
+        printf 'ps-client twin config-locale [%s]:%s\n' "$locale" "$problems" >&2
+        failures=$((failures + 1))
+    fi
+}
+twin_locale=''
+for twin_locale_candidate in en_US.UTF-8 en_US.utf8 C.UTF-8 C.utf8; do
+    # Capture, then match — never `... | grep -q`.  This check runs under
+    # `set -o pipefail`, and a quiet grep that MATCHES exits at once, so sed
+    # takes SIGPIPE and the pipeline reports 141: the arm would read a match as
+    # "no match" and report the sub-part NOT-covered on a host that really has
+    # the behaviour (measured 2026-11-05 on the first version of this block).
+    twin_locale_probe=$(printf 'AGENTQ_HOST=x\n#\377\376\200\n' \
+        | LC_ALL="$twin_locale_candidate" sed -n 's/^AGENTQ_HOST=.*/y/p' 2>&1 || true)
+    case "$twin_locale_probe" in
+        *'RE error'*) twin_locale=$twin_locale_candidate; break ;;
+    esac
+done
+case "$twin_platform_state" in
+checked)
+    if [ -n "$twin_locale" ]; then
+        printf 'AGENTQ_HOST=first-host\nAGENTQ_HOST=bad\377host\n' > "$work/twin-locale-config"
+        twin_locale_case "$twin_locale" "$work/twin-locale-config"
+    else
+        printf 'ps-client twin config-locale=NOT-covered(no-locale-sensitive-sed)\n' >&2
+    fi
+    ;;
+esac
 # --- the config PATH's symlink policy must be one rule, not two --------------
 # Measured 2026-11-04 on macOS, where /tmp is a system symlink to private/tmp:
 # `AGENTQ_CONFIG=/tmp/<dir>/config status` exited 2 here and reached ssh (255)
@@ -1419,7 +1492,7 @@ else
         failures=$((failures + 1))
     fi
 fi
-twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+bom($twin_bom_rows/6)+config($twin_config_rows/5)+cfgpath($twin_cfgpath_rows/4)+ws($twin_ws_rows/9)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
+twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+bom($twin_bom_rows/7)+config($twin_config_rows/5)+cfgpath($twin_cfgpath_rows/4)+ws($twin_ws_rows/9)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
 else
 twin_state=$twin_platform_state
 fi

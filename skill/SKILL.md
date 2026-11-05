@@ -66,6 +66,7 @@ POSIX 客户端的探针都是单行、不受影响，所以**只有「Windows �
 - Windows CMD 使用 `agentq.cmd` 和 `sshp.cmd`；PowerShell 可调用同目录的 `.ps1` 文件，或在新终端中直接调用 `agentq` / `sshp`；Windows Git Bash 使用安装器生成的无扩展名 `agentq` / `sshp` 启动器。三个入口都读取 `%USERPROFILE%\.config\agentq\config`；Git Bash 的 `$HOME` 不参与 Windows 默认配置定位。该启动器显式关闭 MSYS 路径改写，再调用同目录的 PowerShell 客户端，因而 `/home/...`、`/c/...` 和远端命令参数不会被本机 Git Bash 篡改；安装器也会从当前 PATH、注册表和常见目录发现自定义或便携 Git for Windows。
 - Windows 原生 `agentq` 客户端读取 `AGENTQ_HOST` 配置文件时最多接受 4096 字节，并按 UTF-8、UTF-8 BOM 或 UTF-16 BOM 解码；超限、坏编码、目录、文件或其路径链中的 reparse 路径会显式失败，缺失配置仍表示未配置默认主机。
 - 两平台都接受带 UTF-8 BOM（`EF BB BF`）的 `AGENTQ_HOST` 配置——POSIX 端在解析行首时剥掉 BOM，与 Windows 端的解码对齐（实测 2026-11-04）；文件是 UTF-16 时 POSIX（`/bin/sh` 无 UTF-16 解码器的平台边界）会显式拒绝并提示另存为 UTF-8，Windows 端仍按文档解码。
+- 配置的字节契约：两平台都按 `\r?\n` 切行（CRLF 与 LF 等价）、都拒绝含 NUL 字节的文件（`text syntax is required`）——POSIX 一直如此，Windows 自 0.1.19 起对齐；主机解析不依赖调用方的 locale（POSIX 端钉 `LC_ALL=C`，实测同一文件在 `LC_ALL=C` 与 UTF-8 locale 下解析出同一主机）。**非法 UTF-8 是平台能力边界**：Windows 的 .NET 解码器直接拒收，POSIX 逐字节处理、不作校验，同一份含非法字节的配置在两侧行为不同。
 - Windows `sshp` 的临时日志、标准输出和错误输出文件必须是普通非 reparse 文件，且其父级路径链也不得包含 reparse 组件；不安全路径会显式失败并保留原目标。
 - Windows `agentq` 与 `sshp` 读取临时日志、标准输出和错误输出时，先用 `Get-Item -Force` 观察路径；真正缺失返回空文本，目录、叶级或断裂链接、父级或更深祖先 reparse 路径必须经过完整 non-reparse 文件路径校验并显式失败，不得用 `Test-Path` 把不安全条目静默归类为缺失。
 - Windows `agentq` 与 `sshp` 清理临时文件时，先用 `Get-Item -Force` 观察路径；真正缺失保持安全 no-op，目录、叶级或断裂链接、父级或更深祖先 reparse 路径必须经过完整 non-reparse 文件路径校验并拒绝删除，不得用 `Test-Path` 把不安全条目静默归类为缺失。

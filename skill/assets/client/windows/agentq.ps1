@@ -505,23 +505,48 @@ function Read-AgentQConfigFile {
     }
 
     try {
+        $utf8EncodingInUse = $true
         if ($offset -ge 3 -and $buffer[0] -eq 0xEF -and $buffer[1] -eq 0xBB -and $buffer[2] -eq 0xBF) {
             $encoding = [System.Text.UTF8Encoding]::new($true, $true)
             $contentOffset = 3
         } elseif ($offset -ge 2 -and $buffer[0] -eq 0xFF -and $buffer[1] -eq 0xFE) {
             $encoding = [System.Text.UnicodeEncoding]::new($false, $true, $true)
             $contentOffset = 2
+            $utf8EncodingInUse = $false
         } elseif ($offset -ge 2 -and $buffer[0] -eq 0xFE -and $buffer[1] -eq 0xFF) {
             $encoding = [System.Text.UnicodeEncoding]::new($true, $true, $true)
             $contentOffset = 2
+            $utf8EncodingInUse = $false
         } else {
             $encoding = [System.Text.UTF8Encoding]::new($false, $true)
             $contentOffset = 0
         }
-        return $encoding.GetString($buffer, $contentOffset, $offset - $contentOffset)
+        # A NUL byte in a UTF-8 config: POSIX refuses it ("text syntax is
+        # required") because a NUL can hide content from a line reader, while
+        # .NET decodes U+0000 happily, so this client used the host out of a
+        # file its twin rejected.  Measured 2026-11-04: identical file, POSIX
+        # exit 2 / here 255.  Scanned only for the UTF-8 branches -- a UTF-16
+        # file is full of NUL bytes by construction and is handled above.
+        #
+        # The refusal is raised OUTSIDE the try: a throw inside it is caught by
+        # the `catch` below and rewritten into the generic "returned invalid
+        # encoding", which is exactly the wrong-subject diagnostic this round
+        # exists to remove (measured 2026-11-04: the operator saw the encoding
+        # message and no mention of NUL).
+        $nulFound = $utf8EncodingInUse -and
+            [Array]::IndexOf($buffer, [byte]0, $contentOffset, $offset - $contentOffset) -ge 0
+        if ($nulFound) {
+            $decoded = $null
+        } else {
+            $decoded = $encoding.GetString($buffer, $contentOffset, $offset - $contentOffset)
+        }
     } catch {
         throw "AgentQ config file returned invalid encoding"
     }
+    if ($nulFound) {
+        throw "AgentQ config file contains NUL bytes; text syntax is required"
+    }
+    return $decoded
 }
 
 function Get-ConfiguredHost {
