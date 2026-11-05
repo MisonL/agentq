@@ -1493,6 +1493,70 @@ checked)
     ;;
 esac
 
+# --- the session name has a length bound, and it is the twin's --------------
+# Until 2026-11-05 only the charset was guarded, while the resolved Zellij path
+# NEXT TO IT in the same `powershell.exe ... -EncodedCommand` line was bounded
+# at 1024.  Measured then: a 4000-character name built a 10986-character
+# command line, past the 8125 that the DefaultShell truncates at, so the tail
+# -- including the closing quote -- was dropped silently.  Both sides must now
+# refuse the same name with the same sentence, and the positive control below
+# is what stops "refuse every long name" from passing: without it a guard that
+# rejected at length 0 would look identical from here.
+sshp_name_1025=$(printf 'a%.0s' {1..1025})
+sshp_name_1024=$(printf 'a%.0s' {1..1024})
+cases=$((cases + 1))
+sshp_name_p=0
+sshp_name_w=0
+env -u SSHP_SSH -u SSHP_RECONNECT_DELAY HOME="$work/sshp-home" TMPDIR="$work/sshp-tmp" \
+    /bin/sh "$sshp_posix_client" h "$sshp_name_1025" \
+    >"$work/sshp-name-p.out" 2>"$work/sshp-name-p.err" || sshp_name_p=$?
+env -u SSHP_SSH -u SSHP_RECONNECT_DELAY HOME="$work/sshp-home" TMPDIR="$work/sshp-tmp" \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_ps_client_arg" h "$sshp_name_1025" \
+    >"$work/sshp-name-w.out" 2>"$work/sshp-name-w.err" || sshp_name_w=$?
+sshp_name_problems=''
+[ "$sshp_name_p" -eq 2 ] || sshp_name_problems="$sshp_name_problems posix-exit=$sshp_name_p"
+[ "$sshp_name_w" -eq 2 ] || sshp_name_problems="$sshp_name_problems windows-exit=$sshp_name_w"
+grep -qF 'session name must be at most 1024 characters' "$work/sshp-name-p.err" ||
+    sshp_name_problems="$sshp_name_problems posix-missing-the-bound-message"
+{ flatten_err "$work/sshp-name-w.err"; cat "$work/sshp-name-w.out"; } > "$work/sshp-name-w.combined"
+grep -qF 'session name must be at most 1024 characters' "$work/sshp-name-w.combined" ||
+    sshp_name_problems="$sshp_name_problems windows-missing-the-bound-message"
+if [ -n "$sshp_name_problems" ]; then
+    printf 'ps-client sshp session-name-bound [1025]:%s\n' "$sshp_name_problems" >&2
+    head -1 "$work/sshp-name-p.err" "$work/sshp-name-w.err" >&2 || true
+    failures=$((failures + 1))
+fi
+# The positive control: 1024 must pass the bound and be refused by the NEXT
+# guard instead -- SSHP_SSH pointing at a non-executable file, which is local,
+# deterministic and needs no host.  Asserting the absence of the bound message
+# is the whole test: an off-by-one that rejected 1024 would print it.
+if [ "$twin_platform_state" = checked ]; then
+    cases=$((cases + 1))
+    sshp_name_ok_p=0
+    SSHP_SSH="$sshp_unlaunchable" HOME="$work/sshp-home" TMPDIR="$work/sshp-tmp" \
+        /bin/sh "$sshp_posix_client" --check smoke-host "$sshp_name_1024" \
+        >"$work/sshp-name-ok-p.out" 2>"$work/sshp-name-ok-p.err" || sshp_name_ok_p=$?
+    if [ "$sshp_name_ok_p" -ne 2 ] ||
+        ! grep -qF 'SSHP_SSH is not executable' "$work/sshp-name-ok-p.err" ||
+        grep -qF 'session name must be at most' "$work/sshp-name-ok-p.err"; then
+        printf 'ps-client sshp session-name-bound [1024]: the POSIX twin did not accept 1024 and fail later (exit %s): %s\n' \
+            "$sshp_name_ok_p" "$(head -1 "$work/sshp-name-ok-p.err")" >&2
+        failures=$((failures + 1))
+    fi
+fi
+cases=$((cases + 1))
+sshp_name_ok_w=0
+SSHP_SSH="$sshp_unlaunchable_arg" HOME="$work/sshp-home" TMPDIR="$work/sshp-tmp" \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_ps_client_arg" --check smoke-host "$sshp_name_1024" \
+    >"$work/sshp-name-ok-w.out" 2>"$work/sshp-name-ok-w.err" || sshp_name_ok_w=$?
+if [ "$sshp_name_ok_w" -ne 2 ] ||
+    ! grep -qF 'SSHP_SSH cannot be launched' "$work/sshp-name-ok-w.err" ||
+    grep -qF 'session name must be at most' "$work/sshp-name-ok-w.err"; then
+    printf 'ps-client sshp session-name-bound [1024]: the Windows twin did not accept 1024 and fail later (exit %s): %s\n' \
+        "$sshp_name_ok_w" "$(head -1 "$work/sshp-name-ok-w.err")" >&2
+    failures=$((failures + 1))
+fi
+
 # And the comparator must be provably able to go RED, or the section is a
 # rubber stamp.  Revert the POSIX client's global-token fold in a copy and
 # require the same row to disagree; if the fold line cannot be found the

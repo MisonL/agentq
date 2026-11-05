@@ -19,6 +19,13 @@ $script:ReconnectDelay = 0
 $script:SshPath = $null
 $script:TargetHost = ""
 $script:SessionName = "ghostty"
+# The session name rides the same -EncodedCommand line as the resolved Zellij
+# path, which Get-WindowsSessionCommand already bounds at 1024.  The name itself
+# had NO bound until 2026-11-05, only a charset: measured then, a 4000-character
+# name produced a 10986-character command line, past the 8,125 that the
+# DefaultShell truncates at, and the tail was dropped silently.  This is the
+# POSIX twin's constant; smoke/19 reads both out of the assets.
+$script:SessionNameLimit = 1024
 $script:LastInteractiveSshResult = $null
 $script:PreparationResult = $null
 $script:ResolvedZellijPath = ""
@@ -1400,6 +1407,12 @@ if ($script:SessionName -notmatch '^[A-Za-z0-9_.-]+$') {
 }
 if ($script:SessionName.StartsWith("-", [System.StringComparison]::Ordinal)) {
     Stop-Sshp "session name must not begin with a hyphen"
+}
+# Bounded for the same reason the resolved Zellij path is: both ride one
+# -EncodedCommand line.  The charset guard above already limits the name to
+# ASCII, so .Length and the POSIX twin's `${#session}` are the same number.
+if ($script:SessionName.Length -gt $script:SessionNameLimit) {
+    Stop-Sshp "session name must be at most $($script:SessionNameLimit) characters"
 }
 
 $script:SshPath = Resolve-SshPath

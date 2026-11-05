@@ -25,6 +25,16 @@ windows_session_command=''
 # than inlined so smoke/19 can read BOTH values out of the two assets and refuse
 # to pass if they ever disagree -- a restated constant is a constant that drifts.
 windows_zellij_path_limit=1024
+# The session name rides the SAME `powershell.exe ... -EncodedCommand` command
+# line as the resolved Zellij path, so it needs a budget too -- and until
+# 2026-11-05 it had none: only the charset was guarded, while the PATH next to
+# it was bounded at 1024.  Measured then: a 4000-character name built a
+# 10986-character command line, past the 8125 at which powershell.exe truncates,
+# so the tail -- including the closing quote -- was dropped silently and the
+# session started with something nobody asked for.  With both values bounded at
+# 1024 the worst case stays near 5.9K.  Same value as the twin's; smoke/19 reads
+# both out of the assets rather than restating them.
+session_name_limit=1024
 
 usage() {
     cat <<EOF
@@ -508,6 +518,18 @@ case "$session" in
         fail 'session name must not begin with a hyphen'
         ;;
 esac
+
+# The bound is the command-line budget, the same one the resolved Zellij path
+# already has: the name is embedded in a `powershell.exe ... -EncodedCommand`
+# command line that sshd TRUNCATES past the DefaultShell limit.  It sits AFTER
+# the charset guard on purpose -- that guard has already restricted the name to
+# ASCII, which is what makes `${#session}` here the same number the twin's
+# `String.Length` counts (bytes, code points and UTF-16 code units coincide
+# only for ASCII; with a looser charset this would need the UTF-16 conversion
+# the path uses, and smoke/19 pins the path's unit for exactly that reason).
+if [ "${#session}" -gt "$session_name_limit" ]; then
+    fail "session name must be at most $session_name_limit characters"
+fi
 
 resolve_ssh_binary
 is_bounded_nonnegative_integer "$reconnect_delay" || fail 'SSHP_RECONNECT_DELAY must be a non-negative integer'

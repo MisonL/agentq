@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.19'
+agentq_version='0.1.20'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -165,20 +165,20 @@ resolve_windows_user_environment() {
     fi
 
     metadata=${metadata%$'\r'}
-    if ! jq -er '.identity | select(type == "string" and length > 0)' <<<"$metadata" >/dev/null ||
-        ! agentq_user=$(jq -er '.user_name' <<<"$metadata") ||
-        ! agentq_userprofile=$(jq -er '.profile' <<<"$metadata") ||
-        ! agentq_appdata=$(jq -er '.app_data' <<<"$metadata") ||
-        ! agentq_localappdata=$(jq -er '.local_app_data' <<<"$metadata") ||
-        ! agentq_temp=$(jq -er '.temp' <<<"$metadata") ||
-        ! agentq_windows_path=$(jq -er '.path' <<<"$metadata") ||
-        ! agentq_pathext=$(jq -er '.pathext' <<<"$metadata") ||
-        ! agentq_comspec=$(jq -er '.comspec' <<<"$metadata") ||
-        ! agentq_systemroot=$(jq -er '.system_root' <<<"$metadata") ||
-        ! agentq_systemdrive=$(jq -er '.system_drive' <<<"$metadata") ||
-        ! agentq_windir=$(jq -er '.windir' <<<"$metadata") ||
-        ! agentq_homedrive=$(jq -er '.home_drive' <<<"$metadata") ||
-        ! agentq_homepath=$(jq -er '.home_path' <<<"$metadata"); then
+    if ! jq -er '.identity | select(type == "string" and length > 0)' <<<"$metadata" >/dev/null 2>/dev/null ||
+        ! agentq_user=$(jq -er '.user_name' <<<"$metadata") 2>/dev/null ||
+        ! agentq_userprofile=$(jq -er '.profile' <<<"$metadata") 2>/dev/null ||
+        ! agentq_appdata=$(jq -er '.app_data' <<<"$metadata") 2>/dev/null ||
+        ! agentq_localappdata=$(jq -er '.local_app_data' <<<"$metadata") 2>/dev/null ||
+        ! agentq_temp=$(jq -er '.temp' <<<"$metadata") 2>/dev/null ||
+        ! agentq_windows_path=$(jq -er '.path' <<<"$metadata") 2>/dev/null ||
+        ! agentq_pathext=$(jq -er '.pathext' <<<"$metadata") 2>/dev/null ||
+        ! agentq_comspec=$(jq -er '.comspec' <<<"$metadata") 2>/dev/null ||
+        ! agentq_systemroot=$(jq -er '.system_root' <<<"$metadata") 2>/dev/null ||
+        ! agentq_systemdrive=$(jq -er '.system_drive' <<<"$metadata") 2>/dev/null ||
+        ! agentq_windir=$(jq -er '.windir' <<<"$metadata") 2>/dev/null ||
+        ! agentq_homedrive=$(jq -er '.home_drive' <<<"$metadata") 2>/dev/null ||
+        ! agentq_homepath=$(jq -er '.home_path' <<<"$metadata" 2>/dev/null); then
         printf '%s: Windows user profile metadata is incomplete\n' "$program" >&2
         printf '%s: reason=protocol_error\n' "$program" >&2
         exit 2
@@ -557,7 +557,7 @@ validate_pueue_task_shape_in_file() {
     # POSIX path passed as an argument reaches jq unconverted and cannot be
     # opened.  Verified on Windows 10: `jq -e . /tmp/x.json` fails with
     # "Could not open file" while the same read through stdin succeeds.
-    if ! jq -e "$pueue_task_shape_filter" < "$json_path" >/dev/null; then
+    if ! jq -e "$pueue_task_shape_filter" < "$json_path" >/dev/null 2>/dev/null; then
         fail 'Pueue returned an invalid task identity in status'
     fi
 }
@@ -591,7 +591,7 @@ end
 validate_pueue_log_shape_in_file() {
     local json_path=$1
 
-    if ! jq -e "$pueue_log_shape_filter" < "$json_path" >/dev/null; then
+    if ! jq -e "$pueue_log_shape_filter" < "$json_path" >/dev/null 2>/dev/null; then
         fail 'Pueue returned an invalid task identity in logs'
     fi
 }
@@ -2186,9 +2186,9 @@ ensure_group() {
         fail 'cannot inspect the AgentQ group'
     fi
     require_runtime_temporary_file "$group_file"
-    jq -e 'type == "object"' < "$group_file" >/dev/null ||
+    jq -e 'type == "object"' < "$group_file" >/dev/null 2>/dev/null ||
         fail 'AgentQ group response is invalid JSON'
-    if jq -e --arg name "$group_name" 'has($name)' < "$group_file" >/dev/null; then
+    if jq -e --arg name "$group_name" 'has($name)' < "$group_file" >/dev/null 2>/dev/null; then
         group_exists=true
     else
         jq_status=$?
@@ -2226,7 +2226,7 @@ verify_group() {
     jq -e --arg name "$group_name" '
         (.[$name] | type) == "object"
         and .[$name].parallel_tasks == 1
-    ' < "$group_file" >/dev/null || fail "AgentQ group is missing or has unexpected parallelism: $group_name"
+    ' 2>/dev/null < "$group_file" >/dev/null || fail "AgentQ group is missing or has unexpected parallelism: $group_name"
     remove_runtime_temporary_file "$group_file" 'group raw response file' || fail 'failed to clean AgentQ group raw response temporary file'
     group_raw_file=''
 }
@@ -3742,7 +3742,7 @@ request_payload_matches() {
         cleanup_request_payload_after_failure "$payload_file" || return 1
         return 1
     }
-    if jq -e --slurpfile payload "$payload_jq_file" '.payload == $payload[0]' <<<"$record" >/dev/null; then
+    if jq -e --slurpfile payload "$payload_jq_file" '.payload == $payload[0]' <<<"$record" >/dev/null 2>/dev/null; then
         command_status=0
     else
         command_status=$?
@@ -4729,7 +4729,7 @@ wait_reconcile_missing_task() {
         printf '%s: status temporary file became unavailable before wait task lookup\n' "$program" >&2
         return 6
     fi
-    if ! jq -e '(.tasks | type) == "object"' < "$raw_status_file" >/dev/null; then
+    if ! jq -e '(.tasks | type) == "object"' < "$raw_status_file" >/dev/null 2>/dev/null; then
         if remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file'; then
             reconcile_raw_status_file=''
         fi
@@ -4737,7 +4737,7 @@ wait_reconcile_missing_task() {
         printf '%s: Pueue returned an invalid status before waiting for task %s\n' "$program" "$task_id" >&2
         return 6
     fi
-    if jq -e --arg id "$task_id" '.tasks[$id] != null' < "$raw_status_file" >/dev/null; then
+    if jq -e --arg id "$task_id" '.tasks[$id] != null' < "$raw_status_file" >/dev/null 2>/dev/null; then
         if remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file'; then
             reconcile_raw_status_file=''
         fi
@@ -4789,15 +4789,15 @@ wait_reconcile_missing_task() {
 }
 
 task_is_done() {
-    jq -e '.status | has("Done")' >/dev/null
+    jq -e '.status | has("Done")' >/dev/null 2>/dev/null
 }
 
 task_is_queued() {
-    jq -e '.status | has("Queued")' >/dev/null
+    jq -e '.status | has("Queued")' >/dev/null 2>/dev/null
 }
 
 task_succeeded() {
-    jq -e '.status.Done.result == "Success"' >/dev/null
+    jq -e '.status.Done.result == "Success"' >/dev/null 2>/dev/null
 }
 
 task_log_path() {

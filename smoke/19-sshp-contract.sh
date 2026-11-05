@@ -1690,6 +1690,26 @@ if [ -z "$twin_limit" ] || [ "$our_limit" != "$twin_limit" ]; then
     failures=$((failures + 1))
 fi
 
+# The SESSION NAME's bound is a second shared constant, and it is read the same
+# way for the same reason: it is a number both clients must agree on, so the
+# only place it may be written down is the asset, and the extractor must find it
+# in both.  A missing constant is a failure here too -- an empty read would
+# otherwise compare "" to "" and pass.
+twin_session_limit=$(LC_ALL=C grep -c 'SessionName\.Length -gt \$script:SessionNameLimit' "$sshp_ps_client" || true)
+twin_session_value=$(LC_ALL=C sed -n 's/^\$script:SessionNameLimit = \([0-9][0-9]*\)$/\1/p' "$sshp_ps_client" | LC_ALL=C sed -n '1p')
+our_session_limit=$(LC_ALL=C sed -n 's/^session_name_limit=\([0-9][0-9]*\)$/\1/p' "$client" | LC_ALL=C sed -n '1p')
+cases=$((cases + 1))
+if [ -z "$twin_session_value" ] || [ -z "$our_session_limit" ] || [ "$our_session_limit" != "$twin_session_value" ]; then
+    printf 'sshp-contract: the session-name bound is %s here but %s in sshp.ps1 (the bound is shared contract, not a local taste)\n' \
+        "${our_session_limit:-<none>}" "${twin_session_value:-<none>}" >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if [ "${twin_session_limit:-0}" -eq 0 ]; then
+    printf '%s\n' 'sshp-contract: sshp.ps1 no longer bounds the session name during argv validation; the POSIX constant is now unpaired' >&2
+    failures=$((failures + 1))
+fi
+
 windows_path_limit_expected=${twin_limit:-?}
 
 # A static pin beside the behavioural matrix: `${#windows_zellij_path}` is the

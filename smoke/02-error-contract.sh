@@ -971,6 +971,48 @@ else
     done
 fi
 
+# --- a raw subprocess diagnostic may not reach the server's stderr ---------
+# `pueue group --json` that exits 0 with NON-JSON on stdout is not exotic: the
+# generic stub in this file answers exactly that (`pueue 4.0.4`), so the shape
+# is reachable in the harness.  Until 2026-11-05 the `jq` calls that validate
+# that output redirected only stdout, so jq's own diagnostic landed verbatim on
+# the server's stderr:
+#   jq: parse error: Invalid numeric literal at line 1, column 6
+# The server's stderr is a controlled channel -- `agentq-server: ...` plus
+# `reason=<class>` -- and a bare jq line names neither the cause nor the fix,
+# which is the same "diagnostic points at the wrong thing" class this file was
+# built for.  The stub below also answers `status --json`, so `ensure_daemon`
+# returns immediately and nothing here can start a service.
+cases=$((cases + 1))
+cp "$work/pueue" "$work/pueue.json-backup"
+cat > "$work/pueue" <<'STUB'
+#!/bin/sh
+case "$*" in
+    *"group --json"*) printf 'pueue 4.0.4\n' ;;
+    *"status --json"*) printf '{"tasks":{},"groups":{}}\n' ;;
+    *) exit 0 ;;
+esac
+STUB
+chmod 700 "$work/pueue"
+json_leak_status=0
+"$server" status >"$work/jq-leak.stdout" 2>"$work/jq-leak.stderr" || json_leak_status=$?
+mv "$work/pueue.json-backup" "$work/pueue"
+if [ "$json_leak_status" -ne 2 ]; then
+    printf 'jq-stderr-leak: a non-JSON `group --json` exited %s, expected the controlled 2\n' \
+        "$json_leak_status" >&2
+    failures=$((failures + 1))
+elif ! grep -qF 'AgentQ group is missing or has unexpected parallelism: agentq' "$work/jq-leak.stderr"; then
+    printf 'jq-stderr-leak: the refusal did not name the group: %s\n' \
+        "$(head -2 "$work/jq-leak.stderr" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if grep -qE '^jq: ' "$work/jq-leak.stderr"; then
+    printf 'jq-stderr-leak: a raw jq diagnostic reached the server stderr: %s\n' \
+        "$(grep -E '^jq: ' "$work/jq-leak.stderr" | head -1)" >&2
+    failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'error-contract: %s failure(s)\n' "$failures" >&2
     exit 1
