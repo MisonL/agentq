@@ -483,6 +483,12 @@ twin_run_pair() {
         >"$work/twin-w.out" 2>"$work/twin-w.err" || twin_w_status=$?
 }
 
+# `SUBMIT` (in the table below) is the operation token that contains an I: the
+# POSIX client folds the token with `tr`, which on a glibc host under
+# tr_TR.UTF-8 left `I` unfolded (`submIt`, exit 2) while the twin's `switch`
+# matched (PLAN 第七十三类).  Both clients must reach ssh on the upper-case
+# spelling.  (A `#` line INSIDE the table would be parsed as a row -- the first
+# field is non-empty -- so the explanation lives here, outside it.)
 twin_table='0|agentq 0.1.|--version
 0|agentq 0.1.|--VERSION
 0|agentq 0.1.|--Version
@@ -498,6 +504,7 @@ twin_table='0|agentq 0.1.|--version
 255||--HOST smoke-host status
 255||status
 255||STATUS
+255||SUBMIT --workdir /tmp -- true
 255||doctor --FULL
 255||logs 1 --tail all
 255||logs 1 --TAIL all
@@ -514,7 +521,7 @@ twin_rows=0
 # A table that lost most of its rows still agrees with a loop that runs what is
 # left, so the equality gate below cannot see it -- the same shape as a shrunk
 # enumeration.  The floor is a LOWER BOUND, not the count (the reported count
-# stays computed): today's table has 26 rows and a rewrite that drops below 25
+# stays computed): today's table has 27 rows and a rewrite that drops below 25
 # is a different table, not a smaller one.
 if [ "$twin_table_rows" -lt 25 ]; then
     printf 'ps-client twin: the differential table has %s row(s), below the floor of 25; it no longer covers the token surface it was built for\n' \

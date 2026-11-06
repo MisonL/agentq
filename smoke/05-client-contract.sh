@@ -1424,10 +1424,13 @@ fi
 # client's `switch` (a language rule there, a written-out pattern here).
 # Measured 2026-10-21: `AUTO`/`Unix` were accepted by the Windows client and
 # refused by this one, so the same instruction meant "probe as usual" on one
-# platform and "argument error" on the other.  The upper-case forms must now
+# platform and "argument error" on the other.  `UNIX` is the row that exercises
+# the I in the folding: the POSIX client folds with `tr`, and on a glibc host
+# under tr_TR.UTF-8 that used to leave `I` unfolded (PLAN 第七十三类) -- adding
+# the row costs nothing and keeps the exact affected spelling in the table.  The upper-case forms must now
 # reach ssh (255 through this stub) exactly like the lower-case ones; an
 # invalid value must still be refused, which the last row pins.
-for platform_case in auto unix windows AUTO Unix WINDOWS; do
+for platform_case in auto unix windows AUTO Unix WINDOWS UNIX; do
     env_rejections=$((env_rejections + 1))
     platform_status=0
     AGENTQ_REMOTE_PLATFORM="$platform_case" AGENTQ_SSH="$wait_timeout_stub" \

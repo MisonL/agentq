@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.21'
+agentq_client_version='0.1.22'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072); a Windows target re-encodes
 # argv onto a CreateProcess command line capped at 32767 characters, and the
@@ -55,7 +55,7 @@ json_parser=${AGENTQ_JQ:-}
 # value is normalised rather than the `case` pattern widened so everything
 # downstream (the cache comparison at 3005, the launcher probe) sees one form.
 remote_platform=${AGENTQ_REMOTE_PLATFORM:-auto}
-remote_platform=$(printf '%s' "$remote_platform" | tr '[:upper:]' '[:lower:]')
+remote_platform=$(printf '%s' "$remote_platform" | LC_ALL=C tr '[:upper:]' '[:lower:]')
 remote_argument_file=''
 remote_input_file=''
 submit_input_file=''
@@ -193,7 +193,7 @@ config_snapshot_identity_for_path() {
         return 1
     fi
     case "$config_snapshot_identity" in
-        ''|*[!0-9:]*|*:*:*) return 1 ;;
+        ''|*[!0123456789:]*|*:*:*) return 1 ;;
     esac
     printf '%s\n' "$config_snapshot_identity"
 }
@@ -842,7 +842,7 @@ windows_argument_file_identity() {
         return 1
     fi
     case "$windows_argument_identity" in
-        ''|*[!0-9:]*|*:*:*) return 1 ;;
+        ''|*[!0123456789:]*|*:*:*) return 1 ;;
     esac
     printf '%s\n' "$windows_argument_identity"
 }
@@ -1747,7 +1747,7 @@ write_response_metadata() {
     response_metadata_require_file "$response_file" || return $?
     response_bytes=$(wc -c < "$response_file") && response_bytes=$(printf '%s' "$response_bytes" | tr -d '[:space:]') || return 1
     case "$response_bytes" in
-        ''|*[!0-9]*) return 1 ;;
+        ''|*[!0123456789]*) return 1 ;;
     esac
     printf '%s: raw response omitted for safety (%s bytes)\n' "$program" "$response_bytes" >&2
 }
@@ -1782,7 +1782,7 @@ agentq_remote_exit_token() {
     # cannot be a protocol code is not ours; ignoring it falls back to the SSH
     # exit code, which is the fail-closed direction.
     ssh_exit_token_value=$(LC_ALL=C tr -d '\r' < "$ssh_exit_token_log" |
-        LC_ALL=C sed -n 's/^agentq-exit:\([0-9]\{1,3\}\)$/\1/p' | tail -n 1)
+        LC_ALL=C sed -n 's/^agentq-exit:\([0123456789]\{1,3\}\)$/\1/p' | tail -n 1)
     [ -n "$ssh_exit_token_value" ] || return 1
     # Three digits includes 256-999, which are NOT protocol codes -- and the
     # shell folds them: measured 2026-10-13, `return 256` reads 0 under both
@@ -1791,7 +1791,7 @@ agentq_remote_exit_token() {
     # to have closed.  Codes above 255 are not ours; ignore them like a
     # missing token (fail-closed, back to the SSH exit code).
     case "$ssh_exit_token_value" in
-        2[5-9][0-9]|[3-9][0-9][0-9])
+        2[56789][0123456789]|[3456789][0123456789][0123456789])
             return 1
             ;;
     esac
@@ -1804,7 +1804,7 @@ write_ssh_diagnostic_metadata() {
     agentq_ssh_log_require_existing_file "$ssh_metadata_file" || return $?
     ssh_metadata_bytes=$(wc -c < "$ssh_metadata_file") && ssh_metadata_bytes=$(printf '%s' "$ssh_metadata_bytes" | tr -d '[:space:]') || return 1
     case "$ssh_metadata_bytes" in
-        ''|*[!0-9]*) return 1 ;;
+        ''|*[!0123456789]*) return 1 ;;
     esac
     if ssh_transport_error "$ssh_metadata_file"; then
         ssh_metadata_class=transport
@@ -1875,7 +1875,7 @@ validate_json_response() {
     response_expected_task_id=${4:-}
     response_require_existing_file "$response_file" || return $?
     # shellcheck disable=SC2016
-    response_numeric_helpers='def parser_preserves_integer_digits: (9007199254740993 | tostring) == "9007199254740993"; def lexical_integer: (tostring | test("^[0-9]+(?:\\.0+)?$")); def nonnegative_integer: if type == "number" then (. >= 0 and (floor == .) and ((. <= 9007199254740991) or (parser_preserves_integer_digits and lexical_integer))) else false end; def canonical_integer_string: if . == 0 then "0" elif . <= 9007199254740991 then (floor | tostring | sub("^0+"; "") | if . == "" then "0" else . end) else (tostring | sub("\\.0+$"; "") | sub("^0+"; "") | if . == "" then "0" else . end) end; def canonical_decimal_key: tostring | sub("^0+"; "") | if . == "" then "0" else . end; def valid_status_task: (.value | type) == "object" and (.value.id | nonnegative_integer) and (.key | test("^[0-9]+$")) and ((.key | canonical_decimal_key) == .key) and ((.value.id | canonical_integer_string) == (.key | canonical_decimal_key)); def task_id_matches($expected): nonnegative_integer and (canonical_integer_string == ($expected | sub("^0+"; "") | if . == "" then "0" else . end)); def valid_done_result: if type == "string" then length > 0 elif type == "object" then length > 0 else false end;'
+    response_numeric_helpers='def parser_preserves_integer_digits: (9007199254740993 | tostring) == "9007199254740993"; def lexical_integer: (tostring | test("^[0123456789]+(?:\\.0+)?$")); def nonnegative_integer: if type == "number" then (. >= 0 and (floor == .) and ((. <= 9007199254740991) or (parser_preserves_integer_digits and lexical_integer))) else false end; def canonical_integer_string: if . == 0 then "0" elif . <= 9007199254740991 then (floor | tostring | sub("^0+"; "") | if . == "" then "0" else . end) else (tostring | sub("\\.0+$"; "") | sub("^0+"; "") | if . == "" then "0" else . end) end; def canonical_decimal_key: tostring | sub("^0+"; "") | if . == "" then "0" else . end; def valid_status_task: (.value | type) == "object" and (.value.id | nonnegative_integer) and (.key | test("^[0123456789]+$")) and ((.key | canonical_decimal_key) == .key) and ((.value.id | canonical_integer_string) == (.key | canonical_decimal_key)); def task_id_matches($expected): nonnegative_integer and (canonical_integer_string == ($expected | sub("^0+"; "") | if . == "" then "0" else . end)); def valid_done_result: if type == "string" then length > 0 elif type == "object" then length > 0 else false end;'
     # shellcheck disable=SC2016
     case "$response_operation" in
         submit)
@@ -2038,7 +2038,7 @@ append_arg() {
 
 is_task_id() {
     case "$1" in
-        ''|*[!0-9]*) return 1 ;;
+        ''|*[!0123456789]*) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -2053,7 +2053,7 @@ is_positive_integer_or_all() {
     # ("a positive integer or all").
     case "$1" in
         all) return 0 ;;
-        ''|*[!0-9]*|0*) return 1 ;;
+        ''|*[!0123456789]*|0*) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -2079,7 +2079,7 @@ is_positive_integer_or_all() {
 # `^[1-9][0-9]*$` up to 2147483647.
 is_bounded_positive_integer() {
     case "$1" in
-        ''|*[!0-9]*|0*) return 1 ;;
+        ''|*[!0123456789]*|0*) return 1 ;;
     esac
     [ "${#1}" -le 10 ] || return 1
     [ "${#1}" -lt 10 ] && return 0
@@ -2101,7 +2101,7 @@ is_request_id() {
 
 generate_request_id() {
     if command -v uuidgen >/dev/null 2>&1; then
-        generated=$(uuidgen | tr '[:upper:]' '[:lower:]')
+        generated=$(uuidgen | LC_ALL=C tr '[:upper:]' '[:lower:]')
         printf 'aq-%s\n' "$generated"
         return
     fi
@@ -2134,7 +2134,7 @@ ssh_transport_error() {
     # measured 2026-10-21, when dropping the `tr` reclassified every transport
     # failure as class=ssh and killed the retry.
     transport_matches=$(LC_ALL=C tr -d '\r' < "$ssh_log_file" | LC_ALL=C grep -E -c \
-        '^(ssh: connect to host [^[:space:]]+ port [0-9]+: (Connection (refused|timed out|reset by peer|aborted)|Operation timed out|No route to host|Network is unreachable|Host is down)|Connection reset by [^[:space:]]+ port [0-9]+\.?|Connection to [^[:space:]]+ closed by remote host\.?|Connection timed out during banner exchange|banner exchange: Connection to [^[:space:]]+ port [0-9]+: (Connection (timed out|reset by peer)|No route to host|Network is unreachable|Host is down)|kex_exchange_identification: (read: )?(Connection (reset by peer|timed out|refused)|No route to host|Network is unreachable|Host is down)|client_loop: .* (Broken pipe|Connection reset by peer)|packet_write_wait: Connection to [^:]+: Broken pipe|Write failed: Broken pipe|Read from remote host [^:]+: Connection reset by peer|Timeout, server [^[:space:]]+ not responding\.)$') || transport_matches=0
+        '^(ssh: connect to host [^[:space:]]+ port [0123456789]+: (Connection (refused|timed out|reset by peer|aborted)|Operation timed out|No route to host|Network is unreachable|Host is down)|Connection reset by [^[:space:]]+ port [0123456789]+\.?|Connection to [^[:space:]]+ closed by remote host\.?|Connection timed out during banner exchange|banner exchange: Connection to [^[:space:]]+ port [0123456789]+: (Connection (timed out|reset by peer)|No route to host|Network is unreachable|Host is down)|kex_exchange_identification: (read: )?(Connection (reset by peer|timed out|refused)|No route to host|Network is unreachable|Host is down)|client_loop: .* (Broken pipe|Connection reset by peer)|packet_write_wait: Connection to [^:]+: Broken pipe|Write failed: Broken pipe|Read from remote host [^:]+: Connection reset by peer|Timeout, server [^[:space:]]+ not responding\.)$') || transport_matches=0
     [ "${transport_matches:-0}" -gt 0 ]
 }
 
@@ -2179,7 +2179,7 @@ platform_probe_file_identity() {
         return 1
     fi
     case "$platform_probe_identity" in
-        ''|*[!0-9:]*|*:*:*) return 1 ;;
+        ''|*[!0123456789:]*|*:*:*) return 1 ;;
     esac
     printf '%s\n' "$platform_probe_identity"
 }
@@ -2283,7 +2283,7 @@ windows_encoding_file_identity() {
         return 1
     fi
     case "$windows_encoding_identity" in
-        ''|*[!0-9:]*|*:*:*) return 1 ;;
+        ''|*[!0123456789:]*|*:*:*) return 1 ;;
     esac
     printf '%s\n' "$windows_encoding_identity"
 }
@@ -2654,7 +2654,7 @@ run_platform_probe() {
     }
     platform_probe_output_bytes=$(printf '%s' "$platform_probe_output_bytes" | tr -d '[:space:]')
     case "$platform_probe_output_bytes" in
-        ''|*[!0-9]*)
+        ''|*[!0123456789]*)
             printf '%s: cannot measure platform probe output size\n' "$program" >&2
             return 2
             ;;
@@ -3054,7 +3054,7 @@ windows_probe_script_with_exit_token() {
     # incomplete" + 2, and the 42/43 branches were unreachable.  Writing the
     # token before `exit` restores the original control flow exactly.
     windows_probe_rewritten_body=$(printf '%s' "$windows_probe_script_body" |
-        sed -E 's/(^[[:space:]]*|;[[:space:]]*)exit ([0-9]+)/\1[Console]::Out.Write("agentq-exit:" + \2); exit \2/g')
+        sed -E 's/(^[[:space:]]*|;[[:space:]]*)exit ([0123456789]+)/\1[Console]::Out.Write("agentq-exit:" + \2); exit \2/g')
     printf '%s\n' "$windows_probe_rewritten_body"
     # Reached only when the body completed without exiting: the success path.
     printf '%s\n' '[Console]::Out.Write("agentq-exit:0")'
@@ -3090,7 +3090,7 @@ windows_probe_apply_exit_token() {
     case "$windows_probe_token_raw" in
         *agentq-exit:*)
             windows_probe_token_code=${windows_probe_token_raw##*agentq-exit:}
-            windows_probe_token_code=${windows_probe_token_code%%[!0-9]*}
+            windows_probe_token_code=${windows_probe_token_code%%[!0123456789]*}
             # At most three digits (protocol codes are 0-255); a longer token
             # cannot be one of ours and is ignored exactly like a missing one.
             # 256-999 are also not protocol codes and fold on return/exit
@@ -3100,7 +3100,7 @@ windows_probe_apply_exit_token() {
                 windows_probe_token_code=''
             fi
             case "$windows_probe_token_code" in
-                2[5-9][0-9]|[3-9][0-9][0-9])
+                2[56789][0123456789]|[3456789][0123456789][0123456789])
                     windows_probe_token_code=''
                     ;;
             esac
@@ -3210,7 +3210,7 @@ platform_cache_enabled() {
     # for every case shape of "off" -- a hand-written list of the 8 spellings
     # was one short (OfF enabled here, disabled there).  One canonical form
     # cannot drift again.
-    platform_cache_switch=$(printf '%s' "${AGENTQ_PLATFORM_PROBE_CACHE:-on}" | tr '[:upper:]' '[:lower:]')
+    platform_cache_switch=$(printf '%s' "${AGENTQ_PLATFORM_PROBE_CACHE:-on}" | LC_ALL=C tr '[:upper:]' '[:lower:]')
     case "$platform_cache_switch" in
         off) return 1 ;;
         *) return 0 ;;
@@ -3262,7 +3262,7 @@ platform_cache_read() {
         unix|windows) ;;
         *) return 1 ;;
     esac
-    platform_cache_age=$(LC_ALL=C sed -n 's/.*"probed_at":\([0-9]*\).*/\1/p' "$platform_cache_file" | tail -n 1)
+    platform_cache_age=$(LC_ALL=C sed -n 's/.*"probed_at":\([0123456789]*\).*/\1/p' "$platform_cache_file" | tail -n 1)
     # is_bounded_positive_integer, not a bare charset test: a leading-zero
     # value passes `[ !0-9 ]` and `[ -le ]` (test parses decimal), then dies
     # INSIDE `$((now - age))` -- dash parses `0…` as octal, "Illegal number:
@@ -3273,7 +3273,7 @@ platform_cache_read() {
     is_bounded_positive_integer "$platform_cache_age" || return 1
     platform_cache_now=$(date +%s) || return 1
     case "$platform_cache_now" in
-        ''|*[!0-9]*) return 1 ;;
+        ''|*[!0123456789]*) return 1 ;;
     esac
     # A timestamp from the future (clock skew, or an entry written by a machine
     # whose clock was ahead) must not make the entry immortal: with only the
@@ -4371,7 +4371,7 @@ host=$default_host
 # first-token fold and the operation fold below -- normalise the value the parser
 # matches, do not widen every pattern.
 while [ "$#" -gt 0 ]; do
-    global_option=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    global_option=$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')
     case "$global_option" in
         --host)
             [ "$#" -ge 2 ] || fail '--host requires an SSH host'
@@ -4433,7 +4433,7 @@ shift
 # answer).  Only the tokens the local parser matches are folded -- values
 # (workdir, label, the command after --) and what goes on the remote command
 # (branch bodies emit literal lowercase words) are untouched.
-operation=$(printf '%s' "$operation" | tr '[:upper:]' '[:lower:]')
+operation=$(printf '%s' "$operation" | LC_ALL=C tr '[:upper:]' '[:lower:]')
 
 case "$operation" in
     submit)
@@ -4443,7 +4443,7 @@ case "$operation" in
         stdin_script=false
         while [ "$#" -gt 0 ]; do
             # Fold only the option token; the value is read from $2 verbatim.
-            submit_option=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+            submit_option=$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')
             case "$submit_option" in
                 --workdir)
                     [ "$#" -ge 2 ] || fail '--workdir requires a directory'
@@ -4591,7 +4591,7 @@ case "$operation" in
         # user probably wanted `logs` -- the server has no positional status.
         # Shape is validated BEFORE the probe; the if-chain below re-checks the
         # same shapes (unreachable fails then) and owns the values.
-        status_option_1=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+        status_option_1=$(printf '%s' "${1:-}" | LC_ALL=C tr '[:upper:]' '[:lower:]')
         case "$#" in
             0) ;;
             1) [ "$status_option_1" = '--summary' ] || fail 'status accepts --summary or --task <task-id>; for one task log, use logs <task-id>' ;;
@@ -4623,12 +4623,12 @@ case "$operation" in
         # Default queue section is the compact summary; --full restores the
         # historical decorated dump.  doctor itself is NOT read-only (it starts
         # the pueued service); that warning lives in the usage text.
-        [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" = '--full' ]; } || fail 'doctor accepts --full or no arguments'
+        [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')" = '--full' ]; } || fail 'doctor accepts --full or no arguments'
         initialize_remote_invocation
         agentq_operation_profile=$operation
         if [ "$#" -eq 0 ]; then
             append_arg doctor
-        elif [ "$#" -eq 1 ] && [ "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" = '--full' ]; then
+        elif [ "$#" -eq 1 ] && [ "$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')" = '--full' ]; then
             append_arg doctor
             append_arg --full
         else
@@ -4639,7 +4639,7 @@ case "$operation" in
         [ "$#" -eq 1 ] || [ "$#" -eq 3 ] || fail 'logs requires a task id and optional --tail <lines>'
         is_task_id "$1" || fail 'task id must be a non-negative integer'
         if [ "$#" -eq 3 ]; then
-            [ "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" = '--tail' ] || fail 'logs accepts only --tail <lines>'
+            [ "$(printf '%s' "$2" | LC_ALL=C tr '[:upper:]' '[:lower:]')" = '--tail' ] || fail 'logs accepts only --tail <lines>'
             is_positive_integer_or_all "$3" || fail '--tail must be a positive integer or all'
         fi
         initialize_remote_invocation
@@ -4658,8 +4658,8 @@ case "$operation" in
         append_arg "$1"
         ;;
     remove)
-        remove_option_1=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
-        remove_option_3=$(printf '%s' "${3:-}" | tr '[:upper:]' '[:lower:]')
+        remove_option_1=$(printf '%s' "${1:-}" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+        remove_option_3=$(printf '%s' "${3:-}" | LC_ALL=C tr '[:upper:]' '[:lower:]')
         if [ "$#" -eq 3 ] && [ "$remove_option_1" = '--label' ]; then
             [ "$remove_option_3" = '--confirm' ] || fail 'remove --label requires --confirm: a batch removal must be explicitly acknowledged'
             [ -n "$2" ] || fail 'remove --label requires a non-empty label'
@@ -4685,7 +4685,7 @@ case "$operation" in
         [ "$#" -eq 1 ] || [ "$#" -eq 3 ] || fail 'wait requires a task id and optional --timeout <seconds>'
         is_task_id "$1" || fail 'task id must be a non-negative integer'
         if [ "$#" -eq 3 ]; then
-            [ "$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')" = '--timeout' ] || fail 'wait accepts only --timeout <seconds>'
+            [ "$(printf '%s' "$2" | LC_ALL=C tr '[:upper:]' '[:lower:]')" = '--timeout' ] || fail 'wait accepts only --timeout <seconds>'
             is_bounded_positive_integer "$3" || fail '--timeout must be a positive integer of at most 2147483647'
             wait_timeout_seconds=$3
         elif [ -n "$wait_timeout" ]; then

@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.21'
+agentq_version='0.1.22'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -418,7 +418,7 @@ ensure_runtime_dependencies() {
 
 is_task_id() {
     case "$1" in
-        ''|*[!0-9]*) return 1 ;;
+        ''|*[!0123456789]*) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -497,7 +497,7 @@ validate_task_id_precision_in_file() {
         fi
     done < <(
         printf '%s\n' "$json_text" |
-            grep -Eo '"task_id"[[:space:]]*:[[:space:]]*[0-9]+' |
+            grep -Eo '"task_id"[[:space:]]*:[[:space:]]*[0123456789]+' |
             sed -E 's/.*:[[:space:]]*//'
     )
 }
@@ -520,7 +520,7 @@ validate_pueue_task_id_precision_in_file() {
         fi
     done < <(
         printf '%s\n' "$json_text" |
-            grep -Eo '"id"[[:space:]]*:[[:space:]]*[0-9]+' |
+            grep -Eo '"id"[[:space:]]*:[[:space:]]*[0123456789]+' |
             sed -E 's/.*:[[:space:]]*//'
     )
 }
@@ -539,7 +539,7 @@ def valid_task:
     else
         (.value.id >= 0)
         and ((.value.id | floor) == .value.id)
-        and (.key | test("^[0-9]+$"))
+        and (.key | test("^[0123456789]+$"))
         and (.key == (.value.id | canonical_integer_string))
     end;
 if (.tasks | type) != "object" then
@@ -578,7 +578,7 @@ def valid_log:
     else
         (.value.task.id >= 0)
         and ((.value.task.id | floor) == .value.task.id)
-        and (.key | test("^[0-9]+$"))
+        and (.key | test("^[0123456789]+$"))
         and (.key == (.value.task.id | canonical_integer_string))
     end;
 if type != "object" then
@@ -598,7 +598,7 @@ validate_pueue_log_shape_in_file() {
 
 is_positive_integer() {
     case "$1" in
-        ''|*[!0-9]*|0) return 1 ;;
+        ''|*[!0123456789]*|0) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -833,7 +833,7 @@ temporary_file_identity() {
         return 1
     fi
     case "$temporary_identity" in
-        ''|*[!0-9:]*|*:*:*) return 1 ;;
+        ''|*[!0123456789:]*|*:*:*) return 1 ;;
     esac
     printf '%s\n' "$temporary_identity"
 }
@@ -858,7 +858,7 @@ atomic_destination_parent_identity() {
         return 1
     fi
     case "$destination_parent_identity" in
-        ''|*[!0-9:]*|*:*:*) return 1 ;;
+        ''|*[!0123456789:]*|*:*:*) return 1 ;;
     esac
     printf '%s\n' "$destination_parent_identity"
 }
@@ -1024,7 +1024,7 @@ atomic_destination_identity() {
             return 1
         fi
         case "$destination_identity" in
-            ''|*[!0-9:]*|*:*:*) return 1 ;;
+            ''|*[!0123456789:]*|*:*:*) return 1 ;;
         esac
         printf 'present:%s\n' "$destination_identity"
     else
@@ -1431,10 +1431,10 @@ lock_directory_is_stale_empty() {
     lock_mtime=$(stat_mtime "$lock_directory") || return 1
     current_epoch=$(date +%s) || return 1
     case "$lock_mtime" in
-        ''|*[!0-9]*) return 1 ;;
+        ''|*[!0123456789]*) return 1 ;;
     esac
     case "$current_epoch" in
-        ''|*[!0-9]*) return 1 ;;
+        ''|*[!0123456789]*) return 1 ;;
     esac
     [ "$current_epoch" -ge "$lock_mtime" ] || return 1
     [ $((current_epoch - lock_mtime)) -ge "$lock_empty_grace_seconds" ]
@@ -1836,7 +1836,7 @@ acquire_operation_lock() {
     if [ -n "$lock_mtime" ]; then
         current_epoch=$(date +%s) || current_epoch=''
         case "$lock_mtime$current_epoch" in
-            *[!0-9]*) ;;
+            *[!0123456789]*) ;;
             *)
                 # Clamp at zero.  A negative age (the lock directory's mtime is
                 # in the FUTURE -- clock skew, or an NFS/VM clock correction)
