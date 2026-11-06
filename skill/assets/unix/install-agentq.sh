@@ -4,7 +4,7 @@ set -eu
 
 program=${0##*/}
 release_version='4.0.4'
-agentq_version='0.1.21'
+agentq_version='0.1.22'
 asset_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 agentq_home=${AGENTQ_HOME:-"$HOME/.agentq"}
 artifact_source_directory=${AGENTQ_PUEUE_SOURCE_DIR:-}
@@ -96,7 +96,7 @@ require_command() {
 
 is_positive_integer() {
     case "$1" in
-        ''|*[!0-9]*|0) return 1 ;;
+        ''|*[!0123456789]*|0) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -241,7 +241,7 @@ installer_file_identity() {
         return 1
     fi
     case "$installer_identity" in
-        ''|*[!0-9:]*|*:*:*) return 1 ;;
+        ''|*[!0123456789:]*|*:*:*) return 1 ;;
     esac
     printf '%s\n' "$installer_identity"
 }
@@ -1670,7 +1670,7 @@ assert_existing_queue_has_no_active_tasks() {
     if [ -r "$existing_pid_file" ]; then
         existing_pid=$(tr -d '\r\n' < "$existing_pid_file")
         case "$existing_pid" in
-            ''|*[!0-9]*) fail "existing AgentQ daemon pid file is invalid; refuse to overwrite $agentq_home" ;;
+            ''|*[!0123456789]*) fail "existing AgentQ daemon pid file is invalid; refuse to overwrite $agentq_home" ;;
         esac
         if kill -0 "$existing_pid" 2>/dev/null; then
             existing_process_command=$(ps -o command= -p "$existing_pid" 2>/dev/null | awk '{$1 = $1; print}')
@@ -1846,7 +1846,7 @@ prepare_service_stage() {
             # contain a literal "__ALLCAPS__" run to trip it, and if that ever
             # happened the install fails loudly with this message rather than
             # writing a broken service.
-            if grep -qE '__[A-Z][A-Z0-9_]*__' "$service_stage"; then
+            if grep -qE '__[ABCDEFGHIJKLMNOPQRSTUVWXYZ][ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*__' "$service_stage"; then
                 fail "generated launchd plist retained a template placeholder: $service_stage"
             fi
             plutil -lint "$service_stage" >/dev/null || fail "generated launchd plist is invalid: $service_stage"

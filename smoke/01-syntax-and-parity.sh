@@ -2856,21 +2856,24 @@ fi
 # refused both with exit 2 -- and the SERVER accepted the non-ASCII request id
 # (exit 3) that its own contract calls illegal.  Fixed by spelling the set out.
 #
-# This rule pins the SPELLING because no behavioural fixture can cover a guard
-# somebody adds later.  It is deliberately narrow:
-#   * any LETTER range inside the bracket counts -- `A-Z`, `a-z`, but also
-#     `a-f`: `[0-9a-f][0-9a-f]*)` was a REAL offender found after the first
-#     version of this rule, which only knew the literal spellings `A-Z`/`a-z`
-#     (measured 2026-11-06: `éé` passes `[0-9a-f][0-9a-f]*` under
-#     bash+en_US.UTF-8 and named a cache file).  A DIGIT range (`[0-9]`) is
-#     matched literally in every locale measured here (bash/dash x C/en_US.UTF-8
-#     reject Arabic-Indic and full-width digits), so digit ranges are allowed.
-#   * only the `case`-alternative shape is matched: a bracket expression
-#     immediately followed by `*)` or `)` (optionally `*)` then text).  That is
-#     the shape measured on all four real offenders, and it is what keeps the
-#     rule off `sed`/`grep`/`jq` lines whose bracket is followed by something
-#     else -- `sed 's/[^A-Za-z0-9_.-]//g'` and jq's `[A-Za-z0-9+/]{4}` are NOT
-#     shell pattern matching and measured NOT to follow the collation.
+# The landscape differs per TOOL and per LIBC (byte-exact probe, 2026-11-07,
+# `LC_ALL=en_US.UTF-8` vs `C` on each host):
+#   shell `case` ranges:  macOS/BSD -> collation-sensitive; glibc -> literal
+#   `grep`/`sed` ranges:  macOS/BSD -> literal;             glibc -> collation-sensitive
+#   digit ranges:         literal in BOTH tools on BOTH hosts (measured)
+# So neither "this tool is safe" nor "this host is safe" generalises, and the
+# only portable spelling is the explicit set.  This rule pins the SPELLING
+# because no behavioural fixture can cover a guard somebody adds later.
+#   * ANY alnum range inside the bracket counts -- `A-Z`, `a-f`, `0-9`.  The
+#     first version knew only the literal spellings `A-Z`/`a-z` and missed a
+#     real `[0-9a-f]` site (the platform-cache digest prefix, where `éé` passed
+#     and named a cache file under bash+en_US.UTF-8).
+#   * two shapes are matched: a bracket expression immediately followed by `*)`
+#     or `)` (the terminal `case` alternative), and a NEGATED set `[!...]`
+#     anywhere on the line (which is always a shell glob -- prose, `sed`'s
+#     `[^...]` and jq regexes never write `[!`).  A positive range in a
+#     non-terminal alternative (`*[a-z]*|foo*)`) is not seen; no asset writes
+#     one -- recorded boundary, not a claim.
 #   * a line that pins `LC_ALL=C` is exempt: that is this repo's established way
 #     of turning collation off, and several sed sites already do it.
 #   * comment lines are skipped -- this explanation contains the offending
@@ -2878,7 +2881,7 @@ fi
 #     correct tree as broken (smoke/16's self-masking lesson).
 #   * a pattern split across two lines is not seen; no asset writes one.
 chr_range_count=0
-chr_range_regex='\[[^]]*[A-Za-z]-[A-Za-z][^]]*\][[:space:]]*\*?\)'
+chr_range_regex='(\[[^]]*[A-Za-z0-9]-[A-Za-z0-9][^]]*\][[:space:]]*\*?\)|\[![^]]*[A-Za-z0-9]-[A-Za-z0-9][^]]*\])'
 chr_range_hits=$(
     while IFS= read -r chr_file; do
         [ -n "$chr_file" ] || continue
@@ -2893,7 +2896,7 @@ CHRSCRIPTS
 if [ -n "$chr_range_hits" ]; then
     while IFS= read -r chr_hit; do
         [ -n "$chr_hit" ] || continue
-        printf 'shell asset FAILED (bracket RANGE in a case pattern is collation-dependent; write the set out explicitly): %s\n' \
+        printf 'shell asset FAILED (bracket RANGE in a shell pattern is collation-dependent; write the set out explicitly): %s\n' \
             "$chr_hit" >&2
         chr_range_count=$((chr_range_count + 1))
     done <<CHREOF
@@ -2901,24 +2904,138 @@ $chr_range_hits
 CHREOF
     failures=$((failures + 1))
 fi
-# Two-way calibration: the fixture must yield exactly two hits, and both must be
-# case alternatives -- not the comment, not the sed line, not the jq line, and
-# the `a-f` spelling (the one the first version of this rule missed) must count.
+# Two-way calibration: the fixture must yield exactly three hits -- the
+# negated `case` shape, the `a-f` spelling (both missed by the first version's
+# literal `A-Z`/`a-z` test) and a DIGIT range (allowed by the first version,
+# now a violation because digit ranges are only measured-literal, not
+# guaranteed) -- and must NOT count the explicit-set line (the fixed spelling),
+# the comment, the `LC_ALL=C sed` line or the jq regex.
 chr_range_fixture=$(mktemp "${TMPDIR:-/tmp}/agentq-chr-range.XXXXXX")
 printf '%s\n' \
     "    ''|*[!A-Za-z]*) return 1 ;;" \
     "        [0-9a-f][0-9a-f]*) ;;" \
+    "        ''|*[!0-9]*|0*) return 1 ;;" \
     "            LC_ALL=C sed -n 's/[^A-Za-z0-9_.-]//g; p; q'" \
     "            response_filter='test(\"^[A-Za-z0-9+/]{4}\")'" \
-    "        ''|*[!0-9]*) return 1 ;;" \
+    "        ''|*[!0123456789]*) return 1 ;;" \
     '# a comment mentioning [A-Za-z] must not count' > "$chr_range_fixture"
 chr_range_probe=$(LC_ALL=C grep -nE "$chr_range_regex" "$chr_range_fixture" |
     grep -vE '^[0-9]+:[[:space:]]*#' |
     grep -v 'LC_ALL=C' || true)
 rm -f "$chr_range_fixture"
-if [ "$(printf '%s\n' "$chr_range_probe" | grep -c .)" -ne 2 ]; then
-    printf 'shell asset FAILED (the bracket-range rule cannot be calibrated: fixture yields %s hit(s), expected exactly 2)\n' \
+if [ "$(printf '%s\n' "$chr_range_probe" | grep -c .)" -ne 3 ]; then
+    printf 'shell asset FAILED (the bracket-range rule cannot be calibrated: fixture yields %s hit(s), expected exactly 3)\n' \
         "$(printf '%s\n' "$chr_range_probe" | grep -c .)" >&2
+    failures=$((failures + 1))
+fi
+
+# --- the same hazard in `grep`/`sed`/`awk` patterns ---------------------------
+# A bracket range in an ERE is ALSO collation-dependent -- on the OTHER libc:
+# measured 2026-11-07 on Ubuntu 24.04 (glibc), `printf 'café\n' | grep -cE
+# '^[A-Za-z]+$'` answers 1 under en_US.UTF-8 and 0 under C, and `sed -nE
+# 's/^[A-Za-z]+$/yes/p'` prints the line for the same reason; macOS/BSD grep and
+# sed answer 0 in both locales.  (Digit ranges measured literal in both tools on
+# both hosts.)  One real site was fixed this way: install-agentq.sh's
+# unrendered-placeholder detector `grep -qE '__[A-Z][A-Z0-9_]*__'`, which on a
+# glibc host with an accented-locale would treat an accented capital in a
+# service template as a placeholder.
+# The rule keys on the line naming the tool, so jq's `[A-Za-z0-9+/]` (Oniguruma:
+# code-point ranges, not collation) and prose lines are out of scope by
+# construction, and `LC_ALL=C` lines stay allowed.
+tool_range_count=0
+tool_range_regex='\b(grep|sed|awk)\b.*\[[^]]*[A-Za-z0-9]-[A-Za-z0-9][^]]*\]'
+tool_range_hits=$(
+    while IFS= read -r tool_range_file; do
+        [ -n "$tool_range_file" ] || continue
+        LC_ALL=C grep -nE "$tool_range_regex" "$tool_range_file" 2>/dev/null |
+            grep -vE '^[0-9]+:[[:space:]]*#' |
+            grep -v 'LC_ALL=C' |
+            sed "s|^|${tool_range_file#"$root"/}:|" || true
+    done <<TOOLRANGESCRIPTS
+$shell_assets
+TOOLRANGESCRIPTS
+)
+if [ -n "$tool_range_hits" ]; then
+    while IFS= read -r tool_range_hit; do
+        [ -n "$tool_range_hit" ] || continue
+        printf 'shell asset FAILED (bracket RANGE in a grep/sed/awk pattern is collation-dependent on glibc; write the set out explicitly or pin LC_ALL=C): %s\n' \
+            "$tool_range_hit" >&2
+        tool_range_count=$((tool_range_count + 1))
+    done <<TOOLRANGEEOF
+$tool_range_hits
+TOOLRANGEEOF
+    failures=$((failures + 1))
+fi
+# Calibration: exactly one hit -- a bare `grep` with a range.  The `LC_ALL=C
+# sed`, the comment and the jq filter must not count.
+tool_range_fixture=$(mktemp "${TMPDIR:-/tmp}/agentq-tool-range.XXXXXX")
+printf '%s\n' \
+    "            if grep -qE '__[A-Z][A-Z0-9_]*__' \"\$service_stage\"; then" \
+    "        LC_ALL=C sed -n 's/[^A-Za-z0-9_.-]//g; p; q'" \
+    "            response_filter='test(\"^[A-Za-z0-9+/]{4}\")'" \
+    '# grep -E "[a-z]+" in a comment must not count' > "$tool_range_fixture"
+tool_range_probe=$(LC_ALL=C grep -nE "$tool_range_regex" "$tool_range_fixture" |
+    grep -vE '^[0-9]+:[[:space:]]*#' |
+    grep -v 'LC_ALL=C' || true)
+rm -f "$tool_range_fixture"
+if [ "$(printf '%s\n' "$tool_range_probe" | grep -c .)" -ne 1 ]; then
+    printf 'shell asset FAILED (the grep/sed/awk range rule cannot be calibrated: fixture yields %s hit(s), expected exactly 1)\n' \
+        "$(printf '%s\n' "$tool_range_probe" | grep -c .)" >&2
+    failures=$((failures + 1))
+fi
+
+# --- ASCII case folding must not go through a locale-sensitive `tr` ----------
+# `printf '%s' "$1" | tr '[:upper:]' '[:lower:]'` is this repo's idiom for
+# case-insensitive options and environment values -- and `tr`'s character-class
+# mapping is locale-dependent.  Measured 2026-11-07 on Ubuntu 24.04 (glibc) with
+# `tr_TR.UTF-8` generated: `printf 'I\n' | tr '[:upper:]' '[:lower:]'` prints
+# `I` (unfolded), so `agentq SUBMIT` answers `unknown command: submIt` (exit 2)
+# while the same argv under en_US.UTF-8 passes local validation, and
+# `AGENTQ_REMOTE_PLATFORM=UNIX` is rejected.  macOS's BSD `tr` folds `I` to `i`
+# in that locale, and PowerShell's `-eq`/`switch` are culture-invariant
+# (measured under a tr-TR culture), so only the POSIX client on a
+# Turkish-locale glibc host is affected -- which is exactly why this is a static
+# rule: the behaviour cannot be reproduced, let alone go red, on this host.
+# `LC_ALL=C tr` folds ASCII and nothing else (measured on both hosts), and is
+# what the `tr -d` sites in these same files already do.
+tr_fold_count=0
+tr_fold_regex="tr '\[:(upper|lower):\]'"
+tr_fold_hits=$(
+    while IFS= read -r tr_fold_file; do
+        [ -n "$tr_fold_file" ] || continue
+        LC_ALL=C grep -nE "$tr_fold_regex" "$tr_fold_file" 2>/dev/null |
+            grep -vE '^[0-9]+:[[:space:]]*#' |
+            grep -v 'LC_ALL=C' |
+            sed "s|^|${tr_fold_file#"$root"/}:|" || true
+    done <<TRFOLDSCRIPTS
+$shell_assets
+TRFOLDSCRIPTS
+)
+if [ -n "$tr_fold_hits" ]; then
+    while IFS= read -r tr_fold_hit; do
+        [ -n "$tr_fold_hit" ] || continue
+        printf 'shell asset FAILED (case folding through `tr` must pin LC_ALL=C; a locale-dependent fold changes ASCII semantics): %s\n' \
+            "$tr_fold_hit" >&2
+        tr_fold_count=$((tr_fold_count + 1))
+    done <<TRFOLDEOF
+$tr_fold_hits
+TRFOLDEOF
+    failures=$((failures + 1))
+fi
+# Calibration: exactly one hit -- a bare fold.  The `LC_ALL=C tr` on the same
+# shape and the comment must not count.
+tr_fold_fixture=$(mktemp "${TMPDIR:-/tmp}/agentq-tr-fold.XXXXXX")
+printf '%s\n' \
+    "    operation=\$(printf '%s' \"\$operation\" | tr '[:upper:]' '[:lower:]')" \
+    "    operation=\$(printf '%s' \"\$operation\" | LC_ALL=C tr '[:upper:]' '[:lower:]')" \
+    '# a comment about tr '"'"'[:upper:]'"'"' must not count' > "$tr_fold_fixture"
+tr_fold_probe=$(LC_ALL=C grep -nE "$tr_fold_regex" "$tr_fold_fixture" |
+    grep -vE '^[0-9]+:[[:space:]]*#' |
+    grep -v 'LC_ALL=C' || true)
+rm -f "$tr_fold_fixture"
+if [ "$(printf '%s\n' "$tr_fold_probe" | grep -c .)" -ne 1 ]; then
+    printf 'shell asset FAILED (the tr case-fold rule cannot be calibrated: fixture yields %s hit(s), expected exactly 1)\n' \
+        "$(printf '%s\n' "$tr_fold_probe" | grep -c .)" >&2
     failures=$((failures + 1))
 fi
 
@@ -4110,8 +4227,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s chr_ranges=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s workflow_wiring=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$chr_range_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state" "$workflow_wiring_summary")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s chr_ranges=%s tool_ranges=%s tr_fold=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s workflow_wiring=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$chr_range_count" "$tool_range_count" "$tr_fold_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state" "$workflow_wiring_summary")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
