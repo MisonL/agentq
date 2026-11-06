@@ -274,6 +274,13 @@ expect_rejected() {
 
 expect_rejected 'Usage:'                 # no arguments
 expect_rejected 'status accepts --summary or --task' status extra
+# A non-ASCII request id: the charset guard on this client used a bracket RANGE
+# (`A-Za-z`) until 2026-11-06; under bash with a collating locale, accented
+# Latin letters fall inside `A-Z`.  Fixed by writing the set explicitly.
+# 17 characters to pass the length gate and reach only the charset guard.
+rid_accented=$(printf 'aaaaaaaaaaaaaaaa\303\251')
+expect_rejected 'request id must be 16-128 ASCII letters, numbers, dots, underscores, or hyphens' \
+    lookup "$rid_accented"
 # `status --summary` is no longer a local error: the client forwards it and
 # validates the summary shape (asserted below against ssh-modes).
 # --version and --help are local: they must answer before any SSH round trip.

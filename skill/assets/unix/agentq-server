@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.20'
+agentq_version='0.1.21'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -603,9 +603,14 @@ is_positive_integer() {
     esac
 }
 
+# Spelled out, not `A-Za-z`: bracket ranges are collation-dependent, and under
+# bash with a collating locale (macOS defaults to en_US.UTF-8) accented Latin
+# letters fall inside `A-Z`.  Measured 2026-11-06: `lookup aaaaaaaaaaaaaaaaé`
+# was ACCEPTED here (exit 3) while the documented contract is 16-128 ASCII
+# characters -- the same input the Windows client refuses with exit 2.
 is_request_id() {
     case "$1" in
-        ''|*[!A-Za-z0-9._-]*|[!A-Za-z0-9]*) return 1 ;;
+        ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-]*|[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]) return 1 ;;
     esac
 
     [ "${#1}" -ge 16 ] && [ "${#1}" -le 128 ]
@@ -2237,7 +2242,7 @@ normalize_workdir() {
     case "$platform_kind" in
         windows)
             case "$input" in
-                /*|[A-Za-z]:[\\/]*|\\\\*) ;;
+                /*|[abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ]:[\\/]*|\\\\*) ;;
                 *) fail "working directory must be absolute: $input" ;;
             esac
             local unix_path
@@ -3115,7 +3120,7 @@ prune_request_temporary_files_in_directory() {
                     *) candidate_valid=false ;;
                 esac
                 case "$candidate_random" in
-                    ''|*[!A-Za-z0-9]*) candidate_valid=false ;;
+                    ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]*) candidate_valid=false ;;
                 esac
                 if [ "$candidate_valid" = true ] &&
                     is_request_id "$candidate_request_id" &&
@@ -3171,7 +3176,7 @@ prune_cancellation_temporary_files() {
                 temporary_random=${temporary_stem##*.}
                 temporary_stem=${temporary_stem%.*}
                 case "$temporary_random" in
-                    ''|*[!A-Za-z0-9]*) fail "invalid AgentQ cancellation temporary nonce: $temporary_path" ;;
+                    ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]*) fail "invalid AgentQ cancellation temporary nonce: $temporary_path" ;;
                 esac
                 ;;
             .*.*.json)

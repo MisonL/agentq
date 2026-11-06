@@ -172,6 +172,18 @@ expect_rejected 'lookup requires one request id' --host smoke-host lookup a b
 # neither mode.
 expect_rejected 'status accepts --summary or --task' --host smoke-host status extra
 
+# A non-ASCII request id is local-level validation that runs before any ssh
+# call.  The charset guard on the POSIX side was a bracket RANGE until 2026-11-06
+# (it used `A-Za-z`), which under bash with a collating locale includes accented
+# Latin letters.  Both twins must now refuse it with the same message.
+# 17 characters, so the length rule passes and only the charset guard can
+# answer.  The POSIX half of this pair lives in smoke/05 (running both sides on
+# one argv is smoke/12's `stream_case`, but a non-ASCII argv crosses a pwsh
+# console-encoding boundary this check does not want to depend on).
+rid_accented=$(printf 'aaaaaaaaaaaaaaaa\303\251')
+expect_rejected 'request id must be 16-128 ASCII letters, numbers, dots, underscores, or hyphens' \
+    --host smoke-host lookup "$rid_accented"
+
 # `logs` has its own message because it also accepts --tail; the other three
 # share the plain arity message.  Both were read off the client rather than
 # guessed -- the first version of this file asserted messages that do not exist.
