@@ -2018,5 +2018,5 @@ if [ "$failures" -ne 0 ]; then
     printf 'sshp-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'sshp-contract checks passed: cases=%s stub-ssh=yes reconnect=covered argv=checked residue=none trap-window=pinned remote-scripts=%s windows-scripts=%s windows-matrix=%s windows-session=%s windows-units=%s\n' \
-    "$cases" "$remote_script_state" "$windows_script_state" "$windows_matrix_state" "$win_session_state" "$win_units_state"
+printf 'sshp-contract checks passed: cases=%s stub-ssh=yes reconnect=covered argv=checked residue=none trap-window=pinned charset-cells=%s charset-vulnerable=%s remote-scripts=%s windows-scripts=%s windows-matrix=%s windows-session=%s windows-units=%s\n' \
+    "$cases" "$sshp_charset_cells" "$sshp_range_vulnerable_cells" "$remote_script_state" "$windows_script_state" "$windows_matrix_state" "$win_session_state" "$win_units_state"
