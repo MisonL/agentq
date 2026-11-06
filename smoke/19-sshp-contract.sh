@@ -208,6 +208,75 @@ run_case 'session name with slash' 2 'session name must contain only' -- smoke-h
 # this case must be REFUSED, and a legal name must be ACCEPTED.
 run_case 'session name with quote' 2 'session name must contain only' -- smoke-host "a'; touch /tmp/pwned; '"
 run_case 'session name with semi'  2 'session name must contain only' -- smoke-host 'a;id'
+# Bracket RANGES (`A-Za-z`) are collation-dependent: under bash with a collating
+# locale -- macOS defaults to en_US.UTF-8, and /bin/sh is bash 3.2 there --
+# accented Latin letters fall inside `A-Z`.  Measured 2026-11-06: `café` went
+# through the old guard and drove the probe (rc=255) while the Windows twin
+# refused it with 2.  dash, zsh and any C locale refused the same bytes, so
+# this is a shell x locale divergence, not a platform difference.  The name
+# must be refused IN EVERY shell we can actually run; the positive control
+# right after it makes sure a "refuse everything" guard cannot pass.
+# `run_case` always invokes /bin/sh, so the shell x locale matrix is driven
+# DIRECTLY here (one case per cell) with the same stub environment.  The
+# positive control asserts that a legal ASCII name still reaches the probe --
+# without it a guard that refused every non-empty name would pass all the red
+# rows.  The stub's plan makes the probe fail deterministically at 255.
+sshp_accented=$(printf 'caf\303\251')
+sshp_charset_cells=0
+sshp_range_vulnerable_cells=0
+for sshp_charset_shell in /bin/sh bash dash zsh; do
+    command -v "$sshp_charset_shell" >/dev/null 2>&1 || continue
+    for sshp_charset_locale in C en_US.UTF-8; do
+        cases=$((cases + 1)); sshp_charset_cells=$((sshp_charset_cells + 1))
+        # Does THIS cell even have the hazard?  Probe the old idiom directly with
+        # a single accented letter.  Measured 2026-11-06: macOS (BSD libc, bash
+        # 3.2) answers "in the range"; Ubuntu 24.04 (glibc, bash 5.2, en_US.UTF-8
+        # generated) answers "not in the range".  So the refusals below are
+        # asserted everywhere, but only a vulnerable cell can go RED if the
+        # range spelling comes back -- see the note printed when none is found.
+        if LC_ALL="$sshp_charset_locale" "$sshp_charset_shell" \
+            -c 'case "$1" in [A-Za-z]) exit 0 ;; esac; exit 1' _ "$(printf '\303\251')" 2>/dev/null; then
+            sshp_range_vulnerable_cells=$((sshp_range_vulnerable_cells + 1))
+        fi
+        sshp_charset_rc=0
+        SSHP_STUB_DIR="$stub_dir" SSHP_SSH="$work/bin/ssh" HOME="$home" \
+        TMPDIR="$work/tmp" PATH="$work/bin:/usr/bin:/bin" \
+        LC_ALL="$sshp_charset_locale" "$sshp_charset_shell" "$client" \
+            smoke-host "$sshp_accented" >"$work/out" 2>"$work/err" || sshp_charset_rc=$?
+        if [ "$sshp_charset_rc" -ne 2 ] ||
+            ! grep -qF 'session name must contain only' "$work/err"; then
+            printf 'sshp-contract: accented session name [%s/%s] was not refused by the charset guard (exit %s): %s\n' \
+                "$sshp_charset_shell" "$sshp_charset_locale" "$sshp_charset_rc" \
+                "$(head -1 "$work/err")" >&2
+            failures=$((failures + 1))
+        fi
+    done
+done
+# A table that silently shrinks to zero rows is a green table.  Calibrate the
+# enumeration instead of trusting it: this host must be able to run at least
+# /bin/sh (the asset's own shebang) under both locales.
+cases=$((cases + 1))
+if [ "$sshp_charset_cells" -lt 2 ]; then
+    printf 'sshp-contract: only %s shell x locale cell(s) ran; the charset matrix cannot claim coverage\n' \
+        "$sshp_charset_cells" >&2
+    failures=$((failures + 1))
+fi
+# Coverage premise, stated rather than assumed: with zero vulnerable cells the
+# refusals above still hold, but NO cell here could turn red if the guard went
+# back to a range.  That is not an asset failure (glibc measured immune), so it
+# is a note, not a failure -- but it must not read as a demonstrated lock.
+if [ "$sshp_range_vulnerable_cells" -eq 0 ]; then
+    printf 'sshp-contract: note: 0 of %s shell x locale cell(s) here treat a character RANGE as collating (glibc measured immune); this matrix cannot go red on this host -- smoke/01 chr_ranges is the cross-platform lock\n' \
+        "$sshp_charset_cells" >&2
+fi
+run_case 'session name with CJK' 2 'session name must contain only' -- smoke-host "$(printf 'a\344\270\255')"
+# Positive control: --check with a legal ASCII name must get PAST the guard and
+# complete the (stubbed) probe with exit 0.  Without it a guard that refused
+# every name would pass all the red rows above.  plan_stub resets the call
+# counter, so the later "--help must not invoke ssh" assertion still reads a
+# clean slate.
+run_case 'session name ascii accepted' 0 '' -- --check smoke-host abc-1.2
+plan_stub '0	__SSHP_READY__:Linux'
 
 # ---------------------------------------------------------------------------
 # Environment validation.

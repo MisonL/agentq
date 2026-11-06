@@ -2844,6 +2844,84 @@ EOF
     failures=$((failures + 1))
 fi
 
+# --- bracket RANGES in shell patterns are collation-dependent ----------------
+# `case "$x" in *[!A-Za-z0-9_.-]*)` looks like an ASCII test and is not one:
+# bracket RANGES are matched in collation order, and under bash with a locale
+# that has one (macOS defaults to en_US.UTF-8) `A-Z` ALSO CONTAINS the accented
+# Latin letters.  Measured 2026-11-06 -- same bytes, same argv:
+#   bash+en_US.UTF-8  'aé' -> in the range (accepted)
+#   bash+C, dash, zsh 'aé' -> outside it (rejected)
+# and on the real assets: `sshp --check h café` reached the probe (rc=255) and
+# `agentq lookup aaaaaaaaaaaaaaaaé` went on to SSH, while the Windows twin
+# refused both with exit 2 -- and the SERVER accepted the non-ASCII request id
+# (exit 3) that its own contract calls illegal.  Fixed by spelling the set out.
+#
+# This rule pins the SPELLING because no behavioural fixture can cover a guard
+# somebody adds later.  It is deliberately narrow:
+#   * any LETTER range inside the bracket counts -- `A-Z`, `a-z`, but also
+#     `a-f`: `[0-9a-f][0-9a-f]*)` was a REAL offender found after the first
+#     version of this rule, which only knew the literal spellings `A-Z`/`a-z`
+#     (measured 2026-11-06: `éé` passes `[0-9a-f][0-9a-f]*` under
+#     bash+en_US.UTF-8 and named a cache file).  A DIGIT range (`[0-9]`) is
+#     matched literally in every locale measured here (bash/dash x C/en_US.UTF-8
+#     reject Arabic-Indic and full-width digits), so digit ranges are allowed.
+#   * only the `case`-alternative shape is matched: a bracket expression
+#     immediately followed by `*)` or `)` (optionally `*)` then text).  That is
+#     the shape measured on all four real offenders, and it is what keeps the
+#     rule off `sed`/`grep`/`jq` lines whose bracket is followed by something
+#     else -- `sed 's/[^A-Za-z0-9_.-]//g'` and jq's `[A-Za-z0-9+/]{4}` are NOT
+#     shell pattern matching and measured NOT to follow the collation.
+#   * a line that pins `LC_ALL=C` is exempt: that is this repo's established way
+#     of turning collation off, and several sed sites already do it.
+#   * comment lines are skipped -- this explanation contains the offending
+#     spelling on purpose, and a rule that matched its own text would report a
+#     correct tree as broken (smoke/16's self-masking lesson).
+#   * a pattern split across two lines is not seen; no asset writes one.
+chr_range_count=0
+chr_range_regex='\[[^]]*[A-Za-z]-[A-Za-z][^]]*\][[:space:]]*\*?\)'
+chr_range_hits=$(
+    while IFS= read -r chr_file; do
+        [ -n "$chr_file" ] || continue
+        LC_ALL=C grep -nE "$chr_range_regex" "$chr_file" 2>/dev/null |
+            grep -vE '^[0-9]+:[[:space:]]*#' |
+            grep -v 'LC_ALL=C' |
+            sed "s|^|${chr_file#"$root"/}:|" || true
+    done <<CHRSCRIPTS
+$shell_assets
+CHRSCRIPTS
+)
+if [ -n "$chr_range_hits" ]; then
+    while IFS= read -r chr_hit; do
+        [ -n "$chr_hit" ] || continue
+        printf 'shell asset FAILED (bracket RANGE in a case pattern is collation-dependent; write the set out explicitly): %s\n' \
+            "$chr_hit" >&2
+        chr_range_count=$((chr_range_count + 1))
+    done <<CHREOF
+$chr_range_hits
+CHREOF
+    failures=$((failures + 1))
+fi
+# Two-way calibration: the fixture must yield exactly two hits, and both must be
+# case alternatives -- not the comment, not the sed line, not the jq line, and
+# the `a-f` spelling (the one the first version of this rule missed) must count.
+chr_range_fixture=$(mktemp "${TMPDIR:-/tmp}/agentq-chr-range.XXXXXX")
+printf '%s\n' \
+    "    ''|*[!A-Za-z]*) return 1 ;;" \
+    "        [0-9a-f][0-9a-f]*) ;;" \
+    "            LC_ALL=C sed -n 's/[^A-Za-z0-9_.-]//g; p; q'" \
+    "            response_filter='test(\"^[A-Za-z0-9+/]{4}\")'" \
+    "        ''|*[!0-9]*) return 1 ;;" \
+    '# a comment mentioning [A-Za-z] must not count' > "$chr_range_fixture"
+chr_range_probe=$(LC_ALL=C grep -nE "$chr_range_regex" "$chr_range_fixture" |
+    grep -vE '^[0-9]+:[[:space:]]*#' |
+    grep -v 'LC_ALL=C' || true)
+rm -f "$chr_range_fixture"
+if [ "$(printf '%s\n' "$chr_range_probe" | grep -c .)" -ne 2 ]; then
+    printf 'shell asset FAILED (the bracket-range rule cannot be calibrated: fixture yields %s hit(s), expected exactly 2)\n' \
+        "$(printf '%s\n' "$chr_range_probe" | grep -c .)" >&2
+    failures=$((failures + 1))
+fi
+
 # --- a coverage count in a check's summary line must be COMPUTED -------------
 # A summary line is this suite's evidence, and a number in it that nothing
 # computes is a claim, not an observation: it cannot move when the check's
@@ -4032,8 +4110,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s workflow_wiring=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state" "$workflow_wiring_summary")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s chr_ranges=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s workflow_wiring=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$chr_range_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state" "$workflow_wiring_summary")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this

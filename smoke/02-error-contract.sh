@@ -75,6 +75,15 @@ expect_rejected remove-label-missing-flag 'remove --label requires --confirm' pr
 expect_rejected remove-label-empty 'remove --label requires a non-empty label' protocol_error remove --label '' --confirm
 expect_rejected doctor-extra-arg 'doctor accepts --full or no arguments' protocol_error doctor --bogus
 
+# A non-ASCII request id must be rejected here too.  The guard used a bracket
+# RANGE (`A-Za-z`) until 2026-11-06; under bash with a collating locale
+# (macOS defaults to en_US.UTF-8) accented Latin letters fall INSIDE `A-Z`, so
+# this server accepted `aaaaaaaaaaaaaaaaé` and answered 3 `not_found` -- an id
+# its own contract calls illegal, and one the Windows client refuses with 2.
+# 17 characters, so the length rule passes and only the charset can answer.
+expect_rejected lookup-nonascii-id 'request id must be 16-128 ASCII letters' protocol_error \
+    lookup "$(printf 'aaaaaaaaaaaaaaaa\303\251')"
+
 # `[ -x ]` is TRUE for a directory (it tests the search bit), so a directory
 # where the Pueue binary belongs passed require_executable.  Measured
 # 2026-10-27: `doctor` then printed the SHELL's own diagnostic inside its

@@ -510,8 +510,16 @@ esac
 # twin said "must not begin with a hyphen" (measured 2026-10-28).  The empty
 # alternative stays in the charset branch to mirror the twin's `+` quantifier;
 # it is unreachable here because ${2:-ghostty} substitutes for an empty name.
+# The set is spelled out instead of written `A-Za-z`: a bracket RANGE is
+# collation-dependent, and under bash with a locale that has a collation order
+# (macOS defaults to en_US.UTF-8) `A-Z` also contains the accented Latin
+# letters.  Measured 2026-11-06: `café` passed the range form under this
+# host's /bin/sh (bash 3.2) and went on to the probe, while the Windows twin
+# refused it with exit 2; dash, zsh and bash under any C locale refused it.
+# An explicit list is matched byte for byte in every shell and locale
+# (measured: sh/bash/dash/zsh x C/en_US.UTF-8).  Do not "simplify" it back.
 case "$session" in
-    ''|*[!A-Za-z0-9_.-]*)
+    ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-]*)
         fail 'session name must contain only letters, numbers, dots, underscores, or hyphens'
         ;;
     -*)

@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.20'
+agentq_client_version='0.1.21'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072); a Windows target re-encodes
 # argv onto a CreateProcess command line capped at 32767 characters, and the
@@ -2086,9 +2086,14 @@ is_bounded_positive_integer() {
     [ "$1" -le 2147483647 ]
 }
 
+# Spelled out, not `A-Za-z`: bracket ranges are collation-dependent, and under
+# bash with a collating locale accented Latin letters fall inside `A-Z`.
+# Measured 2026-11-06: `aaaaaaaaaaaaaaaaé` passed the range form under this
+# host's bash and went on to SSH, while the Windows twin refused it and the
+# documented contract says ASCII.  The explicit list is locale-proof.
 is_request_id() {
     case "$1" in
-        ''|*[!A-Za-z0-9._-]*|[!A-Za-z0-9]*) return 1 ;;
+        ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-]*|[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]) return 1 ;;
     esac
 
     [ "${#1}" -ge 16 ] && [ "${#1}" -le 128 ]
@@ -3231,7 +3236,11 @@ platform_cache_path_for_host() {
         platform_cache_digest=$(printf '%s' "$host" | LC_ALL=C openssl dgst -sha256 2>/dev/null | sed 's/.*[ =]//' | cut -c1-16)
     fi
     case "$platform_cache_digest" in
-        [0-9a-f][0-9a-f]*) ;;
+        # Spelled out, not `[0-9a-f]`: a bracket RANGE is matched in collation
+        # order, and under bash with a collating locale `a-f` also contains the
+        # accented Latin letters (measured 2026-11-06: `éé` passed the range
+        # form and would have named a cache file).
+        [0123456789abcdef][0123456789abcdef]*) ;;
         # No usable digest tool: skip the cache entirely rather than let every
         # host share one file.  Returning a failure here is a cache MISS by
         # contract (the caller falls through to probing), never a command error.
