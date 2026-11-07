@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.23'
+agentq_client_version='0.1.24'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072); a Windows target re-encodes
 # argv onto a CreateProcess command line capped at 32767 characters, and the
@@ -4483,6 +4483,15 @@ case "$operation" in
             request_id=$(generate_request_id)
         fi
         is_request_id "$request_id" || fail '--request-id must be 16-128 ASCII letters, numbers, dots, underscores, or hyphens and start with a letter or number'
+        # `agentq:<request-id>` is AgentQ's own Pueue label namespace; a user
+        # label with that prefix makes `remove --label` unable to tell the two
+        # apart (measured 2026-11-07: the task whose user label equalled another
+        # task's raw label got deleted instead).  The server refuses it too; the
+        # local check exists so the Windows twin answers identically without a
+        # round trip (smoke/12 compares the two).
+        case "$label" in
+            agentq:*) fail 'label cannot start with the reserved prefix agentq:' ;;
+        esac
 
         initialize_remote_invocation
         append_arg submit
@@ -4663,6 +4672,9 @@ case "$operation" in
         if [ "$#" -eq 3 ] && [ "$remove_option_1" = '--label' ]; then
             [ "$remove_option_3" = '--confirm' ] || fail 'remove --label requires --confirm: a batch removal must be explicitly acknowledged'
             [ -n "$2" ] || fail 'remove --label requires a non-empty label'
+            case "$2" in
+                agentq:*) fail 'label cannot start with the reserved prefix agentq:' ;;
+            esac
         elif [ "$#" -eq 2 ] && [ "$remove_option_1" = '--label' ]; then
             fail 'remove --label requires --confirm: a batch removal must be explicitly acknowledged'
         else

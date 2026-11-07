@@ -385,8 +385,9 @@ jq -e '.task.agentq.cancellation_reason == "user_requested"' <<<"$killed_output"
 # A task whose log is not valid UTF-8 must come back base64-encoded rather than
 # as mangled text.  SKILL.md requires a caller to decode `output_base64` when
 # `output_encoding` is "base64"; returning the bytes as a string would silently
-# corrupt them.  This needs `--tail all`: Pueue only reports the unreadable file
-# on the full-log path, so the default (numbered) tail never reaches it.
+# corrupt them.  `--tail all` is the WHOLE-FILE shape: Pueue refuses the read
+# and says so in `output`.  The default (numbered) tail has a different shape --
+# it replaces just the offending LINE (asserted separately below).
 binary_request_id="${request_id}-bin"
 if ! binary_submit=$("$server" submit --workdir "$work" --label smoke-bin \
         --request-id "$binary_request_id" -- \
@@ -438,6 +439,87 @@ if [ "$decoded" != "$expected" ]; then
         "$decoded" "$expected" >&2
     exit 1
 fi
+
+# The DEFAULT (numbered) tail renders an unreadable line differently: Pueue
+# substitutes `Pueue: Failed to read line.` for that line and exits 0.  That
+# text is byte-identical to a task printing the line itself (measured
+# 2026-11-07), so the server cannot trust the text -- it re-reads the raw
+# window.  Both directions are asserted on two tasks, or a fix that always
+# re-encodes (or never does) would pass one and fail the other.
+line_request_id="${request_id}-line"
+if ! line_submit=$("$server" submit --workdir "$work" --label smoke-line \
+        --request-id "$line_request_id" -- \
+        sh -c 'printf "alpha\n\377\nomega\n"'); then
+    printf '%s\n' 'submit for the default-tail invalid-line case failed' >&2
+    exit 1
+fi
+line_task_id=$(jq -er '.task_id' <<<"$line_submit") || {
+    printf 'default-tail submit returned no task_id: %s\n' "$line_submit" >&2
+    exit 1
+}
+cancel_cleanup_ids="$cancel_cleanup_ids $line_task_id"
+cleanup_task_ids="$cleanup_task_ids $line_task_id"
+"$server" wait "$line_task_id" >/dev/null 2>&1 || {
+    printf '%s\n' 'the default-tail invalid-line task did not succeed' >&2
+    exit 1
+}
+line_status=0
+line_log=$("$server" logs "$line_task_id" 2>"$work/line.err") || line_status=$?
+if [ "$line_status" -ne 0 ]; then
+    printf 'logs (default tail) exited %s for a log with one invalid line: %s\n' \
+        "$line_status" "$(head -1 "$work/line.err")" >&2
+    exit 1
+fi
+jq -e '.output_encoding == "base64"' <<<"$line_log" >/dev/null || {
+    printf 'a default-tail log with invalid bytes was not reported as base64: %s\n' \
+        "$(head -c 200 <<<"$line_log")" >&2
+    exit 1
+}
+line_decoded=$(jq -r '.output_base64' <<<"$line_log" | base64 -d 2>/dev/null | od -An -tx1 | tr -d ' \n') || {
+    printf 'the default-tail base64 payload did not decode: %s\n' \
+        "$(head -c 200 <<<"$line_log")" >&2
+    exit 1
+}
+line_expected=$(printf 'alpha\n\377\nomega\n' | od -An -tx1 | tr -d ' \n')
+if [ "$line_decoded" != "$line_expected" ]; then
+    printf 'the default-tail log did not reproduce the bytes written: %s vs %s\n' \
+        "$line_decoded" "$line_expected" >&2
+    exit 1
+fi
+
+# Control: a task that genuinely PRINTS the marker must keep its plain output.
+# Without this, "always re-encode when the marker is seen" would pass the case
+# above while mislabeling honest output as non-UTF-8.
+literal_request_id="${request_id}-lite"
+if ! literal_submit=$("$server" submit --workdir "$work" --label smoke-literal \
+        --request-id "$literal_request_id" -- \
+        sh -c 'printf "alpha\nPueue: Failed to read line.\nomega\n"'); then
+    printf '%s\n' 'submit for the literal-marker control failed' >&2
+    exit 1
+fi
+literal_task_id=$(jq -er '.task_id' <<<"$literal_submit") || {
+    printf 'literal-marker submit returned no task_id: %s\n' "$literal_submit" >&2
+    exit 1
+}
+cancel_cleanup_ids="$cancel_cleanup_ids $literal_task_id"
+cleanup_task_ids="$cleanup_task_ids $literal_task_id"
+"$server" wait "$literal_task_id" >/dev/null 2>&1 || {
+    printf '%s\n' 'the literal-marker control task did not succeed' >&2
+    exit 1
+}
+literal_status=0
+literal_log=$("$server" logs "$literal_task_id" 2>"$work/literal.err") || literal_status=$?
+if [ "$literal_status" -ne 0 ]; then
+    printf 'logs (default tail) exited %s for a task printing the marker text: %s\n' \
+        "$literal_status" "$(head -1 "$work/literal.err")" >&2
+    exit 1
+fi
+jq -e '(.output == "alpha\nPueue: Failed to read line.\nomega") and (has("output_encoding") | not)' \
+    <<<"$literal_log" >/dev/null || {
+    printf 'a task that printed the marker itself lost its plain output: %s\n' \
+        "$(head -c 200 <<<"$literal_log")" >&2
+    exit 1
+}
 
 # A FINISHED task whose log file is gone (rotation, cleanup) must not be
 # reported as output either: the log is unavailable, which the contract already
@@ -857,6 +939,12 @@ printf '{"version":1,"request_id":"smoke-ambiguous-old-aaaa","payload":{"workdir
 
 ambiguous_status=0
 ambiguous_output=$("$server" wait "$ambiguous_task_id" 2>"$work/ambiguous.err") || ambiguous_status=$?
+# `status --task` must answer the SAME thing as `wait`/`logs` in this state.
+# Measured before the 0.1.24 guard: 0 with Done+Success here while `wait` and
+# `logs` both returned 6/unavailable -- and this is the documented polling
+# fallback, so a caller could report the success `wait` refused to vouch for.
+ambiguous_task_status_status=0
+ambiguous_task_status=$("$server" status --task "$ambiguous_task_id" 2>"$work/ambiguous-task.err") || ambiguous_task_status_status=$?
 rm -f -- "$ambiguous_record"
 
 if [ "$ambiguous_status" -ne 6 ]; then
@@ -877,6 +965,24 @@ jq -e 'has("task") | not' <<<"$ambiguous_output" >/dev/null || {
 grep -q 'ambiguous AgentQ identity' "$work/ambiguous.err" || {
     printf 'an ambiguous id was refused for the wrong reason: %s\n' \
         "$(head -1 "$work/ambiguous.err")" >&2
+    exit 1
+}
+
+if [ "$ambiguous_task_status_status" -ne 6 ]; then
+    printf 'status --task on an id shared by two instances exited %s, expected 6: %s\n' \
+        "$ambiguous_task_status_status" "$ambiguous_task_status" >&2
+    exit 1
+fi
+jq -e --argjson id "$ambiguous_task_id" \
+    '.task_id == $id and .state == "unavailable" and (has("task") | not)' \
+    <<<"$ambiguous_task_status" >/dev/null || {
+    printf 'status --task on an ambiguous id did not report unavailable: %s\n' \
+        "$ambiguous_task_status" >&2
+    exit 1
+}
+grep -q 'ambiguous AgentQ identity' "$work/ambiguous-task.err" || {
+    printf 'status --task refused an ambiguous id for the wrong reason: %s\n' \
+        "$(head -1 "$work/ambiguous-task.err")" >&2
     exit 1
 }
 
@@ -905,6 +1011,60 @@ cleanup_task_ids="$cleanup_task_ids $ambiguous_task_id"
 # The compact views (0.1.11): status --summary, status --task <id>, and
 # doctor's default summary queue section.  Each is asserted against real Pueue
 # output, so a shape that the client validators would reject fails here first.
+# `agentq:` is AgentQ's own Pueue label namespace.  A user label with that
+# prefix made `remove --label` unable to tell a user label from a raw one --
+# measured 2026-11-07: `remove --label <raw label>` deleted the task whose USER
+# label equalled that string and left the raw label's own task alive, exit 0.
+# Both the producer and the consumer refuse the prefix; the positive control
+# below pins that only the PREFIX is reserved.
+reserved_submit_status=0
+reserved_submit_out=$("$server" submit --workdir "$work" --label 'agentq:reserved-probe' \
+    --request-id "${request_id}-resv" -- sh -c true 2>"$work/reserved.err") || reserved_submit_status=$?
+if [ "$reserved_submit_status" -ne 2 ]; then
+    printf 'submit accepted a label with the reserved agentq: prefix (exit %s): %s\n' \
+        "$reserved_submit_status" "$(head -c 200 <<<"$reserved_submit_out")" >&2
+    exit 1
+fi
+grep -q 'reserved prefix agentq:' "$work/reserved.err" || {
+    printf 'the reserved-prefix rejection did not name the reason: %s\n' \
+        "$(head -1 "$work/reserved.err")" >&2
+    exit 1
+}
+grep -q 'reason=protocol_error' "$work/reserved.err" || {
+    printf 'the reserved-prefix rejection carried the wrong reason class: %s\n' \
+        "$(tail -1 "$work/reserved.err")" >&2
+    exit 1
+}
+reserved_remove_status=0
+"$server" remove --label 'agentq:reserved-probe' --confirm 2>"$work/reserved-rm.err" >/dev/null || reserved_remove_status=$?
+if [ "$reserved_remove_status" -ne 2 ]; then
+    printf 'remove --label accepted the reserved agentq: prefix (exit %s)\n' \
+        "$reserved_remove_status" >&2
+    exit 1
+fi
+grep -q 'reserved prefix agentq:' "$work/reserved-rm.err" || {
+    printf 'remove --label did not name the reserved prefix: %s\n' \
+        "$(head -1 "$work/reserved-rm.err")" >&2
+    exit 1
+}
+# Positive control: a label that merely CONTAINS the string is not reserved.
+contains_label_request_id="${request_id}-cont"
+if ! contains_submit=$("$server" submit --workdir "$work" --label 'my-agentq:thing' \
+        --request-id "$contains_label_request_id" -- sh -c true); then
+    printf '%s\n' 'a label merely containing "agentq:" was wrongly rejected' >&2
+    exit 1
+fi
+contains_task_id=$(jq -er '.task_id' <<<"$contains_submit") || {
+    printf 'contains-label submit returned no task_id: %s\n' "$contains_submit" >&2
+    exit 1
+}
+cancel_cleanup_ids="$cancel_cleanup_ids $contains_task_id"
+cleanup_task_ids="$cleanup_task_ids $contains_task_id"
+"$server" wait "$contains_task_id" >/dev/null 2>&1 || {
+    printf '%s\n' 'the contains-label control task did not succeed' >&2
+    exit 1
+}
+
 batch_label="batchroundtrip-$$-aaaa"
 batch_a_id=''
 batch_b_id=''
@@ -1069,5 +1229,5 @@ jq -e 'type == "array" and length == 0' <<<"$empty_out" >/dev/null || {
 # Every token below is printed only after its assertion actually ran -- the
 # three that used to be conditionally skipped now exit 1 instead, so a green
 # summary cannot coexist with an unexercised contract.
-printf 'protocol-roundtrip checks passed: home=%s task=%s fail-task=%s lookup=not_found stale-lock=recovered cancel-running=ok cancel-queued=queued_removed/5 cancel-replay=reused reuse-replay=reused finished-cancel=task_not_running binary-log=base64 missing-log=empty/6 label-surfaces=raw/decorated doctor=ok ambiguous-id=unavailable/6 summary=ok batch-remove=2/2+empty\n' \
+printf 'protocol-roundtrip checks passed: home=%s task=%s fail-task=%s lookup=not_found stale-lock=recovered cancel-running=ok cancel-queued=queued_removed/5 cancel-replay=reused reuse-replay=reused finished-cancel=task_not_running binary-log=base64 missing-log=empty/6 label-surfaces=raw/decorated line-marker=base64/0+text/0 reserved-label=2/2 status-ambiguous=unavailable/6 doctor=ok ambiguous-id=unavailable/6 summary=ok batch-remove=2/2+empty\n' \
     "$runtime_home" "$task_id" "$failure_task_id"

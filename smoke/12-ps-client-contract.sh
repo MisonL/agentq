@@ -515,13 +515,16 @@ twin_table='0|agentq 0.1.|--version
 2|--tail must be a positive integer or all|logs 1 --tail 05
 2|SSH host must not begin with a hyphen|--host -x status
 2|SSH host must not begin with a hyphen|--host -- status
-2|SSH host must not begin with a hyphen|--host -evil status'
+2|SSH host must not begin with a hyphen|--host -evil status
+2|label cannot start with the reserved prefix agentq:|submit --workdir /tmp --label agentq:x --request-id smokeclient00000001 -- true
+2|label cannot start with the reserved prefix agentq:|remove --label agentq:x --confirm
+255||submit --workdir /tmp --label my-agentq:thing --request-id smokeclient00000001 -- true'
 twin_table_rows=$(grep -c . <<< "$twin_table")
 twin_rows=0
 # A table that lost most of its rows still agrees with a loop that runs what is
 # left, so the equality gate below cannot see it -- the same shape as a shrunk
 # enumeration.  The floor is a LOWER BOUND, not the count (the reported count
-# stays computed): today's table has 27 rows and a rewrite that drops below 25
+# stays computed): today's table has 30 rows and a rewrite that drops below 25
 # is a different table, not a smaller one.
 if [ "$twin_table_rows" -lt 25 ]; then
     printf 'ps-client twin: the differential table has %s row(s), below the floor of 25; it no longer covers the token surface it was built for\n' \

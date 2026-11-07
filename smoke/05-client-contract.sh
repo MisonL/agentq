@@ -281,6 +281,16 @@ expect_rejected 'status accepts --summary or --task' status extra
 rid_accented=$(printf 'aaaaaaaaaaaaaaaa\303\251')
 expect_rejected 'request id must be 16-128 ASCII letters, numbers, dots, underscores, or hyphens' \
     lookup "$rid_accented"
+# `agentq:` is AgentQ's own Pueue label namespace.  A user label with that
+# prefix makes `remove --label` unable to tell a user label from a raw one --
+# measured 2026-11-07: `remove --label <raw label>` deleted the task whose USER
+# label equalled that string and left the raw label's own task alive, exit 0.
+# Producer and consumer both refuse it LOCALLY, before any SSH round trip; the
+# server refuses it too (smoke/03).
+expect_rejected 'label cannot start with the reserved prefix agentq:' \
+    submit --workdir /tmp --label agentq:smoke --request-id smokeclient00000001 -- true
+expect_rejected 'label cannot start with the reserved prefix agentq:' \
+    remove --label agentq:smoke --confirm
 # `status --summary` is no longer a local error: the client forwards it and
 # validates the summary shape (asserted below against ssh-modes).
 # --version and --help are local: they must answer before any SSH round trip.
