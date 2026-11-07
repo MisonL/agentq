@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.23'
+agentq_version='0.1.24'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -5133,6 +5133,11 @@ compact_log() {
     local log_pueue_error
     local log_file_readable
     local log_status_has_done
+    local log_needs_raw_file
+    local log_pueue_marker
+    local log_window_rendered
+    local log_window_raw
+    local log_window_raw_status
 
     log_path=$(task_log_path "$task_id")
     if [ "$tail_lines" = all ]; then
@@ -5255,11 +5260,64 @@ compact_log() {
     fi
 
     require_runtime_temporary_file "$compact_log_raw_file"
-    if jq -e --arg id "$task_id" '
-        (.[$id].output? | if type == "string" then . else "" end)
-        | contains("(Pueue error) Failed to read local log output file:")
-          and contains("stream did not contain valid UTF-8")
-    ' < "$compact_log_raw_file" >/dev/null; then
+    # Pueue reports an unrenderable log in TWO shapes, and only one was handled
+    # before 0.1.24:
+    #   --tail all -> the whole read fails and `output` is
+    #                 "(Pueue error) Failed to read local log output file: ...
+    #                  stream did not contain valid UTF-8"
+    #   --tail N   -> Pueue replaces just the offending LINE with
+    #                 "Pueue: Failed to read line." and still exits 0 (measured
+    #                 2026-11-07 on Pueue 4.0.4, both mixed and all-invalid logs)
+    # The second passed through as the task's output with exit 0, and it is
+    # BYTE-IDENTICAL to a task that printed that line itself (measured: one task
+    # with an invalid byte and one printing the marker literally produced
+    # identical `logs` responses), so the text alone cannot be trusted.  The raw
+    # file CAN discriminate: re-read the same window from disk and compare.
+    # Identical -> the task really printed the marker and Pueue's text is the
+    # log (no re-encode).  Different -> Pueue substituted something, so answer
+    # with the real bytes in the same base64 envelope --tail all uses.  A
+    # missing/unreadable raw file also lands in the re-encode arm, whose guards
+    # below report it.
+    log_needs_raw_file=0
+    log_pueue_marker=$(
+        { jq -r --arg id "$task_id" '
+            (.[$id].output? | if type == "string" then . else "" end) as $output
+            | if ($output | contains("(Pueue error) Failed to read local log output file:"))
+                 and ($output | contains("stream did not contain valid UTF-8")) then "full"
+              elif ($output | contains("Pueue: Failed to read line.")) then "line"
+              else "" end
+        ' < "$compact_log_raw_file"; } 2>/dev/null
+    ) || log_pueue_marker=''
+    case "$log_pueue_marker" in
+        full)
+            log_needs_raw_file=1
+            ;;
+        line)
+            # A --tail all read never substitutes a single line (measured: full
+            # mode answers the whole-file wording above), so in full mode this
+            # text is the task's own.
+            if [ "$tail_lines" = all ]; then
+                :
+            elif [ -f "$log_path" ] && [ -r "$log_path" ]; then
+                log_window_rendered=$(
+                    { jq -r --arg id "$task_id" '.[$id].output // ""' \
+                        < "$compact_log_raw_file"; } 2>/dev/null
+                ) || log_window_rendered=''
+                # An out-of-range --tail (no numeric upper bound) makes tail
+                # fail, which would read as "different" and re-encode an honest
+                # log.  Only compare when the re-read succeeded; otherwise keep
+                # Pueue's answer, the pre-0.1.24 behaviour.
+                log_window_raw_status=0
+                log_window_raw=$(tail -n "$tail_lines" "$log_path" 2>/dev/null) || log_window_raw_status=$?
+                if [ "$log_window_raw_status" -eq 0 ] && [ "$log_window_rendered" != "$log_window_raw" ]; then
+                    log_needs_raw_file=1
+                fi
+            else
+                log_needs_raw_file=1
+            fi
+            ;;
+    esac
+    if [ "$log_needs_raw_file" -eq 1 ]; then
         require_task_log_file "$log_path"
         [ -r "$log_path" ] || fail "Pueue reported a non-UTF-8 task log, but the raw log is unavailable: $log_path"
         command -v base64 >/dev/null 2>&1 || fail 'base64 is required to return a non-UTF-8 task log'
@@ -5427,6 +5485,15 @@ submit() {
     done
 
     [ -n "$workdir" ] || fail '--workdir is required'
+    # `agentq:<request-id>` is AgentQ's own label namespace (`pueue add --label`
+    # writes it and several readers parse it back).  A USER label with that
+    # prefix makes `remove --label` unable to tell the two apart -- measured
+    # 2026-11-07: a task whose --label equalled another task's raw label was the
+    # one a `remove --label <raw label>` deleted, while the raw label's own task
+    # survived, exit 0.  Reserve the prefix instead of documenting the trap.
+    case "$label" in
+        agentq:*) fail 'label cannot start with the reserved prefix agentq:' ;;
+    esac
     is_request_id "$request_id" || fail '--request-id must be 16-128 ASCII letters, numbers, dots, underscores, or hyphens and start with a letter or number'
     [ "$#" -gt 0 ] || fail 'submit requires a command after --'
 
@@ -5890,6 +5957,20 @@ status() {
                     status_task_status=$?
                 fi
                 report_compact_task_failure "$status_task_status" "$status_task_id"
+                # The same identity guard `wait` and `logs` apply.  With more
+                # than one live request record claiming this numeric id the
+                # server cannot vouch for the request attribution, and answering
+                # `{"task": ...}` would let a caller draw exactly the final-state
+                # conclusion `wait` refuses to give -- measured 2026-11-07: the
+                # same ambiguous state returned 6/unavailable from `wait` and
+                # `logs` but 0/Done+Success here, and this is the documented
+                # fallback for polling.
+                if ! task_identity_is_unambiguous "$status_task"; then
+                    jq -cn --argjson task_id "$status_task_id" '{task_id: $task_id, state: "unavailable"}'
+                    printf '%s: task %s has an ambiguous AgentQ identity; the status is unavailable\n' \
+                        "$program" "$status_task_id" >&2
+                    return 6
+                fi
                 printf '{"task":%s}\n' "$status_task"
                 ;;
         esac
@@ -6377,6 +6458,13 @@ remove_tasks_by_label() {
     local failed_count=0
 
     [ -n "$match_label" ] || fail 'remove --label requires a non-empty label'
+    # With submit rejecting the prefix, no task can carry such a user label, so
+    # this can only be a raw label copied from `status --summary`.  Answer
+    # loudly instead of returning the silent `[]`/exit 0 that looks like a
+    # successful empty batch (measured 2026-11-07).
+    case "$match_label" in
+        agentq:*) fail 'label cannot start with the reserved prefix agentq:' ;;
+    esac
 
     ensure_daemon
     # `|| return $?` is load-bearing: inside with_operation_lock's `if "$@"` body

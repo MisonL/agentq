@@ -199,7 +199,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFOR
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.23"
+$script:ClientVersion = "0.1.24"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's argv limit, not this machine's platform: a unix
 # target takes up to 100000 base64 characters (the POSIX twin's MAX_ARG_STRLEN
@@ -3293,6 +3293,10 @@ switch ($operation) {
                     if (($position + 1) -ge $arguments.Count) {
                         Stop-AgentQ "--label requires a label"
                     }
+                    if ($arguments[$position + 1].StartsWith("agentq:", [System.StringComparison]::Ordinal)) {
+                        # AgentQ's own Pueue label namespace; see the POSIX twin.
+                        Stop-AgentQ "label cannot start with the reserved prefix agentq:"
+                    }
                     $label = $arguments[$position + 1]
                     $position += 2
                     continue
@@ -3575,6 +3579,9 @@ switch ($operation) {
             }
             if ([string]::IsNullOrEmpty($arguments[$position + 1])) {
                 Stop-AgentQ "remove --label requires a non-empty label"
+            }
+            if ($arguments[$position + 1].StartsWith("agentq:", [System.StringComparison]::Ordinal)) {
+                Stop-AgentQ "label cannot start with the reserved prefix agentq:"
             }
             Initialize-ClientTransport
             $invocation = New-RemoteInvocation -Arguments @("remove", "--label", $arguments[$position + 1], "--confirm")
