@@ -439,6 +439,31 @@ if [ "$decoded" != "$expected" ]; then
     exit 1
 fi
 
+# A FINISHED task whose log file is gone (rotation, cleanup) must not be
+# reported as output either: the log is unavailable, which the contract already
+# spells as `{"task_id":N,"state":"unavailable"}` with exit 6 (the same shape
+# the identity-changed arm uses).  The file is removed directly -- pueue's
+# `clean` would drop the TASK as well and exercise a different path.
+deleted_log_path="$runtime_home/data/task_logs/$binary_task_id.log"
+if [ ! -f "$deleted_log_path" ]; then
+    printf 'cannot locate the finished task log to remove: %s\n' "$deleted_log_path" >&2
+    exit 1
+fi
+rm -f "$deleted_log_path"
+deleted_log_status=0
+deleted_log_output=$("$server" logs "$binary_task_id" --tail all 2>"$work/deleted-log.err") || deleted_log_status=$?
+jq -e --argjson id "$binary_task_id" \
+    '.task_id == $id and .state == "unavailable"' <<<"$deleted_log_output" >/dev/null 2>&1 || {
+    printf 'logs after the log file was removed: expected exit 6 unavailable, got exit %s: %s\n' \
+        "$deleted_log_status" "$(head -c 300 <<<"$deleted_log_output")" >&2
+    exit 1
+}
+if [ "$deleted_log_status" -ne 6 ]; then
+    printf 'logs after the log file was removed exited %s, expected 6: %s\n' \
+        "$deleted_log_status" "$(head -c 300 <<<"$deleted_log_output")" >&2
+    exit 1
+fi
+
 # A task is Queued only when no slot is free, so fill the slots FIRST and only
 # then submit the victim -- submitting the victim first would let it take the
 # free slot and run, and the case would silently test nothing.  How many slots a
@@ -495,6 +520,34 @@ done
 if [ "$victim_queued" -ne 1 ]; then
     printf 'task %s never reached Queued; cannot exercise the queued_removed path\n' \
         "$victim_task_id" >&2
+    exit 1
+fi
+
+# `logs` on a task that has NOT STARTED yet.  Pueue answers `log` with exit 0
+# and its own diagnostic as `output` -- measured 2026-11-07:
+#   (Pueue error) Failed to get log file handle: I/O error at path
+#   "/.../data/task_logs/7.log" while getting log file handle: No such file or
+#   directory (os error 2)
+# Passing that through made `logs` report a FAILURE as the task's output with
+# exit 0, and echoed the server-side log path to the caller.  The contract
+# answer for a task that has produced nothing yet is an empty output; the
+# documented polling workflow calls `logs` on queued tasks, so this must be a
+# normal answer, not an error.
+queued_log_status=0
+queued_log=$("$server" logs "$victim_task_id" 2>"$work/queued-log.err") || queued_log_status=$?
+jq -e '.output == "" and (.task | type == "object")' <<<"$queued_log" >/dev/null 2>&1 || {
+    printf 'logs on a Queued task: expected exit 0 with empty output, got exit %s: %s\n' \
+        "$queued_log_status" "$(head -c 300 <<<"$queued_log")" >&2
+    exit 1
+}
+if [ "$queued_log_status" -ne 0 ]; then
+    printf 'logs on a Queued task exited %s, expected 0: %s\n' \
+        "$queued_log_status" "$(head -c 300 <<<"$queued_log")" >&2
+    exit 1
+fi
+if grep -qF '(Pueue error)' <<<"$queued_log"; then
+    printf 'logs on a Queued task returned Pueue diagnostics as task output: %s\n' \
+        "$(head -c 300 <<<"$queued_log")" >&2
     exit 1
 fi
 
@@ -855,6 +908,7 @@ cleanup_task_ids="$cleanup_task_ids $ambiguous_task_id"
 batch_label="batchroundtrip-$$-aaaa"
 batch_a_id=''
 batch_b_id=''
+batch_a_rid=''
 for suffix in a b; do
     rid="batchroundtrip-$$-${suffix}aaaa"
     submit_json=$("$server" submit --workdir "$work" --label "$batch_label" \
@@ -874,7 +928,12 @@ for suffix in a b; do
         printf 'batch-roundtrip wait for task %s failed\n' "$tid" >&2
         exit 1
     }
-    if [ "$suffix" = a ]; then batch_a_id=$tid; else batch_b_id=$tid; fi
+    if [ "$suffix" = a ]; then
+        batch_a_id=$tid
+        batch_a_rid=$rid
+    else
+        batch_b_id=$tid
+    fi
 done
 
 # --summary answers one compact entry per task with the marker set.
@@ -906,6 +965,26 @@ jq -e --argjson id "$batch_a_id" '.task.id == $id and (.task.status.Done.result 
         "$(head -c 200 <<<"$task_out")" >&2
     exit 1
 }
+
+# The two LABEL surfaces differ on purpose, and that difference is what makes
+# `remove --label` (which matches the USER label) a trap when a caller copies a
+# label out of --summary: the summary deliberately does not join request
+# records, so it can only report Pueue's raw `agentq:<request-id>`.  Pin both
+# sides on the SAME task -- the raw form in the summary, the user label in
+# --task -- so a change to either surface is visible here rather than only in
+# a caller's batch removal that silently matched nothing.
+jq -e --argjson a "$batch_a_id" --arg rid "$batch_a_rid" \
+    '.tasks[($a|tostring)].label == ("agentq:" + $rid)' <<<"$summary_out" >/dev/null || {
+    printf 'status --summary did not report Pueue raw label for task %s: %s\n' \
+        "$batch_a_id" "$(head -c 200 <<<"$summary_out")" >&2
+    exit 1
+}
+task_label_value=$(jq -r '.task.label' <<<"$task_out") || task_label_value=''
+if [ "$task_label_value" != "$batch_label" ]; then
+    printf 'status --task did not report the user label (%s) for task %s: %s\n' \
+        "$batch_label" "$batch_a_id" "$task_label_value" >&2
+    exit 1
+fi
 
 # doctor's default queue section is the same summary; --full keeps the map.
 # Both are asserted against the batch tasks this block just created.  Until
@@ -990,5 +1069,5 @@ jq -e 'type == "array" and length == 0' <<<"$empty_out" >/dev/null || {
 # Every token below is printed only after its assertion actually ran -- the
 # three that used to be conditionally skipped now exit 1 instead, so a green
 # summary cannot coexist with an unexercised contract.
-printf 'protocol-roundtrip checks passed: home=%s task=%s fail-task=%s lookup=not_found stale-lock=recovered cancel-running=ok cancel-queued=queued_removed/5 cancel-replay=reused reuse-replay=reused finished-cancel=task_not_running binary-log=base64 doctor=ok ambiguous-id=unavailable/6 summary=ok batch-remove=2/2+empty\n' \
+printf 'protocol-roundtrip checks passed: home=%s task=%s fail-task=%s lookup=not_found stale-lock=recovered cancel-running=ok cancel-queued=queued_removed/5 cancel-replay=reused reuse-replay=reused finished-cancel=task_not_running binary-log=base64 missing-log=empty/6 label-surfaces=raw/decorated doctor=ok ambiguous-id=unavailable/6 summary=ok batch-remove=2/2+empty\n' \
     "$runtime_home" "$task_id" "$failure_task_id"
