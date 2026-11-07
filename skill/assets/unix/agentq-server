@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.22'
+agentq_version='0.1.23'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -5130,6 +5130,9 @@ compact_log() {
     local command_status
     local log_encoded
     local log_encode_status
+    local log_pueue_error
+    local log_file_readable
+    local log_status_has_done
 
     log_path=$(task_log_path "$task_id")
     if [ "$tail_lines" = all ]; then
@@ -5159,6 +5162,75 @@ compact_log() {
     validate_pueue_task_id_precision_in_file "$compact_log_raw_file"
     require_runtime_temporary_file "$compact_log_raw_file"
     validate_pueue_log_shape_in_file "$compact_log_raw_file"
+
+    # A task whose log FILE does not exist -- still Queued, or finished with its
+    # log rotated away -- makes Pueue answer exit 0 with `output` set to its own
+    # diagnostic:
+    #   (Pueue error) Failed to get log file handle: I/O error at path
+    #   "/.../data/task_logs/7.log" while getting log file handle:
+    #   No such file or directory (os error 2)
+    # Passing that through reported a FAILURE as the task's output with exit 0
+    # and echoed the server-side log path to the caller (measured 2026-11-07:
+    # `logs` on a queued task, and on a finished task after deleting its log).
+    # The sibling non-UTF-8 diagnostic is handled further down; this wording was
+    # not.  When the error is real -- the shape guard above guarantees `output`
+    # is a string -- answer with the contract's own vocabulary instead of
+    # Pueue's text: a task that has produced nothing yet (still queued) gets
+    # `output: ""` with exit 0, because the documented polling workflow calls
+    # `logs` on queued tasks and "nothing yet" is not an error; a finished task
+    # whose log is gone is the same `unavailable` (exit 6) the identity-changed
+    # arm below uses.
+    if ! runtime_temporary_path_is_safe "$compact_log_raw_file"; then
+        fail "unsafe AgentQ runtime temporary file: $compact_log_raw_file"
+    fi
+    log_pueue_error=$(
+        { jq -r --arg id "$task_id" '
+            (.[$id].output // "")
+            | if startswith("(Pueue error) Failed to get log file handle:") then "1" else "" end
+        ' < "$compact_log_raw_file"; } 2>/dev/null
+    ) || log_pueue_error=''
+    if [ "$log_pueue_error" = 1 ]; then
+        # A readable file on disk means the diagnostic is not about a missing
+        # log (Pueue reports the same prefix for an unopenable file), so fall
+        # through to the normal read rather than inventing an answer.
+        log_file_readable=0
+        if [ -f "$log_path" ] && [ -r "$log_path" ]; then
+            log_file_readable=1
+        fi
+        if [ "$log_file_readable" -eq 0 ]; then
+            # `status` is the discriminator: a Done task whose log is gone
+            # has no answer left to give, while a queued task simply has none
+            # yet.
+            log_status_has_done=$(
+                { jq -r --arg id "$task_id" '
+                    if ((.[$id].task.status | type) == "object")
+                       and (.[$id].task.status | has("Done")) then "1" else "" end
+                ' < "$compact_log_raw_file"; } 2>/dev/null
+            ) || log_status_has_done=''
+            if [ "$log_status_has_done" = 1 ]; then
+                jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+                printf '%s: the task log is unavailable: Pueue could not open the log file for task %s\n' \
+                    "$program" "$task_id" >&2
+                command_status=6
+                cleanup_compact_log_raw_file || command_status=1
+                return "$command_status"
+            fi
+            if [ -z "$task" ]; then
+                task=$(compact_task "$task_id") ||
+                    fail "cannot inspect Pueue while reading AgentQ task logs: $task_id"
+            fi
+            if jq -cn --argjson task "$task" '{task: $task, output: ""}'; then
+                command_status=0
+            else
+                command_status=1
+            fi
+            cleanup_compact_log_raw_file || command_status=1
+            if [ "$command_status" -ne 0 ]; then
+                fail 'cannot render the empty task log'
+            fi
+            return 0
+        fi
+    fi
 
     if [ -n "$expected_created_at" ] &&
         ! require_runtime_temporary_file "$compact_log_raw_file"; then
