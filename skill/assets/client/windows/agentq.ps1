@@ -199,7 +199,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFOR
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.24"
+$script:ClientVersion = "0.1.25"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's argv limit, not this machine's platform: a unix
 # target takes up to 100000 base64 characters (the POSIX twin's MAX_ARG_STRLEN
@@ -3292,6 +3292,10 @@ switch ($operation) {
                 "--label" {
                     if (($position + 1) -ge $arguments.Count) {
                         Stop-AgentQ "--label requires a label"
+                    }
+                    if ([string]::IsNullOrEmpty($arguments[$position + 1])) {
+                        # `remove --label` refuses an empty label; see the POSIX twin.
+                        Stop-AgentQ "--label must not be empty"
                     }
                     if ($arguments[$position + 1].StartsWith("agentq:", [System.StringComparison]::Ordinal)) {
                         # AgentQ's own Pueue label namespace; see the POSIX twin.

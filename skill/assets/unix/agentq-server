@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.24'
+agentq_version='0.1.25'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -5137,7 +5137,6 @@ compact_log() {
     local log_pueue_marker
     local log_window_rendered
     local log_window_raw
-    local log_window_raw_status
 
     log_path=$(task_log_path "$task_id")
     if [ "$tail_lines" = all ]; then
@@ -5289,27 +5288,27 @@ compact_log() {
         ' < "$compact_log_raw_file"; } 2>/dev/null
     ) || log_pueue_marker=''
     case "$log_pueue_marker" in
-        full)
-            log_needs_raw_file=1
-            ;;
-        line)
-            # A --tail all read never substitutes a single line (measured: full
-            # mode answers the whole-file wording above), so in full mode this
-            # text is the task's own.
-            if [ "$tail_lines" = all ]; then
-                :
-            elif [ -f "$log_path" ] && [ -r "$log_path" ]; then
+        full|line)
+            # Either wording can ALSO be a task's own output (a task that greps
+            # Pueue logs prints both), and text alone cannot separate the two
+            # (measured 2026-11-07: a substituted line and a literal print are
+            # byte-identical).  Decide by the DATA: compare the rendered window
+            # against the raw file's SAME window.  Identical -> the task printed
+            # it; different -> Pueue substituted something and the real bytes are
+            # answered in the base64 envelope below.  A missing/unreadable raw
+            # file keeps the re-encode arm, whose guards report it loudly --
+            # failing toward the real bytes, never toward Pueue's text.
+            if [ -f "$log_path" ] && [ -r "$log_path" ]; then
                 log_window_rendered=$(
                     { jq -r --arg id "$task_id" '.[$id].output // ""' \
                         < "$compact_log_raw_file"; } 2>/dev/null
                 ) || log_window_rendered=''
-                # An out-of-range --tail (no numeric upper bound) makes tail
-                # fail, which would read as "different" and re-encode an honest
-                # log.  Only compare when the re-read succeeded; otherwise keep
-                # Pueue's answer, the pre-0.1.24 behaviour.
-                log_window_raw_status=0
-                log_window_raw=$(tail -n "$tail_lines" "$log_path" 2>/dev/null) || log_window_raw_status=$?
-                if [ "$log_window_raw_status" -eq 0 ] && [ "$log_window_rendered" != "$log_window_raw" ]; then
+                if [ "$tail_lines" = all ]; then
+                    log_window_raw=$(cat -- "$log_path" 2>/dev/null) || log_window_raw=''
+                else
+                    log_window_raw=$(tail -n "$tail_lines" "$log_path" 2>/dev/null) || log_window_raw=''
+                fi
+                if [ "$log_window_rendered" != "$log_window_raw" ]; then
                     log_needs_raw_file=1
                 fi
             else
@@ -5494,6 +5493,10 @@ submit() {
     case "$label" in
         agentq:*) fail 'label cannot start with the reserved prefix agentq:' ;;
     esac
+    # `remove --label` refuses an empty label, so a task submitted with one could
+    # never be batch-removed by its label (measured 2026-11-07: submit exit 0,
+    # remove --label '' exit 2).  Refuse it at the producer instead.
+    [ -n "$label" ] || fail '--label must not be empty'
     is_request_id "$request_id" || fail '--request-id must be 16-128 ASCII letters, numbers, dots, underscores, or hyphens and start with a letter or number'
     [ "$#" -gt 0 ] || fail 'submit requires a command after --'
 

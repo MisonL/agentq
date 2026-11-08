@@ -569,6 +569,29 @@ if [ "$twin_rows" -ne "$twin_table_rows" ]; then
         "$twin_rows" "$twin_table_rows" >&2
     failures=$((failures + 1))
 fi
+# --- an EMPTY --label cannot be expressed in the table either ------------------
+# `read -ra` does not remove quotes, so `--label ''` in the table would reach
+# both clients as the two-character label `''`.  The empty value needs a direct
+# pair call.  Both clients must refuse it locally: measured 2026-11-07, neither
+# refused it (the server created a task with an empty label) while
+# `remove --label ''` was already refused -- such a task could never be
+# batch-removed by its label.
+cases=$((cases + 1))
+twin_run_pair "$twin_posix" submit --workdir /tmp --label "" --request-id smokeclient00000001 -- true
+twin_empty_label_problems=''
+[ "$twin_p_status" -eq 2 ] || twin_empty_label_problems="$twin_empty_label_problems posix-exit=$twin_p_status"
+[ "$twin_w_status" -eq 2 ] || twin_empty_label_problems="$twin_empty_label_problems windows-exit=$twin_w_status"
+grep -qF -- '--label must not be empty' "$work/twin-p.err" \
+    || twin_empty_label_problems="$twin_empty_label_problems posix-missing-message"
+{ flatten_err "$work/twin-w.err"; cat "$work/twin-w.out"; } > "$work/twin-w.combined"
+grep -qF -- '--label must not be empty' "$work/twin-w.combined" \
+    || twin_empty_label_problems="$twin_empty_label_problems windows-missing-message"
+if [ -n "$twin_empty_label_problems" ]; then
+    printf 'ps-client twin [submit --label ""]:%s\n' "$twin_empty_label_problems" >&2
+    head -2 "$work/twin-p.err" "$work/twin-w.err" >&2 || true
+    failures=$((failures + 1))
+fi
+
 # --- the host VALUE's shape: argv cannot carry a whitespace-only word ---------
 # `read -ra` word-splits, so the table above can express `--host -x` but never
 # `--host ' '`.  The whitespace family goes through AGENTQ_HOST instead -- which

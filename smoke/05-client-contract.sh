@@ -291,6 +291,11 @@ expect_rejected 'label cannot start with the reserved prefix agentq:' \
     submit --workdir /tmp --label agentq:smoke --request-id smokeclient00000001 -- true
 expect_rejected 'label cannot start with the reserved prefix agentq:' \
     remove --label agentq:smoke --confirm
+# An empty label is refused locally too: `remove --label ''` already refuses
+# it, so a task created that way could never be batch-removed (measured
+# 2026-11-07: the client accepted it and reached ssh).
+expect_rejected '--label must not be empty' \
+    submit --workdir /tmp --label '' --request-id smokeclient00000001 -- true
 # `status --summary` is no longer a local error: the client forwards it and
 # validates the summary shape (asserted below against ssh-modes).
 # --version and --help are local: they must answer before any SSH round trip.

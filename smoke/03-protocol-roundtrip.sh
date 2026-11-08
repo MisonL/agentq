@@ -440,6 +440,47 @@ if [ "$decoded" != "$expected" ]; then
     exit 1
 fi
 
+# The `--tail all` wording can ALSO be a task's own output (a task that greps
+# Pueue logs prints it verbatim).  Matching the text alone re-encoded such a
+# log as base64 and contradicted the documented meaning of `output_encoding`
+# ("the target output is not UTF-8") -- measured 2026-11-08 on the 0.1.24
+# asset: an honest task was answered as base64.  Both wordings now decide by
+# comparing the rendered window against the raw file, so this task must keep
+# its plain output while the binary-log case above stays base64.
+fullwording_request_id="${request_id}-fullw"
+if ! fullwording_submit=$("$server" submit --workdir "$work" --label smoke-fullword \
+        --request-id "$fullwording_request_id" -- \
+        sh -c 'printf "x\n(Pueue error) Failed to read local log output file: stream did not contain valid UTF-8\ny\n"'); then
+    printf '%s\n' 'submit for the full-wording control failed' >&2
+    exit 1
+fi
+fullwording_task_id=$(jq -er '.task_id' <<<"$fullwording_submit") || {
+    printf 'full-wording submit returned no task_id: %s\n' "$fullwording_submit" >&2
+    exit 1
+}
+cancel_cleanup_ids="$cancel_cleanup_ids $fullwording_task_id"
+cleanup_task_ids="$cleanup_task_ids $fullwording_task_id"
+"$server" wait "$fullwording_task_id" >/dev/null 2>&1 || {
+    printf '%s\n' 'the full-wording control task did not succeed' >&2
+    exit 1
+}
+fullwording_status=0
+fullwording_log=$("$server" logs "$fullwording_task_id" --tail all 2>"$work/fullwording.err") || fullwording_status=$?
+if [ "$fullwording_status" -ne 0 ]; then
+    printf 'logs --tail all exited %s for a task printing the full wording: %s\n' \
+        "$fullwording_status" "$(head -1 "$work/fullwording.err")" >&2
+    exit 1
+fi
+# --tail all returns the file content verbatim, INCLUDING its trailing newline
+# (measured: a full-mode answer for "hello\n" is "hello\n"), so trim it before
+# the comparison.
+jq -e '((.output | rtrimstr("\n")) == "x\n(Pueue error) Failed to read local log output file: stream did not contain valid UTF-8\ny") and (has("output_encoding") | not)' \
+    <<<"$fullwording_log" >/dev/null || {
+    printf 'a task that printed the full wording itself was not returned as plain text: %s\n' \
+        "$(head -c 200 <<<"$fullwording_log")" >&2
+    exit 1
+}
+
 # The DEFAULT (numbered) tail renders an unreadable line differently: Pueue
 # substitutes `Pueue: Failed to read line.` for that line and exits 0.  That
 # text is byte-identical to a task printing the line itself (measured
@@ -1047,6 +1088,28 @@ grep -q 'reserved prefix agentq:' "$work/reserved-rm.err" || {
         "$(head -1 "$work/reserved-rm.err")" >&2
     exit 1
 }
+# An EMPTY --label is refused at the producer: `remove --label ''` already
+# refuses an empty label, so a task created with one could never be
+# batch-removed (measured 2026-11-07: submit exit 0, remove --label '' exit 2).
+empty_label_status=0
+empty_label_out=$("$server" submit --workdir "$work" --label '' \
+    --request-id "${request_id}-empt" -- sh -c true 2>"$work/empty-label.err") || empty_label_status=$?
+if [ "$empty_label_status" -ne 2 ]; then
+    printf 'submit accepted an empty --label (exit %s): %s\n' \
+        "$empty_label_status" "$(head -c 200 <<<"$empty_label_out")" >&2
+    exit 1
+fi
+grep -q -- '--label must not be empty' "$work/empty-label.err" || {
+    printf 'the empty-label rejection did not name the reason: %s\n' \
+        "$(head -1 "$work/empty-label.err")" >&2
+    exit 1
+}
+grep -q 'reason=protocol_error' "$work/empty-label.err" || {
+    printf 'the empty-label rejection carried the wrong reason class: %s\n' \
+        "$(tail -1 "$work/empty-label.err")" >&2
+    exit 1
+}
+
 # Positive control: a label that merely CONTAINS the string is not reserved.
 contains_label_request_id="${request_id}-cont"
 if ! contains_submit=$("$server" submit --workdir "$work" --label 'my-agentq:thing' \
@@ -1229,5 +1292,5 @@ jq -e 'type == "array" and length == 0' <<<"$empty_out" >/dev/null || {
 # Every token below is printed only after its assertion actually ran -- the
 # three that used to be conditionally skipped now exit 1 instead, so a green
 # summary cannot coexist with an unexercised contract.
-printf 'protocol-roundtrip checks passed: home=%s task=%s fail-task=%s lookup=not_found stale-lock=recovered cancel-running=ok cancel-queued=queued_removed/5 cancel-replay=reused reuse-replay=reused finished-cancel=task_not_running binary-log=base64 missing-log=empty/6 label-surfaces=raw/decorated line-marker=base64/0+text/0 reserved-label=2/2 status-ambiguous=unavailable/6 doctor=ok ambiguous-id=unavailable/6 summary=ok batch-remove=2/2+empty\n' \
+printf 'protocol-roundtrip checks passed: home=%s task=%s fail-task=%s lookup=not_found stale-lock=recovered cancel-running=ok cancel-queued=queued_removed/5 cancel-replay=reused reuse-replay=reused finished-cancel=task_not_running binary-log=base64 missing-log=empty/6 label-surfaces=raw/decorated line-marker=base64/0+text/0 full-wording=text/0 reserved-label=2/2 empty-label=2/2 status-ambiguous=unavailable/6 doctor=ok ambiguous-id=unavailable/6 summary=ok batch-remove=2/2+empty\n' \
     "$runtime_home" "$task_id" "$failure_task_id"
