@@ -608,6 +608,54 @@ fi
 # BOTH the exit code and the fragment.  Reuses twin_run_pair so the environment
 # (AGENTQ_HOST included) is identical to the table's -- a first draft that set
 # its own env forgot the host and both sides failed for the wrong reason.
+# Non-ASCII whitespace: the 0.1.26 first cut used `[[:space:]]` on POSIX and
+# .NET `\s` on Windows, so NBSP / U+3000 flipped with the POSIX locale and
+# U+0085 was never blank on POSIX while .NET treated it as blank.  Both twins
+# now use the ASCII set only, so these three are VALUES on both sides (the
+# server rejects them as non-absolute later) -- equality of exit codes is the
+# assertion, not which code.
+for twin_ws_cp in 85 a0 3000; do
+    cases=$((cases + 1))
+    twin_ws_value=$(python3 -c 'import sys; sys.stdout.write(chr(int(sys.argv[1], 16)))' "$twin_ws_cp")
+    twin_run_pair "$twin_posix" submit --workdir "$twin_ws_value" --request-id smokeclient00000001 -- true
+    if [ "$twin_p_status" -ne "$twin_w_status" ]; then
+        printf 'ps-client twin [non-ASCII whitespace U+%s workdir]: posix-exit=%s windows-exit=%s\n' \
+            "$twin_ws_cp" "$twin_p_status" "$twin_w_status" >&2
+        failures=$((failures + 1))
+    fi
+done
+# The Windows twin's request-id check was `-match '^[A-Za-z0-9][A-Za-z0-9._-]{15,127}$'`
+# for one round: `-match` is case-INSENSITIVE by language rule, so U+212A
+# (KELVIN SIGN) and U+0130 (LATIN CAPITAL I WITH DOT ABOVE) satisfied
+# `[A-Za-z]`, and `$` matches BEFORE a trailing newline, so 16 letters plus LF
+# passed too -- while the POSIX twin's `case` glob and the server's byte set
+# refused all three.  The caller then got 255 with the id already on the wire
+# instead of a local 2 (measured 2026-11-09 on pwsh 7.5.4; `\A`/`\z` and
+# `-cmatch` are the fix).  Built from octal bytes, not `$'...'` or `\u`:
+# macOS ships bash 3.2 for `env bash`, which has neither.
+for twin_id_kind in trailing-lf kelvin-sign dotless-capital-i; do
+    cases=$((cases + 1))
+    case "$twin_id_kind" in
+        trailing-lf) twin_id_value='aaaaaaaaaaaaaaaa'$'\n' ;;
+        kelvin-sign) twin_id_value=$(printf '\342\204\252')aaaaaaaaaaaaaaa ;;
+        dotless-capital-i) twin_id_value=$(printf '\304\260')aaaaaaaaaaaaaaa ;;
+    esac
+    twin_run_pair "$twin_posix" submit --workdir /tmp --request-id "$twin_id_value" -- true
+    twin_id_problems=''
+    [ "$twin_p_status" -eq 2 ] || twin_id_problems="$twin_id_problems posix-exit=$twin_p_status"
+    [ "$twin_w_status" -eq 2 ] || twin_id_problems="$twin_id_problems windows-exit=$twin_w_status"
+    # The reason matters: a 255 here means the id was accepted locally and only
+    # the (stub) transport failed, which is the exact regression this locks.
+    grep -qF -- 'start with a letter or number' "$work/twin-p.err" \
+        || twin_id_problems="$twin_id_problems posix-missing-message"
+    { flatten_err "$work/twin-w.err"; cat "$work/twin-w.out"; } > "$work/twin-w.combined"
+    grep -qF -- 'start with a letter or number' "$work/twin-w.combined" \
+        || twin_id_problems="$twin_id_problems windows-missing-message"
+    if [ -n "$twin_id_problems" ]; then
+        printf 'ps-client twin [request-id %s]:%s\n' "$twin_id_kind" "$twin_id_problems" >&2
+        failures=$((failures + 1))
+    fi
+done
 for twin_ws_argv_kind in request-id workdir; do
     cases=$((cases + 1))
     if [ "$twin_ws_argv_kind" = request-id ]; then

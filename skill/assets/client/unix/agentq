@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.26'
+agentq_client_version='0.1.27'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072); a Windows target re-encodes
 # argv onto a CreateProcess command line capped at 32767 characters, and the
@@ -2111,6 +2111,29 @@ is_request_id() {
     esac
 
     [ "${#1}" -ge 16 ] && [ "${#1}" -le 128 ]
+}
+
+# True when the value is empty or consists only of ASCII whitespace
+# (space, TAB, LF, CR, FF, VT).  Written with explicit LITERAL characters, not
+# `[[:space:]]` and not backslash escapes: `case` brackets do not interpret
+# `\t` (measured: dash/bash both treat the pattern `[!\ \t]` as
+# "not a space, backslash or t"), and `[[:space:]]`'s set depends on the
+# locale while .NET `\s` accepts U+0085/NBSP/U+3000 -- so the POSIX and
+# Windows twins gave opposite answers for the same argv (measured 2026-11-09).
+# The twin uses the same ASCII-only set.  Anything else is a VALUE: the server
+# then rejects a non-absolute path, which is the right answer for `\u00a0`.
+workdir_is_blank() {
+    local remaining
+    # Strip every ASCII whitespace character (space, TAB, LF, CR, FF, VT) and
+    # ask whether anything is left.  `tr` does the stripping with an explicit
+    # BYTE list, so the set cannot drift with the locale, and no `case`
+    # bracket or backslash escape has to represent a control character.
+    # Measured 2026-11-09: with `[[:space:]]` the same argv got opposite
+    # answers under `LC_ALL=C` (NBSP/U+3000 are values) and a UTF-8 locale
+    # (they are blank), and U+0085 was never blank -- while the Windows twin's
+    # .NET `\s` accepted all three.  Both twins now use this ASCII set.
+    remaining=$(printf '%s' "$1" | LC_ALL=C tr -d ' \t\n\r\f\v')
+    [ -z "$remaining" ]
 }
 
 generate_request_id() {
@@ -4509,12 +4532,17 @@ case "$operation" in
         # refuses it: an empty `--workdir` reaches ssh once and is rejected by
         # the server as `working directory must be absolute`, and that message
         # is not forwarded -- so the caller got exit 255 and no explanation
-        # (measured 2026-11-09; the twin already refused this locally).  The
-        # value is not otherwise trimmed.
-        case "$workdir" in
-            *[![:space:]]*) ;;
-            *) fail '--workdir is required' ;;
-        esac
+        # (measured 2026-11-09).
+        #
+        # ASCII whitespace ONLY, spelled as a byte set: `[[:space:]]` depends on
+        # the locale (`LC_ALL=C` rejects NBSP/U+3000 while a UTF-8 locale
+        # accepts them) and never accepts U+0085, while the twin's .NET `\s`
+        # accepts all three -- so the `[[:space:]]` form gave opposite answers
+        # for the SAME input depending on the caller's locale (measured
+        # 2026-11-09).  Anything outside the ASCII set is a value, not absence:
+        # the server rejects a non-absolute path, and that is the right answer
+        # for `\u00a0` anyway.
+        workdir_is_blank "$workdir" && fail '--workdir is required'
         if [ "$stdin_script" = true ]; then
             [ "$#" -eq 0 ] || fail 'submit --stdin-script takes the script from standard input; drop the command after --'
         else

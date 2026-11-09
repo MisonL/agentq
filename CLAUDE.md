@@ -154,6 +154,7 @@ response loss 只能用**同一 request ID** lookup/reconcile；
 | 参数/协议错误 | `protocol_error` | 其它任何消息 | 改参数 |
 | 队列操作锁竞争 | `lock_contention` | `already in progress` | **可重试**，同一 request ID |
 | 对已结束的任务 `cancel` | `task_not_running` | `task is not running` | 无法取消，先读 `status`/`wait` |
+| 安装器维护锁期间 | `lock_contention` | `maintenance is in progress` | **可重试**，等安装器完成 |
 
 消息文本是给人看的、措辞可变；`reason` 是机读契约，改它属于破坏性变更。
 服务端里 `fail()` 是唯一的 `exit 2` 出口，默认类别 `protocol_error`，上述两类

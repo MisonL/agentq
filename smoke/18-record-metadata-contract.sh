@@ -345,6 +345,105 @@ run_case variant symrecord status
 compare_case symrecord
 expect_refused symrecord 'invalid AgentQ request record path'
 
+# 12. Legacy records (written under the PRE-0.1.26 id rule, which had no
+#     leading-character check) must be QUARANTINED, not refused.  Before 0.1.26
+#     a `.`-led id wrote a hidden `.<id>.json`; `_`/`-`-led ids wrote ordinary
+#     files.  Since the rule was tightened, those files match neither the record
+#     scan's id test nor the temporary-file parser, so one leftover made EVERY
+#     command exit 2 (measured 2026-11-09 in the sandbox: `lookup` answered
+#     `invalid ... temporary process id`).  `quarantine_legacy_request_records`
+#     moves them into `.legacy-orphans/` (bytes intact) on both the locked and
+#     the lock-free paths.
+#
+#     The `.agentqtmp.`-looking case matters on its own: a blanket exemption for
+#     that prefix would leave such a record for the TEMP pruner, which refuses
+#     it -- so the exemption must recognise the real temp shape
+#     (`.agentqtmp.<id>.<pid>.<random>.json`), not merely the prefix.
+#
+#     The block also runs under an explicit umask 022: a record carries the
+#     user label and the working directory, and the quarantine directory must
+#     still come out 0700 like its parent.  A bare `mkdir -p` inherits the
+#     caller's umask and produced 0755 (measured 2026-11-09).
+for side in base variant; do
+    legacy_dir="$work/$side/data/agentq-requests"
+    find "$legacy_dir" -maxdepth 1 -name '*.json' -delete
+    find "$legacy_dir/.tombstones" -maxdepth 1 -name '*.json' -delete
+    rm -rf "$legacy_dir/.legacy-orphans"
+    printf '%s\n' "$(record_json '.aaaaaaaaaaaaaaa')" > "$legacy_dir/.aaaaaaaaaaaaaaa.json"
+    printf '%s\n' "$(record_json '_aaaaaaaaaaaaaaa')" > "$legacy_dir/_aaaaaaaaaaaaaaa.json"
+    printf '%s\n' "$(record_json '.agentqtmp.aaaaaaaaaaaaaaaa')" > "$legacy_dir/.agentqtmp.aaaaaaaaaaaaaaaa.json"
+    # A REAL temp record must be left alone (the pruner owns it): wrong id
+    # length is enough to make this a temp file rather than a record.
+    printf '%s\n' '{"x":1}' > "$legacy_dir/.agentqtmp.Abcd.1234567890123.1234.abcd12.json"
+done
+( umask 022; run_case base legacyquarantine status; run_case variant legacyquarantine status )
+cases=$((cases + 1))
+legacy_problem=''
+for side in base variant; do
+    d="$work/$side/data/agentq-requests"
+    for name in '.aaaaaaaaaaaaaaa.json' '_aaaaaaaaaaaaaaa.json' '.agentqtmp.aaaaaaaaaaaaaaaa.json'; do
+        [ -e "$d/.legacy-orphans/$name" ] || legacy_problem="$legacy_problem $side-missing:$name"
+        [ ! -e "$d/$name" ] || legacy_problem="$legacy_problem $side-left:$name"
+    done
+    # The temp record must NOT be quarantined: it is this server's own
+    # transient file, and the temp pruner (not this function) owns its fate.
+    # Asserting "it is gone" would over-specify -- pruning is keyed on whether
+    # the owning process is dead, which this check does not control.
+    [ ! -e "$d/.legacy-orphans/.agentqtmp.Abcd.1234567890123.1234.abcd12.json" ] ||
+        legacy_problem="$legacy_problem $side-temp-quarantined"
+    # 0700, not the caller's umask 022.  Skipped only where no `stat` mode
+    # form works (neither GNU `-c` nor BSD `-f`); an unreadable mode must not
+    # be reported as a pass, so it is a failure, not a skip.
+    legacy_mode=$(stat -c '%a' -- "$d/.legacy-orphans" 2>/dev/null || stat -f '%Lp' "$d/.legacy-orphans" 2>/dev/null)
+    [ "$legacy_mode" = 700 ] || legacy_problem="$legacy_problem $side-quarantine-mode:${legacy_mode:-unknown}"
+done
+if [ -n "$legacy_problem" ]; then
+    printf 'records-contract (legacy quarantine):%s\n' "$legacy_problem" >&2
+    head -2 "$work/variant.legacyquarantine.err" >&2 || true
+    failures=$((failures + 1))
+fi
+# A second run must not change anything (idempotent) and must not overwrite.
+run_case variant legacyquarantine2 status
+cases=$((cases + 1))
+if [ ! -e "$work/variant/data/agentq-requests/.legacy-orphans/.aaaaaaaaaaaaaaa.json" ] ||
+    [ -e "$work/variant/data/agentq-requests/.legacy-orphans/.aaaaaaaaaaaaaaa.json.1" ]; then
+    printf '%s\n' 'records-contract (legacy quarantine): the second run moved or duplicated a quarantined file' >&2
+    failures=$((failures + 1))
+fi
+
+# 13. A whitespace-only `--workdir` is refused LOCALLY by both clients, so it
+#     never reaches this server; the value this server accepts is the outer
+#     bound of that guard.  ASCII whitespace is not an absolute path and must
+#     be refused with exit 2; NBSP/U+3000/U+0085 are VALUES (non-absolute, so
+#     the same 2 -- but the point is that the server decides on the path rule,
+#     not on a whitespace notion that drifts between the twins' locales).
+#     Measured 2026-11-09: `[[:space:]]` made the POSIX client call NBSP blank
+#     under a UTF-8 locale and a value under C, while .NET `\s` accepted
+#     U+0085/NBSP/U+3000 -- the guard is a byte set on both sides now, and
+#     this pins the server-side answer the guard has to stay narrower than.
+python3_probe_status=0
+python3 -c 'import sys' >/dev/null 2>&1 || python3_probe_status=$?
+if [ "$python3_probe_status" -ne 0 ]; then
+    printf '%s\n' 'records-contract NOT run: the python3 on PATH cannot execute (a Microsoft Store alias cannot run scripts); block 13 builds its whitespace fixtures with it.' >&2
+    printf '%s\n' 'Install a real Python 3 and put it on PATH, then re-run.' >&2
+    exit 1
+fi
+for ws_probe in 41 09 0a0d0c0b c2a0 e38080 c285; do
+    cases=$((cases + 1))
+    ws_value=$(python3 -c 'import sys; sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]))' "$ws_probe") || {
+        printf 'records-contract workdir %s: could not build the fixture value\n' "$ws_probe" >&2
+        failures=$((failures + 1))
+        continue
+    }
+    run_case variant "workdir_$ws_probe" submit --workdir "$ws_value" --request-id AQQWSDIR-0000000001 -- true
+    ws_rc=$(cat "$work/variant.workdir_$ws_probe.rc")
+    if [ "$ws_rc" != 2 ]; then
+        printf 'records-contract workdir %s: a non-absolute workdir must be refused with 2, got %s\n' \
+            "$ws_probe" "$ws_rc" >&2
+        failures=$((failures + 1))
+    fi
+done
+
 # --------------------------------------------------------------- summary
 if [ "$failures" -ne 0 ]; then
     printf 'records-contract checks FAILED: cases=%s failures=%s\n' "$cases" "$failures" >&2

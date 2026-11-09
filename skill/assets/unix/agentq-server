@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.26'
+agentq_version='0.1.27'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -3644,7 +3644,10 @@ repair_removed_request_records() {
 
     # Fallback: the original loop, unchanged.  record_task_id is not read here
     # (repair only branches on the state), so it is not decoded.
-    repair_guard_stderr=$(mktemp "${TMPDIR:-/tmp}/agentq-repair-guard.XXXXXX") || return 1
+    # umask 077: the file only ever receives this server's own error text, but
+    # that text carries record paths, and every other temporary file this
+    # script creates is 0600 for the same reason.
+    repair_guard_stderr=$(umask 077; mktemp "${TMPDIR:-/tmp}/agentq-repair-guard.XXXXXX") || return 1
     for record_path in "${record_files[@]}"; do
         request_id=${record_path##*/}
         request_id=${request_id%.json}
@@ -3725,7 +3728,11 @@ prune_request_tombstones() {
     request_tombstones_need_pruning || return 0
     path_chain_is_safe "$request_tombstone_directory" ||
         fail "invalid AgentQ request tombstone directory path: $request_tombstone_directory"
-    find "$request_tombstone_directory" -type f -name '*.json' -mtime +"$request_tombstone_retention_days" -exec rm -f -- {} + || fail 'failed to prune expired AgentQ request tombstones'
+    # `-maxdepth 1`: the quarantine subdirectory holds records an operator may
+    # still want, and a recursive `find` would delete them once they are old
+    # enough (measured 2026-11-09: a backdated file under
+    # `.tombstones/.legacy-orphans/` was selected by the same find).
+    find "$request_tombstone_directory" -maxdepth 1 -type f -name '*.json' -mtime +"$request_tombstone_retention_days" -exec rm -f -- {} + || fail 'failed to prune expired AgentQ request tombstones'
     current_epoch=$(date +%s)
     is_positive_integer "$current_epoch" || fail 'cannot determine the current time for AgentQ tombstone pruning'
     write_runtime_marker "$request_tombstone_prune_marker" "$current_epoch"
@@ -3770,39 +3777,124 @@ quarantine_legacy_request_records_in_directory() {
     local name
     local id
     local quarantine_directory
+    local target
+    local agentqtmp_stem agentqtmp_random agentqtmp_base agentqtmp_pid
+    local agentqtmp_with_id agentqtmp_id agentqtmp_prefix agentqtmp_is_temp
 
     [ -d "$directory" ] || return 0
     quarantine_directory="$directory/.legacy-orphans"
     shopt -s nullglob
-    for file in "$directory"/*.json; do
-        name=${file##*/}
-        id=${name%.json}
-        is_request_id "$id" && continue
-        is_legacy_request_id "$id" || continue
-        if [ ! -d "$quarantine_directory" ]; then
-            mkdir -p -- "$quarantine_directory" ||
-                fail "cannot create the AgentQ $kind quarantine directory: $quarantine_directory"
-        fi
-        mv -f -- "$file" "$quarantine_directory/$name" ||
-            fail "cannot quarantine a legacy AgentQ $kind record: $file"
-    done
-    for file in "$directory"/.*.json; do
+    for file in "$directory"/*.json "$directory"/.*.json; do
         name=${file##*/}
         case "$name" in
-            .agentqtmp.*) continue ;;
+            .|..|.legacy-orphans) continue ;;
+            .agentqtmp.*.json)
+                # Exempt ONLY the shape this server's own make_temporary_file
+                # writes: `.agentqtmp.<request-id>.<pid>.<random>.json`, with a
+                # CURRENTLY legal request id, a numeric pid and a non-empty
+                # random token.  A blanket `.agentqtmp.*` exemption let an old
+                # deployment's request id that merely LOOKED like a temp name
+                # (`.agentqtmp.aaaaaaaaaaaaaaaa`) fall through to the temp
+                # pruner, which then failed it as `invalid ... temporary request
+                # id` and made every command exit 2 (measured 2026-11-09).
+                #
+                # Split with `##`/`%%` on the FINAL `.json` and the LAST dot,
+                # never on a multi-character prefix: `${name#.agentqtmp.}` is a
+                # GLOB whose dots match any character, so it swallowed the id's
+                # own leading `a` as well (measured: `.agentqtmp.aaaaaaaaaaaa
+                # aaaa.json` yielded the stem `aaaaaaaaaaaaaaaa`).
+                #   name   = .agentqtmp.<id>.<pid>.<random>.json
+                #   base   = .agentqtmp.<id>.<pid>   id = <id>   pid = <pid>
+                agentqtmp_stem=${name%.json}
+                agentqtmp_random=${agentqtmp_stem##*.}
+                agentqtmp_base=${agentqtmp_stem%.*}
+                agentqtmp_pid=${agentqtmp_base##*.}      # <pid>
+                agentqtmp_with_id=${agentqtmp_base%.*}   # .agentqtmp.<id>
+                # Strip the prefix by SEARCHING for its literal text: every
+                # `${x#p}` form is a glob, and `.` matches any character, so
+                # `.agentqtmp.` ate the id's own first character (measured:
+                # `.agentqtmp.Abcd.1234.abcd12` yielded the id `Abcd`).
+                agentqtmp_prefix='.agentqtmp.'
+                agentqtmp_id=''
+                case "$agentqtmp_with_id" in
+                    "$agentqtmp_prefix"*) agentqtmp_id=${agentqtmp_with_id#"$agentqtmp_prefix"} ;;
+                    *) agentqtmp_id='' ;;
+                esac
+                # Skip the file ONLY when it IS a well-formed temp record
+                # owned by this server.  Anything else (including an old id
+                # that merely starts with the prefix) falls through to the id
+                # test below and is quarantined.
+                agentqtmp_is_temp=false
+                case "$agentqtmp_random" in
+                    ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]*) ;;
+                    *) agentqtmp_is_temp=true ;;
+                esac
+                if [ "$agentqtmp_is_temp" = true ]; then
+                    case "$agentqtmp_with_id" in
+                        '') agentqtmp_is_temp=false ;;
+                    esac
+                fi
+                if [ "$agentqtmp_is_temp" = true ]; then
+                    case "$agentqtmp_pid" in
+                        ''|*[!0123456789]*) agentqtmp_is_temp=false ;;
+                    esac
+                fi
+                if [ "$agentqtmp_is_temp" = true ]; then
+                    case "$agentqtmp_with_id" in
+                        .agentqtmp) agentqtmp_is_temp=false ;;
+                    esac
+                fi
+                if [ "$agentqtmp_is_temp" = true ] &&
+                    is_request_id "$agentqtmp_id"; then
+                    continue
+                fi
+                ;;
         esac
         # A hidden record's filename is `<id>.json` with the id's own leading
         # dot spelling the dot of the hidden name, so the id is `.<stem>`.
-        id=".${name#.}"
+        if [ "${name#.}" != "$name" ]; then
+            id=".${name#.}"
+        else
+            id=$name
+        fi
         id=${id%.json}
         is_request_id "$id" && continue
         is_legacy_request_id "$id" || continue
         if [ ! -d "$quarantine_directory" ]; then
-            mkdir -p -- "$quarantine_directory" ||
+            # 0700, like every other directory that holds request data: a
+            # record carries the user label and the working directory, and the
+            # request directories themselves are chmod 700.  A bare `mkdir -p`
+            # inherits the caller's umask (022 in practice) and would publish
+            # the orphans to every local user (measured 2026-11-09: the
+            # quarantine directory came out 0755 next to a 0700 parent).
+            ( umask 077; mkdir -p -- "$quarantine_directory" ) ||
                 fail "cannot create the AgentQ $kind quarantine directory: $quarantine_directory"
         fi
-        mv -f -- "$file" "$quarantine_directory/$name" ||
-            fail "cannot quarantine a legacy AgentQ $kind record: $file"
+        # NEVER overwrite: a previous run's copy, or a same-named record from a
+        # different id family, would be silently destroyed by `mv -f` (measured
+        # 2026-11-09: a seeded `.legacy-orphans/.aaaaaaaaaaaaaaa.json` was
+        # replaced by the incoming file).  The filename carries no information
+        # the operator needs beyond the id, so a collision gets a numeric suffix
+        # and both bodies survive.
+        target="$quarantine_directory/$name"
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            local suffix=1
+            while [ -e "$quarantine_directory/$name.$suffix" ] ||
+                [ -L "$quarantine_directory/$name.$suffix" ]; do
+                suffix=$((suffix + 1))
+            done
+            target="$quarantine_directory/$name.$suffix"
+        fi
+        # Two lock-free readers can enumerate the same legacy file; losing the
+        # rename just means the other side quarantined it.  Treat a vanished
+        # SOURCE as success -- the same rule the record readers use -- or a
+        # concurrent `status` would exit 2 with protocol_error (Codex review
+        # 2026-11-09; the race is code-confirmed, not measured).
+        if ! mv -- "$file" "$target"; then
+            if [ -e "$file" ] || [ -L "$file" ]; then
+                fail "cannot quarantine a legacy AgentQ $kind record: $file"
+            fi
+        fi
     done
     shopt -u nullglob
 }
@@ -5272,6 +5364,35 @@ compact_log() {
     require_runtime_temporary_file "$compact_log_raw_file"
     validate_pueue_log_shape_in_file "$compact_log_raw_file"
 
+    # The identity check runs BEFORE the missing-log branch: that branch
+    # answers `{task, output: ""}` / exit 0 from the `$task` snapshot taken
+    # BEFORE this read, so a numeric id reused between the two reads would have
+    # returned the OLD task's metadata for the NEW one (which is still Queued
+    # and therefore has no log yet -- exactly when this branch fires).  Codex
+    # review 2026-11-09; the window needs a concurrent remove+submit of the same
+    # id, so it is reported as code-confirmed, not measured.
+    if [ -n "$expected_created_at" ] &&
+        ! require_runtime_temporary_file "$compact_log_raw_file"; then
+        cleanup_compact_log_raw_file || return 1
+        return 1
+    fi
+    if [ -n "$expected_created_at" ] && ! jq -e \
+        --arg id "$task_id" \
+        --arg expected_created_at "$expected_created_at" \
+        'def canonical_integer_string:
+            tostring
+            | sub("^0+"; "")
+            | if . == "" then "0" else . end;
+        (.[$id].task.id | canonical_integer_string) == ($id | canonical_integer_string)
+        and .[$id].task.created_at == $expected_created_at' \
+        < "$compact_log_raw_file" >/dev/null; then
+        jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+        printf '%s: task %s changed identity while reading logs; the log is unavailable\n' "$program" "$task_id" >&2
+        command_status=6
+        cleanup_compact_log_raw_file || command_status=1
+        return "$command_status"
+    fi
+
     # A task whose log FILE does not exist -- still Queued, or finished with its
     # log rotated away -- makes Pueue answer exit 0 with `output` set to its own
     # diagnostic:
@@ -5339,28 +5460,6 @@ compact_log() {
             fi
             return 0
         fi
-    fi
-
-    if [ -n "$expected_created_at" ] &&
-        ! require_runtime_temporary_file "$compact_log_raw_file"; then
-        cleanup_compact_log_raw_file || return 1
-        return 1
-    fi
-    if [ -n "$expected_created_at" ] && ! jq -e \
-        --arg id "$task_id" \
-        --arg expected_created_at "$expected_created_at" \
-        'def canonical_integer_string:
-            tostring
-            | sub("^0+"; "")
-            | if . == "" then "0" else . end;
-        (.[$id].task.id | canonical_integer_string) == ($id | canonical_integer_string)
-        and .[$id].task.created_at == $expected_created_at' \
-        < "$compact_log_raw_file" >/dev/null; then
-        jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
-        printf '%s: task %s changed identity while reading logs; the log is unavailable\n' "$program" "$task_id" >&2
-        command_status=6
-        cleanup_compact_log_raw_file || command_status=1
-        return "$command_status"
     fi
 
     require_runtime_temporary_file "$compact_log_raw_file"

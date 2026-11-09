@@ -199,7 +199,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFOR
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.26"
+$script:ClientVersion = "0.1.27"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's argv limit, not this machine's platform: a unix
 # target takes up to 100000 base64 characters (the POSIX twin's MAX_ARG_STRLEN
@@ -479,7 +479,14 @@ function Test-TaskIdMatch {
 function Test-RequestId {
     param([string]$Value)
 
-    return (($Value -match '^[A-Za-z0-9][A-Za-z0-9._-]{15,127}$'))
+    # `-cmatch` and `\A`/`\z`, not `-match` and `^`/`$`:
+    #  * `-match` is case-INSENSITIVE by language rule, so U+212A (KELVIN SIGN)
+    #    and U+0130 (LATIN CAPITAL I WITH DOT ABOVE) satisfied `[A-Za-z]` and
+    #    the id went on to ssh while the POSIX twin and the server refused it
+    #    (measured 2026-11-09 on pwsh 7.5.4).
+    #  * `$` also matches BEFORE a trailing newline, so 16 letters plus LF
+    #    passed; POSIX `case` and the server's byte set reject it.
+    return (($Value -cmatch '\A[A-Za-z0-9][A-Za-z0-9._-]{15,127}\z'))
 }
 
 function Read-AgentQConfigFile {
@@ -3329,13 +3336,13 @@ switch ($operation) {
             }
         }
         if ([string]::IsNullOrEmpty($workdir) -or
-            ($workdir -match '^\s*$')) {
-            # Only empty means absent on the twin, but pure whitespace is
-            # refused HERE too: with `-n` alone POSIX sent it to ssh and the
-            # server's `working directory must be absolute` never reached the
-            # caller (measured 2026-11-09).  IsNullOrWhiteSpace originally
-            # refused locally while POSIX did not -- the fix aligns the OUTCOME
-            # (local refusal, exit 2, same message) rather than the predicate.
+            ($workdir -match '^[ \t\n\r\f\v]*$')) {
+            # ASCII whitespace only, spelled explicitly: .NET `\s` also matches
+            # U+0085, NBSP and U+3000, while the POSIX twin's `[[:space:]]`
+            # followed the locale and never matched U+0085 -- so the same argv
+            # got opposite answers depending on the caller's locale (measured
+            # 2026-11-09).  Both twins use this ASCII set; anything else is a
+            # value and the server rejects it as a non-absolute path.
             Stop-AgentQ "--workdir is required"
         }
         if ($stdinScript) {
