@@ -199,7 +199,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFOR
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.25"
+$script:ClientVersion = "0.1.26"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's argv limit, not this machine's platform: a unix
 # target takes up to 100000 base64 characters (the POSIX twin's MAX_ARG_STRLEN
@@ -3328,7 +3328,14 @@ switch ($operation) {
                 }
             }
         }
-        if ([string]::IsNullOrWhiteSpace($workdir)) {
+        if ([string]::IsNullOrEmpty($workdir) -or
+            ($workdir -match '^\s*$')) {
+            # Only empty means absent on the twin, but pure whitespace is
+            # refused HERE too: with `-n` alone POSIX sent it to ssh and the
+            # server's `working directory must be absolute` never reached the
+            # caller (measured 2026-11-09).  IsNullOrWhiteSpace originally
+            # refused locally while POSIX did not -- the fix aligns the OUTCOME
+            # (local refusal, exit 2, same message) rather than the predicate.
             Stop-AgentQ "--workdir is required"
         }
         if ($stdinScript) {
@@ -3340,7 +3347,12 @@ switch ($operation) {
                 Stop-AgentQ "submit requires a command after --, or --stdin-script with the script on standard input"
             }
         }
-        if ([string]::IsNullOrWhiteSpace($requestId)) {
+        if ([string]::IsNullOrEmpty($requestId)) {
+            # IsNullOrEmpty, not IsNullOrWhiteSpace: same reasoning as workdir
+            # above -- POSIX tests `[ -z ]` so `--request-id ' '` falls through
+            # to Test-RequestId and fails, while IsNullOrWhiteSpace silently
+            # generates a new GUID and submits (measured 2026-11-09: POSIX 2 /
+            # Windows 255).
             $requestId = "aq-" + ([Guid]::NewGuid().ToString("N"))
         }
         if (!(Test-RequestId -Value $requestId)) {

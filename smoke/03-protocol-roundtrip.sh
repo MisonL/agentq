@@ -1110,6 +1110,41 @@ grep -q 'reason=protocol_error' "$work/empty-label.err" || {
     exit 1
 }
 
+# `is_request_id` promises "start with a letter or number" in its MESSAGE, and
+# until 2026-11-09 neither the server nor the POSIX client enforced it: the
+# leading-character arm was `[!class]` with no `*`, which only matches a
+# one-character string.  A leading dot is worse than cosmetic -- the record path
+# becomes `$request_directory/.<id>.json`, a HIDDEN file that every `*.json`
+# glob in this server skips (`dotglob` is off), so the request could never be
+# archived or repaired.  Both entry points (submit and lookup) must refuse it
+# with the documented message and reason.
+for invalid_rid in '.aaaaaaaaaaaaaaa' '_aaaaaaaaaaaaaaa' '-aaaaaaaaaaaaaaa'; do
+    for entry in submit lookup; do
+        invalid_rid_status=0
+        if [ "$entry" = submit ]; then
+            "$server" submit --workdir "$work" --request-id "$invalid_rid" -- sh -c true \
+                >"$work/invalid-rid.out" 2>"$work/invalid-rid.err" || invalid_rid_status=$?
+        else
+            "$server" lookup "$invalid_rid" >"$work/invalid-rid.out" 2>"$work/invalid-rid.err" || invalid_rid_status=$?
+        fi
+        if [ "$invalid_rid_status" -ne 2 ]; then
+            printf '%s accepted a request id starting with %s (exit %s)\n' \
+                "$entry" "${invalid_rid%"${invalid_rid#?}"}" "$invalid_rid_status" >&2
+            exit 1
+        fi
+        grep -q 'start with a letter or number' "$work/invalid-rid.err" || {
+            printf '%s did not name the leading-character rule for %s: %s\n' \
+                "$entry" "$invalid_rid" "$(head -1 "$work/invalid-rid.err")" >&2
+            exit 1
+        }
+        grep -q 'reason=protocol_error' "$work/invalid-rid.err" || {
+            printf '%s carried the wrong reason class for %s: %s\n' \
+                "$entry" "$invalid_rid" "$(tail -1 "$work/invalid-rid.err")" >&2
+            exit 1
+        }
+    done
+done
+
 # Positive control: a label that merely CONTAINS the string is not reserved.
 contains_label_request_id="${request_id}-cont"
 if ! contains_submit=$("$server" submit --workdir "$work" --label 'my-agentq:thing' \

@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.25'
+agentq_client_version='0.1.26'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072); a Windows target re-encodes
 # argv onto a CreateProcess command line capped at 32767 characters, and the
@@ -651,6 +651,13 @@ resolve_credential_source() {
         # It is accepted because the user asked for it, and because it is
         # strictly better than a plaintext file on disk -- but it is NOT
         # protected, and the documentation says so.
+        # The same-source ambiguity the ASKPASS branch refuses applies here:
+        # PROMPT is unreachable once a password exists, so a caller with both
+        # set would believe the terminal prompt was the source (measured
+        # 2026-11-09; the Windows twin refuses either way).
+        if [ -n "${AGENTQ_PASSWORD_PROMPT:-}" ]; then
+            credential_refuse 'AGENTQ_PASSWORD and AGENTQ_PASSWORD_PROMPT are both set; set only one'
+        fi
         agentq_credential_source=password
         return 0
     fi
@@ -2092,8 +2099,15 @@ is_bounded_positive_integer() {
 # host's bash and went on to SSH, while the Windows twin refused it and the
 # documented contract says ASCII.  The explicit list is locale-proof.
 is_request_id() {
+    # Same shape as the server's copy (they must accept the same set).  The
+    # leading-character arm is `[!class]*`: the first bracket tests every
+    # character, the second one only rejects a one-character string.  Without
+    # the `*` the message said `start with a letter or number` while
+    # `.aaaaaaaaaaaaaaa` and `-aaaaaaaaaaaaaaa` went on to SSH (measured
+    # 2026-11-09; the Windows twin already refused them).
     case "$1" in
-        ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-]*|[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]) return 1 ;;
+        ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-]*) return 1 ;;
+        [!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]*) return 1 ;;
     esac
 
     [ "${#1}" -ge 16 ] && [ "${#1}" -le 128 ]
@@ -4457,6 +4471,19 @@ case "$operation" in
                     # server refuses it too; the local check keeps the twin's
                     # answer identical without a round trip.
                     [ -n "$2" ] || fail '--label must not be empty'
+                    # `agentq:<request-id>` is AgentQ's own Pueue label
+                    # namespace; a user label with that prefix makes
+                    # `remove --label` unable to tell the two apart (measured
+                    # 2026-11-07: the task whose user label equalled another
+                    # task's raw label got deleted instead).  Checked HERE, in
+                    # the parse arm, not after the loop: the Windows twin checks
+                    # inside its "--label" arm, so a compound-invalid argv
+                    # (`--label agentq:x` with no --workdir) names this error
+                    # on BOTH clients instead of the twin disagreeing about
+                    # which fault to report (measured 2026-11-09).
+                    case "$2" in
+                        agentq:*) fail 'label cannot start with the reserved prefix agentq:' ;;
+                    esac
                     label=$2
                     shift 2
                     ;;
@@ -4478,7 +4505,16 @@ case "$operation" in
                     ;;
             esac
         done
-        [ -n "$workdir" ] || fail '--workdir is required'
+        # Whitespace-only is refused here for the same reason the Windows twin
+        # refuses it: an empty `--workdir` reaches ssh once and is rejected by
+        # the server as `working directory must be absolute`, and that message
+        # is not forwarded -- so the caller got exit 255 and no explanation
+        # (measured 2026-11-09; the twin already refused this locally).  The
+        # value is not otherwise trimmed.
+        case "$workdir" in
+            *[![:space:]]*) ;;
+            *) fail '--workdir is required' ;;
+        esac
         if [ "$stdin_script" = true ]; then
             [ "$#" -eq 0 ] || fail 'submit --stdin-script takes the script from standard input; drop the command after --'
         else
@@ -4488,15 +4524,6 @@ case "$operation" in
             request_id=$(generate_request_id)
         fi
         is_request_id "$request_id" || fail '--request-id must be 16-128 ASCII letters, numbers, dots, underscores, or hyphens and start with a letter or number'
-        # `agentq:<request-id>` is AgentQ's own Pueue label namespace; a user
-        # label with that prefix makes `remove --label` unable to tell the two
-        # apart (measured 2026-11-07: the task whose user label equalled another
-        # task's raw label got deleted instead).  The server refuses it too; the
-        # local check exists so the Windows twin answers identically without a
-        # round trip (smoke/12 compares the two).
-        case "$label" in
-            agentq:*) fail 'label cannot start with the reserved prefix agentq:' ;;
-        esac
 
         initialize_remote_invocation
         append_arg submit

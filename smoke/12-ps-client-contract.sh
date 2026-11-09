@@ -518,6 +518,13 @@ twin_table='0|agentq 0.1.|--version
 2|SSH host must not begin with a hyphen|--host -evil status
 2|label cannot start with the reserved prefix agentq:|submit --workdir /tmp --label agentq:x --request-id smokeclient00000001 -- true
 2|label cannot start with the reserved prefix agentq:|remove --label agentq:x --confirm
+2|label cannot start with the reserved prefix agentq:|submit --label agentq:x --request-id bad
+2|label cannot start with the reserved prefix agentq:|submit --label agentq:x --workdir /tmp
+2|start with a letter or number|submit --workdir /tmp --request-id .aaaaaaaaaaaaaaa -- true
+2|start with a letter or number|submit --workdir /tmp --request-id _aaaaaaaaaaaaaaa -- true
+2|start with a letter or number|submit --workdir /tmp --request-id -aaaaaaaaaaaaaaa -- true
+2|--request-id must be 16-128|submit --workdir /tmp --request-id . -- true
+255||submit --workdir /tmp --request-id Aaaaaaaaaaaaaaaa -- true
 255||submit --workdir /tmp --label my-agentq:thing --request-id smokeclient00000001 -- true'
 twin_table_rows=$(grep -c . <<< "$twin_table")
 twin_rows=0
@@ -591,6 +598,39 @@ if [ -n "$twin_empty_label_problems" ]; then
     head -2 "$work/twin-p.err" "$work/twin-w.err" >&2 || true
     failures=$((failures + 1))
 fi
+
+# --- whitespace-only ARGV values: the same direct-pair need -------------------
+# `--request-id ' '` / `--workdir ' '` cannot go in the table for the same
+# reason.  Measured 2026-11-09, before the fix: POSIX refused the whitespace
+# request id (2) while the twin silently generated a GUID and reached ssh (255);
+# POSIX sent the whitespace workdir to ssh (255) while the twin refused (2).
+# Both are now local refusals with the same message, so the pair must agree on
+# BOTH the exit code and the fragment.  Reuses twin_run_pair so the environment
+# (AGENTQ_HOST included) is identical to the table's -- a first draft that set
+# its own env forgot the host and both sides failed for the wrong reason.
+for twin_ws_argv_kind in request-id workdir; do
+    cases=$((cases + 1))
+    if [ "$twin_ws_argv_kind" = request-id ]; then
+        twin_run_pair "$twin_posix" submit --workdir /tmp --request-id ' ' -- true
+        twin_ws_argv_fragment='--request-id must be 16-128'
+    else
+        twin_run_pair "$twin_posix" submit --workdir ' ' --request-id smokeclient00000001 -- true
+        twin_ws_argv_fragment='--workdir is required'
+    fi
+    twin_ws_argv_problems=''
+    [ "$twin_p_status" -eq 2 ] || twin_ws_argv_problems="$twin_ws_argv_problems posix-exit=$twin_p_status"
+    [ "$twin_w_status" -eq 2 ] || twin_ws_argv_problems="$twin_ws_argv_problems windows-exit=$twin_w_status"
+    grep -qF -- "$twin_ws_argv_fragment" "$work/twin-p.err" \
+        || twin_ws_argv_problems="$twin_ws_argv_problems posix-missing-message"
+    { flatten_err "$work/twin-w.err"; cat "$work/twin-w.out"; } > "$work/twin-w.combined"
+    grep -qF -- "$twin_ws_argv_fragment" "$work/twin-w.combined" \
+        || twin_ws_argv_problems="$twin_ws_argv_problems windows-missing-message"
+    if [ -n "$twin_ws_argv_problems" ]; then
+        printf 'ps-client twin [whitespace %s]:%s\n' "$twin_ws_argv_kind" "$twin_ws_argv_problems" >&2
+        head -2 "$work/twin-p.err" "$work/twin-w.err" >&2 || true
+        failures=$((failures + 1))
+    fi
+done
 
 # --- the host VALUE's shape: argv cannot carry a whitespace-only word ---------
 # `read -ra` word-splits, so the table above can express `--host -x` but never

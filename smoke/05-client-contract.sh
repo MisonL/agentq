@@ -296,6 +296,33 @@ expect_rejected 'label cannot start with the reserved prefix agentq:' \
 # 2026-11-07: the client accepted it and reached ssh).
 expect_rejected '--label must not be empty' \
     submit --workdir /tmp --label '' --request-id smokeclient00000001 -- true
+# `is_request_id` is a two-arm glob: the `*` before `]` rejects any disallowed
+# CHARACTER, the second arm (now `[!class]*`) rejects a bad FIRST character.
+# Without the trailing `*` the second arm only matched a one-character string,
+# so `.aaaaaaaaaaaaaaa` / `_aaaaaaaaaaaaaaa` / `-aaaaaaaaaaaaaaa` passed here
+# and on the server while the Windows twin refused them.  A leading dot also
+# created a HIDDEN `.id.json` record invisible to every `*.json` scan (measured
+# 2026-11-09; the request could never be archived or repaired).
+for leading_dot_id in '.aaaaaaaaaaaaaaa' '_aaaaaaaaaaaaaaa' '-aaaaaaaaaaaaaaa'; do
+    expect_rejected 'start with a letter or number' \
+        submit --workdir /tmp --request-id "$leading_dot_id" -- true
+    expect_rejected 'start with a letter or number' \
+        lookup "$leading_dot_id"
+done
+# Whitespace-only argv values must NOT get a free SSH round trip: POSIX used
+# `[ -n "$workdir" ]` and the server's "must be absolute" never reaches the
+# caller.  The Windows side uses the same local refusal (smoke/12 twin table).
+expect_rejected '--workdir is required' \
+    submit --workdir ' ' --request-id smokeclient00000001 -- true
+expect_rejected '--workdir is required' \
+    submit --workdir "$(printf '\t')" --request-id smokeclient00000001 -- true
+# The reserved prefix is checked in the parse ARM, not after the loop: with
+# compound-invalid argv the twin names THIS fault first (measured 2026-11-09:
+# the post-loop check let `--workdir is required` win).
+expect_rejected 'label cannot start with the reserved prefix agentq:' \
+    submit --label agentq:x --request-id bad
+expect_rejected 'label cannot start with the reserved prefix agentq:' \
+    submit --label agentq:x --workdir /tmp
 # `status --summary` is no longer a local error: the client forwards it and
 # validates the summary shape (asserted below against ssh-modes).
 # --version and --help are local: they must answer before any SSH round trip.
@@ -2064,6 +2091,12 @@ expect_env_rejected 'AGENTQ_ASKPASS must be a regular file' 'askpass is a direct
     AGENTQ_ASKPASS="$work/bin"
 expect_env_rejected 'set only one' 'both sources set' \
     AGENTQ_ASKPASS="$work/askpass-ok" AGENTQ_PASSWORD=both
+# The PASSWORD+PROMPT cell: the ASKPASS branch refuses its two combinations, but
+# the password branch used to take precedence silently, so `PASSWORD_PROMPT`
+# was dead code and the caller believed the prompt was the source (measured
+# 2026-11-09: exit 255, ssh attempted).  The Windows twin refuses either way.
+expect_env_rejected 'set only one' 'password and prompt both set' \
+    AGENTQ_PASSWORD=both AGENTQ_PASSWORD_PROMPT=1
 expect_env_rejected 'AGENTQ_PASSWORD_PROMPT must be 1' 'bad prompt value' \
     AGENTQ_PASSWORD_PROMPT=2
 # No terminal here, so the prompt source must refuse rather than let ssh fall

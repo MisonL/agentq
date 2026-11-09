@@ -116,8 +116,9 @@ remove <task-id>
 doctor
 ```
 
-退出码（`0`–`6` 由 `agentq-server` 产生，`42-45` 与 `124` 由客户端产生；
-服务端本身永远不会返回 `42-45`）：
+退出码（`0`–`6` 由 `agentq-server` 产生——**例外**：`wait` 的客户端预算
+耗尽时两份客户端都本地产 `6`（`wait budget … elapsed`，任务可能仍在跑）；
+`42-45` 与 `124` 由客户端产生；服务端本身永远不会返回 `42-45`）：
 
 | 码 | 含义 |
 | ---: | --- |
@@ -127,7 +128,7 @@ doctor
 | `3` | `lookup` 的 `not_found` / `not_started`——**都不是完成结果**，只可用相同参数与相同 request ID 重试 |
 | `4` | `ambiguous` 或 `removing` / `cancellation_pending`——服务端无法安全判断，**必须停止**，不得自动重试 |
 | `5` | 已移除（`wait`/`lookup` 的 `state: "removed"`；tombstone 保留期内可重复读到，不是一次性） |
-| `6` | 无法给出可信答案（`state: "unavailable"`）：`wait` 是终态不可确认；`logs` 是任务身份歧义或**任务已终态但日志文件不可用**；`status --task` 是任务身份歧义（0.1.24 起三者对同一状态给同一答案） |
+| `6` | 无法给出可信答案（`state: "unavailable"`）：`wait` 是终态不可确认（含**客户端预算耗尽**）；`logs` 是任务身份歧义或**任务已终态但日志文件不可用**；`status --task` 是任务身份歧义（0.1.24 起三者对同一状态给同一答案） |
 | `42-45` | Windows launcher（`agentq.ps1` / `sshp` 客户端） |
 | `124` | 平台探测超时（客户端） |
 

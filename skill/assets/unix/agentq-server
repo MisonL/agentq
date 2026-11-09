@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.25'
+agentq_version='0.1.26'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -609,8 +609,34 @@ is_positive_integer() {
 # was ACCEPTED here (exit 3) while the documented contract is 16-128 ASCII
 # characters -- the same input the Windows client refuses with exit 2.
 is_request_id() {
+    # The FIRST bracket is a glob (`*` before the closing `]`), so it tests
+    # every character; the SECOND is a single-character class and would only
+    # ever match a one-character string -- it was meant to be the leading-
+    # character rule but had no `*`, so `START with a letter or number` was
+    # accepted from nobody and `.aaaaaaaaaaaaaaa` / `-aaaaaaaaaaaaaaa` /
+    # `_aaaaaaaaaaaaaaa` all passed.  Measured 2026-11-09: the POSIX client and
+    # this server accepted a leading dot while the Windows twin refused it, and
+    # a leading dot is not cosmetic -- request_record_path writes
+    # `$request_directory/.<id>.json`, which every `"$request_directory"/*.json`
+    # glob in this file (load_request_records, repair_removed_request_records,
+    # the wait/lookup scan) cannot see because `dotglob` is off.  That record
+    # would never be archived or repaired.  Both arms now spell the rule out.
     case "$1" in
-        ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-]*|[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]) return 1 ;;
+        ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-]*) return 1 ;;
+        [!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]*) return 1 ;;
+    esac
+
+    [ "${#1}" -ge 16 ] && [ "${#1}" -le 128 ]
+}
+
+# The PRE-0.1.26 id rule: same charset and length, but WITHOUT the
+# leading-character arm (the arm existed only in the message; see the note on
+# is_request_id).  Used ONLY to recognise records written by an older
+# deployment so they can be quarantined instead of bricking every scan -- never
+# to admit new input.
+is_legacy_request_id() {
+    case "$1" in
+        ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-]*) return 1 ;;
     esac
 
     [ "${#1}" -ge 16 ] && [ "${#1}" -le 128 ]
@@ -1953,6 +1979,13 @@ remove_stale_lock() {
 }
 
 run_pueue() {
+    # Pueue's OWN stderr never reaches the caller: the client reads the
+    # server's stderr for `reason=<class>` and keeps the LAST match
+    # (`agentq:1756`), so any pueue text shaped like `x: reason=...` could
+    # displace the real class, and on success paths the text is unexplained
+    # noise.  stdout is untouched.  Every call site that needs to say WHY
+    # pueue failed prints its own message (that is what the callers' `if !`
+    # branches are for); this funnel merely stops the raw text escaping.
     case "$platform_kind" in
         windows)
             env -i \
@@ -1974,7 +2007,7 @@ run_pueue() {
                 MSYSTEM="$agentq_msystem" \
                 MSYS_NO_PATHCONV=1 \
                 PATH="$agentq_windows_path" \
-                "$pueue_bin" --config "$pueue_config_path" "$@"
+                "$pueue_bin" --config "$pueue_config_path" "$@" 2>/dev/null
             ;;
         unix)
             # `id -un` is only a fallback for USER/LOGNAME, which ssh command
@@ -1991,7 +2024,7 @@ run_pueue() {
                 PATH="$PATH" \
                 SHELL="${SHELL:-/bin/sh}" \
                 LANG="${LANG:-C.UTF-8}" \
-                "$pueue_bin" --config "$config_path" "$@"
+                "$pueue_bin" --config "$config_path" "$@" 2>/dev/null
             ;;
     esac
 }
@@ -3654,6 +3687,7 @@ repair_removed_request_records() {
 migrate_removed_request_records() {
     local marker_value=''
 
+    quarantine_legacy_request_records
     if [ -e "$request_layout_marker" ] || [ -L "$request_layout_marker" ]; then
         runtime_marker_file_is_safe "$request_layout_marker" || fail "invalid AgentQ request layout marker: $request_layout_marker"
         runtime_marker_file_is_safe "$request_layout_marker" || fail "invalid AgentQ request layout marker: $request_layout_marker"
@@ -3698,11 +3732,79 @@ prune_request_tombstones() {
 }
 
 ensure_request_record_layout() {
+    quarantine_legacy_request_records
     prune_runtime_temporary_files
     prune_request_temporary_files
     prune_cancellation_temporary_files
     migrate_removed_request_records
     prune_request_tombstones
+}
+
+# The PRE-0.1.26 rule accepted request ids that started with a dot, and the
+# record for one of those lives at `$request_directory/.<id>.json` -- a HIDDEN
+# file, invisible to every `"$request_directory"/*.json` walk (dotglob is off),
+# so it was never archived or repaired.  Underscore- and hyphen-led ids were
+# visible but are just as illegal now.  Such a record can never be addressed
+# again (every entry point validates the CURRENT rule), but it must not brick
+# the server: `prune_request_temporary_files` treats every `.*.json` as a temp
+# file and FAILS on a name it cannot parse, and the record/tombstone scans fail
+# on a filename id that no longer validates -- one leftover made EVERY operation
+# exit 2 (measured 2026-11-09 in the sandbox: an old-server probe left
+# `.aaaaaaaaaaaaaaa.json` behind and the fixed server refused `lookup` with
+# `invalid ... temporary process id`).
+#
+# So move them, bytes intact, into `$directory/.legacy-orphans/`.  Nothing
+# scans that subdirectory (every walk here globs one level and needs a `.json`
+# SUFFIX), the data is still on disk for the operator, and no live code path
+# has to learn to skip ids it can no longer address.  `agentqtmp.*` names are
+# exempt: those are this server's temporary records and the pruner owns them.
+quarantine_legacy_request_records() {
+    quarantine_legacy_request_records_in_directory "$request_directory" request
+    quarantine_legacy_request_records_in_directory "$request_tombstone_directory" tombstone
+}
+
+quarantine_legacy_request_records_in_directory() {
+    local directory=$1
+    local kind=$2
+    local file
+    local name
+    local id
+    local quarantine_directory
+
+    [ -d "$directory" ] || return 0
+    quarantine_directory="$directory/.legacy-orphans"
+    shopt -s nullglob
+    for file in "$directory"/*.json; do
+        name=${file##*/}
+        id=${name%.json}
+        is_request_id "$id" && continue
+        is_legacy_request_id "$id" || continue
+        if [ ! -d "$quarantine_directory" ]; then
+            mkdir -p -- "$quarantine_directory" ||
+                fail "cannot create the AgentQ $kind quarantine directory: $quarantine_directory"
+        fi
+        mv -f -- "$file" "$quarantine_directory/$name" ||
+            fail "cannot quarantine a legacy AgentQ $kind record: $file"
+    done
+    for file in "$directory"/.*.json; do
+        name=${file##*/}
+        case "$name" in
+            .agentqtmp.*) continue ;;
+        esac
+        # A hidden record's filename is `<id>.json` with the id's own leading
+        # dot spelling the dot of the hidden name, so the id is `.<stem>`.
+        id=".${name#.}"
+        id=${id%.json}
+        is_request_id "$id" && continue
+        is_legacy_request_id "$id" || continue
+        if [ ! -d "$quarantine_directory" ]; then
+            mkdir -p -- "$quarantine_directory" ||
+                fail "cannot create the AgentQ $kind quarantine directory: $quarantine_directory"
+        fi
+        mv -f -- "$file" "$quarantine_directory/$name" ||
+            fail "cannot quarantine a legacy AgentQ $kind record: $file"
+    done
+    shopt -u nullglob
 }
 
 request_payload() {
@@ -5158,7 +5260,10 @@ compact_log() {
     else
         # `pueue log` failing is a general failure, not a contract code; passing
         # pueue's own exit code through could surface 42-45/124 from the server
-        # (see the submit/wait/remove sites).
+        # (see the submit/wait/remove sites).  Its stderr is suppressed by
+        # run_pueue (the client's reason scanner would otherwise read it), so
+        # print one diagnostic HERE: a silent exit 1 is not an answer.
+        printf '%s: Pueue could not read the log for task %s\n' "$program" "$task_id" >&2
         cleanup_compact_log_raw_file || true
         return 1
     fi
