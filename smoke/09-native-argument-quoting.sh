@@ -50,9 +50,40 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+ps_assets=${AGENTQ_SMOKE_PS_DIR:-$root/skill/assets}
 work_violations=$(mktemp "${TMPDIR:-/tmp}/agentq-smoke-nativearg.XXXXXX")
 work_hits=$(mktemp "${TMPDIR:-/tmp}/agentq-smoke-nativearg-hits.XXXXXX")
-trap 'rm -f -- "$work_violations" "$work_hits"' EXIT
+work_dir=$(mktemp -d "${TMPDIR:-/tmp}/agentq-smoke-nativearg-dir.XXXXXX")
+trap 'rm -f -- "$work_violations" "$work_hits"; rm -rf -- "$work_dir"' EXIT
+
+# QUOTED FLAGS (2026-11-10).  PowerShell accepts `-c`, `'-c'` and `"-c"`; the
+# flag is a string literal like any other.  The first version of this scan
+# only matched the bare spelling, so a site written as
+# `& $bash --noprofile --norc '-c' "$cmd"` was never FOUND -- it is the same
+# word-splitting defect, just spelled through a quote.  The flag set is now one
+# variable used by the grep, by the extraction `sed`, and by the base64-channel
+# test, so the three cannot drift apart.
+flag_ere='(-l?c|'"'"'-l?c'"'"'|"-l?c")'
+
+# Self-test: the scan must recognise every spelling it claims to cover -- a
+# `''`- and a `""`-quoted flag as well as the bare one -- because the grep is
+# the door: a spelling it does not match is a site it never reports.  What it
+# does with the matched line (classify the argument) is covered by the existing
+# `case` arms and by `sites` in the summary.
+st_dir=$work_dir/self-test
+mkdir -p "$st_dir"
+cat >"$st_dir/f.ps1" <<'ST_FIXTURE'
+& $GitBashPath --noprofile --norc -c $a
+& $GitBashPath --noprofile --norc '-c' $b
+& $GitBashPath --noprofile --norc "-c" $c
+& $GitBashPath --noprofile --norc -lc $d
+& $GitBashPath --noprofile --norc '-lc' $e
+ST_FIXTURE
+st_hits=$(grep -nE "&[[:space:]]*\\\$[A-Za-z_][A-Za-z0-9_]*.*[[:space:]]$flag_ere[[:space:]]" "$st_dir/f.ps1" 2>/dev/null | wc -l | tr -d ' ')
+if [ "$st_hits" -ne 5 ]; then
+    printf 'native-argument-quoting: the script-argument matcher found %s of 5 fixture spellings\n' "$st_hits" >&2
+    exit 1
+fi
 
 # crt_argc <string>
 #
@@ -132,7 +163,7 @@ violation() {
 files=0
 sites=0
 
-ps_files=$(find "$root/skill/assets" -name '*.ps1' -type f | sort)
+ps_files=$(find "$ps_assets" -name '*.ps1' -type f | sort)
 if [ -z "$ps_files" ]; then
     printf 'native-argument-quoting: no PowerShell assets found\n' >&2
     exit 1
@@ -148,7 +179,7 @@ for file in $ps_files; do
     # literal added to a helper call.
     hits=$(
         {
-            grep -nE '&[[:space:]]*\$[A-Za-z_][A-Za-z0-9_]*.*[[:space:]]-l?c[[:space:]]' "$file" 2>/dev/null || true
+            grep -nE "&[[:space:]]*\\\$[A-Za-z_][A-Za-z0-9_]*.*[[:space:]]$flag_ere[[:space:]]" "$file" 2>/dev/null || true
             grep -nE 'Invoke-GitBashScript[^|]*-Script[[:space:]]' "$file" 2>/dev/null || true
         } | sort -u
     )
@@ -162,7 +193,7 @@ for file in $ps_files; do
             text=${hit#*:}
             case $text in
             *'-Script'*) arg=${text#*-Script} ;;
-            *) arg=$(printf '%s' "$text" | sed -E 's/.*[[:space:]]-l?c[[:space:]]+//') ;;
+            *) arg=$(printf '%s' "$text" | sed -E "s/.*[[:space:]]$flag_ere[[:space:]]+//") ;;
             esac
             # Strip leading whitespace.
             arg=$(printf '%s' "$arg" | sed -E 's/^[[:space:]]+//')
@@ -238,25 +269,42 @@ for file in $ps_files; do
     fi
 
     # Any asset that passes scripts to bash must carry the base64 channel.
-    if grep -qE 'noprofile --norc -l?c[[:space:]]' "$file" 2>/dev/null; then
-        if ! grep -q 'base64 -d | bash' "$file" 2>/dev/null; then
+    # The pipeline ends `| base64 -d | bash` OR `| base64 -d | sh` (both are
+    # live in this repo -- the Windows client hands the launcher to `sh`), so
+    # the decoder test is `base64 -d` alone; a decoder that is not piped into a
+    # shell is caught by the "no base64 pipeline fed from..." rule below.
+    if grep -qE "noprofile --norc $flag_ere[[:space:]]" "$file" 2>/dev/null; then
+        if ! grep -q 'base64 -d' "$file" 2>/dev/null; then
             violation "$rel: passes a script to bash but has no base64 transfer helper" "(expected a 'printf %s <b64> | base64 -d | bash' channel)"
         fi
     fi
 
-    if grep -q 'base64 -d | bash' "$file" 2>/dev/null; then
+    if grep -q 'base64 -d' "$file" 2>/dev/null; then
         # The encoder must exist AND be fed from the script variable: an asset
         # can hold an unrelated ToBase64String (the installer does, for the
         # launcher payload), so presence alone proves nothing.
-        if ! grep -qE 'ToBase64String\([^)]*\$Script' "$file" 2>/dev/null; then
+        # Up to ONE level of nesting before the script variable: agentq.ps1
+        # writes `GetBytes($script)` (one paren), install-agentq.ps1 writes
+        # `GetBytes($Script)` inside `GetBytes($bytes.ToArray())` helpers.  A
+        # pattern that forbids `)` between the call and the variable flags the
+        # first and only accepts the second, which is the wrong way round.
+        # So the arm spans the whole statement instead: script variable at ANY
+        # bracket depth, stopping at `;` (grep is line-based anyway).
+        if ! grep -qE 'ToBase64String\([^;]*\$[Ss]cript' "$file" 2>/dev/null; then
             violation "$rel: has a base64 decoder but no encoder fed from the script variable" "(the raw script text would reach the command line)"
         fi
-        # And the pipeline must be fed from the ENCODED variable, not the
-        # script itself -- an encoder that exists but is not used is no channel.
-        if grep -qE '\$Script[[:space:]]*\|[[:space:]]*base64 -d' "$file" 2>/dev/null; then
-            violation "$rel: the base64 pipeline is fed from \$Script directly" "(the raw script reaches the command line)"
+        # And the pipeline must be fed from the ENCODED variable, not from the
+        # script or from a variable whose name says it is the script itself --
+        # an encoder that exists but is not used is no channel.  The encoder's
+        # OUTPUT variable is resolved from the ToBase64String assignment and
+        # that name is pinned as `$encoded`, so `| base64 -d | bash` must be
+        # fed by a name that is neither `$Script` nor `$script`.  (The earlier
+        # rule `<any var> | base64 -d | bash` accepted `$Script | …` on any
+        # file whose first alternative this one did not reach.)
+        if grep -qE '\$[Ss]cript[[:space:]]*\|[[:space:]]*base64 -d' "$file" 2>/dev/null; then
+            violation "$rel: the base64 pipeline is fed from the script text directly" "(the raw script reaches the command line)"
         fi
-        if ! grep -qE '\$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\|[[:space:]]*base64 -d \| bash' "$file" 2>/dev/null; then
+        if ! grep -qE '\$[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\|[[:space:]]*base64 -d \|[[:space:]]*(ba)?sh' "$file" 2>/dev/null; then
             violation "$rel: no base64 pipeline fed from an encoded variable" "(the raw script reaches the command line)"
         fi
     fi

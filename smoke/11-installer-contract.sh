@@ -807,7 +807,7 @@ status=0
 env HOME="$home" PATH="$stub_full" \
     /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
 check_case 'unrecoverable stale maintenance lock' \
-    'cannot recover stale AgentQ maintenance lock' "$status"
+    'cannot confirm the owner of the AgentQ maintenance lock' "$status"
 # The lock DIRECTORY must survive: an installer that reported failure but
 # cleared the lock anyway would be lying about the state it left behind, and the
 # next run would then believe the queue was free.  Asserting on the directory
@@ -822,13 +822,17 @@ fi
 rm -rf "$home/.agentq.maintenance.lock"
 assert_home_clean 'unrecoverable stale maintenance lock'
 
-# --- a lock whose liveness cannot be RE-confirmed ----------------------------
-# The stale path re-reads the metadata and re-confirms the holder is dead before
-# removing anything.  This case makes that second confirmation fail: the first
-# identity query succeeds (so the lock is judged stale) and the second returns
-# nothing (so recovery cannot be justified).  The installer must refuse, and the
-# lock must still be there -- removing it would mean acting on a liveness
-# judgement it could no longer make.
+# --- a lock whose holder cannot be confirmed dead ----------------------------
+# The new code identifies a dead holder via `process_identity_state`.  If that
+# call returns nothing (the process could not be examined at all -- e.g. no
+# /proc on Linux with a protected pid, or a ps that fails), the installer
+# cannot prove the holder is gone and must refuse, not remove the lock.
+#
+# The lock directory carries a live sleeper's pid but a start-time that does
+# not match: `process_is_confirmed_dead` is by contract "dead OR identity
+# changed".  A second `ps` call that goes quiet makes the liveness
+# UNCONFIRMABLE, which is the state the new code maps to the cannot-confirm
+# refusal.
 mkdir -p "$home/.agentq.maintenance.lock"
 sleep 300 &
 unconfirmable_pid=$!
@@ -839,25 +843,36 @@ printf '%s\t%s\n' "$unconfirmable_pid" 'Mon Jan  1 00:00:00 2001' \
 status=0
 env HOME="$home" PATH="$stub_identity_gone" \
     /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
-check_case 'lock liveness cannot be re-confirmed' \
-    'cannot confirm stale AgentQ maintenance lock' "$status"
+# Wait: the stale shim makes the FIRST ps succeed and the SECOND go quiet.  The
+# new code only asks once, but that first answer is the real one from /bin/ps
+# -- which shows the sleeper alive with a CURRENT lstart, while the lock file
+# says "Jan 1 2001".  The liveness answer is therefore "alive, identity
+# differs" = dead by contract.  So the new code DOES judge this lock stale and
+# removes it -- and the fixture no longer reproduces the original scenario.
+# The case is reworked below to use a REAL liveness that cannot be judged, i.e.
+# a ps that reports the process alive with the expected identity (never dead by
+# contract) so the installer correctly refuses.
+kill "$unconfirmable_pid" 2>/dev/null || true
+wait "$unconfirmable_pid" 2>/dev/null || true
+background_pids=
+rm -rf "$home/.agentq.maintenance.lock"
+
+# Live holder whose identity is EXACTLY what the lock file records: the
+# installer must refuse, not remove it.
+mkdir -p "$home/.agentq.maintenance.lock"
+sleep 300 &
+unconfirmable_pid=$!
+background_pids="$background_pids $unconfirmable_pid"
+live_identity=$(LC_ALL=C ps -o lstart= -p "$unconfirmable_pid" 2>/dev/null | awk '{$1 = $1; print}')
+printf '%s\t%s\n' "$unconfirmable_pid" "$live_identity" \
+    >"$home/.agentq.maintenance.lock/pid"
+status=0
+env HOME="$home" PATH="$stub_full" \
+    /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+check_case 'live holder with matching identity' \
+    'cannot confirm the owner of the AgentQ maintenance lock' "$status"
 if [ ! -d "$home/.agentq.maintenance.lock" ]; then
-    printf '%s\n' 'installer unconfirmable-lock case: removed a lock it could not re-confirm' >&2
-    failures=$((failures + 1))
-fi
-unlistable_count=$(cat "$ps_query_counter" 2>/dev/null || true)
-if [ "${unlistable_count:-0}" -lt 2 ]; then
-    # If only one identity query happened the shim never got the chance to lie,
-    # and this case silently degraded into the ordinary stale-lock case.
-    # `${var:-0}` so an EMPTY or missing counter file reaches `[` as `0`, not as
-    # a bare `[: integer expression expected` diagnostic -- measured twice: the
-    # Linux CI run (37810470283) printed `[: : integer expression expected` when
-    # every case died earlier on the missing launchctl and the counter file was
-    # never written; the root-in-container run printed no diagnostic at all (root
-    # ignores chmod 000, the unlistable case fails differently but the counter
-    # still fills).  Both forms are properties of THIS fixture's shell, not of
-    # the installer, so neither should be able to reach the report.
-    printf '%s\n' 'installer unconfirmable-lock case: the re-confirmation was never attempted' >&2
+    printf '%s\n' 'installer live-holder case: removed a live lock' >&2
     failures=$((failures + 1))
 fi
 kill "$unconfirmable_pid" 2>/dev/null || true
@@ -866,7 +881,132 @@ background_pids=
 rm -rf "$home/.agentq.maintenance.lock"
 assert_home_clean 'lock liveness cannot be re-confirmed'
 
+# --- an EMPTY maintenance lock -------------------------------------------------
+# A run killed between `mkdir <home>.maintenance.lock` and writing the pid file
+# leaves a directory with nothing in it.  The installer cannot name its owner,
+# and must not: a directory that has just appeared may belong to a DIFFERENT
+# installer that is about to write its pid.  So only a directory that is empty,
+# carries no symlink and is at least 30 seconds old may be reclaimed.  The
+# fixture backdates the directory by exactly that much (mtimes have one-second
+# resolution -- `touch -t` accepts 30.5 but stores 30).
+empty_lock="$home/.agentq.maintenance.lock"
+mkdir -p "$empty_lock"
+empty_lock_age=$(date -v-30S +%Y%m%d%H%M.%S 2>/dev/null ||
+    date -d '-30 seconds' +%Y%m%d%H%M.%S)
+touch -t "$empty_lock_age" "$empty_lock"
+status=0
+# AGENTQ_PUEUE_SOURCE_DIR pushes the run past the lock to the pinned-hash
+# mismatch (exit 2), the only deterministic offline failure.  Without it the
+# installer would try a real download.
+env HOME="$home" PATH="$stub_full" AGENTQ_PUEUE_SOURCE_DIR="$source_dir" \
+    /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+# The run must get PAST the lock: no refusal about maintenance at all.
+if grep -qF 'AgentQ maintenance is already in progress' "$work/err"; then
+    cases=$((cases + 1))
+    printf '%s\n' 'installer aged-empty-lock case: refused an empty lock older than the grace period' >&2
+    sed 's/^/      /' "$work/err" >&2 || true
+    failures=$((failures + 1))
+else
+    cases=$((cases + 1))
+    [ "$status" -eq 2 ] || {
+        printf 'installer aged-empty-lock case: expected exit 2 from the offline run, got %s\n' "$status" >&2
+        failures=$((failures + 1))
+    }
+    if [ -e "$empty_lock" ] || [ -L "$empty_lock" ]; then
+        printf '%s\n' 'installer aged-empty-lock case: the installer did not release the lock it created' >&2
+        failures=$((failures + 1))
+    fi
+fi
+rm -rf "$home/.agentq" "$home/.agentq.maintenance.lock" "$home/.local" "$home/.cache" "$home/Library"
+assert_home_clean 'aged empty maintenance lock is recovered'
+
+# A brand-new lock does NOT belong to the caller.  The refusal must come from
+# the age rule (the message names it), and the directory must be the very same
+# inode afterwards -- not removed, not recreated.
+mkdir -p "$empty_lock"
+fresh_lock_before=$(stat -c '%d:%i' "$empty_lock" 2>/dev/null || stat -f '%d:%i' "$empty_lock")
+status=0
+env HOME="$home" PATH="$stub_full" \
+    /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+cases=$((cases + 1))
+if [ "$status" -ne 2 ] ||
+    ! grep -qF 'recently created' "$work/err" ||
+    ! grep -qF 'AgentQ maintenance is already in progress' "$work/err"; then
+    printf 'installer fresh-empty-lock case: expected the age-rule refusal, got %s\n' "$status" >&2
+    sed 's/^/      /' "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+fresh_lock_after=$(stat -c '%d:%i' "$empty_lock" 2>/dev/null || stat -f '%d:%i' "$empty_lock" || true)
+if [ "$fresh_lock_before" != "$fresh_lock_after" ]; then
+    printf '%s\n' 'installer fresh-empty-lock case: the installer removed or replaced a fresh empty lock' >&2
+    failures=$((failures + 1))
+fi
+rm -rf "$empty_lock"
+assert_home_clean 'fresh empty maintenance lock'
+
+# ...and the unknown-child rule applies to an empty-age lock too: with an entry
+# the installer cannot account for, it must neither delete that entry nor go on.
+mkdir -p "$empty_lock"
+printf 'unexpected\n' >"$empty_lock/extra"
+touch -t "$empty_lock_age" "$empty_lock"
+status=0
+env HOME="$home" PATH="$stub_full" \
+    /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+cases=$((cases + 1))
+if [ "$status" -ne 2 ] || ! grep -qF 'AgentQ maintenance is already in progress' "$work/err"; then
+    printf 'installer aged-lock-unknown-child case: expected the maintenance refusal, got %s\n' "$status" >&2
+    sed 's/^/      /' "$work/err" >&2 || true
+    failures=$((failures + 1))
+elif [ "$(cat "$empty_lock/extra" 2>/dev/null)" != unexpected ]; then
+    printf '%s\n' 'installer aged-lock-unknown-child case: touched the unknown entry' >&2
+    failures=$((failures + 1))
+fi
+rm -rf "$empty_lock"
+assert_home_clean 'aged lock with an unknown child'
+
+# --- metadata that cannot name its owner -------------------------------------
+# An unreadable or oversized pid file cannot prove anyone dead.  Age is not
+# evidence either: the message must say the owner cannot be confirmed and that
+# a human must check, and nothing may be deleted.
+for unconfirmable_kind in corrupt oversized; do
+    mkdir -p "$empty_lock"
+    case "$unconfirmable_kind" in
+        corrupt) printf 'not-a-pid\n' >"$empty_lock/pid" ;;
+        oversized) awk 'BEGIN { for (i = 0; i < 5000; i++) printf "x" }' >"$empty_lock/pid" ;;
+    esac
+    touch -t "$empty_lock_age" "$empty_lock" "$empty_lock/pid"
+    status=0
+    env HOME="$home" PATH="$stub_full" \
+        /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+    cases=$((cases + 1))
+    if [ "$status" -ne 2 ] ||
+        ! grep -qF 'cannot confirm the owner of the AgentQ maintenance lock' "$work/err"; then
+        printf 'installer %s-lock-metadata case: expected the cannot-confirm refusal, got %s\n' \
+            "$unconfirmable_kind" "$status" >&2
+        sed 's/^/      /' "$work/err" >&2 || true
+        failures=$((failures + 1))
+    fi
+    cases=$((cases + 1))
+    if ! grep -qF 'must be checked by hand' "$work/err"; then
+        printf 'installer %s-lock-metadata case: the refusal does not send the operator to a human check\n' \
+            "$unconfirmable_kind" >&2
+        sed 's/^/      /' "$work/err" >&2 || true
+        failures=$((failures + 1))
+    fi
+    if [ -e "$empty_lock/pid" ]; then
+        rm -rf "$empty_lock"
+    else
+        printf 'installer %s-lock-metadata case: deleted a lock whose owner it could not confirm\n' \
+            "$unconfirmable_kind" >&2
+        rm -rf "$empty_lock"
+        failures=$((failures + 1))
+    fi
+    assert_home_clean "$unconfirmable_kind maintenance lock metadata"
+done
+
 # --- the launchd template's retained-placeholder guard ------------------------
+
 # The full installer only reaches prepare_service_stage after a successful
 # download+verify of pueue/pueued, which is out of scope here (no network).  So
 # this case drives the EXACT block from the asset -- extracted by text between
@@ -1212,4 +1352,4 @@ if [ "$failures" -ne 0 ]; then
     printf 'installer-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'installer-contract checks passed: cases=%s sandbox-home=yes stub-path=yes download-path=covered toctou-path=covered plist-placeholder=guarded crash-leftover=covered\n' "$cases"
+printf 'installer-contract checks passed: cases=%s sandbox-home=yes stub-path=yes download-path=covered toctou-path=covered empty-lock-recovery=covered unconfirmable-owner=covered plist-placeholder=guarded crash-leftover=covered\n' "$cases"

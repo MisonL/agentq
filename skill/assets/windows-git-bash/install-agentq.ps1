@@ -18,7 +18,7 @@ $expectedClientHash = "28b0756d54ec16ce13d78b251d086aa62e0057089cb27f793cd649f97
 $expectedDaemonHash = "aafa05e2f26cda9aff3eeb9be261e8f9f67752d1e9bb7fbcb47318e35c52ab1d"
 $releaseVersion = "4.0.4"
 $releaseBaseUrl = "https://github.com/Nukesor/pueue/releases/download/v$releaseVersion"
-$agentqVersion = "0.1.27"
+$agentqVersion = "0.1.28"
 $clientAssetName = "pueue-x86_64-pc-windows-msvc.exe"
 $daemonAssetName = "pueued-x86_64-pc-windows-msvc.exe"
 $gitBashPath = $null
@@ -2698,6 +2698,78 @@ function Acquire-MaintenanceLock {
     throw "AgentQ maintenance is already in progress: $maintenanceLockDirectory"
 }
 
+function Remove-StaleOperationLock {
+    param(
+        [string]$LockDirectory,
+        [string]$ExpectedPid,
+        [string]$ExpectedIdentity
+    )
+
+    # Same contract as the installer's remove_stale_operation_lock (POSIX) and
+    # the server's: re-read the SAME identity, re-judge death, retry a few
+    # times, and on each attempt remove ONLY the verified pid file and then an
+    # rmdir of the (now empty) directory.  A recursive delete of the directory
+    # would take whatever else lives in it -- including files of a lock another
+    # process created after the holder died -- and the earlier code did exactly
+    # that.  Returns 0 on success, 2 on "cannot verify", 1 on "verified dead
+    # but the rmdir refused (unknown entries)".
+    $verdict = 'unverified'
+    for ($attempt = 0; $attempt -lt 3; $attempt += 1) {
+        if ($attempt -gt 0) {
+            Start-Sleep -Seconds 1
+        }
+        $lockItem = Get-Item -LiteralPath $LockDirectory -Force -ErrorAction SilentlyContinue
+        if ($null -eq $lockItem) {
+            return 0
+        }
+        if (!(Test-NonReparseLockPath -Path $LockDirectory -RequireContainer)) {
+            return 2
+        }
+        $pidPath = Join-Path $LockDirectory "pid"
+        $current = Read-LockMetadata -Path $pidPath
+        if ($null -eq $current -or
+            $current.Pid -ne $ExpectedPid -or
+            $current.Identity -ne $ExpectedIdentity -or
+            !(Test-ProcessIsConfirmedDead -ProcessId $current.Pid -ExpectedIdentity $current.Identity)) {
+            # A different lock (a new holder) now sits there: only another
+            # attempt can make progress.
+            $verdict = 'unverified'
+            continue
+        }
+        $pidItem = Get-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue
+        if ($null -ne $pidItem) {
+            if (!(Remove-AgentQInstallerTemporaryFile -Path $pidPath -Description "stale AgentQ operation lock metadata")) {
+                $verdict = 'unverified'
+                continue
+            }
+        }
+        # rmdir-only: a directory that still holds anything other than pid is
+        # not ours to clear.
+        try {
+            [System.IO.Directory]::Delete($LockDirectory, $false)
+        } catch {
+            $stillThere = Get-Item -LiteralPath $LockDirectory -Force -ErrorAction SilentlyContinue
+            if ($null -ne $stillThere) {
+                $verdict = 'unremoval'
+                continue
+            }
+        }
+        return 0
+    }
+
+    $program = $null
+    try { $program = $script:Program } catch { }
+    if ([string]::IsNullOrWhiteSpace($program)) {
+        $program = if (![string]::IsNullOrWhiteSpace($PSCommandPath)) { Split-Path -Leaf $PSCommandPath } else { 'install-agentq.ps1' }
+    }
+    [Console]::Error.WriteLine("$program`: AgentQ operation lock could not be verified as gone (the owner cannot be confirmed dead, or the lock holds entries it does not own): $LockDirectory")
+    [Console]::Error.WriteLine("$program`: verify the owner is gone and remove $LockDirectory by hand, then re-run")
+    if ($verdict -eq 'unverified') {
+        return 2
+    }
+    return 1
+}
+
 function Wait-ForAgentQOperationLock {
     param([string]$RuntimeDirectory)
 
@@ -2715,17 +2787,15 @@ function Wait-ForAgentQOperationLock {
         }
         $metadata = Read-LockMetadata -Path (Join-Path $operationLockDirectory "pid")
         if ($null -ne $metadata -and (Test-ProcessIsConfirmedDead -ProcessId $metadata.Pid -ExpectedIdentity $metadata.Identity)) {
-            if (!(Test-NonReparseLockPath -Path $operationLockDirectory -RequireContainer)) {
-                throw "invalid AgentQ operation lock path: $operationLockDirectory"
-            }
-            try {
-                Remove-Item -LiteralPath $operationLockDirectory -Recurse -Force -ErrorAction Stop
-            } catch {
-            }
-            $operationLockItem = Get-Item -LiteralPath $operationLockDirectory -Force -ErrorAction SilentlyContinue
-            if ($null -eq $operationLockItem) {
+            $recovery = Remove-StaleOperationLock -LockDirectory $operationLockDirectory -ExpectedPid $metadata.Pid -ExpectedIdentity $metadata.Identity
+            if ($recovery -eq 0) {
                 continue
             }
+            if ($recovery -eq 2) {
+                throw "cannot recover stale AgentQ operation lock: $operationLockDirectory"
+            }
+            # 1: verified dead, but the directory holds entries we do not own.
+            # The loop's ordinary timeout reports it.
         }
         Start-Sleep -Seconds 1
     }

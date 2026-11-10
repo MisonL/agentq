@@ -463,6 +463,50 @@ else
     twin_stub_arg="$twin_stub_posix"
 fi
 
+# The reason token is forwarded only from a FAILED ssh run.  A call that
+# SUCCEEDED (exit 0, a valid body) must not print `remote failure reason:`,
+# even when its stderr carries a reason line.  Measured 2026-11-10: the Windows
+# client read the token unconditionally at every Write-Diagnostics site and
+# forwarded a stray one from a successful run; the POSIX twin's submit path had
+# the same shape.  The token stays on stderr here, so this asserts the STATUS
+# gate, not the token's presence; the exit-2 reason fixture (smoke/05) is the
+# positive control proving a real failure is still forwarded.
+reason_success_dir="$work/reason-success-ssh"
+mkdir -p "$reason_success_dir"
+reason_success_posix="$reason_success_dir/ssh"
+printf '#!/bin/sh\nprintf "%%s\\n" "orphan: reason=not_a_failure" >&2\nfor a in "$@"; do case "$a" in *uname*) printf "Linux\\n"; exit 0 ;; esac; done\nprintf "%%s\\n" "{\\"group\\":\\"agentq\\",\\"tasks\\":{}}"\nexit 0\n' > "$reason_success_posix"
+chmod 700 "$reason_success_posix"
+if [ "$client_arg" != "$client" ]; then
+    reason_success_win="$reason_success_dir/ssh.cmd"
+    printf '%s\r\n' '@echo off' 'echo orphan: reason=not_a_failure 1>&2' 'echo {"group":"agentq","tasks":{}}' 'exit /b 0' > "$reason_success_win"
+    reason_success_arg=$(cygpath -w "$reason_success_win")
+else
+    reason_success_arg="$reason_success_posix"
+fi
+for reason_side in posix windows; do
+    cases=$((cases + 1))
+    reason_status=0
+    if [ "$reason_side" = posix ]; then
+        AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix AGENTQ_SSH="$reason_success_posix" \
+        AGENTQ_CONFIG="$work/absent-config" \
+            /bin/sh "$twin_posix" status >"$work/reason-success-$reason_side.out" 2>"$work/reason-success-$reason_side.err" || reason_status=$?
+    else
+        AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix AGENTQ_SSH="$reason_success_arg" \
+        AGENTQ_CONFIG="$work/absent-config" \
+            "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
+            >"$work/reason-success-$reason_side.out" 2>"$work/reason-success-$reason_side.err" || reason_status=$?
+    fi
+    if [ "$reason_status" -ne 0 ]; then
+        printf 'ps-client: the %s client failed a successful status run (exit %s): %s\n' \
+            "$reason_side" "$reason_status" "$(tr '\n' '|' < "$work/reason-success-$reason_side.err" | head -c 300)" >&2
+        failures=$((failures + 1))
+    elif grep -qF 'remote failure reason' "$work/reason-success-$reason_side.err"; then
+        printf 'ps-client: the %s client forwarded a reason line from a SUCCEEDING call: %s\n' \
+            "$reason_side" "$(tr '\n' '|' < "$work/reason-success-$reason_side.err")" >&2
+        failures=$((failures + 1))
+    fi
+done
+
 # twin_run_pair <posix-copy> [args...] -> twin_p_status / twin_w_status
 # Same environment for both, in one place: the first hand sweep of this class
 # produced two false divergences because the two sides were set up separately
@@ -3537,5 +3581,5 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 
-printf 'ps-client-contract checks passed: cases=%s twin=%s pwsh=%s ps51=%s reason=forwarded/injection-safe modes=validated\n' \
+printf 'ps-client-contract checks passed: cases=%s twin=%s pwsh=%s ps51=%s reason=forwarded/injection-safe/failure-only modes=validated\n' \
     "$cases" "$twin_state" "$ps_version" "$ps51_state"

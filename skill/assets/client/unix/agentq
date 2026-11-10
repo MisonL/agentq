@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.27'
+agentq_client_version='0.1.28'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072); a Windows target re-encodes
 # argv onto a CreateProcess command line capped at 32767 characters, and the
@@ -70,6 +70,15 @@ mutation_log_file=''
 # run_ssh_logged's exit status is already the ssh exit code, and both callers (the
 # operation path and the mutation path) need the same value.
 agentq_remote_failure_reason_value=''
+# The exit status the reason above was extracted from.  The token is a CONTRACT
+# for failures -- every agentq-server exit 2 carries one -- so a reason line read
+# out of a call that SUCCEEDED did not come from a failure.  Measured 2026-11-10:
+# a stub ssh exiting 0 whose stderr happened to contain `agentq: reason=nope` made
+# the POSIX submit path print `remote failure reason: nope`.  Every forwarding
+# site now gates on a non-zero status: the runner's own, where one is in scope
+# (run_ssh_logged's ssh_status, the submit loop's agentq_recovery_status, the
+# operation loop's status), otherwise this recorded value.
+agentq_remote_failure_reason_status=0
 # The protected file the remote command's stderr is captured into while an SSH
 # call is in flight.  A global, and registered in cleanup_client_runtime, because
 # run_ssh_logged can return early (an input temporary that fails its identity
@@ -143,9 +152,20 @@ detect_stat_flavor() {
     if [ -n "$stat_flavor" ]; then
         return 0
     fi
-    if stat -c '%d:%i' -- "$0" >/dev/null 2>&1; then
+    # Probe the script's own path, captured at TOP LEVEL in
+    # agentq_script_path, never `$0` here: inside a function zsh sets `$0` to
+    # the FUNCTION NAME, so `zsh <this file> --version` failed the probe and
+    # exited 2 with "cannot determine how to read file identity" before doing
+    # anything (measured 2026-11-10; dash, bash and ksh pass, and a shebang
+    # invocation passes under zsh too, which is why only an explicit
+    # `zsh <file>` shows it).  smoke/01 runs `zsh -n` -- parse, not run -- so
+    # nothing else in the suite can see this.
+    if [ -z "${agentq_script_path:-}" ] || [ ! -e "$agentq_script_path" ]; then
+        agentq_script_path=/
+    fi
+    if stat -c '%d:%i' -- "$agentq_script_path" >/dev/null 2>&1; then
         stat_flavor=gnu
-    elif stat -f '%d:%i' "$0" >/dev/null 2>&1; then
+    elif stat -f '%d:%i' "$agentq_script_path" >/dev/null 2>&1; then
         stat_flavor=bsd
     else
         return 1
@@ -170,6 +190,11 @@ stat_device_inode() {
     fi
     printf '%s\n' "$stat_device_inode_identity"
 }
+
+# The script's own path, captured at TOP LEVEL -- `$0` is the script under every
+# shell measured.  detect_stat_flavor reads it instead of `$0` inside the
+# function; see its comment.
+agentq_script_path=$0
 
 # Probe the stat flavor once, in the top-level shell, as soon as the helper
 # exists.  Placement matters twice over: the identity helpers are reached
@@ -1325,6 +1350,7 @@ run_wait_ssh_with_timeout() {
     fi
 
     agentq_remote_failure_reason_value=''
+    agentq_remote_failure_reason_status=$wait_ssh_status
     if [ -s "$wait_ssh_stderr_capture" ]; then
         if ssh_failure_reason=$(agentq_remote_failure_reason "$wait_ssh_stderr_capture"); then
             agentq_remote_failure_reason_value=$ssh_failure_reason
@@ -3621,6 +3647,7 @@ run_ssh_logged() {
     # the local guard printed the first attempt's reason).  Clearing on entry
     # makes the value describe only the attempt that set it.
     agentq_remote_failure_reason_value=''
+    agentq_remote_failure_reason_status=0
 
     agentq_ssh_log_require_file "$ssh_log_file" || return $?
     agentq_ssh_log_remove_file "$ssh_log_file" || return $?
@@ -3689,6 +3716,7 @@ run_ssh_logged() {
     fi
 
     agentq_remote_failure_reason_value=''
+    agentq_remote_failure_reason_status=$ssh_status
     if [ -n "$ssh_stderr_capture" ]; then
         if [ -s "$ssh_stderr_capture" ]; then
             if ssh_failure_reason=$(agentq_remote_failure_reason "$ssh_stderr_capture"); then
@@ -3752,7 +3780,8 @@ run_ssh_logged() {
 # lock contention most often.  Measured 2026-10-13: same stub fixture,
 # cancel printed the reason, submit printed nothing.
 agentq_submit_forward_reason() {
-    if [ "$agentq_recovery_status" -ne 0 ] && [ -n "$agentq_remote_failure_reason_value" ]; then
+    if [ "$agentq_recovery_status" -ne 0 ] && [ -n "$agentq_remote_failure_reason_value" ] &&
+        [ "$agentq_remote_failure_reason_status" -ne 0 ]; then
         printf '%s: remote failure reason: %s\n' "$program" "$agentq_remote_failure_reason_value" >&2
     fi
 }
@@ -4266,7 +4295,8 @@ run_safe_operation_with_recovery() {
         # surface it for every failed operation -- not only for the two mutating
         # commands.  Only the controlled token is forwarded; raw diagnostics stay
         # withheld below.
-        if [ "$agentq_operation_status" -ne 0 ] && [ -n "$agentq_remote_failure_reason_value" ]; then
+        if [ "$agentq_operation_status" -ne 0 ] && [ -n "$agentq_remote_failure_reason_value" ] &&
+            [ "$agentq_remote_failure_reason_status" -ne 0 ]; then
             printf '%s: remote failure reason: %s\n' "$program" "$agentq_remote_failure_reason_value" >&2
         fi
 
@@ -4853,7 +4883,8 @@ case "$operation" in
         # would be available for every read-only operation and missing for the
         # two mutating ones.  Raw diagnostics stay withheld here as everywhere
         # else; only the controlled token is forwarded.
-        if [ "$mutation_status" -ne 0 ] && [ -n "$agentq_remote_failure_reason_value" ]; then
+        if [ "$mutation_status" -ne 0 ] && [ -n "$agentq_remote_failure_reason_value" ] &&
+            [ "$agentq_remote_failure_reason_status" -ne 0 ]; then
             printf '%s: remote failure reason: %s\n' "$program" "$agentq_remote_failure_reason_value" >&2
         fi
         if [ "$mutation_status" -ne 2 ] && [ "$mutation_body_suppressed" -eq 0 ]; then

@@ -4,11 +4,17 @@ set -eu
 
 program=${0##*/}
 release_version='4.0.4'
-agentq_version='0.1.27'
+agentq_version='0.1.28'
 asset_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 agentq_home=${AGENTQ_HOME:-"$HOME/.agentq"}
 artifact_source_directory=${AGENTQ_PUEUE_SOURCE_DIR:-}
 wrapper_destination="$HOME/.local/bin/agentq"
+# An empty maintenance lock directory (a run killed between `mkdir` and the pid
+# write) may be reclaimed only after this long: a directory that just appeared
+# may belong to another installer that is about to write its pid.  The server
+# reads the same value from the environment (maintenance_lock_empty_grace_seconds).
+maintenance_lock_empty_grace_seconds=${maintenance_lock_empty_grace_seconds:-30}
+lock_retry_delay_seconds=1
 
 stage_home=''
 stage_home_identity=''
@@ -2391,7 +2397,95 @@ maintenance_lock_is_stale() {
     process_is_confirmed_dead "$lock_pid" "$lock_identity"
 }
 
+installer_lock_directory_is_empty() {
+    installer_lock_empty_path=$1
+    if [ -L "$installer_lock_empty_path" ] || [ ! -d "$installer_lock_empty_path" ]; then
+        return 1
+    fi
+    installer_lock_empty_child=$(find "$installer_lock_empty_path" -mindepth 1 -maxdepth 1 -print 2>/dev/null) || return 1
+    [ -z "$installer_lock_empty_child" ]
+}
+
+installer_lock_directory_mtime() {
+    if installer_lock_mtime=$(stat -c '%Y' -- "$1" 2>/dev/null) ||
+        installer_lock_mtime=$(stat -f '%m' "$1" 2>/dev/null); then
+        case "$installer_lock_mtime" in
+            ''|*[!0123456789]*) return 1 ;;
+        esac
+        return 0
+    fi
+    return 1
+}
+
+maintenance_lock_empty_is_stale() {
+    maintenance_empty_lock_observed_mtime=''
+    maintenance_empty_refused_reason=''
+    [ ! -L "$maintenance_lock" ] || return 1
+    [ -d "$maintenance_lock" ] || return 1
+    if [ -e "$maintenance_lock/pid" ] || [ -L "$maintenance_lock/pid" ]; then
+        return 1
+    fi
+    installer_lock_directory_is_empty "$maintenance_lock" || return 1
+    installer_lock_directory_mtime "$maintenance_lock" || return 1
+    maintenance_empty_lock_observed_mtime=$installer_lock_mtime
+    maintenance_empty_lock_observed_now=$(date +%s) || return 1
+    case "$maintenance_empty_lock_observed_now" in
+        ''|*[!0123456789]*) return 1 ;;
+    esac
+    # A directory from the future is not evidence of age.
+    [ "$maintenance_empty_lock_observed_now" -ge "$maintenance_empty_lock_observed_mtime" ] || {
+        maintenance_empty_refused_reason='recently created (mtime is in the future)'
+        return 1
+    }
+    # The shell's -ge truncates, so a fractional age below the grace period
+    # can never satisfy it.
+    if [ $((maintenance_empty_lock_observed_now - maintenance_empty_lock_observed_mtime)) -ge "$maintenance_lock_empty_grace_seconds" ]; then
+        return 0
+    fi
+    maintenance_empty_refused_reason='recently created (younger than the grace period)'
+    return 1
+}
+
+maintenance_lock_fail_unconfirmable() {
+    printf '%s: cannot confirm the owner of the AgentQ maintenance lock: %s\n' "$program" "$maintenance_lock" >&2
+    printf '%s: its metadata cannot prove the holder is gone, and age is not evidence; this lock must be checked by hand before it is removed\n' "$program" >&2
+    exit 2
+}
+
 recover_stale_maintenance_lock() {
+    if maintenance_lock_empty_is_stale; then
+        maintenance_empty_recovery_expected_mtime=$maintenance_empty_lock_observed_mtime
+        if ! maintenance_lock_empty_is_stale ||
+            [ "$maintenance_empty_lock_observed_mtime" != "$maintenance_empty_recovery_expected_mtime" ]; then
+            # Not an empty aged lock any more (a pid appeared, an entry did, or
+            # it is gone): judge it afresh rather than act on the first look.
+            recover_stale_maintenance_lock
+            return $?
+        fi
+        # rmdir refuses a non-empty directory, so this cannot take anything
+        # with it.  ENOENT means another process removed it in between --
+        # the state the caller wanted, not a failure.
+        if ! rmdir -- "$maintenance_lock" 2>/dev/null; then
+            if [ -e "$maintenance_lock" ] || [ -L "$maintenance_lock" ]; then
+                fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock"
+            fi
+        fi
+        return 0
+    fi
+    if [ ! -e "$maintenance_lock" ] && [ ! -L "$maintenance_lock" ]; then
+        return 0
+    fi
+    if [ -L "$maintenance_lock" ] || [ ! -d "$maintenance_lock" ]; then
+        fail "invalid AgentQ maintenance lock path: $maintenance_lock"
+    fi
+    if [ -e "$maintenance_lock/pid" ] || [ -L "$maintenance_lock/pid" ]; then
+        # Unreadable, oversized or malformed metadata, or a holder that is alive
+        # or that cannot be shown to be dead.  None of these can be turned into
+        # "the owner is gone" by waiting -- and age is not evidence either.
+        maintenance_lock_is_stale || maintenance_lock_fail_unconfirmable
+    fi
+    [ ! -e "$maintenance_lock/pid" ] && [ ! -L "$maintenance_lock/pid" ] ||
+        maintenance_lock_fail_unconfirmable
     if maintenance_lock_is_stale; then
         maintenance_recovery_expected_pid=$maintenance_lock_observed_pid
         maintenance_recovery_expected_identity=$maintenance_lock_observed_identity
@@ -2408,11 +2502,20 @@ recover_stale_maintenance_lock() {
 }
 
 remove_stale_operation_lock() {
+    # Re-confirm before removing: the holder was judged dead a moment ago, and
+    # another process may have replaced the lock with a LIVE one since.  The
+    # directory may also hold entries that are not this lock's -- an in-flight
+    # temporary, another tool's marker -- and none of them may be removed.  So:
+    # re-read the SAME identity, re-judge death, and retry that a few times;
+    # after that the lock cannot be shown to be gone, and that is an exit 2 for
+    # the caller, never a removal.
     operation_remove_lock_path=$1
     operation_remove_expected_pid=${2:-}
     operation_remove_expected_identity=${3:-}
     operation_remove_pid_path=''
     operation_remove_status=0
+    operation_remove_attempt=0
+    operation_remove_verdict=''
 
     [ -n "$operation_remove_lock_path" ] || return 1
     if ! installer_directory_is_safe "$operation_remove_lock_path"; then
@@ -2426,41 +2529,50 @@ remove_stale_operation_lock() {
     }
 
     operation_remove_pid_path="$operation_remove_lock_path/pid"
-    if ! read_lock_metadata "$operation_remove_pid_path" ||
-        [ "$lock_pid" != "$operation_remove_expected_pid" ] ||
-        [ "$lock_identity" != "$operation_remove_expected_identity" ]; then
-        printf '%s: AgentQ operation lock identity changed during recovery: %s\n' "$program" "$operation_remove_lock_path" >&2
-        return 2
-    fi
-    if ! process_is_confirmed_dead "$lock_pid" "$lock_identity"; then
-        printf '%s: AgentQ operation lock owner changed during recovery: %s\n' "$program" "$operation_remove_lock_path" >&2
-        return 2
-    fi
-
-    if ! installer_regular_file_is_safe "$operation_remove_pid_path"; then
-        printf '%s: refusing to remove unsafe AgentQ operation lock metadata: %s\n' "$program" "$operation_remove_pid_path" >&2
-        return 2
-    fi
-    if remove_installer_file "$operation_remove_pid_path"; then
-        :
-    else
-        operation_remove_status=$?
-        printf '%s: failed to remove AgentQ operation lock metadata: %s\n' "$program" "$operation_remove_pid_path" >&2
-        return "$operation_remove_status"
-    fi
-    if [ -e "$operation_remove_pid_path" ] || [ -L "$operation_remove_pid_path" ]; then
-        printf '%s: AgentQ operation lock metadata remained after cleanup: %s\n' "$program" "$operation_remove_pid_path" >&2
-        return 1
-    fi
-    if ! rmdir -- "$operation_remove_lock_path"; then
-        printf '%s: failed to remove AgentQ operation lock directory: %s\n' "$program" "$operation_remove_lock_path" >&2
-        return 1
-    fi
-    if [ -e "$operation_remove_lock_path" ] || [ -L "$operation_remove_lock_path" ]; then
-        printf '%s: AgentQ operation lock remained after cleanup: %s\n' "$program" "$operation_remove_lock_path" >&2
-        return 1
-    fi
-    return 0
+    while :; do
+        operation_remove_attempt=$((operation_remove_attempt + 1))
+        if [ ! -e "$operation_remove_lock_path" ] && [ ! -L "$operation_remove_lock_path" ]; then
+            # Gone: whoever held it or cleaned it finished the job.
+            return 0
+        fi
+        if ! installer_directory_is_safe "$operation_remove_lock_path"; then
+            printf '%s: refusing to recover an unsafe AgentQ operation lock: %s\n' "$program" "$operation_remove_lock_path" >&2
+            return 2
+        fi
+        if ! read_lock_metadata "$operation_remove_pid_path" ||
+            [ "$lock_pid" != "$operation_remove_expected_pid" ] ||
+            [ "$lock_identity" != "$operation_remove_expected_identity" ] ||
+            ! process_is_confirmed_dead "$lock_pid" "$lock_identity"; then
+            # A different lock now sits there (a new holder), and it is not
+            # this call's to judge.  An attempt that judges it healthy only
+            # means trying again can make progress, so that is not a failure.
+            operation_remove_verdict='unverified'
+        elif ! installer_regular_file_is_safe "$operation_remove_pid_path"; then
+            operation_remove_verdict='unverified'
+        elif ! remove_installer_file "$operation_remove_pid_path"; then
+            operation_remove_status=$?
+            printf '%s: failed to remove AgentQ operation lock metadata: %s\n' "$program" "$operation_remove_pid_path" >&2
+            return "$operation_remove_status"
+        elif [ -e "$operation_remove_pid_path" ] || [ -L "$operation_remove_pid_path" ]; then
+            operation_remove_verdict='unverified'
+        elif ! rmdir -- "$operation_remove_lock_path" 2>/dev/null &&
+            { [ -e "$operation_remove_lock_path" ] || [ -L "$operation_remove_lock_path" ]; }; then
+            # The pid file was this lock's and the holder is dead, but
+            # something else is still inside.  None of it is ours to remove.
+            operation_remove_verdict='unremoval'
+        else
+            return 0
+        fi
+        if [ "$operation_remove_attempt" -ge 3 ]; then
+            printf '%s: AgentQ operation lock could not be verified as gone (the owner cannot be confirmed dead, or the lock holds entries it does not own): %s\n' \
+                "$program" "$operation_remove_lock_path" >&2
+            printf '%s: verify the owner is gone and remove %s by hand, then re-run\n' \
+                "$program" "$operation_remove_lock_path" >&2
+            [ "$operation_remove_verdict" = unverified ] && return 2
+            return 1
+        fi
+        sleep "$lock_retry_delay_seconds"
+    done
 }
 
 remove_uninitialized_maintenance_lock() {
@@ -2495,6 +2607,12 @@ acquire_maintenance_lock() {
         recover_stale_maintenance_lock
     fi
     if [ -e "$maintenance_lock" ] || [ -L "$maintenance_lock" ]; then
+        # Say WHY an empty lock was not reclaimed: it is younger than the grace
+        # period, not owned by this run.  The generic refusal alone cannot tell
+        # the operator which of the two it hit.
+        if [ -n "${maintenance_empty_refused_reason:-}" ]; then
+            fail "AgentQ maintenance is already in progress: $maintenance_lock ($maintenance_empty_refused_reason)"
+        fi
         fail "AgentQ maintenance is already in progress: $maintenance_lock"
     fi
     if ! mkdir -- "$maintenance_lock" 2>/dev/null; then

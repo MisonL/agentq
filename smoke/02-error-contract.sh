@@ -843,6 +843,10 @@ return2_gap_scan() { # $1 = file -> gap lines + a final __SITES__N line
         END {
             if (pending != "") joined[++n] = pending
             for (i = 1; i <= n; i++) {
+                if (joined[i] ~ /^[[:space:]]*[a-z_][a-z0-9_]*\(\) \{[[:space:]]*$/) {
+                    f = joined[i]; sub(/^[[:space:]]*/, "", f); sub(/\(\).*$/, "", f)
+                    defined[f] = 1
+                }
                 # a call is bare when the whole line is the name, optionally
                 # followed by arguments -- but never when it is part of a
                 # pipeline, an `if`/`while` head, an assignment, or a
@@ -891,6 +895,19 @@ return2_gap_scan() { # $1 = file -> gap lines + a final __SITES__N line
                     if (joined[i] !~ /reason=/) printf "%d [%s]: %s\n", i, cur, joined[i]
                 }
             }
+            # POSITIVE CONTROL THAT STILL EXISTS when the server has no
+            # message+return-2 site left in a bare function.  That happened in
+            # 0.1.28: the rewritten recovery paths answer through fail(), which
+            # exits 2 with its own reason line, so the judged-site count fell
+            # to 0 -- not because the rule went blind, but because the shape is
+            # gone.  Counting BARE-INVOKED FUNCTIONS keeps the "the detector
+            # still matches this server" assertion alive: a bare-call detection
+            # that stopped matching would read 0 here even with judged sites
+            # still present.  (The judged-site count is still reported, and any
+            # gap it finds still fails the check.)
+            nb = 0
+            for (f in defined) if (f in bare) nb++
+            printf "__BAREFUNCS__%d\n", nb
             printf "__SITES__%d\n", sites
         }' "$1"
 }
@@ -921,7 +938,7 @@ another_bare_caller() {
 FIXTURE
 return2_fixture_raw=$(return2_gap_scan "$return2_fixture")
 return2_fixture_sites=$(printf '%s\n' "$return2_fixture_raw" | sed -n 's/^__SITES__//p')
-return2_fixture_gaps=$(printf '%s\n' "$return2_fixture_raw" | grep -v '^__SITES__' | grep -c . || true)
+return2_fixture_gaps=$(printf '%s\n' "$return2_fixture_raw" | grep -v '^__SITES__\|^__BAREFUNCS__' | grep -c . || true)
 if [ "$return2_fixture_sites" != 2 ] || [ "$return2_fixture_gaps" != 1 ]; then
     printf 'error-contract: the return-2 reason scan failed its self-test (expected 2 judged sites / 1 gap, got %s / %s); a blind scan would read as a clean server\n' \
         "$return2_fixture_sites" "$return2_fixture_gaps" >&2
@@ -933,11 +950,15 @@ return2_sites=$(printf '%s\n' "$return2_scan_raw" | sed -n 's/^__SITES__//p')
 case ${return2_sites:-} in
     '' | *[!0-9]*) return2_sites=0 ;;
 esac
-if [ "$return2_sites" -eq 0 ]; then
-    printf '%s\n' 'error-contract: the return-2 reason rule judged 0 sites; a rule that examined nothing must not report "no gaps" -- the bare-call detection or the join has stopped matching the server' >&2
+return2_bare_funcs=$(printf '%s\n' "$return2_scan_raw" | sed -n 's/^__BAREFUNCS__//p')
+case ${return2_bare_funcs:-} in
+    '' | *[!0-9]*) return2_bare_funcs=0 ;;
+esac
+if [ "$return2_bare_funcs" -eq 0 ]; then
+    printf '%s\n' 'error-contract: the return-2 reason rule matched 0 bare-invoked functions; a rule that cannot find the functions it audits must not report "no gaps" -- the bare-call detection has stopped matching the server' >&2
     failures=$((failures + 1))
 fi
-return2_gap_sites=$(printf '%s\n' "$return2_scan_raw" | grep -v '^__SITES__' || true)
+return2_gap_sites=$(printf '%s\n' "$return2_scan_raw" | grep -v '^__SITES__\|^__BAREFUNCS__' || true)
 if [ -n "$return2_gap_sites" ]; then
     printf 'return-2 sites in bare-invoked functions print a message but no reason line:\n%s\n' "$return2_gap_sites" >&2
     failures=$((failures + 1))
@@ -1030,3 +1051,4 @@ printf 'error-contract checks passed: cases=%s commands=%s runtime=synthetic rea
     "$cases" \
     "$(printf '%s\n' $documented_commands | wc -l | tr -d ' ')" \
     "$reason_sites" "$return2_sites" "$reason_gap_count"
+printf 'error-contract return-2 audit: bare-functions=%s\n' "$return2_bare_funcs" >&2

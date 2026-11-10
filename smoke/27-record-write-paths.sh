@@ -106,7 +106,10 @@ run_case() {
     local label=$1
     shift
     local rc=0
-    ( cd "$work" && "$work/agentq-server" "$@" ) >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    # TMPDIR pins mktemp in the SERVER to the tree's own temp dir: macOS's
+    # per-user $TMPDIR otherwise leaves a dangling `$name.maintenance.lock`
+    # symlink that the next mktemp reuses -- a harness artifact, not a case.
+    ( cd "$work" && TMPDIR="$work" "$work/agentq-server" "$@" ) >"$work/$label.out" 2>"$work/$label.err" || rc=$?
     printf '%s' "$rc" > "$work/$label.rc"
 }
 
@@ -346,6 +349,278 @@ assert_rc c4 4
 assert_json c4 '.state == "cancellation_pending"'
 assert_err_has c4 'the task is gone while the cancellation outcome remains unresolved'
 
+clear_runtime
+
+# ------------------------------------------------------------------- wait cases
+# `wait` must answer from the FINAL, identity-checked task snapshot: pueue
+# wait's exit code is dropped once the same instance is Done with a result.
+wait_task_json() { # $1 status class
+    printf '{"tasks":{"1001":{"id":1001,"created_at":"2026-09-29T00:00:00Z","command":"true","label":"agentq:AQCAN-0000000000001","status":%s,"group":"agentq"}},"groups":{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}}' "$1"
+}
+write_wait_stub() { # $1 tasks-json, $2 pueue-wait exit
+    local tasks=$1 wait_exit=$2
+    cat > "$work/pueue" <<SH
+#!/bin/sh
+case "\$*" in
+  *"wait "*) exit $wait_exit ;;
+  *"status --json"*) printf '%s\n' '$tasks' ;;
+  *"group --json"*) printf '%s\n' '{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}' ;;
+  *) printf '%s 4.0.4\n' pueue ;;
+esac
+SH
+    chmod 700 "$work/pueue"
+}
+wait_done_success=$(wait_task_json '{"Done":{"result":"Success","start":"2026-09-29T00:00:00Z","end":"2026-09-29T00:00:01Z"}}')
+wait_done_failed=$(wait_task_json '{"Done":{"result":"Failed","start":"2026-09-29T00:00:00Z","end":"2026-09-29T00:00:01Z"}}')
+wait_running=$(wait_task_json '{"Running":{"start":"2026-09-29T00:00:00Z"}}')
+clear_runtime
+put_record AQCAN-0000000000001 accepted 1001 '"2026-09-29T00:00:00Z"'
+
+# P1. Positive control: pueue wait 0 + Done Success -> 0 with the task body.
+write_wait_stub "$wait_done_success" 0
+run_case p1 wait 1001
+assert_rc p1 0
+assert_json p1 '.task.status.Done.result == "Success"'
+
+# P2. pueue wait failed (e.g. 124) but the snapshot is Done Success -> still 0.
+write_wait_stub "$wait_done_success" 124
+run_case p2 wait 1001
+assert_rc p2 0
+assert_json p2 '.task.status.Done.result == "Success"'
+
+# P3. pueue wait failed and the snapshot is Done Failed -> 1, task body kept.
+write_wait_stub "$wait_done_failed" 124
+run_case p3 wait 1001
+assert_rc p3 1
+assert_json p3 '.task.status.Done.result == "Failed"'
+
+# P4. pueue wait failed and the snapshot is NOT done -> unavailable/6 JSON on
+#     stdout (never a bare 1 with empty stdout).
+write_wait_stub "$wait_running" 124
+run_case p4 wait 1001
+assert_rc p4 6
+assert_json p4 '.state == "unavailable" and .task_id == 1001'
+
+# P6. Negative control for P2/P3: a DIFFERENT task instance on the same id
+#     (created_at moved) must never answer from the new instance's result.
+write_stub '{"tasks":{"1001":{"id":1001,"created_at":"2026-10-01T00:00:00Z","command":"true","label":"agentq:AQCAN-0000000000001","status":{"Done":{"result":"Success","start":"2026-10-01T00:00:00Z","end":"2026-10-01T00:00:01Z"}},"group":"agentq"}},"groups":{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}}'
+run_case p6 wait 1001
+assert_rc p6 6
+assert_json p6 '.state == "unavailable"'
+
+# P7. A Done snapshot whose result is EMPTY is not an answer even if pueue wait
+#     failed: unavailable/6.
+write_wait_stub "$(wait_task_json '{"Done":{"result":"","start":"2026-09-29T00:00:00Z","end":"2026-09-29T00:00:01Z"}}')" 124
+run_case p7 wait 1001
+assert_rc p7 6
+assert_json p7 '.state == "unavailable"'
+
+clear_runtime
+write_stub "$empty_tasks"
+
+# ----------------------------------------------------------- group reason case
+# G1. CONTROL: the normal stub answers the group -> status 0.
+run_case g1 status --summary
+assert_rc g1 0
+# G2. A group that is missing / has parallel_tasks != 1 is a deployment state:
+#     exit 2 with reason=deployment_state (never protocol_error, never pass).
+cat > "$work/pueue" <<'SH'
+#!/bin/sh
+case "$*" in
+  *"status --json"*) printf '%s\n' '{"tasks":{},"groups":{"agentq":{"status":"Running","parallel_tasks":2},"default":{"status":"Running","parallel_tasks":1}}}' ;;
+  *"group --json"*) printf '%s\n' '{"agentq":{"status":"Running","parallel_tasks":2},"default":{"status":"Running","parallel_tasks":1}}' ;;
+  *) printf '%s 4.0.4\n' pueue ;;
+esac
+SH
+chmod 700 "$work/pueue"
+run_case g2 status --summary
+assert_rc g2 2
+assert_err_has g2 'AgentQ group is missing or has unexpected parallelism: agentq'
+cases=$((cases + 1))
+if ! grep -qxF -- 'agentq-server: reason=deployment_state' "$work/g2.err"; then
+    printf 'write-paths g2: the group failure must carry reason=deployment_state\n' >&2
+    sed -n '1,3p' "$work/g2.err" >&2 || true
+    failures=$((failures + 1))
+fi
+cat > "$work/pueue" <<'SH'
+#!/bin/sh
+case "$*" in
+  *"status --json"*) printf '%s\n' '{"tasks":{},"groups":{"default":{"status":"Running","parallel_tasks":1}}}' ;;
+  *"group --json"*) printf '%s\n' '{"default":{"status":"Running","parallel_tasks":1}}' ;;
+  *) printf '%s 4.0.4\n' pueue ;;
+esac
+SH
+chmod 700 "$work/pueue"
+run_case g3 status --summary
+assert_rc g3 2
+assert_err_has g3 'reason=deployment_state'
+write_stub "$empty_tasks"
+
+# ------------------------------------------------- maintenance lock (POSIX dir)
+# The server derives its root from dirname($0), so the lock it looks at is the
+# SIBLING of the tree, `$work.maintenance.lock`.  A POSIX installer mkdirs the
+# lock BEFORE writing `pid`; `ensure_not_in_maintenance` runs before any lock is
+# acquired, so a maintenance lock refused here is left exactly as-is.
+maintenance_lock="$work.maintenance.lock"
+lock_pid_file="$maintenance_lock/pid"
+reset_maintenance_lock() { rm -rf -- "${maintenance_lock:?}"; }
+assert_lock_state() { # $1 label, $2 want (present|absent)
+    cases=$((cases + 1))
+    if [ "$2" = present ] && { [ ! -e "$maintenance_lock" ] || [ -L "$maintenance_lock" ]; }; then
+        printf 'write-paths %s: the maintenance lock was removed but must be kept\n' "$1" >&2
+        failures=$((failures + 1))
+    elif [ "$2" = absent ] && { [ -e "$maintenance_lock" ] || [ -L "$maintenance_lock" ]; }; then
+        printf 'write-paths %s: the maintenance lock was not recovered\n' "$1" >&2
+        failures=$((failures + 1))
+    fi
+}
+assert_reason_is() { # $1 label, $2 reason
+    cases=$((cases + 1))
+    if ! grep -qxF -- "agentq-server: reason=$2" "$work/$1.err"; then
+        printf 'write-paths %s: stderr does not carry reason=%s\n' "$1" "$2" >&2
+        sed -n '1,3p' "$work/$1.err" >&2 || true
+        failures=$((failures + 1))
+    fi
+}
+backdate() { # $1 path, $2 seconds ago
+    local when
+    when=$(( $(date +%s) - $2 ))
+    touch -t "$(date -r "$when" +%Y%m%d%H%M.%S)" "$1"
+}
+# M0. Positive control: no lock -> the command reaches its own logic (the
+#     unknown id is answered, not a maintenance diagnostic).
+reset_maintenance_lock
+run_case m0 status --task 9999
+assert_rc m0 2
+assert_err_has m0 'unknown AgentQ task id: 9999'
+assert_reason_is m0 protocol_error
+# M1. A NEW empty lock (inside the 30 s grace) is a live installer between mkdir
+#     and writing the pid file: keep it, lock_contention.  The age is pinned
+#     with `touch` so a whole-second clock cannot put the lock right on the
+#     grace boundary.
+reset_maintenance_lock
+mkdir -- "$maintenance_lock"
+backdate "$maintenance_lock" 1
+run_case m1 status --task 9999
+# `status --task` runs the maintenance check first, so even an unknown task id
+# answers from the lock.  M0 is the control that the same argv WITHOUT a lock
+# never reports the lock.
+assert_rc m1 2
+assert_reason_is m1 lock_contention
+assert_lock_state m1 present
+# M2. An OLD empty lock (>30 s) is a crash residue: recover it, status 0.
+backdate "$maintenance_lock" 90
+run_case m2 status --task 9999
+assert_rc m2 2
+assert_err_has m2 'unknown AgentQ task id: 9999'
+assert_lock_state m2 absent
+# M3. A corrupt pid file NEVER authorises an age-based removal, however old.
+reset_maintenance_lock
+mkdir -- "$maintenance_lock"
+printf 'garbage\n' > "$lock_pid_file"
+backdate "$lock_pid_file" 9000
+backdate "$maintenance_lock" 9000
+run_case m3 lookup AQCAN-0000000000001
+assert_rc m3 2
+assert_err_has m3 'cannot determine maintenance lock owner; inspect lock manually'
+assert_reason_is m3 deployment_state
+assert_lock_state m3 present
+# M4. A LIVE holder is contention, and its lock is kept.
+live_pid=$$
+process_identity=$(LC_ALL=C ps -o lstart= -p "$live_pid" 2>/dev/null | awk '{$1 = $1; print}') || process_identity=''
+if [ -n "$process_identity" ]; then
+    reset_maintenance_lock
+    mkdir -- "$maintenance_lock"
+    printf '%s\t%s\n' "$live_pid" "$process_identity" > "$lock_pid_file"
+    run_case m4 lookup AQCAN-0000000000001
+    assert_rc m4 2
+    assert_reason_is m4 lock_contention
+    assert_lock_state m4 present
+else
+    printf 'write-paths m4: could not read a live process identity; the live-holder case did not run\n' >&2
+    failures=$((failures + 1))
+fi
+# M5. A DEAD holder (identity is a 1 that no live process carries) is recovered.
+reset_maintenance_lock
+mkdir -- "$maintenance_lock"
+printf '%s\t%s\n' "$live_pid" 'Thu Jan  1 00:00:00 1970' > "$lock_pid_file"
+run_case m5 status --task 9999
+assert_rc m5 2
+assert_err_has m5 'unknown AgentQ task id: 9999'
+assert_lock_state m5 absent
+# M6. A dead holder whose lock disappears between the decision and the removal
+#     (another reader cleaned it) is SUCCESS: no ENOENT text, no reason line.
+reset_maintenance_lock
+mkdir -- "$maintenance_lock"
+printf '%s\t%s\n' "$live_pid" 'Thu Jan  1 00:00:00 1970' > "$lock_pid_file"
+( sleep 2; rm -rf -- "$maintenance_lock" ) & cleaner=$!
+run_case m6 status --task 9999
+wait "$cleaner"
+assert_rc m6 2
+assert_err_has m6 'unknown AgentQ task id: 9999'
+assert_lock_state m6 absent
+# The concurrently cleaned lock must not produce an ENOENT.  The server's
+# normal "unknown AgentQ task id" response has its own reason= line, so we do
+# NOT forbid `reason=` here.
+cases=$((cases + 1))
+if grep -qF 'No such file' "$work/m6.err"; then
+    printf 'write-paths m6: a concurrently cleaned lock leaked an error\n' >&2
+    sed -n '1,3p' "$work/m6.err" >&2
+    failures=$((failures + 1))
+fi
+# M7. A metadata-carrying lock whose DIRECTORY is ancient is NOT aged out
+#     (only truly empty directories are ageable).
+reset_maintenance_lock
+mkdir -- "$maintenance_lock"
+printf 'garbage\n' > "$lock_pid_file"
+backdate "$maintenance_lock" 9000
+run_case m7 lookup AQCAN-0000000000001
+assert_rc m7 2
+assert_reason_is m7 deployment_state
+assert_lock_state m7 present
+reset_maintenance_lock
+
+# ------------------------------------------------------ tombstone retention
+# Quarantined tombstones (and everything else under .legacy-orphans/) are the
+# operator's data: the production prune must never reach them, however old.
+# The prune only runs in `ensure_request_record_layout` (write operations), so
+# these cases use `submit` in a writeable context.
+# clear_runtime() deletes every tombstone in the data directory, so it must run
+# BEFORE the fixtures below are planted -- after them it deleted exactly what
+# this case seeds and the prune assertion then read "0 tombstones" (measured
+# 2026-11-10).  Nothing between here and the submit below writes a tombstone,
+# so moving it up changes nothing else.
+clear_runtime
+put_tombstone AQCAN-0000000000001 1001
+mkdir -p "$work/data/agentq-requests/.tombstones/.legacy-orphans"
+printf '%s\n' '{"old":true}' > "$work/data/agentq-requests/.tombstones/.legacy-orphans/_oldrecord.json"
+backdate "$work/data/agentq-requests/.tombstones/.legacy-orphans/_oldrecord.json" $((45 * 86400))
+put_tombstone AQCAN-0000000000002 1002
+backdate "$work/data/agentq-requests/.tombstones/AQCAN-0000000000002.json" $((45 * 86400))
+# All these files are at least 45 days old.  The prune marker says "prune now".
+printf '%s\n' '2026-09-01' > "$work/runtime/agentq-request-tombstones-pruned-at"
+# Submit a new request to trigger the full ensure_request_record_layout path.
+write_stateful_stub 9999
+rm -f "$work/.added"
+run_case t1 submit --workdir "$work" --label smoke --request-id "$submit_id" -- true
+assert_rc t1 0
+cases=$((cases + 1))
+if [ "$(count_records)" != 1 ]; then
+    printf 'write-paths t1: expected 1 record after submit\n' >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+tombstone_count=$(find "$work/data/agentq-requests/.tombstones" -maxdepth 1 -name '*.json' ! -path '*/.legacy-orphans/*' -not -path '*/.legacy-orphans' | wc -l | tr -d ' ')
+if [ "$tombstone_count" -ne 1 ]; then
+    printf 'write-paths t1: expected 1 tombstone (AQCAN-0000000000002 pruned), got %s\n' "$tombstone_count" >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if [ ! -e "$work/data/agentq-requests/.tombstones/.legacy-orphans/_oldrecord.json" ]; then
+    printf 'write-paths t1: the tombstone prune deleted a quarantined legacy file\n' >&2
+    failures=$((failures + 1))
+fi
+find "$work/data/agentq-requests/.tombstones/.legacy-orphans" -mindepth 1 -delete
 clear_runtime
 
 # --------------------------------------------------------------- summary

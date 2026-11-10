@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.27'
+agentq_version='0.1.28'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -282,6 +282,7 @@ request_tombstone_prune_interval=86400
 lock_acquire_attempts=30
 lock_retry_delay_seconds=1
 lock_empty_grace_seconds=5
+maintenance_lock_empty_grace_seconds=30
 current_lock_pid=''
 current_lock_identity=''
 request_lock=''
@@ -296,6 +297,11 @@ stat_flavor=''
 compact_log_raw_file=''
 reconcile_raw_status_file=''
 group_raw_file=''
+maintenance_lock_verdict=''
+maintenance_lock_observed_pid=''
+maintenance_lock_observed_identity=''
+maintenance_lock_age_seconds=''
+maintenance_lock_state_unsafe=false
 
 usage() {
     cat <<EOF
@@ -831,6 +837,22 @@ stat_device_inode() {
         identity=$(stat -f '%d:%i' "$path" 2>/dev/null) || return 1
     fi
     printf '%s\n' "$identity"
+}
+
+# Octal permission mode; GNU spells it `%a`, BSD spells it `%Lp`.
+stat_mode() {
+    local path=$1
+    local mode=''
+
+    if [ -z "$stat_flavor" ]; then
+        detect_stat_flavor || return 1
+    fi
+    if [ "$stat_flavor" = gnu ]; then
+        mode=$(stat -c %a "$path" 2>/dev/null) || return 1
+    else
+        mode=$(stat -f %Lp "$path" 2>/dev/null) || return 1
+    fi
+    printf '%s\n' "$mode"
 }
 
 # Modification time as whole seconds; GNU spells it %Y, BSD spells it %m.
@@ -1526,100 +1548,221 @@ ensure_runtime_directory() {
     fi
 }
 
-maintenance_lock_is_stale() {
-    local lock_pid=''
-    local lock_identity=''
-
-    case "$platform_kind" in
-        unix)
-            [ -d "$maintenance_lock_directory" ] || return 1
-            read_lock_metadata "$maintenance_lock_directory/pid" || return 1
-            ;;
-        windows)
-            [ -f "$maintenance_lock_directory" ] && [ ! -L "$maintenance_lock_directory" ] || return 1
-            read_lock_metadata "$maintenance_lock_directory" || return 1
-            ;;
-    esac
-
-    process_is_confirmed_dead "$lock_pid" "$lock_identity"
+# Answers WHO owns the maintenance lock, as maintenance_lock_verdict:
+#   live      -- a pid file was read and its holder is alive (or its identity
+#                does not match a reused pid).  lock_contention is the answer.
+#   dead      -- a pid file was read and its holder is confirmed dead.
+#   empty     -- POSIX: no pid file and the directory is truly empty;
+#                maintenance_lock_age_seconds is the directory's age.
+#   unowned   -- anything else: unreadable/corrupt metadata, a Windows lock
+#                without metadata, a non-empty directory without metadata, an
+#                unsafe path, a vanished lock.  NEVER ageable: the installer
+#                writes the pid file AFTER mkdir, so no age proves an
+#                unattended holder.
+maintenance_lock_state_unsafe() {
+    if [ "${maintenance_lock_state_unsafe:-false}" = true ]; then
+        fail "refusing an unsafe AgentQ maintenance lock path: $maintenance_lock_directory" deployment_state
+    fi
 }
 
+maintenance_lock_owner() {
+    local metadata_status=0
+    local child=''
+    local lock_mtime=''
+    local current_epoch=''
+
+    # Lock-free is the NORMAL state: every call reaching this function without
+    # a lock must succeed, so the default verdict is "no lock", never "unowned".
+    maintenance_lock_verdict=none
+    maintenance_lock_observed_pid=''
+    maintenance_lock_observed_identity=''
+    maintenance_lock_age_seconds=''
+    maintenance_lock_state_unsafe=false
+    if ! path_chain_is_safe "$maintenance_lock_directory"; then
+        maintenance_lock_state_unsafe=true
+        return 0
+    fi
+    case "$platform_kind" in
+        unix)
+            # A dangling symlink is ABSENT (nothing to judge); a link to a
+            # directory is the unsafe shape an installer would follow.  A
+            # dangling link is also what the server's own unlink leaves after a
+            # read link's target was removed; it must never brick every command.
+            if [ ! -e "$maintenance_lock_directory" ] &&
+                [ ! -d "$maintenance_lock_directory" ]; then
+                return 0
+            fi
+            if [ -L "$maintenance_lock_directory" ] || [ ! -d "$maintenance_lock_directory" ]; then
+                maintenance_lock_verdict=unowned
+                maintenance_lock_state_unsafe=true
+                return 0
+            fi
+            ;;
+        windows)
+            if [ ! -e "$maintenance_lock_directory" ] && [ ! -L "$maintenance_lock_directory" ]; then
+                return 0
+            fi
+            ;;
+    esac
+    maintenance_lock_verdict=unowned
+
+    if [ "$platform_kind" = unix ]; then
+        if read_lock_metadata "$maintenance_lock_directory/pid"; then
+            maintenance_lock_observed_pid=$lock_pid
+            maintenance_lock_observed_identity=$lock_identity
+            # `process_is_confirmed_dead` starts by checking that the pid is a
+            # valid positive integer via process_identity_state; if that probe
+            # itself fails (corrupt pid metadata like "garbage", or a pid that
+            # no longer exists as ANY process), it returns 1 via `|| return 1`.
+            # That 1 must NOT be read as "alive" -- it means "unable to
+            # determine", which is a corrupt/unreadable state.  A valid integer
+            # that passes identity state still goes through the full dead/live
+            # judgement.
+            if is_positive_integer "$lock_pid"; then
+                if process_is_confirmed_dead "$lock_pid" "$lock_identity"; then
+                    maintenance_lock_verdict=dead
+                else
+                    maintenance_lock_verdict=live
+                fi
+            else
+                maintenance_lock_verdict=unowned
+            fi
+            return 0
+        else
+            metadata_status=$?
+        fi
+        [ "$metadata_status" -eq 1 ] || return 0
+        [ ! -e "$maintenance_lock_directory/pid" ] && [ ! -L "$maintenance_lock_directory/pid" ] || return 0
+        # `find` failing must not read as "empty": `|| child=?` turns any
+        # failure into a non-empty answer, which keeps the lock unowned.
+        child=$(find "$maintenance_lock_directory" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null) || child=?
+        [ -z "$child" ] || return 0
+        lock_mtime=$(stat_mtime "$maintenance_lock_directory") || return 0
+        current_epoch=$(date +%s) || return 0
+        case "$lock_mtime$current_epoch" in
+            ''|*[!0123456789]*) return 0 ;;
+        esac
+        [ "$current_epoch" -ge "$lock_mtime" ] || return 0
+        maintenance_lock_observed_identity=$(stat_device_inode "$maintenance_lock_directory" 2>/dev/null) ||
+            return 0
+        maintenance_lock_age_seconds=$((current_epoch - lock_mtime))
+        maintenance_lock_verdict=empty
+        return 0
+    fi
+    if [ -f "$maintenance_lock_directory" ] && [ ! -L "$maintenance_lock_directory" ] &&
+        read_lock_metadata "$maintenance_lock_directory"; then
+        maintenance_lock_observed_pid=$lock_pid
+        maintenance_lock_observed_identity=$lock_identity
+        if process_is_confirmed_dead "$lock_pid" "$lock_identity"; then
+            maintenance_lock_verdict=dead
+        else
+            maintenance_lock_verdict=live
+        fi
+    else
+        maintenance_lock_state_unsafe=true
+    fi
+}
+
+maintenance_lock_unowned() {
+    fail "cannot determine maintenance lock owner; inspect lock manually: $maintenance_lock_directory" deployment_state
+}
+
+# Removes ONLY the exact lock instance maintenance_lock_owner just judged dead
+# or stale-empty.  Re-reads the SAME identity and re-confirms death; a lock
+# that changed hands in between is left alone and answered as contention.
 recover_stale_maintenance_lock() {
     local lock_pid=''
     local lock_identity=''
-    local maintenance_lock_pid_path
 
-    if ! path_chain_is_safe "$maintenance_lock_directory"; then
-        printf '%s: refusing to recover an unsafe AgentQ maintenance lock: %s\n' "$program" "$maintenance_lock_directory" >&2
-        printf '%s: reason=protocol_error\n' "$program" >&2
-        return 2
-    fi
-    if maintenance_lock_is_stale; then
-        # Re-confirm immediately before removing.  Between the staleness
-        # decision above and the removal below another process may have
-        # removed and recreated the lock with a LIVE holder; without the
-        # re-read, the ms-wide window deletes that live lock and both holders
-        # believe they own it (measured 2026-10-06 by widening the window with
-        # a sleep; the installer's recover_stale_maintenance_lock has
-        # re-confirmed since 2026-09-24 and smoke/11 pins it with a stateful
-        # `ps` stub -- this server copy went straight to the removal).
-        case "$platform_kind" in
-            unix)
-                maintenance_lock_pid_path="$maintenance_lock_directory/pid"
-                if [ -e "$maintenance_lock_pid_path" ] || [ -L "$maintenance_lock_pid_path" ]; then
-                    read_lock_metadata "$maintenance_lock_pid_path" ||
-                        fail "cannot re-read the stale AgentQ maintenance lock metadata: $maintenance_lock_directory"
-                    if ! process_is_confirmed_dead "$lock_pid" "$lock_identity"; then
-                        printf '%s: the AgentQ maintenance lock holder could not be re-confirmed dead; refusing to remove it: %s\n' "$program" "$maintenance_lock_directory" >&2
-                        printf '%s: reason=protocol_error\n' "$program" >&2
-                        return 2
+    case "$maintenance_lock_verdict" in
+        dead)
+            case "$platform_kind" in
+                unix) read_lock_metadata "$maintenance_lock_directory/pid" || maintenance_lock_unowned ;;
+                windows) read_lock_metadata "$maintenance_lock_directory" || maintenance_lock_unowned ;;
+            esac
+            [ "$lock_pid" = "$maintenance_lock_observed_pid" ] &&
+                [ "$lock_identity" = "$maintenance_lock_observed_identity" ] || return 0
+            process_is_confirmed_dead "$lock_pid" "$lock_identity" || return 0
+            case "$platform_kind" in
+                unix)
+                    remove_runtime_temporary_file "$maintenance_lock_directory/pid" \
+                        'stale maintenance lock metadata' ||
+                        fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory" deployment_state
+                    # Non-recursive: a file that appeared after the re-read
+                    # keeps the lock.  Another reader removing it first is
+                    # success, not an error.
+                    rmdir -- "$maintenance_lock_directory" 2>/dev/null
+                    if [ -e "$maintenance_lock_directory" ] || [ -L "$maintenance_lock_directory" ]; then
+                        if [ -e "$maintenance_lock_directory/pid" ] ||
+                            [ -n "$(find "$maintenance_lock_directory" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+                            maintenance_lock_unowned
+                        fi
+                        maintenance_lock_unowned
                     fi
+                    ;;
+                windows)
+                    remove_runtime_temporary_file "$maintenance_lock_directory" 'stale maintenance lock' ||
+                        fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory" deployment_state
+                    [ ! -e "$maintenance_lock_directory" ] && [ ! -L "$maintenance_lock_directory" ] ||
+                        fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory" deployment_state
+                    ;;
+            esac
+            ;;
+        empty)
+            [ "$maintenance_lock_age_seconds" -ge "$maintenance_lock_empty_grace_seconds" ] || return 0
+            path_chain_is_safe "$maintenance_lock_directory" || maintenance_lock_unowned
+            [ -d "$maintenance_lock_directory" ] && [ ! -L "$maintenance_lock_directory" ] || return 0
+            # The directory must still be the SAME one and still empty.
+            [ "$(stat_device_inode "$maintenance_lock_directory" 2>/dev/null)" = \
+                "$maintenance_lock_observed_identity" ] || return 0
+            [ ! -e "$maintenance_lock_directory/pid" ] && [ ! -L "$maintenance_lock_directory/pid" ] || return 0
+            [ -z "$(find "$maintenance_lock_directory" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] || return 0
+            rmdir -- "$maintenance_lock_directory" 2>/dev/null
+            if [ -e "$maintenance_lock_directory" ] || [ -L "$maintenance_lock_directory" ]; then
+                if [ -e "$maintenance_lock_directory/pid" ] ||
+                    [ -n "$(find "$maintenance_lock_directory" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+                    maintenance_lock_unowned
                 fi
-                if ! remove_runtime_temporary_file "$maintenance_lock_directory/pid" 'stale maintenance lock metadata'; then
-                    fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory"
-                fi
-                rmdir -- "$maintenance_lock_directory" 2>/dev/null || fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory"
-                ;;
-            windows)
-                if [ -e "$maintenance_lock_directory" ] && [ ! -L "$maintenance_lock_directory" ]; then
-                    read_lock_metadata "$maintenance_lock_directory" ||
-                        fail "cannot re-read the stale AgentQ maintenance lock metadata: $maintenance_lock_directory"
-                    if ! process_is_confirmed_dead "$lock_pid" "$lock_identity"; then
-                        printf '%s: the AgentQ maintenance lock holder could not be re-confirmed dead; refusing to remove it: %s\n' "$program" "$maintenance_lock_directory" >&2
-                        printf '%s: reason=protocol_error\n' "$program" >&2
-                        return 2
-                    fi
-                fi
-                if ! remove_runtime_temporary_file "$maintenance_lock_directory" 'stale maintenance lock'; then
-                    fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory"
-                fi
-                [ ! -e "$maintenance_lock_directory" ] && [ ! -L "$maintenance_lock_directory" ] || fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory"
-                ;;
-        esac
-    fi
+                maintenance_lock_unowned
+            fi
+            ;;
+        *)
+            maintenance_lock_unowned
+            ;;
+    esac
 }
 
 ensure_not_in_maintenance() {
-    if [ -L "$maintenance_lock_directory" ]; then
-        fail "invalid AgentQ maintenance lock path: $maintenance_lock_directory"
-    fi
-    if [ -e "$maintenance_lock_directory" ]; then
-        case "$platform_kind" in
-            unix)
-                [ -d "$maintenance_lock_directory" ] || fail "invalid AgentQ maintenance lock path: $maintenance_lock_directory"
-                ;;
-            windows)
-                [ -f "$maintenance_lock_directory" ] || fail "invalid AgentQ maintenance lock path: $maintenance_lock_directory"
-                ;;
-        esac
-        recover_stale_maintenance_lock
-    fi
-    if [ -e "$maintenance_lock_directory" ]; then
-        # lock_contention, not the default protocol_error: the message already
-        # tells the caller to retry, and an installer window is exactly the
-        # "retryable, nothing you passed is wrong" case that class names.
-        fail "AgentQ maintenance is in progress; retry after the installer completes" lock_contention
-    fi
+    maintenance_lock_owner
+    maintenance_lock_state_unsafe
+    case "$maintenance_lock_verdict" in
+        unowned)
+            maintenance_lock_unowned
+            ;;
+        live)
+            fail "AgentQ maintenance is in progress; retry after the installer completes" lock_contention
+            ;;
+        dead|empty)
+            recover_stale_maintenance_lock
+            ;;
+    esac
+    # Re-check: a LOCK FREE window could be entered by an installer meanwhile.
+    # empty = an empty directory within the grace period (a starting installer);
+    # dead = a pid-identified holder confirmed dead but never removed (recovery
+    # may have returned 0 because age is below the empty grace or identity
+    # changed); live = a live installer confirmed by pid.  For the re-check
+    # `empty` is treated as `live` contention: the directory is still there
+    # after the recovery attempt, which means either it was too young to remove
+    # or it was recreated -- keep the lock.
+    maintenance_lock_owner
+    case "$maintenance_lock_verdict" in
+        live|empty)
+            fail "AgentQ maintenance is in progress; retry after the installer completes" lock_contention
+            ;;
+        dead|unowned)
+            maintenance_lock_unowned
+            ;;
+    esac
 }
 
 release_owned_lock() {
@@ -2264,7 +2407,7 @@ verify_group() {
     jq -e --arg name "$group_name" '
         (.[$name] | type) == "object"
         and .[$name].parallel_tasks == 1
-    ' 2>/dev/null < "$group_file" >/dev/null || fail "AgentQ group is missing or has unexpected parallelism: $group_name"
+    ' 2>/dev/null < "$group_file" >/dev/null || fail "AgentQ group is missing or has unexpected parallelism: $group_name" deployment_state
     remove_runtime_temporary_file "$group_file" 'group raw response file' || fail 'failed to clean AgentQ group raw response temporary file'
     group_raw_file=''
 }
@@ -3778,6 +3921,8 @@ quarantine_legacy_request_records_in_directory() {
     local id
     local quarantine_directory
     local target
+    local suffix
+    local quarantine_mode
     local agentqtmp_stem agentqtmp_random agentqtmp_base agentqtmp_pid
     local agentqtmp_with_id agentqtmp_id agentqtmp_prefix agentqtmp_is_temp
 
@@ -3860,41 +4005,75 @@ quarantine_legacy_request_records_in_directory() {
         id=${id%.json}
         is_request_id "$id" && continue
         is_legacy_request_id "$id" || continue
-        if [ ! -d "$quarantine_directory" ]; then
-            # 0700, like every other directory that holds request data: a
-            # record carries the user label and the working directory, and the
-            # request directories themselves are chmod 700.  A bare `mkdir -p`
-            # inherits the caller's umask (022 in practice) and would publish
-            # the orphans to every local user (measured 2026-11-09: the
-            # quarantine directory came out 0755 next to a 0700 parent).
-            ( umask 077; mkdir -p -- "$quarantine_directory" ) ||
+        # The glob above says nothing about TYPE: a directory or a dangling
+        # link can carry a `.json` name and is not a record.  Only a regular,
+        # non-symlink file is quarantined; any other type is left for an
+        # operator (failing here would brick every command on it).
+        if [ -L "$file" ] || [ ! -f "$file" ]; then
+            continue
+        fi
+        if [ ! -d "$quarantine_directory" ] || [ -L "$quarantine_directory" ]; then
+            if [ -e "$quarantine_directory" ] || [ -L "$quarantine_directory" ]; then
+                # Pre-placed symlink or file: never follow it (the rename would
+                # land outside the tree) and never remove it.
+                fail "invalid AgentQ $kind quarantine directory: $quarantine_directory" deployment_state
+            fi
+            ( umask 077; mkdir -- "$quarantine_directory" ) 2>/dev/null ||
+                { [ -e "$file" ] || [ -L "$file" ]; } ||
                 fail "cannot create the AgentQ $kind quarantine directory: $quarantine_directory"
+            [ ! -L "$quarantine_directory" ] && [ -d "$quarantine_directory" ] ||
+                fail "invalid AgentQ $kind quarantine directory: $quarantine_directory" deployment_state
+            if [ "$platform_kind" = unix ]; then
+                chmod 700 "$quarantine_directory" ||
+                    fail "cannot secure the AgentQ $kind quarantine directory: $quarantine_directory"
+            fi
+        elif [ "$platform_kind" = unix ]; then
+            # 0700 like every other directory that holds request data: a record
+            # carries the user label and the working directory.  A directory
+            # created by an older deployment (or by hand) must be narrowed.
+            quarantine_mode=$(stat_mode "$quarantine_directory") || quarantine_mode=''
+            if [ "$quarantine_mode" != 700 ]; then
+                chmod 700 "$quarantine_directory" ||
+                    fail "cannot secure the AgentQ $kind quarantine directory: $quarantine_directory"
+            fi
         fi
         # NEVER overwrite: a previous run's copy, or a same-named record from a
-        # different id family, would be silently destroyed by `mv -f` (measured
-        # 2026-11-09: a seeded `.legacy-orphans/.aaaaaaaaaaaaaaa.json` was
-        # replaced by the incoming file).  The filename carries no information
-        # the operator needs beyond the id, so a collision gets a numeric suffix
-        # and both bodies survive.
-        target="$quarantine_directory/$name"
-        if [ -e "$target" ] || [ -L "$target" ]; then
-            local suffix=1
-            while [ -e "$quarantine_directory/$name.$suffix" ] ||
-                [ -L "$quarantine_directory/$name.$suffix" ]; do
+        # different id family, must survive.  A collision gets the first free
+        # numeric suffix; a concurrent mover can race the choice, so the rename
+        # is retried on a fresh suffix instead of using `mv -f`.
+        suffix=0
+        while :; do
+            if [ "$suffix" -eq 0 ]; then
+                target="$quarantine_directory/$name"
+            else
+                target="$quarantine_directory/$name.$suffix"
+            fi
+            # A test-then-rename is not atomic; `ln` is: it fails with EEXIST
+            # instead of replacing an existing copy.  The source is a regular
+            # file (checked above), so the hard link + unlink pair preserves
+            # the bytes exactly.
+            if [ -e "$target" ] || [ -L "$target" ]; then
                 suffix=$((suffix + 1))
-            done
-            target="$quarantine_directory/$name.$suffix"
-        fi
-        # Two lock-free readers can enumerate the same legacy file; losing the
-        # rename just means the other side quarantined it.  Treat a vanished
-        # SOURCE as success -- the same rule the record readers use -- or a
-        # concurrent `status` would exit 2 with protocol_error (Codex review
-        # 2026-11-09; the race is code-confirmed, not measured).
-        if ! mv -- "$file" "$target"; then
+                continue
+            fi
+            if ln -- "$file" "$target" 2>/dev/null; then
+                rm -f -- "$file" 2>/dev/null
+                if [ -e "$file" ] || [ -L "$file" ]; then
+                    fail "cannot quarantine a legacy AgentQ $kind record: $file"
+                fi
+                break
+            fi
+            if [ -e "$target" ] || [ -L "$target" ]; then
+                suffix=$((suffix + 1))
+                continue
+            fi
+            # Two lock-free readers can quarantine the same file; losing means
+            # the other side already did.  Treat a vanished SOURCE as success.
             if [ -e "$file" ] || [ -L "$file" ]; then
                 fail "cannot quarantine a legacy AgentQ $kind record: $file"
             fi
-        fi
+            break
+        done
     done
     shopt -u nullglob
 }
@@ -5279,7 +5458,22 @@ wait_for_task() {
         printf '%s: task %s changed identity while waiting; the final state is unavailable\n' "$program" "$task_id" >&2
         return 6
     fi
+    # The final snapshot is the only authority: pueue wait's exit code is
+    # dropped once the same task instance is Done with a valid result, so an
+    # interrupted wait cannot turn a success into a failure (or the reverse).
     if ! task_is_done <<<"$task"; then
+        if [ "$wait_status" -ne 0 ]; then
+            jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+            printf '%s: pueue wait exited %s before task %s completed; the final state is unavailable\n' "$program" "$wait_status" "$task_id" >&2
+            return 6
+        fi
+        # pueue's own exit code is NOT an AgentQ contract code.  Returning it
+        # raw let a pueue/clap failure (2=usage) surface as a server exit 2 with
+        # no reason line, and a theoretical 42-45/124 (the client-only range)
+        # leak out of a server that must never emit it.  The task did not reach
+        # a completed state and the operation failed -- the contract code for
+        # that is 1 (general failure).  Measured 2026-10-12: a stub `pueue wait`
+        # returning 124 produced `wait exit=124 reason=0`.
         printf '%s: pueue wait exited %s before task %s completed\n' "$program" "$wait_status" "$task_id" >&2
         return 1
     fi
@@ -5300,15 +5494,7 @@ wait_for_task() {
     jq -cn --argjson task "$task" '{task: $task}'
 
     if [ "$wait_status" -ne 0 ]; then
-        printf '%s: pueue wait exited %s for task %s\n' "$program" "$wait_status" "$task_id" >&2
-        # pueue's own exit code is NOT an AgentQ contract code.  Returning it
-        # raw let a pueue/clap failure (2=usage) surface as a server exit 2 with
-        # no reason line, and a theoretical 42-45/124 (the client-only range)
-        # leak out of a server that must never emit it.  The task did not reach
-        # a completed state and the operation failed -- the contract code for
-        # that is 1 (general failure).  Measured 2026-10-12: a stub `pueue wait`
-        # returning 124 produced `wait exit=124 reason=0`.
-        return 1
+        printf '%s: pueue wait exited %s for task %s; answering from the final task state\n' "$program" "$wait_status" "$task_id" >&2
     fi
 
     task_succeeded <<<"$task"

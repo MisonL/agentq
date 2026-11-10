@@ -155,9 +155,10 @@ response loss 只能用**同一 request ID** lookup/reconcile；
 | 队列操作锁竞争 | `lock_contention` | `already in progress` | **可重试**，同一 request ID |
 | 对已结束的任务 `cancel` | `task_not_running` | `task is not running` | 无法取消，先读 `status`/`wait` |
 | 安装器维护锁期间 | `lock_contention` | `maintenance is in progress` | **可重试**，等安装器完成 |
+| 部署状态不对（0.1.28 起） | `deployment_state` | `group is missing or has unexpected parallelism` / `cannot determine maintenance lock owner` / `invalid AgentQ … quarantine directory` | 重试与改参数都无效：去目标机核查 Pueue 组配置或维护锁目录 |
 
 消息文本是给人看的、措辞可变；`reason` 是机读契约，改它属于破坏性变更。
-服务端里 `fail()` 是唯一的 `exit 2` 出口，默认类别 `protocol_error`，上述两类
+服务端里 `fail()` 是唯一的 `exit 2` 出口，默认类别 `protocol_error`，其余类别
 显式覆盖；三个非 `fail` 的顶层 `exit 2`（usage、不支持的平台、Windows 用户环境
 解析失败）也各带一行。
 

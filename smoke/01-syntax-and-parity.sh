@@ -3565,21 +3565,44 @@ fi
 # the fixes added.
 local_hazard_selftest=$(mktemp)
 # Three plants with DISTINCT names -- one per arm of the rule (plain `NAME=`,
-# `if NAME=`, `NAME+=`) -- each inserted with its own single-line sed append:
-# BSD sed ends an `a` command at the first line that is not backslash-continued,
-# so a two-line body in one append silently truncates (measured here).  A plant
-# per arm is what makes deleting an arm visible; a single plant only exercises
-# whichever arm happens to see it.
-sed '/^acquire_request_lock() {$/a\
-    maintenance_lock_pid_path=/tmp/planted
-' "$root/skill/assets/unix/agentq-server" |
-    sed '/^[[:space:]]*maintenance_lock_pid_path=\/tmp\/planted$/a\
-    if lock_holder_age=$(true); then :; fi
-' | sed '/^[[:space:]]*if lock_holder_age=/a\
-    log_encoded+=("appended")
-' >"$local_hazard_selftest"
-if ! grep -q '^[[:space:]]*maintenance_lock_pid_path=/tmp/planted$' "$local_hazard_selftest" ||
-    ! grep -q '^[[:space:]]*if lock_holder_age=' "$local_hazard_selftest"; then
+# `if NAME=`, `NAME+=`).  A plant per arm is what makes deleting an arm
+# visible; a single plant only exercises whichever arm happens to see it.
+#
+# EVERY planted name must be a `local` of ANOTHER function, because that is
+# exactly what this rule reports: a write into a CALLER's local.  Two earlier
+# plants satisfied the rule's negative case instead and reported GREEN on a
+# correct rule -- the arm never ran (both measured 2026-11-10):
+#   * `maintenance_lock_pid_path` (the original plain plant) stopped existing
+#     anywhere in the server when 0.1.28 rewrote the maintenance lock, so it
+#     left the `declared` set and the rule correctly ignored it;
+#   * `request_lock_message` (its replacement) IS declared local by the very
+#     function it was planted in -- a function writing its own local is the
+#     rule's deliberate exemption, not a hazard.
+# The three names below are declared local by OTHER functions and by nothing
+# inside `acquire_request_lock`: lock_mtime and lock_holder_age by the stale
+# operation-lock recovery, log_encoded by compact_log.
+#
+# The plants are applied in awk, not with `sed a`: a plant whose text begins
+# with `/` is read by BSD sed as a `//` address (the empty regex, i.e. the
+# LAST line), so it is appended at the end of the file where it proves
+# nothing -- and the fixture still contains the text, so a `grep` for it
+# passes.  awk places them at the line anchored to the function header.
+local_hazard_selftest=$(mktemp)
+awk '
+    /^acquire_request_lock\(\) \{$/ {
+        print
+        if (n++ == 0) {
+            print "    lock_mtime=planted-plain"
+            print "    if lock_holder_age=$(true); then :; fi"
+            print "    log_encoded+=(\"appended\")"
+        }
+        next
+    }
+    { print }
+' "$root/skill/assets/unix/agentq-server" >"$local_hazard_selftest"
+if ! grep -q '^    lock_mtime=planted-plain$' "$local_hazard_selftest" ||
+    ! grep -q '^    if lock_holder_age=' "$local_hazard_selftest" ||
+    ! grep -q '^    log_encoded+=("appended")$' "$local_hazard_selftest"; then
     printf '%s\n' 'server FAILED (the local-hazard self-check could not plant its violations: the anchor moved)' >&2
     failures=$((failures + 1))
     local_hazard_count=$((local_hazard_count + 1))
@@ -3596,12 +3619,12 @@ else
         failures=$((failures + 1))
         local_hazard_count=$((local_hazard_count + 1))
     else
-        if ! grep -q '^acquire_request_lock: maintenance_lock_pid_path$' <<<"$local_hazard_selftest_report"; then
+        if ! grep -qxF -- 'acquire_request_lock: lock_mtime' <<<"$local_hazard_selftest_report"; then
             printf '%s\n' 'server FAILED (the local-hazard rule missed the plain NAME= plant, or blamed the wrong function)' >&2
             failures=$((failures + 1))
             local_hazard_count=$((local_hazard_count + 1))
         fi
-        if ! grep -q '^acquire_request_lock: lock_holder_age$' <<<"$local_hazard_selftest_report"; then
+        if ! grep -qxF -- 'acquire_request_lock: lock_holder_age' <<<"$local_hazard_selftest_report"; then
             printf '%s\n' 'server FAILED (the local-hazard rule missed the `if NAME=` plant: that pass is not running)' >&2
             failures=$((failures + 1))
             local_hazard_count=$((local_hazard_count + 1))
@@ -3609,7 +3632,7 @@ else
         # A THIRD plant for the append form: `NAME+=` is the same hazard, and
         # it is the one that appends to a caller's local instead of replacing
         # it -- a silent widening rather than a silent overwrite.
-        if ! grep -q '^acquire_request_lock: log_encoded$' <<<"$local_hazard_selftest_report"; then
+        if ! grep -qxF -- 'acquire_request_lock: log_encoded' <<<"$local_hazard_selftest_report"; then
             printf '%s\n' 'server FAILED (the local-hazard rule missed the `NAME+=` plant: the append arm is not matching)' >&2
             failures=$((failures + 1))
             local_hazard_count=$((local_hazard_count + 1))

@@ -1143,6 +1143,47 @@ if grep -qF 'already in progress' "$work/reason.err"; then
     failures=$((failures + 1))
 fi
 
+# The reason token describes a FAILURE.  A call that SUCCEEDED (exit 0, a valid
+# body) must not become `remote failure reason:` on the caller's stderr, even
+# when its stderr carries a reason line -- the token would then report a
+# failure that did not happen.  Measured 2026-11-10: the Windows client read
+# the token unconditionally at every Write-Diagnostics site, so a stray token
+# in a successful run's stderr was forwarded (the POSIX client's submit path
+# did the same; it is pinned by the same predicate in smoke/12's twin block,
+# which drives both clients through one loop).
+#
+# The stub answers the platform probe on stdout and puts the token on STDERR,
+# like the exit-2 fixture above -- the reason extractor never reads the `-E`
+# file, because real ssh never writes the remote's stderr there.  The positive
+# control is the exit-2 fixture above: without it this case would pass on a
+# client that simply never forwards anything.
+success_reason_stub="$work/bin/ssh-reason-success"
+cat > "$success_reason_stub" <<'STUB'
+#!/bin/sh
+printf '%s\n' 'orphan: reason=not_a_failure' >&2
+for argument in "$@"; do
+    case "$argument" in
+        *uname*) printf 'Linux\n'; exit 0 ;;
+    esac
+done
+printf '%s\n' '{"group":"agentq","tasks":{}}'
+exit 0
+STUB
+chmod 700 "$success_reason_stub"
+success_reason_status=0
+AGENTQ_SSH="$success_reason_stub" AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    "$client" status >"$work/reason-ok.out" 2>"$work/reason-ok.err" || success_reason_status=$?
+if [ "$success_reason_status" -ne 0 ]; then
+    printf 'client status on a successful remote exited %s, expected 0: %s\n' "$success_reason_status" \
+        "$(tr '\n' '|' < "$work/reason-ok.err")" >&2
+    failures=$((failures + 1))
+elif grep -qF 'remote failure reason' "$work/reason-ok.err"; then
+    printf 'client forwarded a reason line from a SUCCEEDING call: %s\n' \
+        "$(tr '\n' '|' < "$work/reason-ok.err")" >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+
 # cancel exit 4: the CODE is the contract, the body is decoration.
 # Until 2026-10-21 the client replaced 4 with 2 whenever the body failed its
 # `cancellation_pending` validation -- i.e. it reported "protocol/parameter

@@ -199,7 +199,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFOR
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.27"
+$script:ClientVersion = "0.1.28"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's argv limit, not this machine's platform: a unix
 # target takes up to 100000 base64 characters (the POSIX twin's MAX_ARG_STRLEN
@@ -2000,7 +2000,18 @@ function Get-RemoteFailureReason {
 }
 
 function Write-Diagnostics {
-    param([string]$Diagnostics)
+    param(
+        [string]$Diagnostics,
+        # The exit status of the ssh run these diagnostics came from.  The
+        # reason token is a CONTRACT for failures, so a token found in the
+        # stderr of a run that SUCCEEDED did not come from a failure.  Measured
+        # 2026-11-10: a stub ssh exiting 0 whose stderr held
+        # `agentq: reason=nope` printed `remote failure reason: nope` here on a
+        # succeeding operation.  $null means "not known" and keeps the old
+        # behaviour, which is correct for the probe-timeout and launch-failure
+        # paths whose status really is a failure.
+        [Nullable[int]]$ExitCode = $null
+    )
 
     if ([string]::IsNullOrEmpty($Diagnostics)) {
         return
@@ -2008,8 +2019,7 @@ function Write-Diagnostics {
     $byteCount = [System.Text.Encoding]::UTF8.GetByteCount($Diagnostics)
     $diagnosticClass = Get-SshDiagnosticClass -Diagnostics $Diagnostics
     $remoteReason = Get-RemoteFailureReason -Diagnostics $Diagnostics
-    if ($null -ne $remoteReason) {
-        [Console]::Error.WriteLine("$($script:Program): remote failure reason: $remoteReason")
+    if (($null -ne $remoteReason) -and (($null -eq $ExitCode) -or ($ExitCode -ne 0))) {        [Console]::Error.WriteLine("$($script:Program): remote failure reason: $remoteReason")
     }
     [Console]::Error.WriteLine("$($script:Program): SSH diagnostic omitted for safety (class=$diagnosticClass, $byteCount bytes)")
     # The class line alone does not tell the operator what to DO, and the line
@@ -2865,7 +2875,7 @@ function Confirm-WindowsAgentQProtocol {
         return
     }
 
-    Write-Diagnostics -Diagnostics $protocolProbe.Diagnostics
+    Write-Diagnostics -Diagnostics $protocolProbe.Diagnostics -ExitCode $protocolProbe.ExitCode
     if ($protocolProbe.ExitCode -eq 124) {
         exit 124
     }
@@ -2908,7 +2918,7 @@ function Confirm-NativeWindowsPlatform {
         return $true
     }
 
-    Write-Diagnostics -Diagnostics $windowsProbe.Diagnostics
+    Write-Diagnostics -Diagnostics $windowsProbe.Diagnostics -ExitCode $windowsProbe.ExitCode
     if ($windowsProbe.ExitCode -eq 124) {
         exit 124
     }
@@ -2956,7 +2966,7 @@ function Initialize-RemoteInvocation {
                     }
                 }
             } elseif ($unixProbe.ExitCode -eq 255) {
-                Write-Diagnostics -Diagnostics $unixProbe.Diagnostics
+                Write-Diagnostics -Diagnostics $unixProbe.Diagnostics -ExitCode $unixProbe.ExitCode
                 # 255 is OpenSSH's own failure code, and the POSIX twin returns
                 # it without running the Windows probe: either the recovery
                 # loop already spent its whole transport-retry budget, or ssh
@@ -2982,7 +2992,7 @@ function Initialize-RemoteInvocation {
                 # command the POSIX client completed.  Measured divergence
                 # 2026-10-21 (this file's own comment below already said the
                 # 255 rule was "deliberately NOT applied to 124").
-                Write-Diagnostics -Diagnostics $unixProbe.Diagnostics
+                Write-Diagnostics -Diagnostics $unixProbe.Diagnostics -ExitCode $unixProbe.ExitCode
             }
 
             $windowsProbe = Invoke-PlatformProbeWithRecovery -Probe (Get-WindowsProbeCommand)
@@ -2994,7 +3004,7 @@ function Initialize-RemoteInvocation {
                 Write-PlatformProbeCache
                 return
             }
-            Write-Diagnostics -Diagnostics $windowsProbe.Diagnostics
+            Write-Diagnostics -Diagnostics $windowsProbe.Diagnostics -ExitCode $windowsProbe.ExitCode
             # No exit 124 here either: with the unix probe timed out and the
             # Windows probe timed out too, the POSIX twin takes its "both
             # failed" arm, which prints the unsupported-platform line and
@@ -3051,13 +3061,13 @@ function Invoke-SubmitWithRecovery {
         $result = Invoke-SshLogged -RemoteCommand $SubmitInvocation.Command -InputPayload $SubmitInvocation.Input
         if ($result.ExitCode -eq 0) {
             if (!(Test-AgentQJsonResponse -Operation "submit" -Output $result.Output -ExpectedRequestId $RequestId)) {
-                Write-Diagnostics -Diagnostics $result.Diagnostics
+                Write-Diagnostics -Diagnostics $result.Diagnostics -ExitCode $result.ExitCode
                 return 2
             }
             Write-OperationOutput -Output $result.Output
             return 0
         }
-        Write-Diagnostics -Diagnostics $result.Diagnostics
+        Write-Diagnostics -Diagnostics $result.Diagnostics -ExitCode $result.ExitCode
         if (($result.ExitCode -ne 255) -or !(Test-SshTransportError -Diagnostics $result.TransportDiagnostics)) {
             Write-OperationOutput -Output $result.Output
             return $result.ExitCode
@@ -3072,7 +3082,7 @@ function Invoke-SubmitWithRecovery {
         [Console]::Error.WriteLine("$($script:Program): SSH transport lost while submitting request $RequestId; reconciling attempt $attempt/$($script:SubmitRetryAttempts)...")
         Start-Sleep -Seconds ([int]$script:SubmitRetryDelay)
         $lookup = Invoke-SshLogged -RemoteCommand $LookupInvocation.Command -InputPayload $LookupInvocation.Input
-        Write-Diagnostics -Diagnostics $lookup.Diagnostics
+        Write-Diagnostics -Diagnostics $lookup.Diagnostics -ExitCode $lookup.ExitCode
         if ($lookup.ExitCode -eq 0) {
             if (!(Test-AgentQJsonResponse -Operation "lookup" -Output $lookup.Output -ExpectedRequestId $RequestId)) {
                 return 2
@@ -3127,7 +3137,7 @@ function Invoke-SafeOperationWithRecovery {
         }
         if ($result.ExitCode -eq 0) {
             if (!(Test-AgentQJsonResponse -Operation $validationProfile -Output $result.Output -ExpectedRequestId $ExpectedRequestId -ExpectedTaskId $ExpectedTaskId)) {
-                Write-Diagnostics -Diagnostics $result.Diagnostics
+                Write-Diagnostics -Diagnostics $result.Diagnostics -ExitCode $result.ExitCode
                 return 2
             }
             if (($OperationName -eq "wait") -and !(Test-AgentQWaitContract -Output $result.Output -ExitCode 0 -ExpectedTaskId $ExpectedTaskId)) {
@@ -3137,7 +3147,7 @@ function Invoke-SafeOperationWithRecovery {
             Write-OperationOutput -Output $result.Output
             return 0
         }
-        Write-Diagnostics -Diagnostics $result.Diagnostics
+        Write-Diagnostics -Diagnostics $result.Diagnostics -ExitCode $result.ExitCode
         if (($OperationName -eq "wait") -and ($result.ExitCode -in @(1, 5, 6)) -and
             !(Test-AgentQWaitContract -Output $result.Output -ExitCode $result.ExitCode -ExpectedTaskId $ExpectedTaskId)) {
             [Console]::Error.WriteLine("$($script:Program): remote wait response failed the AgentQ exit/result contract for exit $($result.ExitCode)")
@@ -3175,7 +3185,7 @@ function Invoke-Mutation {
     $validationProfile = if (![string]::IsNullOrEmpty($ResponseProfile)) { $ResponseProfile } else { $OperationName }
 
     $result = Invoke-SshLogged -RemoteCommand $Invocation.Command -InputPayload $Invocation.Input
-    Write-Diagnostics -Diagnostics $result.Diagnostics
+    Write-Diagnostics -Diagnostics $result.Diagnostics -ExitCode $result.ExitCode
     if ($result.ExitCode -eq 0 -and !(Test-AgentQJsonResponse -Operation $validationProfile -Output $result.Output -ExpectedTaskId $ExpectedTaskId)) {
         return 2
     }

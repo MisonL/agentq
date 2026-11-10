@@ -522,6 +522,173 @@ if [ "$failures" -ne 0 ]; then
     printf 'ps-installer-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
+
+# --- the operation lock's stale recovery, driven on the extracted functions ---
+# Wait-ForAgentQOperationLock was unrunnable off Windows for the same reason as
+# everything else in this file (the platform gate), and its stale path removed
+# the WHOLE lock directory with `Remove-Item -Recurse -Force`.  That deletes
+# whatever else lives in the directory -- including the files of a lock another
+# process created after the holder died -- and the test only proves the
+# directory is not a reparse point.  The mirror is the POSIX twin
+# remove_stale_operation_lock: re-read the SAME identity, re-judge death, then
+# remove only the verified pid file and the now-empty directory.
+#
+# Same AST technique as the W5 block: the functions are pure .NET over paths, so
+# they run here unchanged.  `sleep` is replaced by a counter -- the wait loop's
+# 30 one-second sleeps would otherwise cost the case half a minute.
+lock_extract="$work/oplock-extract.ps1"
+cat > "$lock_extract" <<'LOCKEXTRACT'
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+$installerPath = $args[0]
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($installerPath, [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) { [Console]::Error.WriteLine("installer did not parse"); exit 3 }
+$wanted = @(
+    "Wait-ForAgentQOperationLock",
+    "Remove-StaleOperationLock",
+    "Remove-AgentQInstallerTemporaryFile",
+    "Read-LockMetadata",
+    "Test-ProcessIsConfirmedDead",
+    "Get-ProcessIdentityState",
+    "Test-NonReparseLockPath",
+    "Test-NonReparseFilePath"
+)
+$functions = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
+$source = [System.Text.StringBuilder]::new()
+foreach ($name in $wanted) {
+    $match = $functions | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+    if ($null -eq $match) { [Console]::Error.WriteLine("missing function: $name"); exit 3 }
+    [void]$source.AppendLine($match.Extent.Text)
+}
+Invoke-Expression $source.ToString()
+$script:Program = 'install-agentq.ps1'
+
+function Start-Sleep { param([int]$Seconds) $script:sleepCalls += 1 }
+
+function Get-DeadProcessId {
+    $process = [System.Diagnostics.Process]::Start([System.Diagnostics.ProcessStartInfo]::new("/bin/sh", "-c exit 0"))
+    $process.WaitForExit()
+    return [string]$process.Id
+}
+function Get-HolderIdentity {
+    return ([System.Diagnostics.Process]::GetCurrentProcess()).StartTime.ToUniversalTime().Ticks.ToString()
+}
+
+$runtime = Join-Path $args[1] "runtime"
+[System.IO.Directory]::CreateDirectory($runtime) | Out-Null
+$lock = Join-Path $runtime "agentq-operation.lock"
+function Reset-Lock {
+    if ([System.IO.Directory]::Exists($lock)) { [System.IO.Directory]::Delete($lock, $true) }
+    [System.IO.Directory]::CreateDirectory($lock) | Out-Null
+}
+function Write-LockMetadata([string]$PidValue, [string]$Identity) {
+    [System.IO.File]::WriteAllText((Join-Path $lock "pid"), "$PidValue`t$Identity")
+}
+
+$deadPid = Get-DeadProcessId
+$holderIdentity = Get-HolderIdentity
+
+# 1. Holder confirmed dead, nothing unknown beside it -> the lock is recovered
+#    and the wait returns.
+Reset-Lock
+Write-LockMetadata $deadPid "Mon Jan  1 00:00:00 2001"
+$script:sleepCalls = 0
+Wait-ForAgentQOperationLock -RuntimeDirectory $runtime
+if ([System.IO.Directory]::Exists($lock)) {
+    [Console]::Error.WriteLine("oplock dead-holder: the stale lock survived"); exit 1
+}
+
+# 2. Holder confirmed dead, but the directory holds a file the protocol does
+#    not define.  A recursive delete would destroy it; the recovery must remove
+#    its own pid and then FAIL, leaving the unknown file and the directory in
+#    place.  With the pid file gone and the directory non-empty, the wait then
+#    throws -- the wait cannot leave a lock it does not own behind silently.
+Reset-Lock
+Write-LockMetadata $deadPid "Mon Jan  1 00:00:00 2001"
+$unknownPath = Join-Path $lock "unknown"
+[System.IO.File]::WriteAllText($unknownPath, "keep me")
+$script:sleepCalls = 0
+$refused = $false
+try {
+    Wait-ForAgentQOperationLock -RuntimeDirectory $runtime
+} catch {
+    $refused = $_.Exception.Message -like "*still in progress*" -or
+        $_.Exception.Message -like "*cannot recover stale AgentQ operation lock*"
+}
+if (!$refused) {
+    [Console]::Error.WriteLine("oplock unknown-child: the wait did not refuse the unrecoverable lock"); exit 1
+}
+if (![System.IO.File]::Exists($unknownPath)) {
+    [Console]::Error.WriteLine("oplock unknown-child: the recovery deleted a file it does not own"); exit 1
+}
+if (![System.IO.Directory]::Exists($lock)) {
+    [Console]::Error.WriteLine("oplock unknown-child: the recovery removed a directory it does not own"); exit 1
+}
+
+# 3. THE RACE: the stale holder's pid file makes the recovery judge the lock
+#    dead, and before the re-read a different, LIVE lock is in its place (a new
+#    pid file).  That lock belongs to someone else and must survive; the new
+#    holder's directory must not lose anything either.
+Reset-Lock
+Write-LockMetadata $deadPid "Mon Jan  1 00:00:00 2001"
+$swapScript = Join-Path $args[1] "swap.ps1"
+[System.IO.File]::WriteAllText($swapScript, @'
+param([string]$Lock, [string]$HolderPid, [string]$HolderIdentity)
+Remove-Item -LiteralPath (Join-Path $Lock "pid") -Force
+[System.IO.File]::WriteAllText((Join-Path $Lock "pid"), "$HolderPid`t$HolderIdentity")
+Set-Content -LiteralPath (Join-Path $Lock "swapped") -Value "live holder's file"
+'@)
+# Hook the FIRST Test-ProcessIsConfirmedDead call (the one Wait-ForAgentQOperationLock
+# makes, before Remove-StaleOperationLock runs) and swap the lock behind it.
+# Remove-StaleOperationLock re-reads afterwards and sees the changed identity,
+# so it retries the 3 attempts, then returns 2 -- the wait then throws the
+# unverifiable-lock message, and the live lock and its extra file survive.
+$original = ${function:Test-ProcessIsConfirmedDead}
+function Test-ProcessIsConfirmedDead {
+    param([string]$ProcessId, [string]$ExpectedIdentity)
+    $result = & $original -ProcessId $ProcessId -ExpectedIdentity $ExpectedIdentity
+    if ($result -and !$script:swapped) {
+        $script:swapped = $true
+        & $swapScript -Lock $lock -HolderPid ([string]$PID) -HolderIdentity $holderIdentity
+    }
+    return $result
+}
+$script:swapped = $false
+$script:sleepCalls = 0
+$refused = $false
+try {
+    Wait-ForAgentQOperationLock -RuntimeDirectory $runtime
+} catch {
+    $refused = $_.Exception.Message -like "*cannot recover stale AgentQ operation lock*"
+}
+if (!$refused) {
+    [Console]::Error.WriteLine("oplock swapped-live: the wait did not throw the cannot-recover refusal"); exit 1
+}
+$swapMetadata = Read-LockMetadata -Path (Join-Path $lock "pid")
+if ($null -eq $swapMetadata -or $swapMetadata.Pid -ne [string]$PID) {
+    [Console]::Error.WriteLine("oplock swapped-live: the recovery deleted the live holder's lock"); exit 1
+}
+if (![System.IO.File]::Exists((Join-Path $lock "swapped"))) {
+    [Console]::Error.WriteLine("oplock swapped-live: the recovery deleted the live holder's file"); exit 1
+}
+
+[Console]::Out.WriteLine("OPLOCK-OK")
+LOCKEXTRACT
+
+cases=$((cases + 1))
+lock_status=0
+lock_out=$("$pwsh_binary" -NoProfile -NonInteractive -File "$lock_extract" "$installer" "$work" 2>"$work/oplock.err") || lock_status=$?
+if [ "$lock_status" -ne 0 ] || [ "$lock_out" != "OPLOCK-OK" ]; then
+    printf 'ps-installer (operation lock): the stale recovery failed: %s\n' \
+        "$(head -3 "$work/oplock.err" | tr '\n' ' ')" >&2
+    failures=$((failures + 1))
+fi
+if [ "$failures" -ne 0 ]; then
+    exit 1
+fi
+
 # The platform-gate coverage is reported, not assumed: on a Windows host those
 # cases did not run (the gate cannot fire there), and saying "covered" would be
 # the same false claim in the other direction.
@@ -540,5 +707,5 @@ else
     platform_gate_state='platform-gate=covered'
     staging_state='staging=NOT-covered(needs-Windows)'
 fi
-printf 'ps-installer-contract checks passed: cases=%s pwsh=%s binder=%s crash-leftover=covered %s %s\n' \
+printf 'ps-installer-contract checks passed: cases=%s pwsh=%s binder=%s crash-leftover=covered operation-lock=covered %s %s\n' \
     "$cases" "$("$pwsh_binary" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')" "$pwsh_binder" "$platform_gate_state" "$staging_state"
