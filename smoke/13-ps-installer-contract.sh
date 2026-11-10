@@ -568,7 +568,15 @@ $script:Program = 'install-agentq.ps1'
 function Start-Sleep { param([int]$Seconds) $script:sleepCalls += 1 }
 
 function Get-DeadProcessId {
-    $process = [System.Diagnostics.Process]::Start([System.Diagnostics.ProcessStartInfo]::new("/bin/sh", "-c exit 0"))
+    # A process that really exists and really exits, from the SHELL THIS CHECK
+    # IS RUNNING UNDER.  The first version hard-coded /bin/sh: on the Windows CI
+    # job (Git Bash) that path does not exist for .NET, Process.Start threw
+    # "The system cannot find the file specified", the driver exited non-zero,
+    # and the failure came back as "the stale recovery failed" -- reading like a
+    # defect in the asset under test (measured 2026-11-10).
+    $shell = if ($env:COMSPEC -and (Test-Path -LiteralPath $env:COMSPEC)) { $env:COMSPEC } else { "/bin/sh" }
+    $arguments = if ($shell -like "*cmd.exe") { "'/c exit 0'" } else { "'-c exit 0'" }
+    $process = [System.Diagnostics.Process]::Start([System.Diagnostics.ProcessStartInfo]::new($shell, $arguments))
     $process.WaitForExit()
     return [string]$process.Id
 }

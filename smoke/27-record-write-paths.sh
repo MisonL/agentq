@@ -483,9 +483,22 @@ assert_reason_is() { # $1 label, $2 reason
     fi
 }
 backdate() { # $1 path, $2 seconds ago
-    local when
+    local when stamp
     when=$(( $(date +%s) - $2 ))
-    touch -t "$(date -r "$when" +%Y%m%d%H%M.%S)" "$1"
+    # `date -r` takes an epoch on BSD/macOS and a REFERENCE FILE on GNU, where
+    # the epoch form is `date -d @<epoch>`.  The macOS spelling was the only
+    # one here, so the m0-m8 cases -- the ones that actually call this helper --
+    # failed on ubuntu:24.04 with "date: 1794304890: No such file or directory"
+    # followed by `touch: invalid date format` (measured 2026-11-10, linux CI).
+    # Both branches are spelled out, and an empty stamp is refused here rather
+    # than handed to touch.
+    stamp=$(date -r "$when" +%Y%m%d%H%M.%S 2>/dev/null ||
+        date -d "@$when" +%Y%m%d%H%M.%S 2>/dev/null) || stamp=''
+    if [ -z "$stamp" ]; then
+        printf 'write-paths: cannot compute a backdated timestamp on this host (neither BSD nor GNU date accepted the epoch)\n' >&2
+        return 1
+    fi
+    touch -t "$stamp" -- "$1"
 }
 # M0. Positive control: no lock -> the command reaches its own logic (the
 #     unknown id is answered, not a maintenance diagnostic).
