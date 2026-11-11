@@ -3325,9 +3325,82 @@ fi
 # with a writer that closes, CopyTo and the bounded read behave identically
 # (both then refuse on the base64 length), so only a pipe that stays open can
 # tell them apart.  A FIFO does that; the writer is killed in the cleanup.
+# The CLOSED-pipe control runs on every host: an oversized payload whose writer
+# closes must be refused with the controlled message before any ssh launch.  It
+# is the positive control for the message and the exit code, and on a Windows
+# host it is the only half of this pair that can run at all.
 cases=$((cases + 1))
-stdin_fifo="$work/stdin-overlong.fifo"
-rm -f "$stdin_fifo"
+stdin_closed_status=0
+head -c 400000 /dev/zero |
+    AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$twin_stub_arg" AGENTQ_CONFIG="$work/absent-config" \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" \
+    submit --workdir /tmp --stdin-script \
+    >"$work/stdin-closed.out" 2>"$work/stdin-closed.err" || stdin_closed_status=$?
+if [ "$stdin_closed_status" -ne 2 ] ||
+    ! grep -qF 'the script is too large for --stdin-script' "$work/stdin-closed.err"; then
+    printf 'ps-client stdin-script (closed pipe): exited %s, expected 2 with the too-large message; stderr: %s\n' \
+        "$stdin_closed_status" "$(head -2 "$work/stdin-closed.err" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+fi
+
+# The OPEN-pipe leg is POSIX-only, and that is a measured limit rather than a
+# convenience: a Git Bash FIFO redirected into a native Windows process delivers
+# EOF immediately -- the client answers "submit --stdin-script received no
+# script on standard input" (measured on the Windows CI job 2026-11-11, twice:
+# first with a POSIX ssh stub that failed the launch check, then with the right
+# stub and an empty read).  So the host declares this SUB-PART not covered, with
+# the reason named, instead of the case silently passing or SKIPping -- the
+# Windows job refuses SKIP, and a silent pass would let a shape that never ran
+# read as green.
+stdin_open_pipe_state='checked'
+case "$(uname -s)" in
+MINGW*|MSYS*|CYGWIN*)
+    stdin_open_pipe_state='NOT-covered(needs-POSIX-pipes)'
+    ;;
+*)
+    cases=$((cases + 1))
+    stdin_fifo="$work/stdin-overlong.fifo"
+    rm -f "$stdin_fifo"
+    mkfifo "$stdin_fifo"
+    ( head -c 400000 /dev/zero ; sleep 60 ) > "$stdin_fifo" 2>/dev/null &
+    stdin_writer=$!
+    stdin_overlong_status=0
+    AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$twin_stub_arg" AGENTQ_CONFIG="$work/absent-config" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" \
+        submit --workdir /tmp --stdin-script \
+        < "$stdin_fifo" >"$work/stdin-overlong.out" 2>"$work/stdin-overlong.err" &
+    stdin_client=$!
+    # Poll instead of waiting: a reader that blocks on the open pipe would never
+    # return, and the check itself must not hang.  12s is far above the measured
+    # cost of reading 300KB and base64-ing it.
+    stdin_waited=0
+    while [ "$stdin_waited" -lt 48 ]; do
+        if ! kill -0 "$stdin_client" 2>/dev/null; then break; fi
+        sleep 0.25
+        stdin_waited=$((stdin_waited + 1))
+    done
+    if kill -0 "$stdin_client" 2>/dev/null; then
+        printf '%s\n' 'ps-client stdin-script: the client was still reading 12s after the cap with the writer holding the pipe open; the read is unbounded' >&2
+        kill -9 "$stdin_client" 2>/dev/null || true
+        failures=$((failures + 1))
+    else
+        wait "$stdin_client" || stdin_overlong_status=$?
+        if [ "$stdin_overlong_status" -ne 2 ] ||
+            ! grep -qF 'the script is too large for --stdin-script' "$work/stdin-overlong.err"; then
+            printf 'ps-client stdin-script: an over-long script exited %s, expected 2 with the too-large message; stderr: %s\n' \
+                "$stdin_overlong_status" "$(head -2 "$work/stdin-overlong.err" | tr '\n' '|')" >&2
+            failures=$((failures + 1))
+        fi
+    fi
+    kill "$stdin_writer" 2>/dev/null || true
+    wait "$stdin_writer" 2>/dev/null || true
+    rm -f "$stdin_fifo"
+    ;;
+esac
 mkfifo "$stdin_fifo"
 ( head -c 400000 /dev/zero ; sleep 60 ) > "$stdin_fifo" 2>/dev/null &
 stdin_writer=$!
@@ -3674,5 +3747,5 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 
-printf 'ps-client-contract checks passed: cases=%s twin=%s pwsh=%s ps51=%s reason=forwarded/injection-safe/failure-only modes=validated\n' \
-    "$cases" "$twin_state" "$ps_version" "$ps51_state"
+printf 'ps-client-contract checks passed: cases=%s twin=%s pwsh=%s ps51=%s stdin-open-pipe=%s reason=forwarded/injection-safe/failure-only modes=validated\n' \
+    "$cases" "$twin_state" "$ps_version" "$ps51_state" "$stdin_open_pipe_state"
