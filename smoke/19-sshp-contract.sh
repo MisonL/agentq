@@ -2014,6 +2014,41 @@ elif [ -n "$init_line" ] && [ "$exit_trap_line" -ge "$init_line" ]; then
     failures=$((failures + 1))
 fi
 
+# The Windows sibling's top-level trap, added in 0.1.29.  The POSIX checks
+# above pin sshp's signal traps; sshp.ps1 had NO trap at all, so an unexpected
+# throw ended it with exit 1 and a raw PowerShell exception dump (file, line,
+# ANSI colour) where the POSIX twin writes one `sshp: <msg>` line and exits 2.
+# Measured 2026-11-10 on the SAME symlinked-TMPDIR input fed to both.
+#
+# Position and form are both asserted, for the reason the POSIX trap-window
+# locks below give: a bare grep of the trap text is position-blind, and a trap
+# placed after the first function would leave every call that runs before it
+# unguarded.  A trap does NOT intercept `exit`, so deliberate codes keep
+# their value either way -- this lock is about the UNEXPECTED path only.
+cases=$((cases + 1))
+ps_trap_line=$(grep -n '^trap {$' "$sshp_ps_client" | head -1 | cut -d: -f1) || true
+ps_first_function=$(grep -n '^function ' "$sshp_ps_client" | head -1 | cut -d: -f1) || true
+if [ -z "$ps_trap_line" ]; then
+    printf '%s\n' 'sshp-contract: sshp.ps1 has no top-level trap; an unexpected throw exits 1 with a raw PowerShell dump' >&2
+    failures=$((failures + 1))
+elif [ -n "$ps_first_function" ] && [ "$ps_trap_line" -ge "$ps_first_function" ]; then
+    printf 'sshp-contract: the sshp.ps1 trap binds at line %s, not before the first function (%s); calls above it stay unguarded\n' \
+        "$ps_trap_line" "$ps_first_function" >&2
+    failures=$((failures + 1))
+else
+    # The trap window is captured into a variable FIRST and grepped through
+    # here-strings: a `sed | grep -q` pipeline reads a FOUND match as absent
+    # under pipefail (sed takes SIGPIPE when the quiet grep exits on its first
+    # match), and the repo's own quiet-grep rule reported exactly that shape
+    # in this file on the first full-suite run.
+    ps_trap_window=$(sed -n "${ps_trap_line},$((ps_trap_line + 3))p" "$sshp_ps_client") || true
+    if ! grep -qF '[Console]::Error.WriteLine("$($script:Program): $($_.Exception.Message)")' <<<"$ps_trap_window" ||
+        ! grep -qx '    exit 2' <<<"$ps_trap_window"; then
+        printf '%s\n' 'sshp-contract: the sshp.ps1 trap is not the stderr-one-line-plus-exit-2 form; the diagnostic contract would diverge from the POSIX twin' >&2
+        failures=$((failures + 1))
+    fi
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'sshp-contract: %s failure(s)\n' "$failures" >&2
     exit 1

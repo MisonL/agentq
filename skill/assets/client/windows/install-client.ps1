@@ -85,6 +85,14 @@ $windowsUserProfile = Resolve-CurrentWindowsUserProfile
 $script:WindowsUserLocalAppData = Join-Path $windowsUserProfile "AppData\Local"
 if ([string]::IsNullOrWhiteSpace($DestinationDirectory)) {
     $DestinationDirectory = Join-Path $windowsUserProfile ".local\bin"
+} else {
+    # A RELATIVE -DestinationDirectory used to reach Add-DirectoryToUserPath
+    # verbatim, i.e. a relative entry landed in the user's PERSISTENT PATH --
+    # resolved against whatever directory the next `agentq` invocation happens
+    # to run in, so any `agentq.cmd` there hijacks the command.  Normalise to an
+    # absolute path before anything consumes it (measured 2026-11-10: the raw
+    # value reached Add-DirectoryToUserPath unnormalised).
+    $DestinationDirectory = [System.IO.Path]::GetFullPath($DestinationDirectory)
 }
 
 function Assert-NonReparsePathChain {

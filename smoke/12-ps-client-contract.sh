@@ -172,6 +172,26 @@ expect_rejected 'lookup requires one request id' --host smoke-host lookup a b
 # neither mode.
 expect_rejected 'status accepts --summary or --task' --host smoke-host status extra
 
+# --- trailing-LF rejection (0.1.29) -----------------------------------------
+# .NET's `$` matches BEFORE a final newline, so `'^[1-9][0-9]*$'` accepted
+# "1\n" and the value reached ssh -- while the POSIX twin refused it locally.
+# Measured 2026-11-10: POSIX exit 2 / 0 ssh calls, this client exit 255 / 1
+# call.  The anchors are now `\A…\z`.  `$'1\n'` is a REAL trailing newline, not
+# the two characters backslash-n.
+nl_value=$'1\n'
+expect_rejected 'task id must be a non-negative integer' --host smoke-host logs "$nl_value"
+expect_rejected '--timeout must be a positive integer' --host smoke-host wait 1 --timeout "$nl_value"
+cases=$((cases + 1))
+status=0
+AGENTQ_HOST=smoke-host AGENTQ_OPERATION_RETRY_ATTEMPTS="$nl_value" \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" --version \
+    >"$work/out" 2>"$work/err" || status=$?
+if [ "$status" -ne 2 ]; then
+    printf 'ps-client numeric env with a trailing LF: expected exit 2, got %s\n' "$status" >&2
+    head -3 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+
 # A non-ASCII request id is local-level validation that runs before any ssh
 # call.  The charset guard on the POSIX side was a bracket RANGE until 2026-11-06
 # (it used `A-Za-z`), which under bash with a collating locale includes accented
@@ -1023,8 +1043,23 @@ twin_config_case "$client_arg" blank-middle  255 beta   'AGENTQ_HOST=alpha
 AGENTQ_HOST=
 AGENTQ_HOST=beta
 '
-if [ "$twin_config_rows" -lt 5 ]; then
-    printf 'ps-client twin config: only %s row(s) ran (expected 5); the enumeration broke\n' \
+# --- config KEYS are case-sensitive, exactly like the environment -----------
+# Measured 2026-11-10 (independent review, on this twin differential): a config
+# line `agentq_host=lower-host` was HONOURED by the Windows client -- its
+# `-match` is case-insensitive -- and ignored by the POSIX twin's anchored
+# `sed`, which is case-sensitive.  One config file therefore produced opposite
+# answers: Windows connected to a host the file never named (in the documented
+# spelling) while POSIX refused with "no SSH host configured".  The Windows
+# regex is now `-cmatch '\AAGENTQ_HOST=…\z'`.  The exact-spelling row is the
+# positive control: without it, "refuse every config file" would pass.
+twin_config_case "$client_arg" key-lowercase 2   -        'agentq_host=lower-host
+'
+twin_config_case "$client_arg" key-mixedcase 2   -        'AgentQ_Host=lower-host
+'
+twin_config_case "$client_arg" key-exact     255 cfg-host 'AGENTQ_HOST=cfg-host
+'
+if [ "$twin_config_rows" -lt 8 ]; then
+    printf 'ps-client twin config: only %s row(s) ran (expected 8); the enumeration broke\n' \
         "$twin_config_rows" >&2
     failures=$((failures + 1))
 fi
@@ -1996,7 +2031,7 @@ else
         failures=$((failures + 1))
     fi
 fi
-twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+bom($twin_bom_rows/7)+config($twin_config_rows/5)+cfgpath($twin_cfgpath_rows/4)+ws($twin_ws_rows/9)+wsstr($twin_strblank_rows/9)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
+twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+bom($twin_bom_rows/7)+config($twin_config_rows/8)+cfgpath($twin_cfgpath_rows/4)+ws($twin_ws_rows/9)+wsstr($twin_strblank_rows/9)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
 else
 twin_state=$twin_platform_state
 fi
@@ -3277,6 +3312,58 @@ elif [ "$oversize_b64" -le "$oversize_limit" ]; then
     printf 'ps-client: the local command-line budget did not shrink the usable payload (%s > %s is false)\n' "$oversize_b64" "$oversize_limit" >&2
     failures=$((failures + 1))
 fi
+
+# --- an over-long stdin script must be REFUSED while the writer is still open
+# The stdin-script reader used CopyTo, which blocks until EOF: a producer that
+# keeps the pipe open past the cap made this client buffer without bound and
+# delay the refusal until EOF -- measured 2026-11-10 with a 100000-byte payload
+# whose writer never closed: the POSIX twin refused immediately, this one was
+# still running after 3 seconds.  A reader now stops at the largest possible
+# target limit and lets the exact check refuse.
+#
+# The case has to reproduce the OPEN pipe, not merely an oversized payload:
+# with a writer that closes, CopyTo and the bounded read behave identically
+# (both then refuse on the base64 length), so only a pipe that stays open can
+# tell them apart.  A FIFO does that; the writer is killed in the cleanup.
+cases=$((cases + 1))
+stdin_fifo="$work/stdin-overlong.fifo"
+rm -f "$stdin_fifo"
+mkfifo "$stdin_fifo"
+( head -c 400000 /dev/zero ; sleep 60 ) > "$stdin_fifo" 2>/dev/null &
+stdin_writer=$!
+stdin_overlong_status=0
+AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+AGENTQ_SSH="$twin_stub_posix" AGENTQ_CONFIG="$work/absent-config" \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" \
+    submit --workdir /tmp --stdin-script \
+    < "$stdin_fifo" >"$work/stdin-overlong.out" 2>"$work/stdin-overlong.err" &
+stdin_client=$!
+# Poll instead of waiting: a reader that blocks on the open pipe would never
+# return, and the check itself must not hang.  12s is far above the measured
+# cost of reading 300KB and base64-ing it.
+stdin_waited=0
+while [ "$stdin_waited" -lt 48 ]; do
+    if ! kill -0 "$stdin_client" 2>/dev/null; then break; fi
+    sleep 0.25
+    stdin_waited=$((stdin_waited + 1))
+done
+if kill -0 "$stdin_client" 2>/dev/null; then
+    printf '%s\n' 'ps-client stdin-script: the client was still reading 12s after the cap with the writer holding the pipe open; the read is unbounded' >&2
+    kill -9 "$stdin_client" 2>/dev/null || true
+    failures=$((failures + 1))
+else
+    wait "$stdin_client" || stdin_overlong_status=$?
+    if [ "$stdin_overlong_status" -ne 2 ] ||
+        ! grep -qF 'the script is too large for --stdin-script' "$work/stdin-overlong.err"; then
+        printf 'ps-client stdin-script: an over-long script exited %s, expected 2 with the too-large message; stderr: %s\n' \
+            "$stdin_overlong_status" "$(head -2 "$work/stdin-overlong.err" | tr '\n' '|')" >&2
+        failures=$((failures + 1))
+    fi
+fi
+kill "$stdin_writer" 2>/dev/null || true
+wait "$stdin_writer" 2>/dev/null || true
+rm -f "$stdin_fifo"
 
 # --version must be byte-identical to the POSIX twin's line.  Measured
 # 2026-10-21: this client printed `agentq.ps1 0.1.16` while the POSIX client

@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.28'
+agentq_version='0.1.29'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -309,7 +309,7 @@ Usage:
   $program submit --workdir <directory> [--label <label>] --request-id <id> -- <command> [arguments...]
   $program lookup <request-id>
   $program status [--summary | --task <task-id>]
-  $program logs <task-id> [--tail <lines>]
+  $program logs <task-id> [--tail <line-count|all>]
   $program cancel <task-id>
   $program wait <task-id>
   $program remove <task-id> | --label <label> --confirm
@@ -1464,18 +1464,43 @@ write_lock_metadata() {
     fi
 }
 
-lock_directory_is_stale_empty() {
+# A lock directory may legitimately hold ONE kind of leftover: the lock metadata
+# writer builds its temporary file INSIDE the lock directory (so the final
+# rename stays same-directory) and a process killed between `mktemp` and the
+# rename leaves it there.  Without this arm such a directory is neither "empty"
+# nor does it carry a `pid`, so it matched NEITHER recovery branch: every later
+# WRITE retried the whole budget and then reported lock_contention -- with no
+# holder to name, because no pid was ever written -- while lock-free reads kept
+# working, so the machine looked "half alive" and nothing ever healed it.
+# Measured 2026-11-10 by planting the file: submit/lookup/wait/cancel all
+# exited 2 after ~32s, status/doctor exited 0, and the file never went away.
+# This predicate is also the upgrade path: a host wedged by an older version
+# reclaims itself on the next command instead of needing a hand-deleted file.
+lock_directory_has_only_metadata_temporaries() {
+    local lock_directory=$1
+    local unexpected=''
+
+    [ -n "$lock_directory" ] || return 1
+    [ -d "$lock_directory" ] && [ ! -L "$lock_directory" ] || return 1
+    [ ! -e "$lock_directory/pid" ] && [ ! -L "$lock_directory/pid" ] || return 1
+    # Anything that is not a regular file (subdirectory, symlink, fifo) means
+    # this directory is not ours to reclaim.
+    unexpected=$(find "$lock_directory" -mindepth 1 -maxdepth 1 ! -type f -print -quit 2>/dev/null) ||
+        return 1
+    [ -z "$unexpected" ] || return 1
+    # ...and every regular file must carry the metadata writer's own prefix.
+    unexpected=$(find "$lock_directory" -mindepth 1 -maxdepth 1 -type f \
+        ! -name '.agentq-lock-metadata.*' -print -quit 2>/dev/null) || return 1
+    [ -z "$unexpected" ] || return 1
+}
+
+lock_directory_is_stale_unowned() {
     local lock_directory=$1
     local lock_mtime=''
     local current_epoch=''
-    local child=''
 
     path_chain_is_safe "$lock_directory" || return 1
-    [ ! -L "$lock_directory" ] || return 1
-    [ -d "$lock_directory" ] || return 1
-    [ ! -e "$lock_directory/pid" ] && [ ! -L "$lock_directory/pid" ] || return 1
-    child=$(find "$lock_directory" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null) || return 1
-    [ -z "$child" ] || return 1
+    lock_directory_has_only_metadata_temporaries "$lock_directory" || return 1
     lock_mtime=$(stat_mtime "$lock_directory") || return 1
     current_epoch=$(date +%s) || return 1
     case "$lock_mtime" in
@@ -1906,13 +1931,13 @@ recover_stale_operation_lock_for_read() {
                     fail "cannot recover stale AgentQ operation lock: $candidate"
             fi
         fi
-    elif lock_directory_is_stale_empty "$candidate"; then
+    elif lock_directory_is_stale_unowned "$candidate"; then
         if remove_stale_lock "$candidate" operation '' '' true; then
             :
         else
             stale_read_recovery_status=$?
             [ "$stale_read_recovery_status" -eq 2 ] ||
-                fail "cannot recover empty AgentQ operation lock: $candidate"
+                fail "cannot recover unowned AgentQ operation lock: $candidate"
         fi
     fi
     return 0
@@ -1979,9 +2004,9 @@ acquire_operation_lock() {
                 fi
                 continue
             fi
-        elif lock_directory_is_stale_empty "$candidate"; then
+        elif lock_directory_is_stale_unowned "$candidate"; then
             if ! remove_stale_lock "$candidate" operation '' '' true; then
-                fail "cannot recover empty AgentQ operation lock: $candidate"
+                fail "cannot recover unowned AgentQ operation lock: $candidate"
             fi
             continue
         fi
@@ -2090,9 +2115,18 @@ remove_stale_lock() {
     fi
     pid_path="$lock_path/pid"
     if [ "$require_empty" = true ]; then
-        if [ -e "$pid_path" ] || [ -L "$pid_path" ]; then
-            printf '%s: AgentQ %s lock changed while recovering its empty directory: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+        # Re-verify under the lock: the verdict was reached OUTSIDE, and the
+        # only thing that may be inside is the metadata writer's own temporary
+        # (see lock_directory_has_only_metadata_temporaries).  A `pid` that
+        # appeared meanwhile, or any foreign entry, means the lock is live or
+        # not ours -- refuse and let the caller retry.
+        if ! lock_directory_has_only_metadata_temporaries "$lock_path"; then
+            printf '%s: AgentQ %s lock changed while recovering its unowned directory: %s\n' "$program" "$lock_kind" "$lock_path" >&2
             return 2
+        fi
+        if ! find "$lock_path" -mindepth 1 -maxdepth 1 -type f -delete; then
+            printf '%s: failed to remove AgentQ %s stale lock metadata: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+            return 1
         fi
     elif [ -n "$expected_pid" ]; then
         if ! read_lock_metadata "$pid_path" ||
@@ -2599,6 +2633,38 @@ request_record_path() {
 
     is_request_id "$request_id" || fail "invalid AgentQ request record id: $request_id"
     printf '%s/%s.json\n' "$request_directory" "$request_id"
+}
+
+# A record FILENAME is the request id, and request ids are case-sensitive ASCII
+# (16-128 of `[A-Za-z0-9._-]`, first character alphanumeric).  On a
+# case-INSENSITIVE file system (the macOS default, NTFS by default) two ids that
+# differ only in case map to ONE file: `[ -e .../AAAA.json ]` is true when only
+# `aaaa.json` exists, so the reader below would hand the WRONG record to jq,
+# whose `request_id` binding rejects it -- and submit's "does a record exist?"
+# test could then take the not-exists branch and OVERWRITE the surviving
+# record, after which EVERY command fails `invalid AgentQ request record` until
+# the file is deleted by hand.  Measured 2026-11-10 on the default macOS
+# volume: submit of 32 lowercase `a` then 32 uppercase `A` left ONE file whose
+# request_id was the uppercase spelling, and status/lookup of either id exited
+# 2 with reason=protocol_error.  Detect the aliasing instead of guessing: a
+# record exists under a DIFFERENT spelling of this id.
+request_record_has_case_alias() {
+    local request_id=$1
+    local record_path
+    local entries=()
+    local entry
+
+    record_path="$request_directory/$request_id.json"
+    [ -e "$record_path" ] || [ -L "$record_path" ] || return 1
+    # Collect in the parent shell (the repo's usual nullglob idiom): a glob that
+    # matches nothing must mean "nothing", not the literal pattern.
+    shopt -s nullglob
+    entries=("$request_directory"/*.json)
+    shopt -u nullglob
+    for entry in "${entries[@]}"; do
+        [ "${entry##*/}" = "$request_id.json" ] && return 1
+    done
+    return 0
 }
 
 request_tombstone_path() {
@@ -3124,6 +3190,8 @@ read_request_record_state_and_body() {
 
     is_request_id "$request_id" || fail "invalid AgentQ request record id: $request_id"
     record_path=$(request_record_path "$request_id")
+    request_record_has_case_alias "$request_id" &&
+        fail "request id differs only in case from an existing AgentQ record; use the recorded spelling: $request_id"
     if [ ! -e "$record_path" ] && [ ! -L "$record_path" ]; then
         return 1
     fi
@@ -3190,6 +3258,8 @@ read_request_record() {
 
     is_request_id "$request_id" || fail "invalid AgentQ request record id: $request_id"
     record_path=$(request_record_path "$request_id")
+    request_record_has_case_alias "$request_id" &&
+        fail "request id differs only in case from an existing AgentQ record; use the recorded spelling: $request_id"
     if [ ! -e "$record_path" ] && [ ! -L "$record_path" ]; then
         return 1
     fi
@@ -3319,6 +3389,20 @@ prune_request_temporary_files_in_directory() {
             fail "invalid AgentQ $kind temporary request id: $temporary_path"
         is_positive_integer "$temporary_pid" ||
             fail "invalid AgentQ $kind temporary process id: $temporary_path"
+        # These directories are NOT write-only under the operation lock: a
+        # lock-free read (status/logs/wait/doctor) archives a removed request
+        # into a tombstone while a writer holds the lock, and `wait` writes its
+        # tombstone AFTER releasing the lock (it must not hold it across
+        # `pueue wait`).  Deleting by shape alone removed a LIVE process's
+        # in-flight temporary file, so the reader's install failed and a
+        # read-only command exited 2/protocol_error -- the opposite of the
+        # documented "reads return immediately during a write" contract.
+        # Measured 2026-11-10: same shape, same live owner, the request pruner
+        # deleted it while the runtime pruner kept it.  Keep the same
+        # dead-owner rule the runtime pruner has used all along.
+        if ! process_is_confirmed_dead "$temporary_pid"; then
+            continue
+        fi
         rm -f -- "$temporary_path" ||
             fail "cannot remove stale AgentQ $kind temporary record: $temporary_path"
     done
@@ -3375,6 +3459,12 @@ prune_cancellation_temporary_files() {
             fail "non-canonical AgentQ cancellation temporary task id: $temporary_path"
         is_positive_integer "$temporary_pid" ||
             fail "invalid AgentQ cancellation temporary process id: $temporary_path"
+        # Same dead-owner rule as the request/tombstone pruner and the runtime
+        # pruner: a marker temporary written by a live process must survive a
+        # concurrent writer's sweep.
+        if ! process_is_confirmed_dead "$temporary_pid"; then
+            continue
+        fi
         rm -f -- "$temporary_path" ||
             fail "cannot remove stale AgentQ cancellation temporary file: $temporary_path"
     done
@@ -3480,6 +3570,15 @@ write_request_record() {
     local record_path
     local temporary
 
+    # The LAST line of defence for the case-alias defect: the readers' `fail`
+    # runs inside `$( )` (it exits only the subshell), so a submit whose record
+    # read was rejected as "invalid" would otherwise reach this function and
+    # REPLACE the surviving record of the other spelling -- after which every
+    # command on this host failed `invalid AgentQ request record` until the file
+    # was deleted by hand (measured 2026-11-10).  This call is direct, not in a
+    # command substitution, so `fail` reaches the caller.
+    request_record_has_case_alias "$request_id" &&
+        fail "refusing to overwrite an AgentQ record whose request id differs only in case: $request_id"
     record_path=$(request_record_path "$request_id")
     temporary=$(umask 077; make_temporary_file "$request_directory" ".agentqtmp.${request_id}" '.json') ||
         fail "cannot create temporary AgentQ request record: $request_id"
@@ -4179,9 +4278,9 @@ acquire_request_lock() {
                 fi
                 continue
             fi
-        elif lock_directory_is_stale_empty "$candidate"; then
+        elif lock_directory_is_stale_unowned "$candidate"; then
             if ! remove_stale_lock "$candidate" request '' '' true; then
-                fail "cannot recover empty AgentQ request lock: $candidate"
+                fail "cannot recover unowned AgentQ request lock: $candidate"
             fi
             continue
         fi
@@ -6277,7 +6376,7 @@ logs() {
     shift
 
     if [ "$#" -gt 0 ]; then
-        [ "$#" -eq 2 ] && [ "$1" = --tail ] || fail 'logs accepts only --tail <lines>'
+        [ "$#" -eq 2 ] && [ "$1" = --tail ] || fail 'logs accepts only --tail <line-count|all>'
         if [ "$2" = all ]; then
             tail_lines=all
         else
@@ -6575,12 +6674,12 @@ doctor_with_read_lock() {
 task_instance_created_at_is_recorded() {
     local task_id=$1
     local expected_created_at=$2
-    # Evidence grade.  "any" (default) accepts a request record or a tombstone;
-    # "tombstone" accepts ONLY a tombstone.  A tombstone proves AgentQ already
-    # removed the task, so it stands on its own while Pueue is unreadable; an
-    # accepted record only proves that SOME instance of this (recyclable) id was
-    # tracked, which an earlier instance satisfies just as well as the live one.
-    local evidence_grade=${3:-any}
+    # Necessary evidence, NOT sufficient on its own: a record or a tombstone
+    # with this creation time proves that an AgentQ task instance once held this
+    # id.  It cannot prove that no LIVE task occupies the id right now, because
+    # Pueue recycles numeric ids.  The caller must therefore also require a
+    # READABLE Pueue that says the id is free (rc=4) -- see the gate in
+    # cancel_task; this function is never a replay verdict by itself.
     local path request_id created_at
     local file_body
     local records=()
@@ -6604,9 +6703,7 @@ task_instance_created_at_is_recorded() {
     # functions do not sit on one stack today, which is exactly the argument
     # that stops being true the next time someone adds a call.
     local probe
-    if [ "$evidence_grade" != tombstone ]; then
-        if [ "${#records[@]}" -gt 0 ]; then combined+=("${records[@]}"); fi
-    fi
+    if [ "${#records[@]}" -gt 0 ]; then combined+=("${records[@]}"); fi
     if [ "${#tombstones[@]}" -gt 0 ]; then combined+=("${tombstones[@]}"); fi
     if [ "${#combined[@]}" -gt 0 ]; then
         if probe=$( {
@@ -6622,8 +6719,8 @@ task_instance_created_at_is_recorded() {
             return 1
         fi
     fi
-    # Fallback: the original per-file scan, unchanged apart from the grade.
-    if [ "$evidence_grade" != tombstone ] && [ "${#records[@]}" -gt 0 ]; then
+    # Fallback: the original per-file scan, unchanged.
+    if [ "${#records[@]}" -gt 0 ]; then
         for path in "${records[@]}"; do
             request_id=${path##*/}
             request_id=${request_id%.json}
@@ -6668,7 +6765,6 @@ task_instance_created_at_is_recorded() {
 
 cancelled_task_replay() {
     local task_id=$1
-    local evidence_grade=${2:-any}
     local marker
     local marker_created_at
 
@@ -6690,7 +6786,7 @@ cancelled_task_replay() {
     # tombstone.  Without this, a marker left behind by an earlier task that
     # reused the id would make an unrelated task look like a replay.
     marker_created_at=$(jq -r '.created_at' <<<"$marker")
-    task_instance_created_at_is_recorded "$task_id" "$marker_created_at" "$evidence_grade" || return 1
+    task_instance_created_at_is_recorded "$task_id" "$marker_created_at" || return 1
     jq -cn --argjson task_id "$task_id" \
         --arg requested_at "$(jq -r '.requested_at' <<<"$marker")" \
         '{task_id: $task_id, action: "cancel_requested", cancellation_requested_at: $requested_at, reused: true}'
@@ -6705,7 +6801,6 @@ cancel_task() {
     local marker_state=''
     local marker_created_at=''
     local raw_compact_status=0
-    local replay_evidence
 
     ensure_daemon
     # One status call, not two: raw_compact_task already fails for an unknown
@@ -6721,26 +6816,22 @@ cancel_task() {
     else
         # $? is still raw_compact_task's status at the top of the else branch.
         raw_compact_status=$?
-        # Two GRADES of replay evidence, because the two kinds do not say the
-        # same thing:
-        #   - a TOMBSTONE means AgentQ already removed the task; it cannot come
-        #     back, so a replay is safe even while Pueue is unreadable;
-        #   - an ACCEPTED RECORD only means some instance of this id was
-        #     tracked.  Pueue recycles ids, so a record left by an EARLIER
-        #     instance satisfies the instance binding exactly, and on a read
-        #     failure (rc 1/2/5) the task this call is about may be a different,
-        #     still-running one.  The binding has no discriminating power there
-        #     and a replay would answer "cancelled" (exit 0) about a live task.
-        # So rc=4 (Pueue answered "not visible") accepts either grade;
-        # an unreadable Pueue accepts tombstones only.  smoke/15 pins the
-        # tombstone half, smoke/03 the rc=4 half.
+        # One GRADE of replay evidence, and it needs a READABLE Pueue:
+        #   - rc=4 means Pueue ANSWERED "this id is not visible", so no live task
+        #     can be occupying the id and a tombstone/record for a previous
+        #     instance is conclusive;
+        #   - an unreadable Pueue (rc 1/2/5) proves NOTHING about the id now.
+        #     A tombstone only says "some instance with this created_at was
+        #     removed"; Pueue recycles ids, so a NEW task -- e.g. one a normal
+        #     submit just created with a fresh created_at -- can be sitting on
+        #     that id and running.  Answering `cancel_requested`/`reused:true`
+        #     for it is a false success about a LIVE task.  Measured 2026-11-10
+        #     (independent review): old marker + old tombstone + a live reused
+        #     id + one failed status read returned exit 0 / reused:true while the
+        #     task stayed Running, and the injected failure was the only thing
+        #     distinguishing it from a genuine replay.
         if [ "$raw_compact_status" -eq 4 ]; then
-            replay_evidence=any
-        else
-            replay_evidence=tombstone
-        fi
-        cancelled_task_replay "$task_id" "$replay_evidence" && return 0
-        if [ "$raw_compact_status" -eq 4 ]; then
+            cancelled_task_replay "$task_id" && return 0
             # The task is gone, but a marker may still record that the
             # cancellation outcome was never confirmed.  "unknown AgentQ task
             # id" would misattribute that -- the id is known (its record or

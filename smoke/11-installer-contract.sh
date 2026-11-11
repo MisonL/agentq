@@ -1352,4 +1352,92 @@ if [ "$failures" -ne 0 ]; then
     printf 'installer-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'installer-contract checks passed: cases=%s sandbox-home=yes stub-path=yes download-path=covered toctou-path=covered empty-lock-recovery=covered unconfirmable-owner=covered plist-placeholder=guarded crash-leftover=covered\n' "$cases"
+
+# --- the macOS system-service ownership guard --------------------------------
+# On macOS the installer manages ONE system label, com.agentq.pueued, whose
+# plist names the account it runs as.  A second user installing without any
+# ~/.agentq of their own used to pass the busy-queue guard (it returns early
+# when $agentq_home is absent) and then boot the SAME system label out --
+# killing another account's running tasks.  Measured 2026-11-10 (independent
+# review) against a launchctl stub; a real cross-account launchd run was NOT
+# made, so this is the reviewed control flow, not a live-host result.
+#
+# A STATIC lock: the reachable path needs root launchctl on a macOS host with a
+# foreign service installed, and this sandbox has neither.  Five properties are
+# asserted separately, so a red names the one that broke:
+#   1. the helper exists as a top-level function;
+#   2. it compares the plist's identity IN FULL (label, user, HOME, working
+#      directory, argv) -- an owner check on UserName alone would accept a
+#      foreign queue config or a rewritten argv;
+#   3. a LOADED label with no readable plist fails closed;
+#   4. all THREE call sites exist (bootstrap, stop, replace) -- a guard on the
+#      bootstrap path alone leaves the rollback stop and the file swap open;
+#   5. in stop_managed_daemon the check precedes the dispatch that stops.
+# The count in (4) is asserted, not assumed: a silent deletion of two of the
+# three call sites would otherwise still leave "a call site exists".
+cases=$((cases + 1))
+installer_text=$(cat -- "$assets/install-agentq.sh")
+ownership_body=$(awk '/^assert_macos_system_service_ownership\(\) \{/,/^\}/' "$assets/install-agentq.sh")
+ownership_problems=''
+if [ -z "$ownership_body" ]; then
+    ownership_problems="${ownership_problems}the ownership helper is not a top-level function;"
+else
+    for ownership_field in '.Label == "com.agentq.pueued"' '.UserName == $user' \
+        '.EnvironmentVariables.HOME == $home' '.WorkingDirectory == $agentq_home' \
+        '.ProgramArguments == [($agentq_home + "/pueued")'; do
+        case $ownership_body in
+            *"$ownership_field"*) : ;;
+            *) ownership_problems="${ownership_problems}the ownership helper no longer compares [$ownership_field];" ;;
+        esac
+    done
+    case $ownership_body in
+        *'cannot confirm ownership of the loaded macOS AgentQ system service without its plist'*) : ;;
+        *) ownership_problems="${ownership_problems}a loaded label with no readable plist no longer fails closed;" ;;
+    esac
+    # OUT-PARAMETER contract: the caller reads `macos_current_system_service_active`
+    # straight after the call, under `set -u`.  A helper that verifies everything
+    # but stops SETTING it does not fail an identity assertion -- it aborts the
+    # installer with "unbound variable" before it can refuse anything (measured
+    # 2026-11-10 on a no-op mutant: line 1358, eleven failures, none of them
+    # about ownership).
+    case $ownership_body in
+        *'macos_current_system_service_active=true'*) : ;;
+        *) ownership_problems="${ownership_problems}the helper no longer sets macos_current_system_service_active (the caller reads it under set -u);" ;;
+    esac
+fi
+# Four occurrences = the definition plus exactly three call sites.
+ownership_calls=$(printf '%s\n' "$installer_text" | grep -c 'assert_macos_system_service_ownership') || true
+if [ "$ownership_calls" -ne 4 ]; then
+    ownership_problems="${ownership_problems}expected 4 occurrences of the ownership helper (definition + 3 call sites), found $ownership_calls;"
+fi
+bootstrap_body=$(awk '/^bootstrap_existing_macos_service\(\) \{/,/^\}/' "$assets/install-agentq.sh")
+stop_body=$(awk '/^stop_managed_daemon\(\) \{/,/^\}/' "$assets/install-agentq.sh")
+replace_body=$(awk '/^replace_service_file\(\) \{/,/^\}/' "$assets/install-agentq.sh")
+for ownership_site in bootstrap stop replace; do
+    case $ownership_site in
+        bootstrap) ownership_text=$bootstrap_body ;;
+        stop) ownership_text=$stop_body ;;
+        replace) ownership_text=$replace_body ;;
+    esac
+    case $ownership_text in
+        *assert_macos_system_service_ownership*) : ;;
+        *) ownership_problems="${ownership_problems}no ownership check in the $ownership_site path;" ;;
+    esac
+done
+# Position inside stop_managed_daemon: the check must precede the dispatch.
+ownership_guard_line=$(printf '%s\n' "$stop_body" | grep -n 'assert_macos_system_service_ownership' | head -1 | cut -d: -f1) || true
+ownership_stop_line=$(printf '%s\n' "$stop_body" | grep -n 'case "$platform_kind" in' | head -1 | cut -d: -f1) || true
+if [ -z "$ownership_guard_line" ] || [ -z "$ownership_stop_line" ] ||
+    [ "$ownership_guard_line" -ge "$ownership_stop_line" ]; then
+    ownership_problems="${ownership_problems}the stop path checks ownership at or after the dispatch that stops the daemon;"
+fi
+if [ -n "$ownership_problems" ]; then
+    printf 'installer system-service ownership: %s\n' "$ownership_problems" >&2
+    failures=$((failures + 1))
+fi
+
+if [ "$failures" -ne 0 ]; then
+    printf 'installer-contract: %s failure(s)\n' "$failures" >&2
+    exit 1
+fi
+printf 'installer-contract checks passed: cases=%s sandbox-home=yes stub-path=yes download-path=covered toctou-path=covered empty-lock-recovery=covered unconfirmable-owner=covered plist-placeholder=guarded crash-leftover=covered system-service-ownership=pinned\n' "$cases"

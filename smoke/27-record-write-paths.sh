@@ -254,6 +254,41 @@ if ! jq -e '.state == "accepted" and .task_id == 4242' "$work/data/agentq-reques
     failures=$((failures + 1))
 fi
 
+# S7. Request ids are case-SENSITIVE.  On a filesystem that is not (APFS
+#     default, NTFS) the two spellings would alias ONE record file: a submit
+#     under the other spelling would read the existing record as if it were its
+#     own and could overwrite it.  Measured 2026-11-10 (independent review):
+#     nothing refused that write, and it was reachable through any ordinary
+#     submit.
+#
+#     The guard is only REACHABLE where the filesystem aliases the two names,
+#     so the host is probed rather than assumed (CI's ext4 is case-sensitive).
+#     On a case-sensitive host the same row becomes the POSITIVE CONTROL: a
+#     spelling that differs only in case is a DIFFERENT id there, and refusing
+#     it would be over-refusal -- so that arm asserts the submit succeeds.
+clear_runtime
+case_probe=$(mktemp -d "$work/case-probe.XXXXXX")
+touch "$case_probe/Upper.json"
+if [ -e "$case_probe/upper.json" ]; then case_aliasing=yes; else case_aliasing=no; fi
+rm -rf "$case_probe"
+rm -f "$work/.added"
+write_stateful_stub 4242
+put_record AQCASE-ALIAS-00001 prepared null null
+if [ "$case_aliasing" = yes ]; then
+    run_case s7 submit --workdir "$work" --label smoke --request-id aqcase-alias-00001 -- true
+    assert_rc s7 2
+    assert_err_has s7 'differs only in case'
+    assert_reason s7
+    assert_counts s7 1 0
+else
+    printf '%s\n' 'write-paths s7: case-sensitive filesystem -- asserting the over-refusal control instead'
+    run_case s7 submit --workdir "$work" --label smoke --request-id aqcase-alias-00001 -- true
+    assert_rc s7 0
+    assert_json s7 '.task_id == 4242'
+    assert_counts s7 2 0
+fi
+clear_runtime
+
 # ------------------------------------------------------------------ cancel cases
 write_stub '{"tasks":{"1001":{"id":1001,"created_at":"2026-09-29T00:00:00Z","command":"sleep 60","label":"agentq:AQCAN-0000000000001","status":{"Running":{}},"group":"agentq"}},"groups":{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}}'
 

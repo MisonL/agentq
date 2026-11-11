@@ -34,13 +34,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
       - name: Install check dependencies
         # smoke/01 parses the .yml assets (pyyaml), re-parses the shell assets
         # under zsh, and lints the plists (xmllint); 07 and 17 start their own
         # sshd on a high port, which needs the binary and its privilege
         # separation directory; smoke/05's shellcheck lock covers the nine
-        # shell assets, the repo's own 31 scripts and every comment line that
+        # shell assets, the repo's own 32 scripts and every comment line that
         # could be a directive, and WITHOUT the tool it degrades to
         # `shellcheck=absent` and exits 0 -- the assertion below is what keeps
         # that degradation from reading as green.  pwsh and jq are already on
@@ -186,7 +186,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
       - name: Ensure pyyaml for the .yml assets
         # smoke/01's tool inventory reports skipped(tool-pyaml) without it and
         # the summary assertion below turns red -- which is the point of the
@@ -199,7 +199,7 @@ jobs:
         # smoke/01 probes for is the one that has pyyaml.
         run: |
           python3 -m venv "$RUNNER_TEMP/aq-venv"
-          "$RUNNER_TEMP/aq-venv/bin/pip" install --quiet pyyaml
+          "$RUNNER_TEMP/aq-venv/bin/pip" install --quiet "pyyaml==6.0.2"
           echo "$RUNNER_TEMP/aq-venv/bin" >> "$GITHUB_PATH"
       - name: Run the quick suite
         run: |
@@ -242,7 +242,7 @@ jobs:
       # meet the interpreter whose behaviours they exist to pin down.
       AGENTQ_SMOKE_PWSH: powershell.exe
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
       - name: PowerShell 5.1 client contracts
         shell: bash
         run: |

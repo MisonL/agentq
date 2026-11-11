@@ -2,6 +2,20 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $script:Program = Split-Path -Leaf $PSCommandPath
+# Same top-level trap as its sibling `agentq.ps1` (0.1.18 there, missing here
+# until 0.1.29).  Without it an UNEXPECTED throw -- a temporary-file identity
+# assertion, the remote-user-environment resolver, a rethrow from a failed ssh
+# -- ended the script with exit 1 and a raw PowerShell exception dump (file,
+# line, ANSI colour), where the POSIX twin's `fail()` writes one `sshp: <msg>`
+# line and exits 2.  Measured 2026-11-10 on the same symlinked-TMPDIR input:
+# `agentq.ps1` answered `agentq.ps1: Invalid AgentQ temporary file path...` with
+# exit 2, `sshp.ps1` answered exit 1 with the raw dump.  A trap does NOT
+# intercept `exit`, so every deliberate code (Stop-Sshp's 2, the probe codes)
+# keeps its exact value.
+trap {
+    [Console]::Error.WriteLine("$($script:Program): $($_.Exception.Message)")
+    exit 2
+}
 # IsNullOrEmpty, NOT IsNullOrWhiteSpace: the POSIX twin resolves SSHP_* with
 # `${VAR:-default}` / `[ -n ]`, which substitute only for EMPTY, so a
 # whitespace-only value is SET there and goes on to validation.  Measured
@@ -64,7 +78,7 @@ function Convert-ToReconnectDelay {
     # configuration error worth naming at startup rather than at the first
     # reconnect.
     [int]$seconds = 0
-    if ($Value -notmatch '^[0-9]+$') {
+    if ($Value -cnotmatch '\A[0-9]+\z') {
         Stop-Sshp "SSHP_RECONNECT_DELAY must be a non-negative 32-bit integer"
     }
     if (![int]::TryParse($Value, [ref]$seconds) -or ($seconds -lt 0)) {
@@ -1402,7 +1416,7 @@ if ($arguments.Count -eq 2) {
         $script:SessionName = $arguments[1]
     }
 }
-if ($script:SessionName -notmatch '^[A-Za-z0-9_.-]+$') {
+if ($script:SessionName -cnotmatch '\A[A-Za-z0-9_.-]+\z') {
     Stop-Sshp "session name must contain only letters, numbers, dots, underscores, or hyphens"
 }
 if ($script:SessionName.StartsWith("-", [System.StringComparison]::Ordinal)) {

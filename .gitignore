@@ -51,6 +51,7 @@ config/agentq/
 /out
 /err
 *.smoke-out
+/smoke.log
 *.syntax.*
 
 # Editor and OS noise.

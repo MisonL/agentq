@@ -113,7 +113,7 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
 - SSHP 只承载人类交互会话，不用来代替 AgentQ 任务。
 - 任何 `wait` 必须同时核对调用退出码和 `task.status.Done.result`。
 - 退出码 `2` 的类别读 `reason=<class>`（`protocol_error` / `lock_contention` /
-  `task_not_running`），不要匹配消息文本；细节见 `CLAUDE.md` 与 `SKILL.md`。
+  `task_not_running` / `deployment_state`），不要匹配消息文本；细节见 `CLAUDE.md` 与 `SKILL.md`。
 - 不得只升级服务端或只升级客户端——没有协议版本协商，部署单元是 23 个文件的同一
   版本（刻意决定，见 `CLAUDE.md` 操作边界）。
 - response loss 只能使用同一 request ID lookup/reconcile；不得换新 request ID

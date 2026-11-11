@@ -253,6 +253,34 @@ assert_rc l7 2
 assert_err_has l7 'request id must be 16-128'
 assert_reason l7
 
+# L8. Request ids are case-SENSITIVE, and on a filesystem that is not (APFS
+#     default, NTFS) a lookup under the other spelling would resolve to the
+#     SAME record file while the record's own `request_id` disagrees with the
+#     name being asked for.  Measured 2026-11-10 (independent review): the read
+#     answered from the aliased file instead of refusing the naming ambiguity.
+#     The guard is only reachable where the filesystem aliases the names, so
+#     the host is probed; on a case-sensitive host the same row is the
+#     POSITIVE CONTROL -- the other spelling is a different id and must stay a
+#     clean not_found (exit 3), never a refusal.
+clear_runtime
+put_record AQREAD-CASE-0000001 prepared null null
+case_probe=$(mktemp -d "$work/case-probe.XXXXXX")
+touch "$case_probe/Upper.json"
+if [ -e "$case_probe/upper.json" ]; then case_aliasing=yes; else case_aliasing=no; fi
+rm -rf "$case_probe"
+if [ "$case_aliasing" = yes ]; then
+    run_case l8 lookup aqread-case-0000001
+    assert_rc l8 2
+    assert_err_has l8 'differs only in case'
+    assert_reason l8
+else
+    printf '%s\n' 'read-paths l8: case-sensitive filesystem -- asserting the not_found control instead' >&2
+    run_case l8 lookup aqread-case-0000001
+    assert_rc l8 3
+    assert_json l8 '.state == "not_found"'
+fi
+clear_runtime
+
 # ------------------------------------------------------------------ wait cases
 
 # W1. A task Pueue has never seen, with no record or tombstone: unknown id, exit 2.
@@ -1319,6 +1347,57 @@ fi
 fi
 find "$work/data/task_logs" -maxdepth 1 -name '*.log' -delete
 clear_runtime
+
+# --- the operation lock directory holding only a metadata temporary ----------
+# `write_lock_metadata` builds its temporary INSIDE the lock directory (so the
+# final rename is same-directory); a process killed in that window leaves
+# `.agentq-lock-metadata.<pid>.<random>` with no `pid`.  Before 0.1.29 that
+# directory matched NEITHER recovery branch (no pid to prove dead, not empty),
+# so every WRITE retried the full budget and exited 2 lock_contention with no
+# holder named, while reads kept working -- measured 2026-11-10.  The verdict is
+# now "nothing but metadata temporaries", with the same 30 s grace; these cases
+# pin both directions: the stray is reclaimed, and a FOREIGN child is NOT.
+#
+# The age grace is what makes the case reachable at all: a real writer's
+# directory is seconds old, so the case backdates the directory the same way
+# smoke/27 does.
+backdate_dir() {
+    local when
+    when=$(date -r "$(( $(date +%s) - 120 ))" '+%Y%m%d%H%M.%S' 2>/dev/null) ||
+        when=$(date -d "@$(( $(date +%s) - 120 ))" '+%Y%m%d%H%M.%S' 2>/dev/null) ||
+        { printf '%s\n' 'read-paths: cannot compute a backdated timestamp' >&2; return 1; }
+    [ -n "$when" ] || return 1
+    touch -t "$when" "$1"
+}
+
+clear_runtime
+find "$work/runtime" -mindepth 1 -maxdepth 1 -name 'agentq-operation.lock' -exec rm -rf -- {} + 2>/dev/null || true
+mkdir -p "$work/runtime/agentq-operation.lock"
+printf 'leftover\n' > "$work/runtime/agentq-operation.lock/.agentq-lock-metadata.999.abc123"
+backdate_dir "$work/runtime/agentq-operation.lock"
+run_case l1 status --summary
+assert_rc l1 0
+cases=$((cases + 1))
+if [ -e "$work/runtime/agentq-operation.lock" ]; then
+    printf 'read-paths l1: a stale operation lock holding only its own metadata temporary was not reclaimed\n' >&2
+    find "$work/runtime/agentq-operation.lock" -mindepth 1 -maxdepth 1 >&2
+    failures=$((failures + 1))
+fi
+
+# The FALSE-RED direction: a child we do not recognise must keep the lock, even
+# after the grace period -- deleting a directory we cannot attribute is the
+# failure mode this whole verdict exists to avoid.
+mkdir -p "$work/runtime/agentq-operation.lock"
+printf 'not ours\n' > "$work/runtime/agentq-operation.lock/unexpected-entry"
+backdate_dir "$work/runtime/agentq-operation.lock"
+run_case l2 status --summary
+assert_rc l2 0
+cases=$((cases + 1))
+if [ ! -e "$work/runtime/agentq-operation.lock/unexpected-entry" ]; then
+    printf 'read-paths l2: the recovery deleted an unrecognised lock-directory entry\n' >&2
+    failures=$((failures + 1))
+fi
+rm -rf -- "$work/runtime/agentq-operation.lock"
 
 # --------------------------------------------------------------- summary
 if [ "$failures" -ne 0 ]; then

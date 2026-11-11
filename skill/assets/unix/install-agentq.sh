@@ -4,7 +4,7 @@ set -eu
 
 program=${0##*/}
 release_version='4.0.4'
-agentq_version='0.1.28'
+agentq_version='0.1.29'
 asset_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 agentq_home=${AGENTQ_HOME:-"$HOME/.agentq"}
 artifact_source_directory=${AGENTQ_PUEUE_SOURCE_DIR:-}
@@ -1340,6 +1340,45 @@ resolve_macos_launch_domain() {
     macos_system_service_destination="$macos_system_service_directory/com.agentq.pueued.plist"
 }
 
+assert_macos_system_service_ownership() {
+    [ "$platform_kind" = macos ] || return 0
+    macos_system_service_destination="$macos_system_service_directory/com.agentq.pueued.plist"
+    macos_current_system_service_active=false
+    if run_as_root launchctl print system/com.agentq.pueued >/dev/null 2>&1; then
+        macos_current_system_service_active=true
+    fi
+    if [ ! -e "$macos_system_service_destination" ] && [ ! -L "$macos_system_service_destination" ]; then
+        [ "$macos_current_system_service_active" = false ] ||
+            fail "cannot confirm ownership of the loaded macOS AgentQ system service without its plist: $macos_system_service_destination"
+        return 0
+    fi
+
+    installer_existing_regular_file_is_safe "$macos_system_service_destination" ||
+        fail "cannot confirm macOS AgentQ system service ownership from an unsafe plist: $macos_system_service_destination"
+    macos_existing_service_json=$(run_as_root plutil -convert json -o - -- "$macos_system_service_destination" 2>/dev/null) ||
+        fail "cannot read macOS AgentQ system service ownership: $macos_system_service_destination"
+    macos_expected_service_user=$(id -un) ||
+        fail 'cannot determine the user for macOS AgentQ system service ownership'
+    # The system label is SHARED across accounts, unlike the per-home queue and
+    # maintenance lock, so the plist is checked in full before anything stops or
+    # replaces it: label, user, HOME, working directory and the exact argv.
+    # Measured 2026-11-10 (independent review; control flow against a launchctl
+    # stub -- a real cross-account launchd run was NOT made): without this, a
+    # second account installing with no ~/.agentq of its own passed the
+    # busy-queue guard (it returns early when $agentq_home is absent) and then
+    # booted the SAME system label out, killing another account's running tasks.
+    if ! printf '%s\n' "$macos_existing_service_json" | jq -e \
+        --arg user "$macos_expected_service_user" --arg home "$HOME" --arg agentq_home "$agentq_home" '
+            .Label == "com.agentq.pueued"
+            and .UserName == $user
+            and .EnvironmentVariables.HOME == $home
+            and .WorkingDirectory == $agentq_home
+            and .ProgramArguments == [($agentq_home + "/pueued"), "--config", ($agentq_home + "/config/pueue.yml")]
+        ' >/dev/null 2>&1; then
+        fail "macOS AgentQ system service ownership does not match this user and AgentQ home; refusing to stop or replace $macos_system_service_destination"
+    fi
+}
+
 bootstrap_existing_macos_service() {
     existing_service_path="$HOME/Library/LaunchAgents/com.agentq.pueued.plist"
     macos_uid=$(id -u)
@@ -1350,12 +1389,8 @@ bootstrap_existing_macos_service() {
 
     [ "$platform_kind" = macos ] || return 0
     macos_system_service_destination="$macos_system_service_directory/com.agentq.pueued.plist"
-    if [ ! -e "$agentq_home" ] && [ ! -e "$existing_service_path" ] && [ ! -e "$macos_system_service_destination" ]; then
-        return 0
-    fi
-    if run_as_root launchctl print system/com.agentq.pueued >/dev/null 2>&1; then
-        macos_service_active_before=true
-    fi
+    assert_macos_system_service_ownership
+    macos_service_active_before=$macos_current_system_service_active
     if [ -e "$existing_service_path" ]; then
         macos_legacy_plist_existed_before=true
         if run_as_root launchctl print "gui/$macos_uid/com.agentq.pueued" >/dev/null 2>&1; then
@@ -1871,6 +1906,14 @@ prepare_service_stage() {
 }
 
 stop_managed_daemon() {
+    if [ "$platform_kind" = macos ]; then
+        # Re-verify ownership here rather than trusting the value read at
+        # bootstrap: this helper is ALSO called from the rollback path, where
+        # the plist may have been replaced in between.  The subshell keeps a
+        # refusal from ending the whole installer, so a rollback still preserves
+        # its recovery artifacts.
+        ( assert_macos_system_service_ownership ) || return 1
+    fi
     if [ "$previous_install" = false ] && [ "$candidate_installed" = false ] && \
         [ "$macos_legacy_service_active_before" = false ] && [ "$macos_service_active_before" = false ]; then
         return 0
@@ -1993,6 +2036,9 @@ ensure_agentq_group() {
 }
 
 replace_service_file() {
+    if [ "$platform_kind" = macos ]; then
+        assert_macos_system_service_ownership
+    fi
     service_parent_directory=$(dirname "$service_destination")
     installer_path_is_safe "$service_parent_directory" ||
         fail "service destination parent is unsafe: $service_parent_directory"

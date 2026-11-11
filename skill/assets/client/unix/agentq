@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.28'
+agentq_client_version='0.1.29'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072); a Windows target re-encodes
 # argv onto a CreateProcess command line capped at 32767 characters, and the
@@ -783,7 +783,7 @@ Usage:
   $program [--host <ssh-host>] submit --workdir <remote-directory> [--label <label>] [--request-id <id>] --stdin-script < script
   $program [--host <ssh-host>] lookup <request-id>
   $program [--host <ssh-host>] status [--summary | --task <task-id>]
-  $program [--host <ssh-host>] logs <task-id> [--tail <lines>]
+  $program [--host <ssh-host>] logs <task-id> [--tail <line-count|all>]
   $program [--host <ssh-host>] cancel <task-id>
   $program [--host <ssh-host>] wait <task-id> [--timeout <seconds>]
   $program [--host <ssh-host>] remove <task-id> | --label <label> --confirm
@@ -4735,10 +4735,10 @@ case "$operation" in
         fi
         ;;
     logs)
-        [ "$#" -eq 1 ] || [ "$#" -eq 3 ] || fail 'logs requires a task id and optional --tail <lines>'
+        [ "$#" -eq 1 ] || [ "$#" -eq 3 ] || fail 'logs requires a task id and optional --tail <line-count|all>'
         is_task_id "$1" || fail 'task id must be a non-negative integer'
         if [ "$#" -eq 3 ]; then
-            [ "$(printf '%s' "$2" | LC_ALL=C tr '[:upper:]' '[:lower:]')" = '--tail' ] || fail 'logs accepts only --tail <lines>'
+            [ "$(printf '%s' "$2" | LC_ALL=C tr '[:upper:]' '[:lower:]')" = '--tail' ] || fail 'logs accepts only --tail <line-count|all>'
             is_positive_integer_or_all "$3" || fail '--tail must be a positive integer or all'
         fi
         initialize_remote_invocation

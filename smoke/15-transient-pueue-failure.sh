@@ -331,12 +331,14 @@ if ! grep -q 'cannot inspect Pueue' "$work/marker.stderr"; then
     failures=$((failures + 1))
 fi
 
-# A CONFIRMED-cancel replay must still succeed while Pueue is unreadable: the
-# evidence (marker state "requested" + the instance's recorded creation time)
-# lives entirely in local files, and the caller must not be told "unknown task
-# id" about a cancel it already saw confirmed.  This also locks the gate order:
-# the replay check sits BEFORE the rc=4 gate, and only rc=4 may claim "the task
-# is gone".
+# A confirmed-cancel replay needs a READABLE Pueue (0.1.29).  Before that, a
+# tombstone alone was accepted while Pueue was unreadable -- but a tombstone
+# only proves an EARLIER instance was removed, and Pueue recycles numeric ids,
+# so the id may now be a NEW, running task.  Measured 2026-11-10 (independent
+# review): old marker + old tombstone + a live reused id + one failed status
+# read returned exit 0 with reused:true while the task stayed Running.  The
+# answer must now be a failure, the same one logs/remove give for an
+# unreadable queue.
 replay_task_id=991177
 replay_request_id="smoke-replay-$$-$(date -u '+%Y%m%dT%H%M%SZ')"
 replay_request_id=${replay_request_id:0:120}
@@ -352,12 +354,16 @@ replay_output=$("$server" cancel "$replay_task_id" 2>"$work/replay.stderr") || r
 printf '0\n' > "$control/status.target"
 rm -f "$home/data/agentq-cancellations/$replay_task_id.json" \
     "$home/data/agentq-requests/.tombstones/$replay_request_id.json"
-if [ "$replay_status" -ne 0 ]; then
-    note "confirmed-cancel replay failed under a transient read failure (exit $replay_status): $(head -c 200 "$work/replay.stderr")"
+if [ "$(jq -r '.reused' <<<"$replay_output" 2>/dev/null)" = true ]; then
+    note "a tombstone-only marker replayed as reused:true while Pueue was unreadable; a tombstone proves only that an OLDER instance was removed"
     failures=$((failures + 1))
 fi
-if [ "$(jq -r '.reused' <<<"$replay_output" 2>/dev/null)" != true ]; then
-    note "confirmed-cancel replay did not report reused:true: $replay_output"
+if [ "$replay_status" -eq 0 ]; then
+    note "a tombstone-only marker exited 0 while Pueue was unreadable; only a readable Pueue can prove the id is free"
+    failures=$((failures + 1))
+fi
+if ! grep -qx 'agentq-server: reason=protocol_error' "$work/replay.stderr"; then
+    note 'a tombstone-only replay did not carry reason=protocol_error'
     failures=$((failures + 1))
 fi
 

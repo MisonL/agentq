@@ -199,7 +199,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFOR
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.28"
+$script:ClientVersion = "0.1.29"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's argv limit, not this machine's platform: a unix
 # target takes up to 100000 base64 characters (the POSIX twin's MAX_ARG_STRLEN
@@ -284,7 +284,7 @@ Usage:
   $($script:Program) [--host <ssh-host>] submit --workdir <remote-directory> [--label <label>] [--request-id <id>] --stdin-script < script
   $($script:Program) [--host <ssh-host>] lookup <request-id>
   $($script:Program) [--host <ssh-host>] status [--summary | --task <task-id>]
-  $($script:Program) [--host <ssh-host>] logs <task-id> [--tail <lines>]
+  $($script:Program) [--host <ssh-host>] logs <task-id> [--tail <line-count|all>]
   $($script:Program) [--host <ssh-host>] cancel <task-id>
   $($script:Program) [--host <ssh-host>] wait <task-id> [--timeout <seconds>]
   $($script:Program) [--host <ssh-host>] remove <task-id> | --label <label> --confirm
@@ -330,7 +330,7 @@ function Stop-AgentQ {
 function Test-PositiveInteger {
     param([string]$Value)
 
-    return ($Value -match '^[1-9][0-9]*$')
+    return ($Value -cmatch '\A[1-9][0-9]*\z')
 }
 
 function Convert-ToPositiveInt32 {
@@ -373,7 +373,7 @@ function Test-PositiveIntegerOrAll {
 function Test-TaskId {
     param([string]$Value)
 
-    return ($Value -match '^[0-9]+$')
+    return ($Value -cmatch '\A[0-9]+\z')
 }
 
 function Convert-ToCanonicalTaskIdString {
@@ -587,7 +587,7 @@ function Get-ConfiguredHost {
         # refuse with exit 2 ("no SSH host configured") while this one connected
         # to first-host.  Blanking the line is how a user unsets a host; the
         # fail-closed answer is the POSIX one.
-        if ($line -match '^AGENTQ_HOST=([^\s]*)$') {
+        if ($line -cmatch '\AAGENTQ_HOST=([^\s]*)\z') {
             $configuredHost = $Matches[1]
         }
     }
@@ -2098,7 +2098,7 @@ function Test-JsonTaskMap {
     }
 
     foreach ($property in $Tasks.PSObject.Properties) {
-        if ($property.Name -notmatch '^[0-9]+$') {
+        if ($property.Name -cnotmatch '\A[0-9]+\z') {
             return $false
         }
         $canonicalKey = $property.Name.TrimStart('0')
@@ -2151,7 +2151,7 @@ function Test-JsonSummaryMap {
     }
 
     foreach ($property in $Tasks.PSObject.Properties) {
-        if ($property.Name -notmatch '^[0-9]+$') {
+        if ($property.Name -cnotmatch '\A[0-9]+\z') {
             return $false
         }
         $canonicalKey = $property.Name.TrimStart('0')
@@ -3394,7 +3394,21 @@ switch ($operation) {
             $stdinStream = [Console]::OpenStandardInput()
             $stdinMemory = New-Object System.IO.MemoryStream
             try {
-                $stdinStream.CopyTo($stdinMemory)
+                # Read with an explicit ceiling instead of CopyTo (which blocks
+                # until EOF): a producer that keeps the pipe open past the cap
+                # made the client buffer without bound and delay the refusal
+                # until EOF -- measured 2026-11-10 with a 100000-byte payload
+                # and no EOF: the POSIX twin refused immediately, this one was
+                # still running after 3s and only answered once the writer
+                # closed.  The cap is the LARGEST possible target limit; the
+                # exact per-target check still runs below, on the base64 length.
+                $stdinReadLimit = [Math]::Max($script:StdinScriptLimitUnix, $script:StdinScriptLimitWindows) * 3 + 3
+                $stdinBuffer = New-Object byte[] 8192
+                while ($stdinMemory.Length -le $stdinReadLimit) {
+                    $read = $stdinStream.Read($stdinBuffer, 0, $stdinBuffer.Length)
+                    if ($read -le 0) { break }
+                    $stdinMemory.Write($stdinBuffer, 0, $read)
+                }
             } finally {
                 $stdinStream.Dispose()
             }
@@ -3522,7 +3536,7 @@ switch ($operation) {
     "logs" {
         $remaining = $arguments.Count - $position
         if (($remaining -ne 1) -and ($remaining -ne 3)) {
-            Stop-AgentQ "logs requires a task id and optional --tail <lines>"
+            Stop-AgentQ "logs requires a task id and optional --tail <line-count|all>"
         }
         $taskId = $arguments[$position]
         if (!(Test-TaskId -Value $taskId)) {
@@ -3531,7 +3545,7 @@ switch ($operation) {
         $remoteArguments = @("logs", $taskId)
         if ($remaining -eq 3) {
             if ($arguments[$position + 1] -ne "--tail") {
-                Stop-AgentQ "logs accepts only --tail <lines>"
+                Stop-AgentQ "logs accepts only --tail <line-count|all>"
             }
             if (!(Test-PositiveIntegerOrAll -Value $arguments[$position + 2])) {
                 Stop-AgentQ "--tail must be a positive integer or all"
@@ -3567,7 +3581,7 @@ switch ($operation) {
             if ($arguments[$position + 1] -ne "--timeout") {
                 Stop-AgentQ "wait accepts only --timeout <seconds>"
             }
-            if (!($arguments[$position + 2] -match '^[1-9][0-9]*$')) {
+            if (!($arguments[$position + 2] -cmatch '\A[1-9][0-9]*\z')) {
                 Stop-AgentQ "--timeout must be a positive integer"
             }
             $waitTimeoutSeconds = Convert-ToPositiveInt32 -Value $arguments[$position + 2] -Name "--timeout"
@@ -3578,7 +3592,7 @@ switch ($operation) {
             # budget reaches the target as the AGENTQ_WAIT_BUDGET assignment
             # the unix wrapper consumes, so the remote wait is bounded too.
         } elseif (![string]::IsNullOrEmpty($env:AGENTQ_WAIT_TIMEOUT)) {
-            if ($env:AGENTQ_WAIT_TIMEOUT -notmatch '^[1-9][0-9]*$') {
+            if ($env:AGENTQ_WAIT_TIMEOUT -cnotmatch '\A[1-9][0-9]*\z') {
                 Stop-AgentQ "AGENTQ_WAIT_TIMEOUT must be a positive integer"
             }
             # Convert-ToPositiveInt32, not a bare [int] cast: 99999999999

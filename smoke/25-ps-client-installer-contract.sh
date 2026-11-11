@@ -25,7 +25,7 @@
 set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-installer="$root/skill/assets/client/windows/install-client.ps1"
+installer=${AGENTQ_SMOKE_PS_CLIENT_INSTALLER:-$root/skill/assets/client/windows/install-client.ps1}
 [ -f "$installer" ] || { printf '%s\n' 'ps-client-installer: missing asset' >&2; exit 1; }
 
 # AGENTQ_SMOKE_PWSH selects the interpreter, as in the other PS checks (measured
@@ -517,6 +517,37 @@ if [ "$pair_status" -ne 0 ] || [ "$pair_out" != "PAIR-OK" ]; then
     printf 'ps-client-installer (W4 pair): the staging invariant failed: %s
 '         "$(strip_ansi "$work/pair.err" | head -2 | tr '
 ' ' ')" >&2
+    failures=$((failures + 1))
+fi
+
+# --- a caller-supplied -DestinationDirectory is normalised to an absolute path
+# A RELATIVE value used to reach Add-DirectoryToUserPath verbatim, i.e. a
+# relative entry landed in the user's PERSISTENT PATH and resolved against
+# whatever directory the next `agentq` call happened to run in -- any
+# `agentq.cmd` there would hijack the command.  Measured 2026-11-10
+# (independent review): the value is consumed as-is.
+#
+# This is a STATIC lock, and the reason is structural rather than lazy: the
+# platform gate throws before line 100 on every non-Windows host, so no
+# behaviour here is reachable off Windows (smoke/25's header states that limit
+# for the whole file).  What is asserted is the invariant that makes the gate
+# irrelevant to this defect: the GetFullPath normalisation must sit ABOVE the
+# FIRST consumer of the value.  Deleting it, or moving it below any consumer,
+# must go red -- position, not presence, is what a hijackable PATH entry needs.
+cases=$((cases + 1))
+normalize_line=$(grep -n 'DestinationDirectory = \[System.IO.Path\]::GetFullPath($DestinationDirectory)' "$installer" | head -1 | cut -d: -f1) || true
+# Every place the value is USED, not the declaration and not the gate message.
+first_consumer=$(grep -nE 'Join-Path \$DestinationDirectory|NonReparsePathChain -Path \$DestinationDirectory|Add-DirectoryToUserPath -Path \$DestinationDirectory|CreateDirectory\(\$DestinationDirectory\)' "$installer" | head -1 | cut -d: -f1) || true
+normalize_problem=''
+if [ -z "$normalize_line" ]; then
+    normalize_problem='the -DestinationDirectory normalisation is gone; a relative value would land in the persistent PATH'
+elif [ -z "$first_consumer" ]; then
+    normalize_problem='no consumer of $DestinationDirectory was found; the lock would compare nothing'
+elif [ "$normalize_line" -ge "$first_consumer" ]; then
+    normalize_problem="the normalisation binds at line $normalize_line, not before the first consumer ($first_consumer); a caller-supplied relative path still reaches the PATH"
+fi
+if [ -n "$normalize_problem" ]; then
+    printf 'ps-client-installer -DestinationDirectory: %s\n' "$normalize_problem" >&2
     failures=$((failures + 1))
 fi
 

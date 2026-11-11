@@ -180,7 +180,7 @@ fetch_verified() {
     else
         rm -f "$cached"
         printf '  %s (downloading)\n' "$asset"
-        curl -fsSL -o "$cached" "$url" || die "download failed: $url"
+        curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 -o "$cached" "$url" || die "download failed: $url"
         local actual
         actual=$(sha256_of "$cached")
         if [ "$actual" != "$expected" ]; then
