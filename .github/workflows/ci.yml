@@ -295,7 +295,21 @@ jobs:
             # (measuring 2026-10-20: doing so installs and edits the user's
             # PATH), so their staging cases are withheld BY CHOICE there rather
             # than being unreachable -- a different fact, and a different token.
-            bad_tokens=$(grep -o 'NOT-covered([^)]*)' "$log" | grep -vE '^NOT-covered\((needs-Windows|needs-non-Windows|deliberately-not-exercised)\)$' || true)
+            # `needs-POSIX-pipes` is the fourth: smoke/12's open-pipe stdin leg
+            # (the writer holds the pipe open past the cap) cannot be expressed
+            # here -- a Git Bash FIFO redirected into a native Windows process
+            # delivers EOF at once, measured twice on this job 2026-11-11, and
+            # the client correctly answers "received no script on standard
+            # input".  The closed-pipe control still runs on this host, so the
+            # message and exit code stay covered; only the OPEN shape is the
+            # declared gap.
+            # The last three belong to smoke/12's non-Windows twin section: they
+            # are emitted only while `twin_platform_state=checked`, which is never
+            # the case here, so they cannot reach this log -- listed anyway so the
+            # LOCAL parity rule (smoke/01) can stay a plain "every reason a script
+            # can print is allowed" check instead of modelling branch reachability
+            # statically.
+            bad_tokens=$(grep -o 'NOT-covered([^)]*)' "$log" | grep -vE '^NOT-covered\((needs-Windows|needs-non-Windows|deliberately-not-exercised|needs-POSIX-pipes|needs-unprivileged-user|needs-symlinked-tmp|no-locale-sensitive-sed)\)$' || true)
             if [ -n "$bad_tokens" ]; then
               echo "$check reported NOT-covered without a named platform reason:" >&2
               echo "$bad_tokens" >&2

@@ -1732,6 +1732,107 @@ else
     ci_pin_summary='skipped(no pyyaml)'
 fi
 
+# --- every NOT-covered REASON a smoke script can print is on ci.yml's list ----
+# The Windows job refuses a NOT-covered token whose parenthesised reason is not
+# in an ALLOWLIST hard-coded in ci.yml.  That allowlist has no local consumer,
+# so a script that starts printing a new reason is green in every local run and
+# red only on the Windows CI job -- measured 2026-11-11 (smoke/12's
+# `needs-POSIX-pipes`), after three earlier CI round trips on the same check.
+# The rule: every `NOT-covered(<word>)` literal in smoke/*.sh must appear in
+# ci.yml's allowlist.  Self-calibrated -- a fixture with an unlisted word must
+# be reported, and a fixture with a listed one must not.
+ncov_reasons_rc=0
+ncov_reasons_summary='skipped(no pyyaml)'
+if python3 -c 'import yaml' >/dev/null 2>&1; then
+    ncov_reasons_out=$(python3 - "$root" <<'PY'
+import glob
+import os
+import re
+import sys
+
+root = sys.argv[1]
+ci_path = os.path.join(root, ".github", "workflows", "ci.yml")
+try:
+    ci_text = open(ci_path, encoding="utf-8").read()
+except OSError as exc:
+    print("ci.yml is unreadable: %s" % exc, file=sys.stderr)
+    sys.exit(2)
+allow_line = None
+for line in ci_text.splitlines():
+    if "bad_tokens=" in line and "NOT-covered" in line:
+        allow_line = line
+        break
+if allow_line is None:
+    print("ci.yml has no NOT-covered reason allowlist", file=sys.stderr)
+    sys.exit(2)
+# The allowlist is the alternation in that line, e.g. (needs-Windows|needs-non-Windows|...).
+m = re.search(r"\(([A-Za-z0-9_-]+(?:\|[A-Za-z0-9_-]+)+)\)", allow_line)
+if not m:
+    print("ci.yml's NOT-covered allowlist is not an alternation of words",
+          file=sys.stderr)
+    sys.exit(2)
+allowed = set(m.group(1).split("|"))
+
+
+def reasons(files):
+    found = {}
+    for path in files:
+        try:
+            body = open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        for token in re.findall(r"NOT-covered\(([A-Za-z0-9_-]+)\)", body):
+            found.setdefault(token, os.path.basename(path))
+    return found
+
+
+# smoke/01 is skipped: it CONTAINS this fixture's text, so scanning it would
+# report the fixture as a live printer of the planted word.
+# Calibration: a fixture carrying one listed and one unlisted reason must yield
+# exactly those two, so a rule that reports nothing (or everything) fails here.
+fixture = os.path.join(root, "smoke", "_ncov_calibration_fixture.txt")
+try:
+    with open(fixture, "w", encoding="utf-8") as fh:
+        fh.write("x=NOT-covered(needs-Windows) y=NOT-covered(" + "planted-" + "reason-xyz)\n")
+    cal = reasons([fixture])
+finally:
+    try:
+        os.unlink(fixture)
+    except OSError:
+        pass
+if cal != {"needs-Windows": "_ncov_calibration_fixture.txt",
+           "planted-reason-xyz": "_ncov_calibration_fixture.txt"}:
+    print("the reason extractor is miscalibrated (saw %r)" % (cal,), file=sys.stderr)
+    sys.exit(2)
+
+scripts = sorted(glob.glob(os.path.join(root, "smoke", "*.sh")))
+scripts = [p for p in scripts
+           if "_ncov_calibration_fixture" not in p and not p.endswith("01-syntax-and-parity.sh")]
+unknown = {k: v for k, v in reasons(scripts).items() if k not in allowed}
+if unknown:
+    for word, where in sorted(unknown.items()):
+        print("smoke/%s can print NOT-covered(%s) but ci.yml's Windows-job"
+              " allowlist does not list it (that job would go red; add the"
+              " reason there, with why the platform cannot exercise it)"
+              % (where, word), file=sys.stderr)
+    sys.exit(1)
+print("%d" % len(allowed))
+PY
+    ) || ncov_reasons_rc=$?
+    case $ncov_reasons_rc in
+    0) ncov_reasons_summary=$ncov_reasons_out ;;
+    *)
+        printf 'NOT-covered reason allowlist FAILED (a reason a local run can print is not accepted by the Windows CI job):\n' >&2
+        sed 's/^/      /' >&2 <<EOF
+$ncov_reasons_out
+EOF
+        failures=$((failures + 1))
+        ;;
+    esac
+else
+    ncov_reasons_summary='skipped(no pyyaml)'
+fi
+
 # --- .service: structural ----------------------------------------------------
 # systemd-analyze verify needs systemd, which macOS does not have, so this
 # asserts the shape the unit must have rather than asking systemd.  An
@@ -4250,8 +4351,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s chr_ranges=%s tool_ranges=%s tr_fold=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s workflow_wiring=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$chr_range_count" "$tool_range_count" "$tr_fold_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state" "$workflow_wiring_summary")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s chr_ranges=%s tool_ranges=%s tr_fold=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s workflow_wiring=%s ncov_reasons=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$chr_range_count" "$tool_range_count" "$tr_fold_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state" "$workflow_wiring_summary" "$ncov_reasons_summary")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
@@ -4263,7 +4364,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census release_gate workflow_wiring'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census release_gate workflow_wiring ncov_reasons'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned
