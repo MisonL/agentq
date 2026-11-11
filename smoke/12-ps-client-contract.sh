@@ -3332,9 +3332,15 @@ mkfifo "$stdin_fifo"
 ( head -c 400000 /dev/zero ; sleep 60 ) > "$stdin_fifo" 2>/dev/null &
 stdin_writer=$!
 stdin_overlong_status=0
+# $twin_stub_arg, not $twin_stub_posix: on a Windows host this client refuses a
+# POSIX-script ssh at startup ("not a valid application for this OS platform")
+# and exits 2 BEFORE reading stdin, so the case would test the launch check and
+# never the cap -- measured on the Windows CI job (2026-11-11), where the red
+# was the HOST premise, not the asset.  (The comment sits ABOVE the whole
+# continuation block: a comment line inside it breaks the backslash chain.)
 AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
 AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
-AGENTQ_SSH="$twin_stub_posix" AGENTQ_CONFIG="$work/absent-config" \
+AGENTQ_SSH="$twin_stub_arg" AGENTQ_CONFIG="$work/absent-config" \
     "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" \
     submit --workdir /tmp --stdin-script \
     < "$stdin_fifo" >"$work/stdin-overlong.out" 2>"$work/stdin-overlong.err" &
