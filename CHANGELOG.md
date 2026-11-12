@@ -57,6 +57,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
 
+2026-11-12  **覆盖债口径按当前字节重算**：`docs/PLAN.md` 里那条 2026-10-14 的「391 行 / 27,821 = 1.4%」分母已过时 24%——现按 23 个资产逐个核对「有没有检查实际执行过」，得 **417 行 / 34,514 = 1.21%**（口径不变：语法/结构解析不算、抽函数执行不算执行过整个资产）。分子增加的 26 行全来自 `agentq-start-daemon.ps1` 268→294 与少量声明式配置增长；逐项构成与「别再引用的旧数字」清单写进正文。资产零改动
+  |  ./run-tests.sh --quick → exit 0（59s）
+
 2026-11-12  **专用 Windows 测试机整体升级 0.1.3 → 0.1.29（两侧同时替换）并端到端验证**——服务端与客户端此前差 26 个版本，用它做的任何真机结论都只能代表 0.1.3。走官方安装器（`INSTALLER_EXIT=0`、`updated_atomically: true`），部署单元六个资产与仓库逐字节相同（`launcher`/`pueue.yml` 只差安装器渲染的 Git Bash 路径，模板本身纯 ASCII）；279 条 record 零丢失、无事务残留、daemon 与计划任务正常；客户端侧 `install-client.ps1 --Check` 报 `match canonical assets`、`--version` 为 0.1.29。协议端到端 `submit(282)→wait(Success)→logs(AGENTQ-E2E-OK)→lookup(reused:true)→remove→wait(5/removed)` 全通。**过程中确认的一条主机事实**：该机每次协议读 30–78 秒——`docs/performance.md` 实测补充四记过同一台机（chocolatey 的 .NET `jq` 壳比真 jq 慢 7 倍、279 条 record），**不是 0.1.29 的回归**；裸 ssh 往返仍是 1 秒
   |  `./run-tests.sh --quick` → exit 0（63s）；测试机 `agentq=0.1.29`、客户端 `0.1.29`、残留清理 0
 
