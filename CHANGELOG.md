@@ -57,6 +57,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
 
+2026-11-12  **专用 Windows 测试机整体升级 0.1.3 → 0.1.29（两侧同时替换）并端到端验证**——服务端与客户端此前差 26 个版本，用它做的任何真机结论都只能代表 0.1.3。走官方安装器（`INSTALLER_EXIT=0`、`updated_atomically: true`），部署单元六个资产与仓库逐字节相同（`launcher`/`pueue.yml` 只差安装器渲染的 Git Bash 路径，模板本身纯 ASCII）；279 条 record 零丢失、无事务残留、daemon 与计划任务正常；客户端侧 `install-client.ps1 --Check` 报 `match canonical assets`、`--version` 为 0.1.29。协议端到端 `submit(282)→wait(Success)→logs(AGENTQ-E2E-OK)→lookup(reused:true)→remove→wait(5/removed)` 全通。**过程中确认的一条主机事实**：该机每次协议读 30–78 秒——`docs/performance.md` 实测补充四记过同一台机（chocolatey 的 .NET `jq` 壳比真 jq 慢 7 倍、279 条 record），**不是 0.1.29 的回归**；裸 ssh 往返仍是 1 秒
+  |  `./run-tests.sh --quick` → exit 0（63s）；测试机 `agentq=0.1.29`、客户端 `0.1.29`、残留清理 0
+
 2026-11-12  **真机补验：PS 5.1 + 真实 sshd 管道下逐字节读与块读的差别，量到了**——此前这条只是静态锁（`smoke/12`）的推断，因为挂起在 pwsh/POSIX 宿主上不可复现。在专用 Windows 测试机（PS 5.1.19041.3996）上把资产里 launcher 载荷读取区原样抽出跑：200 KB 载荷下**逐字节 6/6 完成、块读 3/9 挂起**（`timeout` 杀掉，rc=124、零输出）；100 KB 块读 1/3 挂、逐字节 5/5 完成；53 KB 块读 6/6 完成。结论与边界：挂起类真实且间歇，逐字节形态 11/11 无挂；但 `--stdin-script` 自己的上界（unix 目标 ≤18018 字节）低于可复现区间，该上界内块读也跑得完——所以这条修复真正保护的是读上限 1M 字符的 launcher 载荷通道，`--stdin-script` 上则是「形态正确、危害不可达」。资产零改动，只更新 `docs/PLAN.md` 与 `docs/verification-status.md` 的边界记录
   |  ./run-tests.sh --quick → exit 0（44s，parity=ok version=0.1.29）
 
