@@ -30,8 +30,9 @@
 ### 归档会话复核增补（2026-09-18）
 
 本次复核的源会话为 `019fa2b6-2ce4-7a71-a481-d4ac8e276008`。该会话已归档，
-不是丢失；原始记录位于
-`/Volumes/Work/CodexArchive/archived_sessions/rollout-2026-07-27T16-34-35-019fa2b6-2ce4-7a71-a481-d4ac8e276008.3090113d26e829405dd42bda0f5c2b3d9daa7fc801410f6df86d1ac4c7abb9ec.jsonl`，
+不是丢失；原始记录是归档目录下的
+`rollout-2026-07-27T16-34-35-019fa2b6-2ce4-7a71-a481-d4ac8e276008.3090113d26e829405dd42bda0f5c2b3d9daa7fc801410f6df86d1ac4c7abb9ec.jsonl`
+（涉及本机目录布局的完整路径不入库，按该文件名在归档根下检索即可），
 对应元数据状态为 `evicted`，SHA-256 与元数据一致。
 
 原会话不能视为完整闭环：全面复核期间发现了服务端读路径会改写 Pueue group、

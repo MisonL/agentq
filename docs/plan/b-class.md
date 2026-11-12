@@ -35,7 +35,7 @@
 落地时比「一次初始提交」多做了三件事，每件都有具体理由：
 
 - **`.gitattributes` 用 `* -text`**。这不是风格偏好：开发机 `core.autocrlf=input`
-  （实测 `file:/Users/mison/.gitconfig`），而 `assets/` 要**原样部署**——一次换行
+  （实测读取开发机的全局 git 配置即可复现），而 `assets/` 要**原样部署**——一次换行
   转换就会让 `cmp` 的两条 canonical 资产不再相同。实测同一份 CRLF 文件，有这个
   文件时入库仍是 `0d 0a`，去掉它就变成 `0a`。
 - **`.gitignore` 用机制挡住凭据落库**（askpass 助手、密钥、`.env`、本机 agentq 状态）。

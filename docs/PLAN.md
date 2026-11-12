@@ -238,7 +238,7 @@ SSH 走 **2222** 端口
 以下需要授权，**默认不做**：
 
 - 未获授权的远端安装、升级、回滚、服务变更、队列 mutation、凭证操作、生产写入
-- 触碰真实 `/Users/mison/.agentq` 与真实 launchd 域
+- 触碰真实的 `~/.agentq` 与真实 launchd 域
 - 触碰 13 台真实生产 SSH 主机（仅用户在当次会话中点名的那几台获授权）
 - 在目标机运行 `codex exec`，或把 Skill 客户端降级为普通前台 SSH
 - 打印凭证内容（`shared_secret`、`daemon.key`）——只检查结构
@@ -288,8 +288,9 @@ SSH 走 **2222** 端口
     否则安装装出旧代码、且 `SKILL.md` 会静默分叉。两者不会自动保持一致，忘了就分叉：
     ```sh
     SKILL_DIR="${SKILL_DIR:-$HOME/.agents/skills/agentq}"
-    rsync -a --delete /Volumes/Work/code/agentq/skill/ "$SKILL_DIR/"
-    diff -rq /Volumes/Work/code/agentq/skill "$SKILL_DIR"   # 必须无输出
+    AGENTQ_REPO_ROOT=$(git rev-parse --show-toplevel)
+    rsync -a --delete "$AGENTQ_REPO_ROOT/skill/" "$SKILL_DIR/"
+    diff -rq "$AGENTQ_REPO_ROOT/skill" "$SKILL_DIR"   # 必须无输出
     ```
     **为什么是整目录**：旧规则只同步 `assets/`，于是 `SKILL.md` 不在范围内、静默分叉
     （2026-09-29 实测：仓库的 `SKILL.md` 比全局目录里的新 5 行，差的正是几处已被推翻的断言）。
@@ -1403,7 +1404,7 @@ A5b 随之修复并经两列双向验证——见 A5b 正文与本节 A5b 行。
     - **同类先例**：2026-10-25 的 `__pycache__` 排除（`is_derived_bytecode()`）是同一形状——**不可提交的构建/系统残留让套件报假的不全绿**。而 `smoke/01` 早就把这三个 basename 当 `junk`（`asset_kind()` 函数）：`smoke/16` 缺的正是同一张表。
     - **修法**：`smoke/16` 新增 `is_os_junk()`——按 **basename** 判（`.DS_Store`/`Thumbs.db`/`desktop.ini`），与 `smoke/01` 的 `junk` 表逐字相同；文件遍历改成 `if is_derived_bytecode "$file" || is_os_junk "$file"; then continue; fi`。**刻意窄**：只这三个名字。宽成 `*.tmp`、`*~` 会把真实文件也吞掉，而含 NUL 的**普通名字**文本文件必须仍然被上报而不是跳过——自检（下）双向钉住这一点。
     - **锁（自检，双向）**：`smoke/16` 新增 `expect_junk()`——9 条：**5 条必须被判为 junk**（`.DS_Store` 相对路径、绝对路径、子目录、`notes/Thumbs.db`、`notes/desktop.ini`），**4 条必须仍被扫描**（`.DS_Store.bak` 不是垃圾、`smoke/.DS_Store.txt` 只是**名字里嵌了**垃圾名、`logs/notes.tmp` 是 class 之外的临时文件、`CHANGELOG.md` 是普通仓库文件）。任一方向不符即计一次自检失败并退 1——与 `expect_bytecode()` 同形。
-    - **红证（两向，实测在内仓库内跑，逐条点名）**：① 把 `.DS_Store` 从 case 里去掉（模拟「排除没接上」）→ **3 条** `the OS-junk exclusion misses …` 并退 1；② 把 case 宽成裸 `*`（模拟「排得过宽」）→ **4 条** `the OS-junk exclusion covers … but must not` 并退 1。**A/B 在真资产上**：`git show HEAD:` 的旧版 `smoke/16` 打印 `… looks binary by NUL bytes … /Volumes/Work/code/agentq/.DS_Store` 且 `files=117`，修后同样的树打印 `files=116` 且**没有**那一行。
+    - **红证（两向，实测在内仓库内跑，逐条点名）**：① 把 `.DS_Store` 从 case 里去掉（模拟「排除没接上」）→ **3 条** `the OS-junk exclusion misses …` 并退 1；② 把 case 宽成裸 `*`（模拟「排得过宽」）→ **4 条** `the OS-junk exclusion covers … but must not` 并退 1。**A/B 在真资产上**：`git show HEAD:` 的旧版 `smoke/16` 打印 `… looks binary by NUL bytes … <checkout>/.DS_Store` 且 `files=117`，修后同样的树打印 `files=116` 且**没有**那一行。
     - **收尾实测**：修完在冻结树上重跑全量套件 → `30 ran, 0 skipped, 0 partial, 0 failed`，`PASS` 行不再伴随 `NOT A FULL PASS`。
     - **边界**：① 排除只认这三个 basename；含 NUL 的普通文件仍被**上报**（这一条正是 `smoke/16` 存在的理由之一，不能被这次修复松动）。② 用别后缀强加入库的 `.pyc`（`git add -f`）仍走 `is_derived_bytecode` 那条既有的、已记录的边界。③ 本类只动 `smoke/16` 一个文件，`skill/assets/` 零变更。
 

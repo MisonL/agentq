@@ -39,8 +39,9 @@ root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 # silently skip on every other clone path -- repo half green, memory half
 # unverified, invisible in CI because of the named allowance below.  Derive the
 # slug from the actual checkout path: Claude replaces each run of non-alphanumeric
-# characters with a single '-', keeping the LEADING one (measured: /Volumes/Work/
-# code/agentq -> -Volumes-Work-code-agentq).  AGENTQ_SMOKE_MEMORY_DIR overrides.
+# characters with a single '-', keeping the LEADING one (measured: a checkout
+# path such as /Volumes/<volume>/<dir> becomes -Volumes-<volume>-<dir>).
+# AGENTQ_SMOKE_MEMORY_DIR overrides.
 memory_slug=$(printf '%s' "$root" | LC_ALL=C sed -E 's/[^A-Za-z0-9]+/-/g')
 memory_dir=${AGENTQ_SMOKE_MEMORY_DIR:-$HOME/.claude/projects/$memory_slug/memory}
 
