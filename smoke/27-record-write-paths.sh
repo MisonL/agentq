@@ -289,6 +289,198 @@ else
 fi
 clear_runtime
 
+# S9. A reader failure is NOT an absent record.  Inject one jq failure in the
+#     per-id reader only (layout validation uses the batch filter, so it cannot
+#     consume the injection before submit reaches its own read).  The existing
+#     record must survive byte-for-byte and nothing may be enqueued: without
+#     this arm a transient read failure fell through to the "no record yet"
+#     branch, which WRITES -- overwriting an accepted record (losing its
+#     task_id) and enqueuing a second task under the same request id.  Measured
+#     2026-11-10 (independent review) with exactly this injection: submit exited
+#     0, the record was replaced and `pueue add` ran.
+real_jq=$(command -v jq)
+mkdir -p "$work/reader-bin"
+cat > "$work/reader-bin/jq" <<'SH'
+#!/usr/bin/env bash
+if [[ ${1:-} == -ce && ${2:-} == --arg && ${3:-} == request_id &&
+      ${4:-} == "$AGENTQ_READER_ID" &&
+      ${5:-} == *"error(\"invalid AgentQ request $AGENTQ_READER_KIND\")"* &&
+      ! -e "$AGENTQ_READER_HIT" ]]; then
+    printf '%s\n' "$AGENTQ_READER_KIND" > "$AGENTQ_READER_HIT"
+    exit 5
+fi
+exec "$AGENTQ_REAL_JQ" "$@"
+SH
+chmod 700 "$work/reader-bin/jq"
+for reader_kind in record tombstone; do
+    clear_runtime
+    rm -f "$work/.added" "$work/reader-hit"
+    write_stateful_stub 4242
+    if [ "$reader_kind" = record ]; then
+        put_record "$submit_id" accepted 1001 '"2026-09-29T00:00:00Z"'
+        reader_path="$work/data/agentq-requests/$submit_id.json"
+        want_records=1
+        want_tombstones=0
+    else
+        put_tombstone "$submit_id" 1001
+        reader_path="$work/data/agentq-requests/.tombstones/$submit_id.json"
+        want_records=0
+        want_tombstones=1
+    fi
+    cp "$reader_path" "$work/reader-before.json"
+    reader_case="s9-$reader_kind"
+    PATH="$work/reader-bin:$PATH" AGENTQ_REAL_JQ="$real_jq" \
+        AGENTQ_READER_ID="$submit_id" AGENTQ_READER_KIND="$reader_kind" \
+        AGENTQ_READER_HIT="$work/reader-hit" \
+        run_case "$reader_case" submit --workdir "$work" --label smoke --request-id "$submit_id" -- true
+    assert_rc "$reader_case" 2
+    assert_err_has "$reader_case" "invalid AgentQ request $reader_kind:"
+    assert_reason "$reader_case"
+    assert_counts "$reader_case" "$want_records" "$want_tombstones"
+    cases=$((cases + 1))
+    if [ "$(cat "$work/reader-hit" 2>/dev/null)" != "$reader_kind" ]; then
+        printf 'write-paths %s: the reader failure injection was not reached\n' "$reader_case" >&2
+        failures=$((failures + 1))
+    fi
+    cases=$((cases + 1))
+    if ! cmp -s "$work/reader-before.json" "$reader_path"; then
+        printf 'write-paths %s: the rejected submit changed existing metadata\n' "$reader_case" >&2
+        failures=$((failures + 1))
+    fi
+    cases=$((cases + 1))
+    if [ -e "$work/.added" ]; then
+        printf 'write-paths %s: a reader failure still reached pueue add\n' "$reader_case" >&2
+        failures=$((failures + 1))
+    fi
+    cases=$((cases + 1))
+    if [ "$(grep -c '^agentq-server: reason=' "$work/$reader_case.err")" != 1 ]; then
+        printf 'write-paths %s: expected exactly one reason line\n' "$reader_case" >&2
+        failures=$((failures + 1))
+    fi
+done
+
+# S8. Numeric ids are reused, so a marker left by an OLDER instance must be
+#     discarded by the next submit -- and a marker belonging to the instance
+#     being recovered must be PRESERVED (the opposite direction: a cleanup that
+#     does not bind to the instance would delete a live cancellation's only
+#     record).  A stale requested marker plus a tombstone must also not answer
+#     for a new live instance while status cannot be read.
+clear_runtime
+rm -f "$work/.added" "$work/.killed" "$work/.gone" "$work/fail-status" "$work/status-count"
+old_request_id=AQOLD-CANCEL-00001
+new_created_at=2026-09-30T00:00:00Z
+put_tombstone "$old_request_id" 1001
+put_marker() {
+    printf '{"version":1,"task_id":1001,"created_at":"%s","requested_at":"2026-09-29T00:05:00Z","reason":"kill_confirmed","state":"requested"}\n' \
+        "$1" > "$work/data/agentq-cancellations/1001.json"
+}
+put_marker 2026-09-29T00:00:00Z
+cat > "$work/pueue" <<SH
+#!/bin/sh
+printf '%s\n' "\$*" >> "$work/reuse.calls"
+case "\$*" in
+  *"kill "*) : > "$work/.killed" ;;
+  *"remove "*) : > "$work/.gone" ;;
+  *"add "*) printf '%s\n' 1001; : > "$work/.added" ;;
+  *"status --json"*)
+    count=0
+    [ ! -e "$work/status-count" ] || count=\$(cat "$work/status-count")
+    count=\$((count + 1))
+    printf '%s\n' "\$count" > "$work/status-count"
+    if [ -e "$work/fail-status" ] && [ "\$count" -eq 2 ]; then exit 1; fi
+    if [ -e "$work/.added" ] && [ ! -e "$work/.gone" ]; then
+      printf '%s\n' '{"tasks":{"1001":{"id":1001,"created_at":"$new_created_at","command":"true","label":"agentq:$submit_id","status":{"Running":{}},"group":"agentq"}},"groups":{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}}'
+    else
+      printf '%s\n' '{"tasks":{},"groups":{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}}'
+    fi
+    ;;
+  *"group --json"*) printf '%s\n' '{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}' ;;
+  *) printf '%s 4.0.4\n' pueue ;;
+esac
+SH
+chmod 700 "$work/pueue"
+run_case s8-stale submit --workdir "$work" --label smoke --request-id "$submit_id" -- true
+assert_rc s8-stale 0
+assert_json s8-stale '.task_id == 1001 and .reused == false'
+cases=$((cases + 1))
+if [ -e "$work/data/agentq-cancellations/1001.json" ]; then
+    printf 'write-paths s8-stale: submit kept the old task instance marker\n' >&2
+    failures=$((failures + 1))
+fi
+
+# Recovery from prepared with an already-visible task reaches submit's final
+# marker cleanup; accepted-record replay returns earlier and cannot test it.
+put_record "$submit_id" prepared null null
+put_marker "$new_created_at"
+cp "$work/data/agentq-cancellations/1001.json" "$work/current-marker.json"
+run_case s8-current submit --workdir "$work" --label smoke --request-id "$submit_id" -- true
+assert_rc s8-current 0
+assert_json s8-current '.task_id == 1001 and .reused == true'
+cases=$((cases + 1))
+if ! cmp -s "$work/current-marker.json" "$work/data/agentq-cancellations/1001.json"; then
+    printf 'write-paths s8-current: recovered submit deleted its own cancellation marker\n' >&2
+    failures=$((failures + 1))
+fi
+
+# Archiving an OLD removed record must not delete a NEW instance's marker.
+put_marker "$new_created_at"
+put_record "$old_request_id" removed 1001 '"2026-09-29T00:00:00Z"'
+run_case c5-fence status --task 1001
+assert_rc c5-fence 0
+cases=$((cases + 1))
+if ! cmp -s "$work/current-marker.json" "$work/data/agentq-cancellations/1001.json"; then
+    printf 'write-paths c5-fence: archiving an old record deleted the current marker\n' >&2
+    failures=$((failures + 1))
+fi
+
+# Restore a crash residue independently of submit's cleanup so this assertion
+# detects the replay defect even if the cleanup fix is retained in a mutant.
+put_marker 2026-09-29T00:00:00Z
+cp "$work/data/agentq-cancellations/1001.json" "$work/old-marker.json"
+: > "$work/reuse.calls"
+rm -f "$work/status-count"
+: > "$work/fail-status"
+run_case c6-unreadable cancel 1001
+assert_rc c6-unreadable 2
+assert_reason c6-unreadable
+cases=$((cases + 1))
+if [ -s "$work/c6-unreadable.out" ] || [ -e "$work/.killed" ] || [ -e "$work/.gone" ] ||
+   ! cmp -s "$work/old-marker.json" "$work/data/agentq-cancellations/1001.json"; then
+    printf 'write-paths c6-unreadable: unreadable status produced a success or mutation\n' >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if [ "$(cat "$work/status-count")" != 2 ]; then
+    printf 'write-paths c6-unreadable: did not reach the injected task-read failure\n' >&2
+    failures=$((failures + 1))
+fi
+
+# Readable live instance: actually kill it and bind the new marker.
+rm -f "$work/fail-status" "$work/status-count"
+run_case c7-live cancel 1001
+assert_rc c7-live 0
+assert_json c7-live '.action == "cancel_requested" and (.reused == null)'
+cases=$((cases + 1))
+if [ ! -e "$work/.killed" ] ||
+   ! jq -e --arg created "$new_created_at" '.created_at == $created and .state == "requested"' \
+       "$work/data/agentq-cancellations/1001.json" >/dev/null; then
+    printf 'write-paths c7-live: live cancellation did not kill and record the new instance\n' >&2
+    failures=$((failures + 1))
+fi
+
+# Explicit absence still permits a confirmed replay, from a record OR tombstone.
+: > "$work/.gone"
+run_case c8-record cancel 1001
+assert_rc c8-record 0
+assert_json c8-record '.action == "cancel_requested" and .reused == true'
+clear_runtime
+put_tombstone "$old_request_id" 1001
+put_marker 2026-09-29T00:00:00Z
+run_case c8-tombstone cancel 1001
+assert_rc c8-tombstone 0
+assert_json c8-tombstone '.action == "cancel_requested" and .reused == true'
+clear_runtime
+
 # ------------------------------------------------------------------ cancel cases
 write_stub '{"tasks":{"1001":{"id":1001,"created_at":"2026-09-29T00:00:00Z","command":"sleep 60","label":"agentq:AQCAN-0000000000001","status":{"Running":{}},"group":"agentq"}},"groups":{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}}'
 

@@ -152,6 +152,31 @@ for leftover in "$stale_marker" "$stale_record" \
     fi
 done
 
+# The check's OWN records from an earlier run are the same collision one step
+# later, and the EXIT trap cannot always clear them: it removes each task from
+# Pueue, and a task that is already gone (the queued-cancel victim, or anything
+# the runtime dropped) leaves its record behind, because `remove` needs a task
+# to remove.  Measured 2026-11-11, twice: a run that failed midway left four
+# records this way, and the NEXT run then submitted onto the same recycled
+# numeric ids and died at the first `wait` with "task N has an ambiguous AgentQ
+# identity" -- an unrelated-looking failure that says nothing about the leftover
+# or about the contract that went unexercised.  Report it as what it is.
+# Every id this check builds starts with `smoke-` and carries its pid and a UTC
+# stamp, so matching the prefix cannot hit a real deployment's records.
+own_leftovers=''
+if [ -d "$runtime_home/data/agentq-requests" ]; then
+    for candidate in "$runtime_home"/data/agentq-requests/smoke-*.json; do
+        [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+        own_leftovers="$own_leftovers ${candidate##*/}"
+    done
+fi
+if [ -n "$own_leftovers" ]; then
+    printf 'a previous run of this check left request record(s) in the runtime:%s\n' "$own_leftovers" >&2
+    printf 'Run `%s remove <task-id>` for each, or delete those record files, then re-run.\n' "$server" >&2
+    printf '%s\n' '(Pueue recycles numeric task ids, so submitting onto them would read as an identity collision.)' >&2
+    exit 1
+fi
+
 # submit
 if ! submit_output=$("$server" submit --workdir "$work" --label smoke \
         --request-id "$request_id" -- sh -c 'printf smoke-ok'); then
@@ -809,6 +834,38 @@ if [ "$reused_fixture_ready" -eq 1 ]; then
     }
 fi
 
+# A marker from an OLDER instance of a recycled id must be DELETED, not merely
+# ignored.  `remove_cancellation_marker_for_task` only removes a marker whose
+# created_at equals the instance it is called with, so the branch that means
+# "this marker belongs to some other instance" called it with the CURRENT
+# created_at -- a call that can never match by construction, i.e. a branch that
+# reads as cleanup and removes nothing.  Consequence: the stale marker survives,
+# and once the current instance leaves Pueue (rc=4) a later `cancel` for this id
+# finds a marker whose created_at IS recorded as an older instance and answers
+# `cancel_requested` / reused:true about a task nobody cancelled.
+#
+# The observation point is the finished task's id: a cancel on it takes the
+# stale-marker branch and then fails `task is not running`, so nothing else
+# writes a marker afterwards and the file's presence is the whole assertion.
+stale_cleanup_marker="$runtime_home/data/agentq-cancellations/$task_id.json"
+finished_cancel_status=0
+printf '{"task_id":%s,"created_at":"2001-01-01T00:00:00Z","requested_at":"2001-01-01T00:00:01Z","reason":"user_requested","state":"requested"}\n' \
+    "$task_id" > "$stale_cleanup_marker"
+"$server" cancel "$task_id" >"$work/finished-cancel.out" 2>"$work/finished-cancel.err" ||
+    finished_cancel_status=$?
+if [ "$finished_cancel_status" -ne 2 ]; then
+    printf 'cancelling a finished task exited %s, expected 2 with task_not_running: %s\n' \
+        "$finished_cancel_status" "$(head -1 "$work/finished-cancel.err")" >&2
+    rm -f -- "$stale_cleanup_marker"
+    exit 1
+fi
+if [ -e "$stale_cleanup_marker" ] || [ -L "$stale_cleanup_marker" ]; then
+    printf '%s\n' 'a cancellation marker from an older instance of this task id survived the cancel that found it; it will make a later cancel for this id answer reused:true about a task nobody cancelled' >&2
+    rm -f -- "$stale_cleanup_marker"
+    exit 1
+fi
+stale_marker_cleanup='removed'
+
 # This is the assertion the whole case exists for: a task removed because it
 # was cancelled must NOT come back as a completed task.
 queued_wait_status=0
@@ -1327,5 +1384,5 @@ jq -e 'type == "array" and length == 0' <<<"$empty_out" >/dev/null || {
 # Every token below is printed only after its assertion actually ran -- the
 # three that used to be conditionally skipped now exit 1 instead, so a green
 # summary cannot coexist with an unexercised contract.
-printf 'protocol-roundtrip checks passed: home=%s task=%s fail-task=%s lookup=not_found stale-lock=recovered cancel-running=ok cancel-queued=queued_removed/5 cancel-replay=reused reuse-replay=reused finished-cancel=task_not_running binary-log=base64 missing-log=empty/6 label-surfaces=raw/decorated line-marker=base64/0+text/0 full-wording=text/0 reserved-label=2/2 empty-label=2/2 status-ambiguous=unavailable/6 doctor=ok ambiguous-id=unavailable/6 summary=ok batch-remove=2/2+empty\n' \
-    "$runtime_home" "$task_id" "$failure_task_id"
+printf 'protocol-roundtrip checks passed: home=%s task=%s fail-task=%s lookup=not_found stale-lock=recovered cancel-running=ok cancel-queued=queued_removed/5 cancel-replay=reused reuse-replay=reused stale-marker=%s finished-cancel=task_not_running binary-log=base64 missing-log=empty/6 label-surfaces=raw/decorated line-marker=base64/0+text/0 full-wording=text/0 reserved-label=2/2 empty-label=2/2 status-ambiguous=unavailable/6 doctor=ok ambiguous-id=unavailable/6 summary=ok batch-remove=2/2+empty\n' \
+    "$runtime_home" "$task_id" "$failure_task_id" "$stale_marker_cleanup"

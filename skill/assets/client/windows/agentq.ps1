@@ -3391,33 +3391,6 @@ switch ($operation) {
             if (![Console]::IsInputRedirected) {
                 Stop-AgentQ "submit --stdin-script needs the script on standard input (pipe or redirect it)"
             }
-            $stdinStream = [Console]::OpenStandardInput()
-            $stdinMemory = New-Object System.IO.MemoryStream
-            try {
-                # Read with an explicit ceiling instead of CopyTo (which blocks
-                # until EOF): a producer that keeps the pipe open past the cap
-                # made the client buffer without bound and delay the refusal
-                # until EOF -- measured 2026-11-10 with a 100000-byte payload
-                # and no EOF: the POSIX twin refused immediately, this one was
-                # still running after 3s and only answered once the writer
-                # closed.  The cap is the LARGEST possible target limit; the
-                # exact per-target check still runs below, on the base64 length.
-                $stdinReadLimit = [Math]::Max($script:StdinScriptLimitUnix, $script:StdinScriptLimitWindows) * 3 + 3
-                $stdinBuffer = New-Object byte[] 8192
-                while ($stdinMemory.Length -le $stdinReadLimit) {
-                    $read = $stdinStream.Read($stdinBuffer, 0, $stdinBuffer.Length)
-                    if ($read -le 0) { break }
-                    $stdinMemory.Write($stdinBuffer, 0, $read)
-                }
-            } finally {
-                $stdinStream.Dispose()
-            }
-            $scriptBytes = $stdinMemory.ToArray()
-            $stdinMemory.Dispose()
-            if ($scriptBytes.Length -eq 0) {
-                Stop-AgentQ "submit --stdin-script received no script on standard input"
-            }
-            $scriptBase64 = [Convert]::ToBase64String($scriptBytes)
             # The cap belongs to the TARGET's argv, not this machine: the same
             # client can drive a Linux host (MAX_ARG_STRLEN headroom -> 100000
             # b64 chars) or a Windows host (CreateProcess 32767 -> 20000).
@@ -3433,6 +3406,10 @@ switch ($operation) {
             # 18000 base64 characters, not the 100000 the target would allow.
             # Without the tighter cap a 13.5 KB-75 KB script passed this check
             # and then failed at the local process launch instead.
+            #
+            # It is computed BEFORE the read because the read is bounded by it;
+            # a ceiling taken from the larger of the two limits leaves the
+            # refusal waiting for EOF (see the two measurements below).
             $stdinScriptLimit = if ($script:RemotePlatform -eq "windows") {
                 $script:StdinScriptLimitWindows
             } else {
@@ -3441,11 +3418,62 @@ switch ($operation) {
             if ($script:RemotePlatform -ne "windows") {
                 # 4/3 for the outer base64 plus the fixed local overhead, in
                 # the same units the check compares (base64 characters).
-                $localBudget = [int](($script:LocalCommandLineLimit - $script:LocalCommandLineFixedOverhead) * 3 / 4)
+                # Floor, not a plain [int] cast: PowerShell rounds a cast to the
+                # nearest even integer, so 97753.5 became 97754 while the POSIX
+                # twin's shell arithmetic truncates to 97753.  One character of
+                # divergence in a bound is still divergence -- the twins must
+                # accept and refuse the same payloads (measured 2026-11-11).
+                $localBudget = [int][Math]::Floor(($script:LocalCommandLineLimit - $script:LocalCommandLineFixedOverhead) * 3 / 4)
                 if ($localBudget -lt $stdinScriptLimit) {
                     $stdinScriptLimit = $localBudget
                 }
             }
+            # Read at most enough BYTES to exceed that base64 budget, then let
+            # the check below refuse -- never more, and never a block at a time.
+            #
+            # 1. The bound must be the target's own, not the larger of the two:
+            #    with a ceiling sized to 100000 base64 characters (300003 bytes)
+            #    any producer holding the pipe open stalled the refusal until EOF
+            #    for every payload between the target's budget and that ceiling.
+            #    Measured 2026-11-11: 100000 bytes, writer still open, unix
+            #    target -- the POSIX twin exited 2 in about 1s, this client was
+            #    still reading at 12s.  The 2026-11-10 fix for the same class
+            #    used a payload ABOVE that ceiling (400000 bytes), so the window
+            #    stayed open and its case stayed green.
+            # 2. ReadByte, not a block read: 0.1.10 measured Windows PowerShell
+            #    5.1 hanging intermittently on [Console]::In.Read(char[]) over
+            #    the OpenSSH pipe past ~4.5K characters (near-certainly past
+            #    ~8.6K), while per-byte reads on this same .NET stream completed
+            #    12/12 at payloads up to 53K.  The launcher wrapper inside
+            #    New-WindowsRemoteInvocation carries that fix too; this is the
+            #    second stdin reader in this file, so it needs the same shape.
+            #    Only this one is reachable on a Windows host without the
+            #    launcher, and smoke/12 pins it statically because the PS 5.1
+            #    pipe shape cannot be reproduced on the hosts that run the suite.
+            #
+            # +1 byte so the base64 length of what was read is always past the
+            # budget.  The "base64 length" in the refusal below is therefore the
+            # length of what was READ, not of the whole script -- exactly what
+            # the POSIX twin's `head -c $((limit * 3 / 4 + 1))` reports, so the
+            # two twins keep the same message shape.
+            $stdinByteLimit = [int]([Math]::Floor($stdinScriptLimit * 3 / 4)) + 1
+            $stdinStream = [Console]::OpenStandardInput()
+            $stdinMemory = New-Object System.IO.MemoryStream
+            try {
+                while ($stdinMemory.Length -lt $stdinByteLimit) {
+                    $nextByte = $stdinStream.ReadByte()
+                    if ($nextByte -lt 0) { break }
+                    $stdinMemory.WriteByte([byte]$nextByte)
+                }
+                $scriptBytes = $stdinMemory.ToArray()
+            } finally {
+                $stdinStream.Dispose()
+                $stdinMemory.Dispose()
+            }
+            if ($scriptBytes.Length -eq 0) {
+                Stop-AgentQ "submit --stdin-script received no script on standard input"
+            }
+            $scriptBase64 = [Convert]::ToBase64String($scriptBytes)
             if ($scriptBase64.Length -gt $stdinScriptLimit) {
                 Stop-AgentQ ("the script is too large for --stdin-script (base64 length " + $scriptBase64.Length +
                     " exceeds $stdinScriptLimit on this target); stage it as a file and submit a command that reads it")

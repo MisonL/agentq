@@ -3167,6 +3167,109 @@ if [ -n "$ps1_stdin_guard_problem" ]; then
     mode_static_failures=$((mode_static_failures + 1))
 fi
 
+# The stdin-script READER: byte-wise, and bounded by the TARGET's budget.
+#
+# A STATIC lock, and the reason is measured rather than stylistic.  0.1.10
+# measured Windows PowerShell 5.1 stalling intermittently on
+# `[Console]::In.Read(char[])` block reads over the OpenSSH pipe once the
+# payload passed ~4.5K characters (near-certainly past ~8.6K), while per-byte
+# reads on the same .NET stream completed 12/12 at payloads up to 53K.  Nothing
+# in this suite runs PS 5.1 over a real pipe -- this check runs under pwsh on a
+# POSIX host, where both shapes work -- so NO behavioural case can see the
+# difference, and the launcher wrapper's fix does not cover this reader (it is a
+# different one, inside New-WindowsRemoteInvocation).
+#
+# The bound half is behavioural and IS covered: `narrow` in the open-pipe case
+# below refuses a payload that only the target's own budget rejects.  It is
+# pinned statically as well because a bound that is merely computed somewhere
+# and not used by the loop reads the same as a correct one at a glance.
+#
+# The region is delimited by the redirected-stdin guard and the base64 encode,
+# so neither half can be satisfied by an edit elsewhere in the file.
+stdin_reader_region_bounds='if (![Console]::IsInputRedirected) {|ToBase64String($scriptBytes)'
+stdin_reader_region=$(/usr/bin/awk '/if \(!\[Console\]::IsInputRedirected\) \{/ { f = 1 } f { print } f && /ToBase64String\(\$scriptBytes\)/ { exit }' "$client" 2>/dev/null || true)
+stdin_reader_problem() { # <region text> -> one line naming the first violation, else empty
+    if [ -z "$1" ]; then
+        printf '%s\n' "the stdin-script reader was not found (no region between '${stdin_reader_region_bounds%%|*}' and '${stdin_reader_region_bounds##*|}')"
+        return 0
+    fi
+    # Comments are stripped first, and the rule needs that to stay honest in
+    # both directions: the region's own prose names the block-read call it is
+    # explaining (`Console]::In.Read(char[])`), so a comment-blind match made
+    # this rule report the FIXED asset as a block reader -- measured on the
+    # first run of this lock, 2026-11-11.  Same reasoning as the guard lock
+    # above: removing the code while keeping its explanation must not pass.
+    stdin_reader_code=$(/usr/bin/grep -v '^[[:space:]]*#' <<< "$1" || true)
+    if [ -z "$stdin_reader_code" ]; then
+        printf '%s\n' 'the stdin-script reader is empty once comments are removed'
+        return 0
+    fi
+    if /usr/bin/grep -qF -e '$stdinStream.Read(' -e '.CopyTo(' -e 'Console]::In.Read' <<< "$stdin_reader_code"; then
+        printf '%s\n' 'the stdin-script reader uses a block read; PS 5.1 stalls on the OpenSSH pipe, so it must use ReadByte'
+        return 0
+    fi
+    if ! /usr/bin/grep -qF 'ReadByte()' <<< "$stdin_reader_code"; then
+        printf '%s\n' 'the stdin-script reader does not read byte-by-byte'
+        return 0
+    fi
+    stdin_bound_line=$(/usr/bin/grep -m1 -F '$stdinByteLimit =' <<< "$stdin_reader_code" || true)
+    if [ -z "$stdin_bound_line" ]; then
+        printf '%s\n' 'the stdin-script reader has no $stdinByteLimit'
+        return 0
+    fi
+    if /usr/bin/grep -qF '[Math]::Max(' <<< "$stdin_bound_line"; then
+        printf '%s\n' 'the stdin-script reader is bounded by the larger of the two target limits, so a payload it would reject still waits for EOF'
+        return 0
+    fi
+    if ! /usr/bin/grep -qF '$stdinScriptLimit' <<< "$stdin_bound_line"; then
+        printf '%s\n' 'the stdin-script reader is not bounded by the target-resolved $stdinScriptLimit'
+        return 0
+    fi
+    if ! /usr/bin/grep -qF 'Length -lt $stdinByteLimit' <<< "$stdin_reader_code"; then
+        printf '%s\n' 'the stdin-script read loop does not use $stdinByteLimit'
+        return 0
+    fi
+}
+# Calibrate on the region itself rather than on a hand-written fixture: a
+# fixture only proves the rule can match ITS OWN idea of the code, and three of
+# this project's self-calibrations have passed while testing a shape the asset
+# never has.  Each mutant below is the real region with one measured defect
+# re-inserted, and a mutant that changes nothing is itself a failure.
+stdin_reader_calibration_failures=0
+stdin_reader_actual=$(stdin_reader_problem "$stdin_reader_region")
+if [ -n "$stdin_reader_actual" ]; then
+    printf 'ps-client: %s\n' "$stdin_reader_actual" >&2
+    mode_static_failures=$((mode_static_failures + 1))
+fi
+for stdin_reader_case in \
+    'block-read|s/\$stdinStream\.ReadByte()/$stdinStream.Read($stdinBuffer, 0, 1)/|block read' \
+    'wide-bound|s/\$stdinByteLimit = \[int\](\[Math\]::Floor(\$stdinScriptLimit \* 3 \/ 4)) + 1/$stdinByteLimit = [Math]::Max($script:StdinScriptLimitUnix, $script:StdinScriptLimitWindows) * 3 + 3/|larger of the two target limits' \
+    'unused-bound|s/Length -lt \$stdinByteLimit/Length -lt 300003/|does not use $stdinByteLimit'; do
+    stdin_reader_label=${stdin_reader_case%%|*}
+    stdin_reader_rest=${stdin_reader_case#*|}
+    stdin_reader_sed=${stdin_reader_rest%%|*}
+    stdin_reader_want=${stdin_reader_rest#*|}
+    stdin_reader_mutant=$(printf '%s\n' "$stdin_reader_region" | sed -e "$stdin_reader_sed")
+    if [ "$stdin_reader_mutant" = "$stdin_reader_region" ]; then
+        printf 'ps-client: the stdin-script reader static rule is miscalibrated: the %s mutant changed nothing in the asset\n' \
+            "$stdin_reader_label" >&2
+        stdin_reader_calibration_failures=$((stdin_reader_calibration_failures + 1))
+        continue
+    fi
+    stdin_reader_mutant_problem=$(stdin_reader_problem "$stdin_reader_mutant")
+    case $stdin_reader_mutant_problem in
+        *"$stdin_reader_want"*) ;;
+        *)
+            printf 'ps-client: the stdin-script reader static rule is miscalibrated: the %s mutant reported [%s], expected it to name the %s\n' \
+                "$stdin_reader_label" "$stdin_reader_mutant_problem" "$stdin_reader_want" >&2
+            stdin_reader_calibration_failures=$((stdin_reader_calibration_failures + 1))
+            ;;
+    esac
+done
+if [ "$stdin_reader_calibration_failures" -ne 0 ]; then
+    mode_static_failures=$((mode_static_failures + 1))
+fi
+
 # The platform cache must live under the SAME SID-resolved profile as the config
 # path.  The client's stated rule is that USERPROFILE is not trusted (Git Bash,
 # OpenSSH, runas and stale sessions pollute it), and it resolves the profile
@@ -3297,7 +3400,7 @@ cases=$((cases + 1))
 oversize_probe='
 $ErrorActionPreference = "Stop"
 . "'"$client_arg"'" 2>$null
-$limit = [int](($script:LocalCommandLineLimit - $script:LocalCommandLineFixedOverhead) * 3 / 4)
+$limit = [int][Math]::Floor(($script:LocalCommandLineLimit - $script:LocalCommandLineFixedOverhead) * 3 / 4)
 $payload = "x" * ($limit + 4096)
 $scriptBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payload))
 Write-Output ("limit=" + $limit + " b64=" + $scriptBase64.Length)
@@ -3318,13 +3421,25 @@ fi
 # keeps the pipe open past the cap made this client buffer without bound and
 # delay the refusal until EOF -- measured 2026-11-10 with a 100000-byte payload
 # whose writer never closed: the POSIX twin refused immediately, this one was
-# still running after 3 seconds.  A reader now stops at the largest possible
-# target limit and lets the exact check refuse.
+# still running after 3 seconds.
+#
+# THE SIZE OF THE OPEN-PIPE PAYLOAD IS THE WHOLE CASE, and that is how the
+# 2026-11-10 fix passed this check while leaving the defect in place.  It capped
+# the read at the LARGER of the two target limits (100000 base64 characters ->
+# 300003 bytes) and the case fed 400000 bytes, i.e. past that ceiling -- so the
+# reader always reached its ceiling, and the window between the target's own
+# budget and that ceiling was never exercised.  A producer holding the pipe open
+# in that window still stalled the refusal until EOF.  Measured 2026-11-11: a
+# unix target, 100000 bytes, writer still open -- the POSIX twin exited 2 in
+# about 1s, this client was still reading at 12s.  The reader now computes the
+# TARGET's budget before reading and stops one byte past `budget * 3 / 4`, the
+# same bound the POSIX twin's `head -c` uses, so both sizes below must refuse.
 #
 # The case has to reproduce the OPEN pipe, not merely an oversized payload:
-# with a writer that closes, CopyTo and the bounded read behave identically
-# (both then refuse on the base64 length), so only a pipe that stays open can
-# tell them apart.  A FIFO does that; the writer is killed in the cleanup.
+# with a writer that closes, an unbounded read and a bounded one behave
+# identically (both then refuse on the base64 length), so only a pipe that stays
+# open can tell them apart.  A FIFO does that; the writer is killed in the
+# cleanup.
 # The CLOSED-pipe control runs on every host: an oversized payload whose writer
 # closes must be refused with the controlled message before any ssh launch.  It
 # is the positive control for the message and the exit code, and on a Windows
@@ -3366,45 +3481,84 @@ MINGW*|MSYS*|CYGWIN*)
     stdin_open_pipe_state='NOT-covered(needs-POSIX-pipes)'
     ;;
 *)
-    cases=$((cases + 1))
-    stdin_fifo="$work/stdin-overlong.fifo"
-    rm -f "$stdin_fifo"
-    mkfifo "$stdin_fifo"
-    ( head -c 400000 /dev/zero ; sleep 60 ) > "$stdin_fifo" 2>/dev/null &
-    stdin_writer=$!
-    stdin_overlong_status=0
-    AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
-    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
-    AGENTQ_SSH="$twin_stub_arg" AGENTQ_CONFIG="$work/absent-config" \
-        "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" \
-        submit --workdir /tmp --stdin-script \
-        < "$stdin_fifo" >"$work/stdin-overlong.out" 2>"$work/stdin-overlong.err" &
-    stdin_client=$!
-    # Poll instead of waiting: a reader that blocks on the open pipe would never
-    # return, and the check itself must not hang.  12s is far above the measured
-    # cost of reading 300KB and base64-ing it.
-    stdin_waited=0
-    while [ "$stdin_waited" -lt 48 ]; do
-        if ! kill -0 "$stdin_client" 2>/dev/null; then break; fi
-        sleep 0.25
-        stdin_waited=$((stdin_waited + 1))
-    done
-    if kill -0 "$stdin_client" 2>/dev/null; then
-        printf '%s\n' 'ps-client stdin-script: the client was still reading 12s after the cap with the writer holding the pipe open; the read is unbounded' >&2
-        kill -9 "$stdin_client" 2>/dev/null || true
-        failures=$((failures + 1))
-    else
-        wait "$stdin_client" || stdin_overlong_status=$?
-        if [ "$stdin_overlong_status" -ne 2 ] ||
-            ! grep -qF 'the script is too large for --stdin-script' "$work/stdin-overlong.err"; then
-            printf 'ps-client stdin-script: an over-long script exited %s, expected 2 with the too-large message; stderr: %s\n' \
-                "$stdin_overlong_status" "$(head -2 "$work/stdin-overlong.err" | tr '\n' '|')" >&2
+    # The narrow payload is the ASSET's own declared unix ceiling plus 1000
+    # bytes: over the largest script any target accepts, and far below the
+    # 300003-byte ceiling the previous reader used -- which is exactly the
+    # window that stayed open.  Read from the asset rather than restated, so a
+    # future change to the constant moves the case with it.
+    stdin_narrow_bytes=$("$pwsh_binary" -NoProfile -NonInteractive -Command '
+$ErrorActionPreference = "Stop"
+. "'"$client_arg"'" 2>$null
+Write-Output ([int]([Math]::Ceiling($script:StdinScriptLimitUnix * 3 / 4) + 1000))
+' 2>/dev/null | tr -d '\r')
+    case $stdin_narrow_bytes in
+        ''|*[!0-9]*)
+            printf 'ps-client: could not read the stdin-script ceiling from the asset (got [%s])\n' "$stdin_narrow_bytes" >&2
             failures=$((failures + 1))
+            stdin_narrow_bytes=''
+            ;;
+    esac
+    # <bytes> <label> -- one open-pipe run; a refusal must arrive without EOF.
+    stdin_open_pipe_case() {
+        case_bytes=$1
+        case_label=$2
+        cases=$((cases + 1))
+        case_fifo="$work/stdin-$case_label.fifo"
+        rm -f "$case_fifo"
+        if ! mkfifo "$case_fifo"; then
+            printf 'ps-client stdin-script (%s): could not create a FIFO in %s\n' "$case_label" "$work" >&2
+            failures=$((failures + 1))
+            return 0
         fi
+        ( head -c "$case_bytes" /dev/zero ; sleep 60 ) > "$case_fifo" 2>/dev/null &
+        case_writer=$!
+        case_status=0
+        AGENTQ_HOST=smoke-host AGENTQ_REMOTE_PLATFORM=unix \
+        AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+        AGENTQ_SSH="$twin_stub_arg" AGENTQ_CONFIG="$work/absent-config" \
+            "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" \
+            submit --workdir /tmp --stdin-script \
+            < "$case_fifo" >"$work/stdin-$case_label.out" 2>"$work/stdin-$case_label.err" &
+        case_client=$!
+        # Poll instead of waiting: a reader that blocks on the open pipe would
+        # never return, and the check itself must not hang.  The budget is 30s,
+        # the writer stays open for 60s, so a blocking reader cannot be mistaken
+        # for a slow one.  30s is 3x the slowest measured run (10s for the
+        # 100000-byte payload on a loaded macOS host under pwsh 7.5; the read is
+        # now byte-by-byte, because a block read hangs on PS 5.1's OpenSSH pipe
+        # -- 0.1.10 -- and byte-wise reads are the slow shape).
+        case_waited=0
+        while [ "$case_waited" -lt 120 ]; do
+            if ! kill -0 "$case_client" 2>/dev/null; then break; fi
+            sleep 0.25
+            case_waited=$((case_waited + 1))
+        done
+        if kill -0 "$case_client" 2>/dev/null; then
+            printf 'ps-client stdin-script (%s, %s bytes): the client was still reading 30s in with the writer holding the pipe open; the refusal is waiting for EOF\n' \
+                "$case_label" "$case_bytes" >&2
+            kill -9 "$case_client" 2>/dev/null || true
+            failures=$((failures + 1))
+        else
+            wait "$case_client" || case_status=$?
+            if [ "$case_status" -ne 2 ] ||
+                ! grep -qF 'the script is too large for --stdin-script' "$work/stdin-$case_label.err"; then
+                printf 'ps-client stdin-script (%s, %s bytes): exited %s, expected 2 with the too-large message; stderr: %s\n' \
+                    "$case_label" "$case_bytes" "$case_status" \
+                    "$(head -2 "$work/stdin-$case_label.err" | tr '\n' '|')" >&2
+                failures=$((failures + 1))
+            fi
+        fi
+        kill "$case_writer" 2>/dev/null || true
+        wait "$case_writer" 2>/dev/null || true
+        rm -f "$case_fifo"
+    }
+    # Past every ceiling: the original case, kept because it is the one the
+    # 2026-11-10 fix was written against.
+    stdin_open_pipe_case 400000 wide
+    # Between the target's budget and that ceiling: the window that stayed open.
+    if [ -n "$stdin_narrow_bytes" ]; then
+        stdin_open_pipe_case "$stdin_narrow_bytes" narrow
     fi
-    kill "$stdin_writer" 2>/dev/null || true
-    wait "$stdin_writer" 2>/dev/null || true
-    rm -f "$stdin_fifo"
     ;;
 esac
 

@@ -219,6 +219,17 @@ response loss 只能用**同一 request ID** lookup/reconcile；
 该 id 记录的 `task_created_at`（request record 或 tombstone 里的）一致。否则一个
 更早任务遗留的 marker 会让一个从未被取消的任务看起来像重放。
 
+**历史记录不能代替当前队列快照，而陈旧 marker 必须被删掉、不能只是被忽略。**
+record 与 tombstone 都只证明**某个历史实例**用过该数字 id；只有 Pueue 可读且明确
+报告该 id 不可见（rc=4）时，才允许用它们确认重放，读取失败一律退 `2`。
+另一面：`remove_cancellation_marker_for_task(N, created_at)` 只在 marker 的 `created_at`
+**等于**参数时删除，所以「这个 marker 属于别的实例」的分支若用它就是**永远删不掉的
+no-op**——那是 0.1.29 之前的状态，2026-11-11 修（`remove_stale_cancellation_marker_for_task`，
+以 marker 自己的 `created_at` 作删除围栏，`smoke/03` 与 `smoke/27` 的 `s8-*` 钉两个方向）。
+**`submit` 同理**：`if record=$(read_request_record ...)` 不能区分 rc=1（不存在）与
+rc=2（读不出），而「不存在」分支会**写**——一次瞬时读取失败就会覆盖已有 record 并重复入队。
+rc=1 才是「不存在」，其余原样返回（`smoke/27` 的 `s9-*`）。
+
 **窗口有限，但不是缺陷**：`wait`/`lookup` 走 removed 恢复时会清理该 marker
 （`agentq-server` 里 `remove_cancellation_marker_for_task` 的调用点之一，
 在 removed 恢复分支内——**不要引用行号**，该文件在本会话里已经改过多次、行号漂移过），
@@ -314,9 +325,14 @@ skill/                  ~/.agents/skills/agentq/
 
 ```sh
 SKILL_DIR="${SKILL_DIR:-$HOME/.agents/skills/agentq}"
-rsync -a --delete /Volumes/Work/code/agentq/skill/ "$SKILL_DIR/"
-diff -rq /Volumes/Work/code/agentq/skill "$SKILL_DIR"   # 必须无输出
+AGENTQ_REPO_ROOT=$(git rev-parse --show-toplevel)
+rsync -a --delete "$AGENTQ_REPO_ROOT/skill/" "$SKILL_DIR/"
+diff -rq "$AGENTQ_REPO_ROOT/skill" "$SKILL_DIR"   # 必须无输出
 ```
+
+源是**本次修改所在的工作区**，不是某个固定路径：并行 worktree 里改的 `skill/`
+若用主检出路径同步，推过去的会是主检出的版本（或者反过来，把主检出的版本
+覆盖成 worktree 的）。同步前先核对一次 `AGENTQ_REPO_ROOT`，别对着错误的工作区跑。
 
 **为什么是整目录，而不是只同步 `assets/`**：旧规则只同步 `assets/`，于是
 `SKILL.md` **不在同步范围内、静默分叉**。2026-09-29 实测发现仓库的 `SKILL.md`

@@ -5486,6 +5486,43 @@ remove_cancellation_marker_for_task() {
     fi
 }
 
+# Delete a marker left by an OLDER instance of a recycled task id.
+#
+# remove_cancellation_marker_for_task removes only a marker whose created_at
+# equals the instance it is given, so the site that means "this marker belongs
+# to some other instance" used to call it with the CURRENT created_at: by the
+# branch's own condition that can never match, so the call was reachable,
+# looked like cleanup, and deleted nothing.  Measured 2026-11-11 by planting a
+# marker with a foreign created_at at a finished task's id and cancelling it:
+# the marker was still there after the command, while the branch that was
+# supposed to remove it had "succeeded".
+#
+# The leftover is not cosmetic.  A later `cancel` for that id, once the current
+# instance has left Pueue (rc=4), asks task_instance_created_at_is_recorded
+# whether the MARKER's created_at was ever recorded -- and for a genuinely older
+# instance of the same id the answer is yes, so the stale marker is accepted as
+# a confirmed replay: exit 0 / reused:true about a task nobody cancelled.
+#
+# Fence: the deletion re-reads the marker and removes it only while it still
+# names the OLD instance, so a concurrent cancel that has just written a marker
+# for the CURRENT one survives.
+remove_stale_cancellation_marker_for_task() {
+    local task_id=$1
+    local current_created_at=$2
+    local marker
+    local marker_created_at
+    local read_status
+
+    if marker=$(read_cancellation_marker "$task_id"); then
+        marker_created_at=$(jq -er '.created_at' <<<"$marker") || return $?
+        [ "$marker_created_at" != "$current_created_at" ] || return 0
+        remove_cancellation_marker_for_task "$task_id" "$marker_created_at"
+    else
+        read_status=$?
+        [ "$read_status" -eq 1 ] || return "$read_status"
+    fi
+}
+
 wait_for_task() {
     local task_id=$1
     local task
@@ -5942,6 +5979,8 @@ submit() {
     local observed_task_id
     local task_created_at
     local record_state
+    local record_read_status=0
+    local tombstone_read_status=0
     local pueue_add_status=0
     local recovered=false
 
@@ -6010,7 +6049,22 @@ submit() {
     acquire_request_lock "$request_id"
     acquire_operation_lock
 
-    if record=$(read_request_record "$request_id"); then
+    # `$( )`-in-errexit-off trap again: a FAILED record read is not an absent
+    # record.  Both look the same to `if record=$(...)`, and the absent branch
+    # WRITES -- so one transient failure (a jq error, an id that differs only in
+    # case rejected by request_record_has_case_alias) fell through to "no record
+    # yet", replaced an existing accepted record (losing its task_id) and
+    # enqueued a second task for the same request id.  Measured 2026-11-10
+    # (independent review) by failing one jq call in the per-id reader only:
+    # submit exited 0, the record was overwritten and pueue add ran.  rc=1 is
+    # the reader's GONE code; anything else is returned unchanged, and the
+    # reader has already printed its own reason line, so the caller must not
+    # print a second one.
+    record=$(read_request_record "$request_id") || record_read_status=$?
+    if [ "$record_read_status" -ne 0 ] && [ "$record_read_status" -ne 1 ]; then
+        return "$record_read_status"
+    fi
+    if [ "$record_read_status" -eq 0 ]; then
         request_payload_matches "$record" "$payload" || fail "request id was already used with different submit arguments: $request_id"
 
         record_state=$(jq -r '.state' <<<"$record")
@@ -6063,9 +6117,15 @@ submit() {
                 fail "AgentQ request disappeared while recovering removal: $request_id"
             fi
         fi
-    elif read_request_tombstone "$request_id" >/dev/null; then
+    elif ( read_request_tombstone "$request_id" ) >/dev/null; then
         fail "request id was already consumed by a task that has been removed: $request_id"
     else
+        # Same rule for the tombstone: only rc=1 says "no tombstone".  The
+        # subshell above keeps the reader's `fail` from ending the server
+        # before its status can be inspected; without this arm a failed read
+        # looked like "no tombstone" and submit went on to enqueue.
+        tombstone_read_status=$?
+        [ "$tombstone_read_status" -eq 1 ] || return "$tombstone_read_status"
         # Same `$( )`-in-errexit-off trap as `request_payload` above: the inner
         # jq failure only ends the assignment's subshell, an empty `record`
         # reaches `write_request_record`, and the resulting one-newline file
@@ -6208,7 +6268,10 @@ submit() {
     if ! write_request_record "$request_id" "$record"; then
         fail "cannot persist accepted AgentQ request: $request_id"
     fi
-    remove_cancellation_marker_for_task "$task_id" "$task_created_at" ||
+    # A freshly submitted instance must not inherit a marker left by whatever
+    # previously held this recycled id: it would be read as a confirmed
+    # cancellation of this task.  See remove_stale_cancellation_marker_for_task.
+    remove_stale_cancellation_marker_for_task "$task_id" "$task_created_at" ||
         fail "cannot remove stale AgentQ cancellation marker after submit: $task_id"
     request_response "$request_id" "$task_id" "$recovered"
 }
@@ -6863,7 +6926,10 @@ cancel_task() {
             marker_state=$(jq -r '.state' <<<"$marker")
             requested_at=$(jq -r '.requested_at' <<<"$marker")
         else
-            remove_cancellation_marker_for_task "$task_id" "$created_at" ||
+            # This marker names a DIFFERENT instance, so it is deleted by its
+            # own created_at -- passing the current instance's (as the shared
+            # helper requires) can never match here. See the helper's comment.
+            remove_stale_cancellation_marker_for_task "$task_id" "$created_at" ||
                 fail "cannot remove stale AgentQ cancellation marker: $task_id"
         fi
     fi
