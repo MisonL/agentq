@@ -380,6 +380,95 @@ PYEOF7
 )
 check_site 'sshp.ps1: Windows session (two-stage)' "$win_sshp_session_len"
 
+# 10. The Windows `--stdin-script` bound, and the guard that enforces it.
+#
+# This file's budget above is about the SSH command line; this site is about a
+# DIFFERENT ceiling that was mistaken for it.  Measured 2026-11-12 on a real
+# Windows target (Pueue 4.0.4, Git Bash shell_command): Pueue stores the command
+# in full (an 8256-character --stdin-script command came back byte-intact from
+# `pueue status --json`) and CUTS it when pueued executes it, at 8191 characters
+# of stored command -- a stored 8160 ran correctly, 8200 was cut and the task
+# still exited 0.  Both clients had declared 20000, citing CreateProcess's
+# 32767; every --stdin-script between ~8K and 20K was therefore accepted and
+# silently lost its tail.
+#
+# Three properties, each one a way the fix can regress:
+#   1. both twins agree on the constant (a one-sided edit is this repo's
+#      recurring shape: two implementations of one contract);
+#   2. the constant stays under the derived ceiling -- the decode wrapper costs
+#      156 characters around the base64, so 8191 - 156 = 8035 is the absolute
+#      maximum, and the shipped value keeps margin below it;
+#   3. each client actually REFUSES above it, on the target-resolved platform,
+#      instead of only declaring a number (a constant nothing enforces is the
+#      same false green as a bound nothing reads).
+windows_stdin_limit_posix=$(sed -n 's/^stdin_script_windows_limit=\([0-9][0-9]*\)$/\1/p' "$posix_client" | head -1)
+windows_stdin_limit_ps=$(sed -n 's/^\$script:StdinScriptLimitWindows = \([0-9][0-9]*\)$/\1/p' "$windows_client" | head -1)
+windows_stdin_decoder_overhead=156
+windows_stdin_ceiling=$((8191 - windows_stdin_decoder_overhead))
+if [ -z "$windows_stdin_limit_posix" ] || [ -z "$windows_stdin_limit_ps" ]; then
+    printf 'Windows stdin-script bound: could not read the constant (POSIX %s, Windows %s) -- the extraction matched nothing\n' \
+        "$windows_stdin_limit_posix" "${windows_stdin_limit_ps:-<none>}" >&2
+    failures=$((failures + 1))
+else
+    sites=$((sites + 1))
+    if [ "$windows_stdin_limit_posix" != "$windows_stdin_limit_ps" ]; then
+        printf 'Windows stdin-script bound: the twins disagree (POSIX %s, Windows %s); the same script would be refused by one client and accepted by the other\n' \
+            "$windows_stdin_limit_posix" "$windows_stdin_limit_ps" >&2
+        failures=$((failures + 1))
+    fi
+    if [ "$windows_stdin_limit_posix" -ge "$windows_stdin_ceiling" ]; then
+        printf 'Windows stdin-script bound %s is not under the measured ceiling %s (8191 stored characters minus the %s-character decode wrapper): a payload at the declared limit would be cut at execution and the task would still report success\n' \
+            "$windows_stdin_limit_posix" "$windows_stdin_ceiling" "$windows_stdin_decoder_overhead" >&2
+        failures=$((failures + 1))
+    fi
+    printf '%-46s %6s chars  (ceiling %s)  ok\n' 'Windows stdin-script bound (twins)' "$windows_stdin_limit_posix" "$windows_stdin_ceiling"
+fi
+# The enforcement site.  Anchored on the guard's own accumulator rather than on
+# its `if ... = windows` line: eight such lines exist in this client, so a rule
+# armed by the first one reported the guard missing WHILE the guard was there
+# (measured on the rule's first run).  A fixed LINE WINDOW is the weak part --
+# the variable and its comparison are 15 lines apart today and an unrelated
+# edit can move them -- so the window is generous (25) and what it proves is
+# that the comparison reads THIS accumulator, not some other length.
+# No-set-e note: a no-match awk under `set -e -o pipefail` aborts the whole file
+# with no message, which reads as an environment failure; hence `|| rc=$?`.
+posix_windows_guard_rc=0
+awk '
+    /windows_command_length=0/ { found = 1; seen = NR }
+    found && NR - seen <= 25 && match($0, /windows_command_length" -gt [0-9]+ \]/) {
+        threshold = substr($0, RSTART, RLENGTH)
+        sub(/.* -gt /, "", threshold)
+        sub(/ \].*/, "", threshold)
+        enforced = 1
+    }
+    END { exit (found && enforced && threshold + 0 <= 8100) ? 0 : 1 }
+' "$posix_client" || posix_windows_guard_rc=$?
+if [ "$posix_windows_guard_rc" -ne 0 ]; then
+    printf '%s\n' 'POSIX client: the Windows stored-command guard is missing, no longer compares windows_command_length, or compares it against more than 8100 -- beyond that it lets pueued cut the command silently' >&2
+    failures=$((failures + 1))
+fi
+ps_windows_guard=$(python3 - "$windows_client" <<'PYEOF8'
+import io, re, sys
+src = io.open(sys.argv[1], encoding="utf-8").read()
+i = src.find('$windowsCommandLength = 0')
+if i < 0:
+    sys.stdout.write("missing")
+    sys.exit(0)
+window = src[i:i + 2000]
+m = re.search(r'if \(\$windowsCommandLength -gt ([0-9]+)\)', window)
+if not m:
+    sys.stdout.write("unbounded")
+elif int(m.group(1)) > 8100:
+    sys.stdout.write("threshold " + m.group(1))
+else:
+    sys.stdout.write("ok")
+PYEOF8
+)
+if [ "$ps_windows_guard" != ok ]; then
+    printf 'Windows client: the stored-command guard is %s -- a long command is submitted for pueued to cut silently\n' "$ps_windows_guard" >&2
+    failures=$((failures + 1))
+fi
+
 # The three DefaultShell limits this budget came from, restated so a reader can
 # re-derive the number instead of trusting it.
 printf '\nlimits measured on a real host: bash=8176 cmd=8155 powershell=8125\n'

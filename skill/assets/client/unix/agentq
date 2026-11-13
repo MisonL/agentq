@@ -35,15 +35,33 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.29'
+agentq_client_version='0.1.30'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
-# caps a single argument at MAX_ARG_STRLEN (131072); a Windows target re-encodes
-# argv onto a CreateProcess command line capped at 32767 characters, and the
-# payload shares that line with the rest of the server invocation.  The unix
-# bound keeps a safety margin under the Linux cap; the Windows bound leaves
-# ~12K of headroom on the command line.
+# caps a single argument at MAX_ARG_STRLEN (131072), and the unix bound keeps a
+# safety margin under it.
+#
+# A Windows target is NOT bounded by CreateProcess's 32767 characters, which is
+# what this constant claimed until 2026-11-12.  Measured on a real Windows 10
+# target (Pueue 4.0.4, shell_command = Git Bash `-lc`): Pueue stores the command
+# in full -- a 8256-character --stdin-script command came back byte-intact from
+# `pueue status --json` -- and the TRUNCATION happens when pueued executes it.
+# Feeding Pueue directly (command read from a file, so the ssh hop cannot be
+# blamed) brackets the cap: a stored command of 8160 characters runs correctly
+# while 8200 is cut -- `printf %s <8160 A's> | wc -c` printed the A's instead of
+# the count, and the task still exited 0.  That brackets the limit at 8191, i.e.
+# `cmd.exe`'s, with 7 characters of wrapper around the stored string (8160 + 7
+# > 8191 would fail; 8184 fits exactly).  Through the AgentQ path the same cliff
+# shows up one level up: base64 8010 executed, base64 8040 was cut mid-quote and
+# the task died with `unexpected EOF while looking for matching '`.
+#
+# So the budget is on the STORED command: `sh -c '<decode>'` costs 156
+# characters around the base64 (8 for the wrapper, 6 for Pueue's escaping of the
+# guard's own quotes, 142 for the decode pipeline), leaving 8184 - 156 = 8028
+# base64 characters at best.  7800 keeps 228 characters of margin for a Pueue
+# whose escaping or wrapper differs -- the mechanism above is measured, the exact
+# wrapper is not read from source.
 stdin_script_unix_limit=100000
-stdin_script_windows_limit=20000
+stdin_script_windows_limit=7800
 platform_probe_output_limit=65536
 ssh_binary=${AGENTQ_SSH:-}
 json_parser=${AGENTQ_JQ:-}
@@ -4584,6 +4602,43 @@ case "$operation" in
         is_request_id "$request_id" || fail '--request-id must be 16-128 ASCII letters, numbers, dots, underscores, or hyphens and start with a letter or number'
 
         initialize_remote_invocation
+        # A Windows target's Pueue stores the command as ONE escaped string and
+        # executes it through a command line capped at 8191 characters.  A
+        # longer one is CUT, and the task usually still exits 0, so the caller
+        # cannot tell its command lost its tail.  Measured 2026-11-12 on the
+        # Windows test target (Pueue 4.0.4, Git Bash shell_command): a stored
+        # command of 8160 characters ran correctly, 8200 was cut (`printf %s
+        # <A x 8160> | wc -c` printed the A's instead of the count).  The cap
+        # belongs to pueued, so it applies to cmd and Git Bash targets alike.
+        #
+        # The estimate is an UPPER bound under the escaping Pueue 4.0.4
+        # applies: every argument pays its quoting (+2) and every embedded
+        # single quote its `'\''` escape (+3), joined by one space.
+        # Over-estimating refuses a command that would have fitted;
+        # under-estimating submits one that gets cut, which is the failure this
+        # guard exists for -- so the bound errs high, keeping 91 characters of
+        # margin under the measured 8191.  `${#arg}` counts BYTES under dash/C,
+        # i.e. more than characters for non-ASCII commands: the same direction.
+        if [ "$remote_platform" = windows ]; then
+            windows_command_length=0
+            for windows_argument in "$@"; do
+                windows_command_length=$((windows_command_length + ${#windows_argument} + 2))
+                windows_remainder=$windows_argument
+                while [ -n "$windows_remainder" ]; do
+                    case $windows_remainder in
+                        *"'"*)
+                            windows_command_length=$((windows_command_length + 3))
+                            windows_remainder=${windows_remainder#*"'"}
+                            ;;
+                        *) windows_remainder='' ;;
+                    esac
+                done
+            done
+            [ "$#" -eq 0 ] || windows_command_length=$((windows_command_length + $# - 1))
+            if [ "$windows_command_length" -gt 8100 ]; then
+                fail "the command is too long for a Windows target's Pueue (about $windows_command_length escaped characters; pueued cuts the stored command at 8191 and the task still reports success); stage the script as a file and submit a command that runs it"
+            fi
+        fi
         append_arg submit
         append_arg --workdir
         append_arg "$workdir"
@@ -4597,12 +4652,11 @@ case "$operation" in
             # decode pattern (`printf %s <b64> | base64 -d | sh`) -- the base64
             # alphabet needs no quoting, so the payload survives every hop
             # (ssh, the remote shell, Pueue's argv) byte-exactly.  The bound is
-            # the target's argv limit, which the payload must fit into as a
-            # single argument: Linux caps one argv element at MAX_ARG_STRLEN
-            # (128 KiB); a Windows target re-encodes argv onto a CreateProcess
-            # command line capped at 32767 characters, so the payload plus the
-            # rest of the server invocation must stay under that.  Bigger
-            # scripts belong in a staged file (SKILL.md).
+            # the target's Pueue command ceiling: Linux caps one argv element at
+            # MAX_ARG_STRLEN (128 KiB), while a Windows target truncates the
+            # STORED command at 8191 characters when pueued executes it (see the
+            # constants at the top).  Bigger scripts belong in a staged file
+            # (SKILL.md).
             if [ -t 0 ]; then
                 fail 'submit --stdin-script needs the script on standard input (pipe or redirect it)'
             fi

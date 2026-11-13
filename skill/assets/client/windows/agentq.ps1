@@ -199,18 +199,25 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFOR
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.29"
+$script:ClientVersion = "0.1.30"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
-# cap follows the target's argv limit, not this machine's platform: a unix
-# target takes up to 100000 base64 characters (the POSIX twin's MAX_ARG_STRLEN
-# headroom), a Windows target 20000 -- Windows re-encodes argv onto a
-# CreateProcess command line capped at 32767 characters and the payload shares
-# that line with the rest of the server invocation.  Resolved per submission
-# against the probed remote platform; see the submit arm.  Fixed 2026-10-16:
-# a single constant applied the Windows cap to every target, refusing a 60K
-# script to a unix host with a message that blamed the wrong limit.
+# cap follows the target's Pueue command ceiling, not this machine's platform: a
+# unix target takes up to 100000 base64 characters (the POSIX twin's
+# MAX_ARG_STRLEN headroom), a Windows target 7800.  The Windows number is NOT
+# CreateProcess's 32767 -- that was this constant's claim until 2026-11-12, and
+# it is wrong: measured on a real Windows 10 target, Pueue stores the command in
+# full (an 8256-character --stdin-script command came back byte-intact) and
+# truncates it when pueued EXECUTES it, at 8191 characters of stored command
+# (cmd.exe's cap; a 8160-character stored command ran, 8200 was cut and still
+# exited 0).  The decode wrapper costs 156 characters around the base64, so the
+# ceiling leaves 8028; 7800 keeps 228 of margin.  The measurement and the
+# derivation are written out beside the POSIX twin's constants (smoke/14 pins
+# the two numbers together).  Resolved per submission against the probed remote
+# platform; see the submit arm.  Fixed 2026-10-16: a single constant applied the
+# Windows cap to every target, refusing a 60K script to a unix host with a
+# message that blamed the wrong limit.
 $script:StdinScriptLimitUnix = 100000
-$script:StdinScriptLimitWindows = 20000
+$script:StdinScriptLimitWindows = 7800
 # The LOCAL limit, which is the one that actually bites.
 #
 # The unix-target payload is base64 TWICE before it reaches ssh: once by the
@@ -3382,18 +3389,18 @@ switch ($operation) {
             # decode pattern (`printf %s <b64> | base64 -d | sh`) -- the base64
             # alphabet needs no quoting, so the payload survives every hop
             # (ssh, the remote shell, Pueue's argv) byte-exactly.  The bound is
-            # the target's argv limit, which the payload must fit into as a
-            # single argument: a Windows target re-encodes argv onto a
-            # CreateProcess command line capped at 32767 characters, and the
-            # payload shares that line with the rest of the server invocation
-            # (the POSIX twin carries the unix-side MAX_ARG_STRLEN bound).
+            # the target's Pueue command ceiling, not an argv limit: Linux caps
+            # one argv element at MAX_ARG_STRLEN (128 KiB), while a Windows
+            # target truncates the STORED command at 8191 characters when
+            # pueued executes it (see the constants at the top of this file).
             # Bigger scripts belong in a staged file (SKILL.md).
             if (![Console]::IsInputRedirected) {
                 Stop-AgentQ "submit --stdin-script needs the script on standard input (pipe or redirect it)"
             }
-            # The cap belongs to the TARGET's argv, not this machine: the same
-            # client can drive a Linux host (MAX_ARG_STRLEN headroom -> 100000
-            # b64 chars) or a Windows host (CreateProcess 32767 -> 20000).
+            # The cap belongs to the TARGET's Pueue, not this machine: the
+            # same client can drive a Linux host (MAX_ARG_STRLEN headroom ->
+            # 100000 b64 chars) or a Windows host (8191-char stored command ->
+            # 7800).
             # Fixed 2026-10-16: it used to apply the Windows cap to every
             # target, so a 60K-character script to a unix host was refused
             # with a message that blamed the wrong limit.
@@ -3493,6 +3500,38 @@ switch ($operation) {
             $commandArguments = @("sh", "-c", "command -v base64 >/dev/null 2>&1 || { echo 'agentq: --stdin-script requires base64 on the target' >&2; exit 2; }; printf %s $scriptBase64 | base64 -d | sh")
         } else {
             $commandArguments = @($arguments[$commandStart..($arguments.Count - 1)])
+        }
+        # A Windows target's Pueue stores the command as ONE escaped string and
+        # executes it through a command line capped at 8191 characters.  A
+        # longer one is CUT, and the task usually still exits 0, so the caller
+        # cannot tell its command lost its tail.  Measured 2026-11-12 on the
+        # Windows test target (Pueue 4.0.4, Git Bash shell_command): a stored
+        # command of 8160 characters ran correctly, 8200 was cut (`printf %s
+        # <A x 8160> | wc -c` printed the A's instead of the count).  The cap
+        # belongs to pueued, so it applies to cmd and Git Bash targets alike.
+        #
+        # The estimate is an UPPER bound under the escaping Pueue 4.0.4
+        # applies: every argument pays its quoting (+2) and every embedded
+        # single quote its escape (+3), joined by one space.  Over-estimating
+        # refuses a command that would have fitted; under-estimating submits
+        # one that gets cut, which is the failure this guard exists for -- so
+        # the bound errs high, keeping 91 characters of margin under the
+        # measured 8191.  UTF8 byte counts, not .NET character counts, so this
+        # answers exactly as the POSIX twin's `${#arg}` does for non-ASCII
+        # commands (the twins must accept and refuse the same payloads).
+        if ($script:RemotePlatform -eq "windows") {
+            $windowsCommandLength = 0
+            foreach ($windowsArgument in $commandArguments) {
+                $windowsCommandLength += [System.Text.Encoding]::UTF8.GetByteCount($windowsArgument) + 2
+                $windowsCommandLength += 3 * (($windowsArgument -split "'").Count - 1)
+            }
+            if ($commandArguments.Count -gt 0) {
+                $windowsCommandLength += $commandArguments.Count - 1
+            }
+            if ($windowsCommandLength -gt 8100) {
+                Stop-AgentQ ("the command is too long for a Windows target's Pueue (about " + $windowsCommandLength +
+                    " escaped characters; pueued cuts the stored command at 8191 and the task still reports success); stage the script as a file and submit a command that runs it")
+            }
         }
         $submitArguments = @("submit", "--workdir", $workdir, "--label", $label, "--request-id", $requestId, "--") + $commandArguments
         $lookupArguments = @("lookup", $requestId)

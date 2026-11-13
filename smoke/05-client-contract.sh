@@ -1741,6 +1741,42 @@ if [ "$submit_leftovers" -ne 0 ]; then
     failures=$((failures + 1))
 fi
 
+# A command longer than a Windows target's Pueue can store must be REFUSED
+# locally, not submitted and silently cut.
+#
+# Why this is behavioural: the ceiling is invisible from the client's side.
+# Pueue stores the command in FULL (measured: a 8256-character --stdin-script
+# command came back byte-intact from `pueue status --json`); the CUT happens
+# when pueued executes it, and the task still exits 0 -- measured 2026-11-12 on
+# a real Windows target, where a stored command of 8160 characters ran and 8200
+# was cut (`printf %s <A x 8160> | wc -c` printed the A's instead of the count).
+# So nothing downstream reports the truncation: the client has to refuse before
+# it hands the launcher a payload the target will cut.
+#
+# Red before the guard existed: this case saw exit 0 and a launcher call.
+windows_longarg=$(head -c 9000 /dev/zero | tr '\0' 'A')
+launcher_calls_before=$(awk '/^launcher /{n++} END{print n+0}' "$work/calls.txt" 2>/dev/null)
+windows_long_status=0
+AGENTQ_WINDOWS_STUB_WORK="$work" AGENTQ_SSH="$windows_stub" \
+    AGENTQ_HOST=smoke-win AGENTQ_REMOTE_PLATFORM=auto TMPDIR="$windows_tmp" \
+    "$client" submit --workdir /tmp --request-id smokeclient00000001 -- printf %s "$windows_longarg" \
+    >"$work/winlong.out" 2>"$work/winlong.err" || windows_long_status=$?
+if [ "$windows_long_status" -ne 2 ]; then
+    printf 'a 9000-character command sent to a Windows target exited %s, expected 2: Pueue cuts the stored command at 8191 characters and the task still reports success, so this must be refused locally: %s\n' \
+        "$windows_long_status" "$(head -c 200 "$work/winlong.err" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+elif ! grep -qF -- "too long for a Windows target's Pueue" "$work/winlong.err"; then
+    printf 'the over-long refusal does not name the Windows Pueue ceiling: %s\n' \
+        "$(head -c 200 "$work/winlong.err" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+fi
+launcher_calls_after=$(awk '/^launcher /{n++} END{print n+0}' "$work/calls.txt" 2>/dev/null)
+if [ "$launcher_calls_after" -ne "$launcher_calls_before" ]; then
+    printf 'the over-long command still reached the Windows launcher (%s -> %s calls); the refusal must come before a payload is sent\n' \
+        "$launcher_calls_before" "$launcher_calls_after" >&2
+    failures=$((failures + 1))
+fi
+
 # --- the flattened exit-code column (DefaultShell=powershell.exe) --------------
 # When sshd's DefaultShell is powershell.exe, the outer PowerShell flattens the
 # exit code of a native child (the `powershell.exe -EncodedCommand` launcher) to
