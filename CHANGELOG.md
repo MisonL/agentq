@@ -58,6 +58,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
 
+2026-11-13  **专用 Windows 测试机整体升级 0.1.29 → 0.1.30（两侧同时替换）并端到端验证**。走官方安装器（服务端 `install-agentq.ps1 -StageDirectory` → `SERVER_RC=0`、`AgentQ 0.1.30 installed`；客户端 `install-client.ps1` → `CLIENT_RC=0`），两侧部署字节逐文件与仓库 sha256 相同（6 个服务端资产 + 6 个客户端入口；launcher 只差安装器渲染的 Git Bash 路径、`.bash` 启动器按设计落地为无扩展名入口）。队列 291 条 `Done` 全部保留、0 非终态、daemon 重起正常、无事务残留。协议端到端 `submit(307)→wait(Success)→logs(agentq-0130-e2e)→lookup→remove→wait(5/removed，连查 3 次一致)` 全通。本次实测一个沿用性事实：`logs` 经该机返回耗时超过 120 秒（`wait`/`submit`/`lookup`/`remove` 均秒级），与 2026-11-12 那条「该机每次协议读 30–78 秒」同源，不是本次改动引入的
+  |  `./run-tests.sh --quick` → exit 0（本仓资产零改动，升级的是目标机）
+
 2026-11-13  **评估后决定不做：服务端侧的命令长度守卫**（只改文档，资产零改动）。第八十二类把「服务端守卫」记为后续项，这一轮按本项目的实际使用方式判定为不值得做：多行脚本本来就该走 `--stdin-script`（那条路的上限客户端已管住），客户端与服务端是同一版本绑定部署、不存在常态的「新服务端 + 旧客户端」，而队列强制串行，被截断的命令最多占一个槽位且失败立刻可见；服务端侧要落地还得在 macOS 上绕过 `ps -W`/`Get-Process`/profile/操作锁初始化层层前置去做行为验证，只能留下没有行为证据的静态锁。理由与「不是遗留项、不要再翻出来」的说明写进 `docs/PLAN.md` 第八十二类
   |  文档改动，资产零改动；`./run-tests.sh --quick` → exit 0
 
