@@ -58,6 +58,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
 
+2026-11-13  **专用 Linux 主机整体升级 0.1.3 → 0.1.30 并完成 unix 目标端到端验证**——此前 0.1.30 的真机证据只有 Windows 目标，unix 侧一直是「未验证」。走官方 `install-agentq.sh`（`INSTALLER_EXIT=0`），`unix/` 7 个暂存资产 sha256 与仓库逐个相同；`agentq-server` 部署字节与仓库一致、wrapper 保持 60 字节 exec 形态、`agentq-pueued` active+enabled 并以新 PID 运行；数据保留（260 request record + 2 cancellation marker，队列 261 条全 `Done`）。协议端到端 `submit(842)→wait(Success)→logs(agentq-0130-unix-e2e)→lookup→remove→wait(5/removed)` 全通，且各步均秒级——与 Windows 测试机那条 120 秒级 `logs` 延迟形成对照，支持「延迟是该机本机属性」的判断。生产主机仍未验证。该机三个 2026-07/09 陈旧暂存目录非本次产物，未删除
+  |  `./run-tests.sh --quick` → exit 0（本仓资产零改动，升级的是目标机）
+
 2026-11-13  **专用 Windows 测试机整体升级 0.1.29 → 0.1.30（两侧同时替换）并端到端验证**。走官方安装器（服务端 `install-agentq.ps1 -StageDirectory` → `SERVER_RC=0`、`AgentQ 0.1.30 installed`；客户端 `install-client.ps1` → `CLIENT_RC=0`），两侧部署字节逐文件与仓库 sha256 相同（6 个服务端资产 + 6 个客户端入口；launcher 只差安装器渲染的 Git Bash 路径、`.bash` 启动器按设计落地为无扩展名入口）。队列 291 条 `Done` 全部保留、0 非终态、daemon 重起正常、无事务残留。协议端到端 `submit(307)→wait(Success)→logs(agentq-0130-e2e)→lookup→remove→wait(5/removed，连查 3 次一致)` 全通。本次实测一个沿用性事实：`logs` 经该机返回耗时超过 120 秒（`wait`/`submit`/`lookup`/`remove` 均秒级），与 2026-11-12 那条「该机每次协议读 30–78 秒」同源，不是本次改动引入的
   |  `./run-tests.sh --quick` → exit 0（本仓资产零改动，升级的是目标机）
 
