@@ -208,11 +208,11 @@ $script:ClientVersion = "0.1.30"
 # it is wrong: measured on a real Windows 10 target, Pueue stores the command in
 # full (an 8256-character --stdin-script command came back byte-intact) and
 # truncates it when pueued EXECUTES it, at 8191 characters of stored command
-# (cmd.exe's cap; a 8160-character stored command ran, 8200 was cut and still
-# exited 0).  The decode wrapper costs 156 characters around the base64, so the
-# ceiling leaves 8028; 7800 keeps 228 of margin.  The measurement and the
-# derivation are written out beside the POSIX twin's constants (smoke/14 pins
-# the two numbers together).  Resolved per submission against the probed remote
+# (a 8160-character stored command ran, 8200 was cut and still exited 0).  The
+# decode wrapper costs 156 characters around the base64, so the hard ceiling is
+# 8191 - 156 = 8035; 7800 leaves 235 for whatever wrapper Pueue adds (its exact
+# form was not read from source).  The full derivation is written out beside the
+# POSIX twin's constants; smoke/14 pins the two numbers together.  Resolved per submission against the probed remote
 # platform; see the submit arm.  Fixed 2026-10-16: a single constant applied the
 # Windows cap to every target, refusing a 60K script to a unix host with a
 # message that blamed the wrong limit.

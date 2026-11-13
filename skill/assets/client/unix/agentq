@@ -48,18 +48,25 @@ agentq_client_version='0.1.30'
 # Feeding Pueue directly (command read from a file, so the ssh hop cannot be
 # blamed) brackets the cap: a stored command of 8160 characters runs correctly
 # while 8200 is cut -- `printf %s <8160 A's> | wc -c` printed the A's instead of
-# the count, and the task still exited 0.  That brackets the limit at 8191, i.e.
-# `cmd.exe`'s, with 7 characters of wrapper around the stored string (8160 + 7
-# > 8191 would fail; 8184 fits exactly).  Through the AgentQ path the same cliff
-# shows up one level up: base64 8010 executed, base64 8040 was cut mid-quote and
-# the task died with `unexpected EOF while looking for matching '`.
+# the count, and the task still exited 0.  Through the AgentQ path the same
+# cliff shows up one level up: base64 8010 executed (stored command 8166),
+# base64 8040 was cut mid-quote (stored command 8196) and the task died with
+# `unexpected EOF while looking for matching '`.
 #
-# So the budget is on the STORED command: `sh -c '<decode>'` costs 156
-# characters around the base64 (8 for the wrapper, 6 for Pueue's escaping of the
-# guard's own quotes, 142 for the decode pipeline), leaving 8184 - 156 = 8028
-# base64 characters at best.  7800 keeps 228 characters of margin for a Pueue
-# whose escaping or wrapper differs -- the mechanism above is measured, the exact
-# wrapper is not read from source.
+# The exact wrapper around the stored string was NOT read from Pueue's source,
+# so the constant does not try to name the limit to the character: 8191 is
+# cmd.exe's command-line cap and is the most any wrapper can leave.  What is
+# measured is that 8196 was cut and 8166 was not, which is consistent with any
+# limit in that range.
+#
+# The budget is therefore arithmetic on the WORST case, not a fitted number:
+# the decode command `sh -c '<decode>'` costs 142 characters around the base64
+# (the guard plus the pipeline) and Pueue's quoting of it 14 more, so a stored
+# command is b64 + 156.  Even with a wrapper of zero, b64 must stay at or below
+# 8191 - 156 = 8035; 7800 leaves 235 characters for the wrapper.  The mechanism
+# is measured, the wrapper is not -- so the margin absorbs it.  Measured on the
+# real target 2026-11-13: a base64-7800 submission stores exactly 7956
+# characters (tail intact), i.e. the 156-character figure holds end to end.
 stdin_script_unix_limit=100000
 stdin_script_windows_limit=7800
 platform_probe_output_limit=65536
