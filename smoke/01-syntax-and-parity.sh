@@ -1952,8 +1952,11 @@ fi
 # nothing noticed because nothing read either value.  The six records -- the two
 # installers, the server (doctor reports it as agentq=), README.md, and the two
 # CLIENTS (whose constants were added to this comparison 2026-10-21 after a
-# one-sided bump went unnoticed) -- must agree and be X.Y.Z.  The success lines
-# must interpolate the AgentQ value: a revert to release_version leaves every
+# one-sided bump went unnoticed) -- must agree and be X.Y.Z.  The canonical
+# server TWIN is not in this list and does not need to be: the byte-parity
+# check above requires the two server files to be identical, so the twin
+# carries whatever `server` carries.  The success lines must interpolate the
+# AgentQ value: a revert to release_version leaves every
 # definition agreeing, so the values alone cannot catch that shape.  Same lesson
 # as rule E for the launcher protocol: one mechanism copied into several files
 # stays consistent only if a check compares the copies.
@@ -2015,7 +2018,7 @@ if [ -n "$version_recorded" ]; then
     version_unique_count=$(printf '%s\n' $version_recorded | sort -u | grep -c . || true)
 fi
 if [ -z "$version_recorded" ]; then
-    printf '%s\n' 'version FAILED: no version was extracted from any of the six files; refusing to report a pass' >&2
+    printf '%s\n' 'version FAILED: no version was extracted from any of the seven files; refusing to report a pass' >&2
     failures=$((failures + 1))
 elif [ "$version_unique_count" -ne 1 ]; then
     printf 'version FAILED: the six records disagree -- POSIX installer "%s", Windows installer "%s", server "%s", README "%s", POSIX client "%s", Windows client "%s"\n' \

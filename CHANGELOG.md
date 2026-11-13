@@ -58,6 +58,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
 
+2026-11-14  **CHANGELOG 三层结构与 tag 纪律规范化，并落成机器检查 `smoke/31-changelog-and-tags`**——此前的三层约定（tag → 版本索引 → 日志条目）与条目短格式只写在文档里，没有任何检查读它：索引可以指向不存在的 tag、tag 可以没有索引行、索引可以乱序、新条目可以不写验证行，全部是绿的。新检查四条规则：① 索引每个 `vX.Y.Z` 必须有对应 tag；② 每个 tag 恰好一条索引；③ 索引按数值严格降序（`v0.1.9` 在 `v0.1.10` 之下，字符串比较会反过来）；④ 最新条目必须带 `|` 实测验证行且首行日期为全段最新。**只保护下一条条目**——2026-11-15 之前的 137 条历史条目无验证行，不检查不重写。六向变异全红、还原后 `cmp` 一致；浅克隆报 `NOT-covered(no-tags-in-checkout)`；新检查初版有两处 `printf … | grep -q` 被 `smoke/01` 的 pipeline 规则当场判红，已改为对文件直接求值。配套修正：`ci.yml` linux job 改 `fetch-depth: 0`（实测浅克隆 `tags=0`、全量 `tags=31`，否则该规则在 CI 永远降级、只在开发机生效）、`expected_checks` 与 NOT-covered 白名单登记新检查、`CONTRIBUTING.md` 的「六处版本记录」改为与实现一致的「七处记录 / 检查比六处 + 孪生由字节parity保证」、`smoke/01` 注释订正、新增 tag 一律 annotated 的约定（历史 7 个轻量 tag 不回溯）
+  |  `AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq ./run-tests.sh` → exit 0（31 ran / 0 skipped / 0 partial / 0 failed）；无运行时跑为 31 ran / 6 skipped / 0 failed；`smoke/31` 六向变异红证（幽灵 tag / 缺索引 / 重复索引 / 顺序颠倒 / 最新条目缺验证行 / 顶部倒填日期），还原后 `cmp` 一致；浅克隆与现代仓库形态两向边界实测
+
 2026-11-13  **专用 Linux 主机整体升级 0.1.3 → 0.1.30 并完成 unix 目标端到端验证**——此前 0.1.30 的真机证据只有 Windows 目标，unix 侧一直是「未验证」。走官方 `install-agentq.sh`（`INSTALLER_EXIT=0`），`unix/` 7 个暂存资产 sha256 与仓库逐个相同；`agentq-server` 部署字节与仓库一致、wrapper 保持 60 字节 exec 形态、`agentq-pueued` active+enabled 并以新 PID 运行；数据保留（260 request record + 2 cancellation marker，队列 261 条全 `Done`）。协议端到端 `submit(842)→wait(Success)→logs(agentq-0130-unix-e2e)→lookup→remove→wait(5/removed)` 全通，且各步均秒级——与 Windows 测试机那条 120 秒级 `logs` 延迟形成对照，支持「延迟是该机本机属性」的判断。生产主机仍未验证。该机三个 2026-07/09 陈旧暂存目录非本次产物，未删除
   |  `./run-tests.sh --quick` → exit 0（本仓资产零改动，升级的是目标机）
 

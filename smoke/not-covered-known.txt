@@ -17,3 +17,4 @@
 22-launcher-contract
 23-durable-move-contract
 25-ps-client-installer-contract
+31-changelog-and-tags

@@ -85,6 +85,15 @@ Three steps, and nothing else:
 ./run-tests.sh --quick  # only check 01 (syntax, byte-parity, PowerShell parse)
 ```
 
+Step 3 has one hard requirement: every new log entry ends with a
+`|  <measured verification>` line. Check `31` fails when the newest entry omits
+it. The same check ties `CHANGELOG.md`'s version index to the tags in the
+checkout: an index line with no tag, a tag with no index line, or an index out
+of descending order all fail. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md#the-changelog-format) for the format and
+[`CONTRIBUTING.md`](CONTRIBUTING.md#versioning-and-releases) for the release
+ritual (annotated tags, three per push, all three layers updated together).
+
 Some checks need a real runtime and skip without one. To run everything:
 
 ```sh

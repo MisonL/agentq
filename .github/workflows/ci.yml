@@ -35,6 +35,16 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        with:
+          # smoke/31 compares the CHANGELOG version index against the tags this
+          # checkout can see.  The default fetch-depth of 1 fetches neither the
+          # history nor the tags, so the check would degrade to
+          # NOT-covered(no-tags-in-checkout) on every run and the release
+          # contract would be enforced nowhere except a developer's laptop.
+          # Measured 2026-11-14: with the default depth, `git tag --list`
+          # printed nothing in a fresh clone.  The repository is 27 MB; fetching
+          # all of it is the cheaper side of that trade.
+          fetch-depth: 0
       - name: Install check dependencies
         # smoke/01 parses the .yml assets (pyyaml), re-parses the shell assets
         # under zsh, and lints the plists (xmllint); 07 and 17 start their own
@@ -102,7 +112,7 @@ jobs:
           # striking it here turns the job red.  Order and spelling are pinned
           # too: a renamed check is a different check, and the NOT-covered gate
           # below matches by name.
-          expected_checks='01-syntax-and-parity 02-error-contract 03-protocol-roundtrip 04-degraded-contracts 05-client-contract 06-lock-contention 07-client-transport 08-jq-path-arguments 09-native-argument-quoting 10-installer-invariants 11-installer-contract 12-ps-client-contract 13-ps-installer-contract 14-remote-command-length 15-transient-pueue-failure 16-no-host-identifiers 17-askpass-credential 18-record-metadata-contract 19-sshp-contract 20-ps-native-argv-roundtrip 21-install-client-contract 22-launcher-contract 23-durable-move-contract 24-git-bash-launcher-contract 25-ps-client-installer-contract 26-record-read-paths 27-record-write-paths 28-client-interrupt 29-jq-reserved-identifiers 30-sandbox-daemon-reaper'
+          expected_checks='01-syntax-and-parity 02-error-contract 03-protocol-roundtrip 04-degraded-contracts 05-client-contract 06-lock-contention 07-client-transport 08-jq-path-arguments 09-native-argument-quoting 10-installer-invariants 11-installer-contract 12-ps-client-contract 13-ps-installer-contract 14-remote-command-length 15-transient-pueue-failure 16-no-host-identifiers 17-askpass-credential 18-record-metadata-contract 19-sshp-contract 20-ps-native-argv-roundtrip 21-install-client-contract 22-launcher-contract 23-durable-move-contract 24-git-bash-launcher-contract 25-ps-client-installer-contract 26-record-read-paths 27-record-write-paths 28-client-interrupt 29-jq-reserved-identifiers 30-sandbox-daemon-reaper 31-changelog-and-tags'
           actual_checks=$(grep -E '^(ok|SKIP|PART|NCOV|FAIL) +[0-9]{2}-' smoke.log \
             | sed -E 's/^(ok|SKIP|PART|NCOV|FAIL) +([0-9]{2}-[a-z0-9-]+) .*/\2/' \
             | sort -u | tr '\n' ' ' | sed 's/ $//')
@@ -309,7 +319,7 @@ jobs:
             # LOCAL parity rule (smoke/01) can stay a plain "every reason a script
             # can print is allowed" check instead of modelling branch reachability
             # statically.
-            bad_tokens=$(grep -o 'NOT-covered([^)]*)' "$log" | grep -vE '^NOT-covered\((needs-Windows|needs-non-Windows|deliberately-not-exercised|needs-POSIX-pipes|needs-unprivileged-user|needs-symlinked-tmp|no-locale-sensitive-sed)\)$' || true)
+            bad_tokens=$(grep -o 'NOT-covered([^)]*)' "$log" | grep -vE '^NOT-covered\((needs-Windows|needs-non-Windows|deliberately-not-exercised|needs-POSIX-pipes|needs-unprivileged-user|needs-symlinked-tmp|no-locale-sensitive-sed|no-tags-in-checkout)\)$' || true)
             if [ -n "$bad_tokens" ]; then
               echo "$check reported NOT-covered without a named platform reason:" >&2
               echo "$bad_tokens" >&2

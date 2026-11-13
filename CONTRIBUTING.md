@@ -107,21 +107,67 @@ process note — is history, not a task. `docs/PLAN.md` is the list.
 ## Versioning and releases
 
 AgentQ carries its own version, separate from Pueue's. The value is recorded in
-**six** places — the two installers, the server (which `doctor` reports as
-`agentq=`), the two clients, and `README.md`; check `01` asserts all six copies
-agree and that both installers' success messages print the AgentQ version rather
-than Pueue's. The two client constants joined that comparison on 2026-10-21,
-after a one-sided client bump left every check green — the deployment unit is
-all 23 assets, so a version recorded in only some of them is not a version at
-all.
+**seven** places: the two installers, the server and its canonical twin (both
+under `skill/assets/`, and `doctor` reports it as `agentq=`), the two clients, and
+`README.md`. Check `01` compares **six** of them — the server twin is covered by
+the byte-parity assertion instead, which requires the two server files to be
+identical, so the twin cannot carry a different value from the server. The
+release gate (`release.yml`) reads all seven, including the twin, because a tag
+push does not run check `01`. Both installers' success messages must print the
+AgentQ version rather than Pueue's. The two client constants joined on
+2026-10-21 after a one-sided client bump left every check green — the deployment
+unit is all 23 assets, so a version recorded in only some of them is not a
+version at all.
+
+The record set is **derived from the tree**, never hand-listed: the release gate
+enumerates every file under `skill/assets/` that declares one of the constant
+shapes, so a new record cannot leave the gate behind — check `01` fails until the
+new file is also read by `release.yml`, on the same line as its own constant name.
 
 - The version denotes **the deployment unit**: any change to the bytes under
   `skill/assets/` bumps it; documentation-only changes do not.
-- Releases are git tags (`vX.Y.Z`), with release notes pointing at the matching
-  `CHANGELOG.md` entries. There are no build artifacts to publish — the
-  deployment unit is the `skill/` directory itself.
+- **Releases are annotated tags.** `git tag -a vX.Y.Z -m "..."`, then push. A
+  lightweight tag still passes the `release.yml` gate (it compares the name, not
+  the object type), but the annotation carries the release note that links back
+  to the `CHANGELOG.md` entry, and this repository has been inconsistent about
+  that: seven of the first thirty-one tags were lightweight. New tags are
+  annotated.
+- **At most three tags per push.** Pushing more than three in one `push` does
+  not trigger `release.yml` for the rest; they arrive silently ungated. Push in
+  batches of three or fewer and check that the gate ran for each.
+- A release updates **all three layers** together: tag → version-index line at
+  the top of `CHANGELOG.md` → log entry. Check `31` fails when an index line
+  names a tag that does not exist, when a tag has no index line, or when the
+  index is not strictly descending. It reads the tags in the checkout, so a
+  shallow clone reports `NOT-covered(no-tags-in-checkout)` instead of passing;
+  CI checks out with `fetch-depth: 0` so the rule always runs there.
+- There are no build artifacts to publish — the deployment unit is the `skill/`
+  directory itself.
 - Semver: a change to the protocol contract (exit codes, JSON fields, accepted
   arguments) is a minor or major bump; a fix that does not alter it is a patch.
+
+## The changelog format
+
+One entry per change, newest first, under `### 变更日志（2026-09-29 纳入 git 起 · 降序）`:
+
+```
+YYYY-MM-DD  what changed and what it does to behaviour
+  |  ./run-tests.sh → exit 0 (counts)
+```
+
+- The first line states the change and its behavioural effect in one or two
+  sentences. Investigation narrative, mutation proofs and lessons belong in
+  `docs/PLAN.md`, not here.
+- The `|` line is the change's **measured** verification — the exit code and the
+  counts actually observed, never an expectation.
+- **Every new entry carries a `|` line.** Check `31` fails when the newest entry
+  does not. It does not scan older entries: entries written before this
+  convention (short format from 2026-10-15; 137 of 227 in the descending section
+  as of 2026-11-14) legitimately end without one, and rewriting history is not
+  something this repository does. Rule `31` protects the next entry, not the
+  archive; it prints the historical count instead of failing on it.
+- Entries are newest first by the first line's date; `31` fails if a back-dated
+  entry is inserted above the newest.
 
 ## Pull requests
 
