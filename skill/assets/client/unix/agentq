@@ -4617,12 +4617,24 @@ case "$operation" in
         # Over-estimating refuses a command that would have fitted;
         # under-estimating submits one that gets cut, which is the failure this
         # guard exists for -- so the bound errs high, keeping 91 characters of
-        # margin under the measured 8191.  `${#arg}` counts BYTES under dash/C,
-        # i.e. more than characters for non-ASCII commands: the same direction.
+        # margin under the measured 8191.
+        #
+        # The unit is UTF-8 BYTES, counted with `wc -c`, NOT `${#arg}`: the
+        # shell's idea of "length" depends on what is running this file --
+        # dash counts bytes, bash with a UTF-8 locale counts characters -- so
+        # the same argv would be accepted on Debian and refused on macOS, and
+        # the Windows twin (UTF8.GetByteCount) would answer a third way.  Bytes
+        # are the unit both twins can agree on, and for non-ASCII commands they
+        # over-estimate the real ceiling (UTF-16 units), which is the safe
+        # direction: a CJK command near the limit may be refused although it
+        # would have fitted, but nothing is ever silently cut.
+        #
+        # BSD `wc -c` pads its count with spaces, hence the `tr`.
         if [ "$remote_platform" = windows ]; then
             windows_command_length=0
             for windows_argument in "$@"; do
-                windows_command_length=$((windows_command_length + ${#windows_argument} + 2))
+                windows_argument_bytes=$(printf '%s' "$windows_argument" | wc -c | tr -d '[:space:]')
+                windows_command_length=$((windows_command_length + windows_argument_bytes + 2))
                 windows_remainder=$windows_argument
                 while [ -n "$windows_remainder" ]; do
                     case $windows_remainder in

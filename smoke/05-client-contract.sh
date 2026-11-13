@@ -36,6 +36,19 @@ export AGENTQ_PLATFORM_CACHE_DIR="$work/platform-cache"
 export AGENTQ_PLATFORM_PROBE_CACHE=off
 trap 'rm -rf -- "$work"' EXIT
 
+# python3 is used below to build a non-ASCII fixture whose exact BYTE length is
+# the assertion.  Probe that it RUNS, not that a name resolves: on a zh-CN
+# Windows the `python3` on PATH is the Microsoft Store alias, which exits 49
+# with zero output and would read as a contract failure instead of an
+# environment fault (measured 2026-10-20; same rule as smoke/14's probe).
+python3_probe_status=0
+python3 -c 'import sys' >/dev/null 2>&1 || python3_probe_status=$?
+if [ "$python3_probe_status" -ne 0 ]; then
+    printf '%s\n' 'client-contract NOT run: the python3 on PATH cannot execute (a Microsoft Store alias cannot run scripts).' >&2
+    printf '%s\n' 'Install a real Python 3 and put it on PATH, then re-run.' >&2
+    exit 1
+fi
+
 # A stub ssh.  The client probes the remote platform before it validates its own
 # arguments, so without a reachable probe nothing below would be exercised.  It
 # answers the platform probe and returns an empty success for anything else --
@@ -1774,6 +1787,33 @@ launcher_calls_after=$(awk '/^launcher /{n++} END{print n+0}' "$work/calls.txt" 
 if [ "$launcher_calls_after" -ne "$launcher_calls_before" ]; then
     printf 'the over-long command still reached the Windows launcher (%s -> %s calls); the refusal must come before a payload is sent\n' \
         "$launcher_calls_before" "$launcher_calls_after" >&2
+    failures=$((failures + 1))
+fi
+
+# The estimate's UNIT is UTF-8 bytes, not the shell's "length".  `${#arg}`
+# answers bytes under dash and CHARACTERS under bash with a UTF-8 locale, so the
+# same non-ASCII command would be refused on Debian and accepted on macOS -- and
+# the Windows twin (UTF8.GetByteCount) would answer a third way.  This case is
+# shaped to tell the units apart: 2699 CJK characters are 8097 bytes but only
+# 2699 characters, so a byte-based estimate is over 8100 and a character-based
+# one is far below it.
+cjk_argument=$(python3 -c 'import sys; sys.stdout.write("\u4e2d" * 2699)')
+cjk_argument_bytes=$(printf '%s' "$cjk_argument" | wc -c | tr -d '[:space:]')
+cjk_status=0
+AGENTQ_WINDOWS_STUB_WORK="$work" AGENTQ_SSH="$windows_stub" \
+    AGENTQ_HOST=smoke-win AGENTQ_REMOTE_PLATFORM=auto TMPDIR="$windows_tmp" \
+    "$client" submit --workdir /tmp --request-id smokeclient00000002 -- sh -c "$cjk_argument" \
+    >"$work/wincjk.out" 2>"$work/wincjk.err" || cjk_status=$?
+if [ "$cjk_status" -ne 2 ]; then
+    printf 'a %s-byte (2699-character) CJK command sent to a Windows target exited %s, expected 2: the stored-command estimate must count BYTES, or a non-ASCII command is under-counted on a host whose shell counts characters\n' \
+        "$cjk_argument_bytes" "$cjk_status" >&2
+    failures=$((failures + 1))
+# Three arguments -- sh, -c, the CJK string -- so the estimate is the byte
+# count, plus 2 per argument, plus 2 separators: +12.  Exact, not a range: a
+# range would also accept a count that is off by a few bytes.
+elif ! grep -qF -- "about $((cjk_argument_bytes + 12)) escaped characters" "$work/wincjk.err"; then
+    printf 'the CJK refusal reports a length that is not the UTF-8 byte count: %s\n' \
+        "$(head -1 "$work/wincjk.err" | cut -c1-160)" >&2
     failures=$((failures + 1))
 fi
 

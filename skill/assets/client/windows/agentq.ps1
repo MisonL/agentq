@@ -3516,9 +3516,13 @@ switch ($operation) {
         # refuses a command that would have fitted; under-estimating submits
         # one that gets cut, which is the failure this guard exists for -- so
         # the bound errs high, keeping 91 characters of margin under the
-        # measured 8191.  UTF8 byte counts, not .NET character counts, so this
-        # answers exactly as the POSIX twin's `${#arg}` does for non-ASCII
-        # commands (the twins must accept and refuse the same payloads).
+        # measured 8191.  The unit is UTF-8 BYTES, not .NET character counts
+        # and not the shell's `Length`: the POSIX twin counts with `wc -c` for
+        # exactly this reason -- `${#arg}` is bytes under dash and CHARACTERS
+        # under bash with a UTF-8 locale, so a character-based unit would give
+        # the same command three different verdicts across the hosts this repo
+        # is developed and tested on.  Bytes over-estimate the real ceiling
+        # (UTF-16 units), which is the safe direction: refuse early, never cut.
         if ($script:RemotePlatform -eq "windows") {
             $windowsCommandLength = 0
             foreach ($windowsArgument in $commandArguments) {
