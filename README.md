@@ -21,11 +21,13 @@ or Zellij session and reconnects when the OpenSSH transport drops. Do not use
 
 ## What is in this repository
 
-Everything that actually runs lives in `skill/` — one complete Skill, 25 files:
+Everything that actually runs lives in `skill/` — one complete Skill, 30 files:
 
 ```
 skill/
-  SKILL.md             protocol contract and operating instructions
+  SKILL.md             protocol contract and operating instructions (the operating summary)
+  references/          the details behind it: contract, clients, install, doctor,
+                       and the Windows installer path invariants
   agents/openai.yaml   Skill metadata
   assets/              the deployment unit — 23 files
     client/unix/       POSIX agentq, sshp, install-client.sh
@@ -131,7 +133,7 @@ Start here:
 
 | File | What it is |
 | --- | --- |
-| [`skill/SKILL.md`](skill/SKILL.md) | Protocol contract and operating instructions — the authoritative reference for exit codes, `cancel` semantics, and Windows terminal behaviour |
+| [`skill/SKILL.md`](skill/SKILL.md) | Operating summary: command surface, exit-code table, hard rules, workflow — with `skill/references/` holding the full contract, client and installer details behind it |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | How to contribute: the development loop, the load-bearing rules, and the full documentation map |
 | [`CHANGELOG.md`](CHANGELOG.md) | One line per change, each with its verification result |
 

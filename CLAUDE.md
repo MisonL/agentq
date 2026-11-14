@@ -14,8 +14,8 @@
 ## 这个项目是什么
 
 AgentQ 是基于 SSH + Pueue 4.0.4 的远端任务队列。真正被使用的东西只有
-`skill/` 下的 **25 个文件**（一个完整 Skill：`SKILL.md` + `agents/` + `assets/`
-23 个资产）；其余一切都是为了保护它们而存在的。
+`skill/` 下的 **30 个文件**（一个完整 Skill：`SKILL.md` + `references/` 5 篇 +
+`agents/` + `assets/` 23 个资产）；其余一切都是为了保护它们而存在的。
 
 ```
 skill/

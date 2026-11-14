@@ -2,9 +2,9 @@
 
 AgentQ is a remote task queue over SSH, backed by
 [Pueue](https://github.com/Nukesor/pueue). Everything that actually runs lives
-in `skill/` — one complete Skill, 25 files (`SKILL.md` + `agents/` + the 23
-assets under `assets/`). Everything else in this repository — the tests, the
-documentation, the sandbox script — exists to protect those files.
+in `skill/` — one complete Skill, 30 files (`SKILL.md` + `references/` +
+`agents/` + the 23 assets under `assets/`). Everything else in this repository —
+the tests, the documentation, the sandbox script — exists to protect those files.
 
 ## The development loop
 
@@ -92,7 +92,8 @@ Each document has one job. Where two disagree, the one whose job it is wins.
 
 | File | Authoritative for |
 | --- | --- |
-| [`skill/SKILL.md`](skill/SKILL.md) | The protocol contract: exit codes, `cancel` semantics, Windows terminal behaviour, installation steps |
+| [`skill/SKILL.md`](skill/SKILL.md) | The operating summary: command surface, exit-code table, hard rules, workflow |
+| `skill/references/` | The details behind `SKILL.md`, verbatim: `contract.md` (JSON shapes, `cancel` replay, `reason` classes), `clients.md` (client env vars, credentials, probes, Windows terminals, `sshp`), `install.md` (onboarding and installers), `windows-installer-invariants.md` (32 path-chain invariants), `doctor.md` |
 | [`README.md`](README.md) | The front door: what this is, how to install it, how to run the tests |
 | [`CLAUDE.md`](CLAUDE.md) | Development order: the entry point — what is verified, what is not, and the boundaries that are not todos |
 | [`docs/PLAN.md`](docs/PLAN.md) | **The only authoritative list of open work**; A/B entry records live in `docs/plan/` |
@@ -107,12 +108,13 @@ process note — is history, not a task. `docs/PLAN.md` is the list.
 ## Versioning and releases
 
 AgentQ carries its own version, separate from Pueue's. The value is recorded in
-**seven** places: the two installers, the server and its canonical twin (both
-under `skill/assets/`, and `doctor` reports it as `agentq=`), the two clients, and
-`README.md`. Check `01` compares **six** of them — the server twin is covered by
-the byte-parity assertion instead, which requires the two server files to be
-identical, so the twin cannot carry a different value from the server. The
-release gate (`release.yml`) reads all seven, including the twin, because a tag
+**eight** places: the two installers, the server and its canonical twin (both
+under `skill/assets/`, and `doctor` reports it as `agentq=`), the two clients,
+`README.md`, and `skill/SKILL.md`'s frontmatter. Check `01` compares **seven** of
+them — the server twin is covered by the byte-parity assertion instead, which
+requires the two server files to be identical, so the twin cannot carry a
+different value from the server. The
+release gate (`release.yml`) reads all eight, including the twin, because a tag
 push does not run check `01`. Both installers' success messages must print the
 AgentQ version rather than Pueue's. The two client constants joined on
 2026-10-21 after a one-sided client bump left every check green — the deployment

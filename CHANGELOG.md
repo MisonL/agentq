@@ -58,6 +58,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
 
+2026-11-14  **Skill 自身纳入版本管理，`SKILL.md` 按「怎么用 / 为什么」拆分**——`SKILL.md` 从 228 行 / 81.9 KB 降到 108 行 / 12.1 KB：操作必需的命令面、退出码表、硬性规则与执行工作流留在正文，机制细节与实现不变量原文搬进 `skill/references/` 五篇（`contract.md` 协议细节、`clients.md` 客户端契约、`install.md` 接入与安装、`windows-installer-invariants.md` 32 条路径链不变量、`doctor.md`）。其中「新主机接入」66 行里有 44 条近乎同构的 `Get-Item -Force` 路径不变量，是这次杂乱感的主要来源。**正文逐字保留、零改写**（机械核对：原 197 个非空行全部存在，只少 4 个变成文件标题的章节名）。同时 `SKILL.md` frontmatter 新增 `version: 0.1.30`——Skill 随仓库发布，此前它**没有任何版本标记**，无法判断手上这份 Skill 描述的是哪个部署单元；该记录已进 `smoke/01` 的版本比较与 `release.yml` 的 tag 门禁（`01` 另要求 `release.yml` 必须读它）。`skill/` 文件数 25 → 30（assets 仍 23 个、字节未动）
+  |  `AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq ./run-tests.sh` → exit 0（31 ran / 0 skipped / 0 partial / 0 failed）；首轮全量被 `smoke/16` 判红——本轮写进文档的变异描述是四段数字、被主机标识规则当成 IP——改成无字面量的措辞后复绿（`violations=0`）；Skill 版本三向红证：改 Skill 版本 → `the seven records disagree`、写成四段式版本 → `not X.Y.Z`、删掉 release.yml 的读取块 → `release-gate FAILED (release.yml never reads skill/SKILL.md)`，三向还原后 `cmp` 一致
+
 2026-11-14  **文档订正：`docs/PLAN.md` 的对设计判断把 14.2% 写成现状**——那段以 2026-09-24 的旧口径（9 个资产 / 3,498 行）作主语，现役口径 1.21%（417 行 / 34,514，2026-11-12）只作为破折号里的一句附注，读到开头的人会拿到一个过时 12 倍的数字。改为现役口径在前、旧口径标明「只作对照、不要再引用」。资产零改动
   |  `./smoke/31-changelog-and-tags.sh` → exit 0；文档改动，资产零改动
 

@@ -68,6 +68,9 @@ jobs:
           v=${v#\*\*Version:\*\* }
           compare 'README' 'README.md' "${v%% *}"
 
+          v=$(awk 'NR == 1 { next } /^---$/ { exit } /^version: / { print; exit }' skill/SKILL.md || true)
+          compare 'Skill' 'skill/SKILL.md' "${v#version: }"
+
           v=$(grep -m1 '^agentq_client_version=' skill/assets/client/unix/agentq || true)
           compare 'POSIX client' 'skill/assets/client/unix/agentq' "$(unquote "${v#agentq_client_version=}")"
 

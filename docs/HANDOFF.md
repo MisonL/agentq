@@ -143,4 +143,4 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
   它打印的 `AGENTQ_SMOKE_HOME` 形如 `/tmp/aqsb/home/.agentq`
 - 覆盖边界与假绿防护：见 `docs/verification-status.md`
 - 变更记录：`CHANGELOG.md`
-- 产品本体：`skill/`（25 个文件 = `SKILL.md` + `agents/` + `assets/` 23 个资产），与全局 Skill 目录结构一一对应
+- 产品本体：`skill/`（30 个文件 = `SKILL.md` + `references/` 5 篇 + `agents/` + `assets/` 23 个资产），与全局 Skill 目录结构一一对应

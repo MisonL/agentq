@@ -1946,10 +1946,10 @@ if ! cmp -s "$root/skill/assets/unix/agentq-server" "$root/skill/assets/windows-
     failures=$((failures + 1))
 fi
 
-# --- AgentQ's own version: one value, six records ---------------------------
+# --- AgentQ's own version: one value, seven records -------------------------
 # The 2026-10-08 defect this replaces: both installers printed Pueue's
 # release_version (the value that builds the download URL) as AgentQ's own, and
-# nothing noticed because nothing read either value.  The six records -- the two
+# nothing noticed because nothing read either value.  The seven records -- the two
 # installers, the server (doctor reports it as agentq=), README.md, and the two
 # CLIENTS (whose constants were added to this comparison 2026-10-21 after a
 # one-sided bump went unnoticed) -- must agree and be X.Y.Z.  The canonical
@@ -1990,6 +1990,12 @@ version_windows_client=${version_windows_client%\"}
 version_readme_line=$(grep -m1 '^\*\*Version:\*\* ' "$root/README.md" || true)
 version_readme=${version_readme_line#\*\*Version:\*\* }
 version_readme=${version_readme%% *}
+# The Skill itself records the deployment-unit version in its frontmatter: an
+# operator (or an agent loading the Skill) can tell which contract this copy
+# documents.  Added 2026-11-14 together with the SKILL.md split; it is a record
+# like the other seven, not a comment.
+version_skill_line=$(awk 'NR == 1 { next } /^---$/ { exit } /^version: / { print; exit }' "$root/skill/SKILL.md" || true)
+version_skill=${version_skill_line#version: }
 
 version_recorded=
 version_check_record() {
@@ -2010,6 +2016,7 @@ version_check_record 'POSIX installer' "$version_posix"
 version_check_record 'Windows installer' "$version_windows"
 version_check_record 'server' "$version_server"
 version_check_record 'README' "$version_readme"
+version_check_record 'Skill' "$version_skill"
 version_check_record 'POSIX client' "$version_unix_client"
 version_check_record 'Windows client' "$version_windows_client"
 
@@ -2018,11 +2025,11 @@ if [ -n "$version_recorded" ]; then
     version_unique_count=$(printf '%s\n' $version_recorded | sort -u | grep -c . || true)
 fi
 if [ -z "$version_recorded" ]; then
-    printf '%s\n' 'version FAILED: no version was extracted from any of the seven files; refusing to report a pass' >&2
+    printf '%s\n' 'version FAILED: no version was extracted from any of the seven records; refusing to report a pass' >&2
     failures=$((failures + 1))
 elif [ "$version_unique_count" -ne 1 ]; then
-    printf 'version FAILED: the six records disagree -- POSIX installer "%s", Windows installer "%s", server "%s", README "%s", POSIX client "%s", Windows client "%s"\n' \
-        "$version_posix" "$version_windows" "$version_server" "$version_readme" "$version_unix_client" "$version_windows_client" >&2
+    printf 'version FAILED: the seven records disagree -- POSIX installer "%s", Windows installer "%s", server "%s", README "%s", Skill "%s", POSIX client "%s", Windows client "%s"\n' \
+        "$version_posix" "$version_windows" "$version_server" "$version_readme" "$version_skill" "$version_unix_client" "$version_windows_client" >&2
     failures=$((failures + 1))
 else
     version_summary=$version_posix
@@ -2077,13 +2084,14 @@ release_gate_reads() { # $1=workflow file, $2=repo-relative path, $3=marker -> 0
 }
 release_gate_record_marker() { # $1=file -> the constant token its declaration line carries
     local line
-    line=$(grep -m1 -E '^(agentq_version=|agentq_client_version=|\$agentqVersion = |\$script:ClientVersion = |\*\*Version:\*\* )' "$1" || true)
+    line=$(grep -m1 -E '^(agentq_version=|agentq_client_version=|\$agentqVersion = |\$script:ClientVersion = |\*\*Version:\*\* |version: )' "$1" || true)
     case $line in
         'agentq_client_version='*) printf 'agentq_client_version=' ;;
         'agentq_version='*) printf 'agentq_version=' ;;
         '$agentqVersion = '*) printf 'agentqVersion' ;;
         '$script:ClientVersion = '*) printf 'ClientVersion' ;;
         '**Version:** '*) printf 'Version:' ;;
+        'version: '*) printf 'version:' ;;
         *) printf '' ;;
     esac
 }
@@ -2118,6 +2126,11 @@ EOF
 # the records the gate must read.  It is outside skill/assets/, hence the
 # explicit call (the derivation above covers the deployment unit).
 release_gate_check "$root/README.md" 'README.md'
+# The Skill's own frontmatter records the deployment-unit version too (added
+# 2026-11-14 with the SKILL.md split).  It sits outside skill/assets/, so the
+# derivation above cannot see it -- the explicit call is the same shape as
+# README's.
+release_gate_check "$root/skill/SKILL.md" 'skill/SKILL.md'
 # The derived set must COVER the files smoke/01 compares by name above.  Measured
 # 2026-11-04 while mutating this rule: a one-letter typo in the grep -E above
 # made the derivation enumerate zero files, every remaining check passed, and the
