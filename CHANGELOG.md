@@ -58,6 +58,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
 
+2026-11-15  **读路径批量优化做出来又撤回了：一行代码未进 0.1.31，仓库回到 0.1.30 的字节**——把 `load_request_records` 的「每条记录一次 `cat`」折成「整批一次 `cat` + 一次 jq」，在 Windows 测试机上 200 条记录由 **6.2s 降到 0.86s（约 7 倍）**，macOS 上约 2 倍。但这条形态把「守卫→读取」窗口从一条记录拉长到整批，而「换掉—读—换回」这扇窗在 bash 3.2 与 Windows Git Bash 上都堵不上：`exec {fd}` 在 3.2 不存在，`exec 3<dir` 后 `/dev/fd/3/name` 在 macOS 不可用、在 Windows 可用但不锚定目录（换链后照样读外部内容），按 inode 读每条一个进程等于没省。实现留在分支 `perf/batch-record-read`；`skill/assets/` 字节与 0.1.30 完全相同。**留下的**：`smoke/18` 新增用例 7b（非法文件名 + 自洽 body 必须被拒，0.1.30 同样适用）、`docs/performance.md` 两节实测、`docs/PLAN.md` 第八十五类（含三轮 Codex 复审与我自己三个错误的记录）。对外行为**零变化**
+  |  `AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq ./run-tests.sh` → exit 0（31 ran / 0 skipped / 0 partial / 0 failed）；`cmp skill/assets/unix/agentq-server <0.1.30 原件` = 0；`cmp` 孪生 = 0；批量读在 macOS 3.3s→1.5s、Windows 6.2s→0.86s（各 2 次/2 次实测），换链窗口在 macOS 与 Windows 上均复现（新旧两版都返回外部内容）
+
 2026-11-14  **Skill 自身纳入版本管理，`SKILL.md` 按「怎么用 / 为什么」拆分**——`SKILL.md` 从 228 行 / 81.9 KB 降到 108 行 / 12.1 KB：操作必需的命令面、退出码表、硬性规则与执行工作流留在正文，机制细节与实现不变量原文搬进 `skill/references/` 五篇（`contract.md` 协议细节、`clients.md` 客户端契约、`install.md` 接入与安装、`windows-installer-invariants.md` 32 条路径链不变量、`doctor.md`）。其中「新主机接入」66 行里有 44 条近乎同构的 `Get-Item -Force` 路径不变量，是这次杂乱感的主要来源。**正文逐字保留、零改写**（机械核对：原 197 个非空行全部存在，只少 4 个变成文件标题的章节名）。同时 `SKILL.md` frontmatter 新增 `version: 0.1.30`——Skill 随仓库发布，此前它**没有任何版本标记**，无法判断手上这份 Skill 描述的是哪个部署单元；该记录已进 `smoke/01` 的版本比较与 `release.yml` 的 tag 门禁（`01` 另要求 `release.yml` 必须读它）。`skill/` 文件数 25 → 30（assets 仍 23 个、字节未动）
   |  `AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq ./run-tests.sh` → exit 0（31 ran / 0 skipped / 0 partial / 0 failed）；首轮全量被 `smoke/16` 判红——本轮写进文档的变异描述是四段数字、被主机标识规则当成 IP——改成无字面量的措辞后复绿（`violations=0`）；Skill 版本三向红证：改 Skill 版本 → `the seven records disagree`、写成四段式版本 → `not X.Y.Z`、删掉 release.yml 的读取块 → `release-gate FAILED (release.yml never reads skill/SKILL.md)`，三向还原后 `cmp` 一致
 

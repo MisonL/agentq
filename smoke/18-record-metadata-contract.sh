@@ -266,6 +266,24 @@ run_case variant shortname status
 compare_case shortname
 expect_refused shortname 'invalid AgentQ request record filename'
 
+# 7b. The same illegal filename with a body that NAMES ITSELF.  Case 7 cannot
+# show the filename rule deciding anything: its body carries the good id, so
+# the aggregate filter refuses the pair on the body and the filename check is
+# never the party that fails.  Here the body agrees with the file, so only a
+# filename rule can refuse it.  What this case pins is the CONTRACT, not which
+# reader enforces it: measured 2026-11-14, the refusal comes from the repair
+# and scan readers (each checks the name before reading), and deleting the
+# fast path's own filename check inside load_request_records left every case
+# in this file green.  That check is therefore defence in depth -- a command
+# that ever reaches load_request_records without one of those readers would
+# otherwise be served a record the contract rejects (proved at the function
+# level, recorded in docs/PLAN.md 第八十五类).
+case_wellformed shortself.json "$(record_json shortself)"
+run_case base shortself status
+run_case variant shortself status
+compare_case shortself
+expect_refused shortself 'invalid AgentQ request record filename'
+
 # 8. A malformed record sitting between two good ones -- the batch must not
 #    fail open on position.
 case_wellformed AQAAA-00000000000001.json "$(record_json AQAAA-00000000000001)"
