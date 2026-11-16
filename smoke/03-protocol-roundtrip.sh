@@ -870,22 +870,43 @@ fi
 
 victim_queued=0
 victim_task_id=''
+victim_request_id_used=''
 victim_states=''
+# The blocker set is fixed before the first submit.  Measured 2026-11-17 on a
+# pueued that had been running for days: the victim reaches Running within a
+# second of its submit, so by the time a second try could add a blocker it has
+# already finished -- "add one only if the first try started" always arrived too
+# late.  Every blocker here is registered for cleanup first.
+add_blocker
+first_blocker_id=$blocker_started_id
+add_blocker
+second_blocker_id=$blocker_started_id
+for _ in $(seq 1 20); do
+    blockers_running=0
+    for blocker in $first_blocker_id $second_blocker_id; do
+        [ "$(task_status_name "$blocker")" = Running ] && blockers_running=$((blockers_running + 1))
+    done
+    [ "$blockers_running" -eq 2 ] && break
+    sleep 0.5
+done
+if [ "${blockers_running:-0}" -ne 2 ]; then
+    pueue_parallel 1
+    for blocker in $first_blocker_id $second_blocker_id; do
+        printf 'blocker %s is %s\n' "$blocker" "$(task_status_name "$blocker")" >&2
+    done
+    printf 'only %s of 2 blocker task(s) reached Running; cannot exercise the queued path\n' \
+        "${blockers_running:-0}" >&2
+    exit 1
+fi
 for try in 1 2; do
     if [ "$try" -eq 2 ]; then
-        add_blocker
-        for _ in $(seq 1 20); do
-            [ "$(task_status_name "$blocker_started_id")" = Running ] && break
-            sleep 0.5
-        done
-        if [ "$(task_status_name "$blocker_started_id")" != Running ]; then
-            pueue_parallel 1
-            printf 'blocker task %s never reached Running; cannot exercise the queued path\n' \
-                "$blocker_started_id" >&2
-            exit 1
-        fi
+        # A new id per try: the first try's victim has a tombstone once removed,
+        # and `submit` answers `already consumed` (exit 2) for any id that has
+        # one (measured twice).
         pueue_parallel 0
     fi
+    victim_request_id="${request_id}-queued"
+    [ "$try" -eq 2 ] && victim_request_id="${request_id}-queued2"
     if ! victim_submit=$("$server" submit --workdir "$work" --label smoke-queued \
             --request-id "$victim_request_id" -- sleep 60); then
         pueue_parallel 1
@@ -897,6 +918,7 @@ for try in 1 2; do
         printf 'queued-cancel submit returned no task_id: %s\n' "$victim_submit" >&2
         exit 1
     fi
+    victim_request_id_used=$victim_request_id
     cleanup_task_ids="$cleanup_task_ids $victim_task_id"
     for _ in $(seq 1 10); do
         if task_shows_queued "$victim_task_id"; then
@@ -910,19 +932,16 @@ for try in 1 2; do
     if [ "$(task_status_name "$victim_task_id")" != Running ]; then
         break
     fi
-    # Started: end the victim with `remove` (never `cancel`).  Its id is NOT
-    # reused for the second try: a completed removal writes a tombstone, a
-    # tombstone is kept for its retention window, and `submit` answers
-    # `already consumed` (exit 2) for any id that has one -- measured here
-    # twice.  The second try gets its own id, `-queued2`.
+    # Started: end the victim with `remove` (never `cancel`, which would leave a
+    # cancellation marker for the replay case below).
     agentq_task_harness remove "$victim_task_id"
-    victim_request_id="${request_id}-queued2"
 done
 if [ "$victim_queued" -ne 1 ]; then
     printf 'a submitted task was never Queued (states: %s); the queued-cancel path was NOT exercised\n' \
         "${victim_states:-none}" >&2
     exit 1
 fi
+victim_request_id=$victim_request_id_used
 queued_log_status=0
 queued_log=$("$server" logs "$victim_task_id" 2>"$work/queued-log.err") || queued_log_status=$?
 jq -e '.output == "" and (.task | type == "object")' <<<"$queued_log" >/dev/null 2>&1 || {
