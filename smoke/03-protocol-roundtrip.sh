@@ -1257,20 +1257,17 @@ for id in $cancel_cleanup_ids; do
         record_still_active "$id" || break
         sleep 0.5
     done
-    # The id in the held record is a plain id (without the bare prefix); a
-    # held record is an ambiguous identity by definition -- `remove` cannot
-    # finish it -- so name it and drop it: it is this check's own request (it
-    # carries this run's id), and leaving it makes every later run see an
-    # identity collision it did not create.
-    held_record=$(jq -rs --argjson id "$id" \
-        'first(.[] | select(.task_id == $id) | .request_id) // empty' \
-        "$request_record_directory"/*.json 2>/dev/null || true)
-    if [ -n "$held_record" ]; then
-        cleanup_remaining="$cleanup_remaining $id"
-        printf 'cleanup: held record %s %s\n' "$held_record" \
-            "$(jq -c . "$request_record_directory/$held_record.json" 2>/dev/null || true)" >&2
-        rm -f -- "${request_record_directory:?}/$held_record.json"
+    # A still-held record here is the planted second instance: the run died
+    # before the ambiguous-identity case removed it (the victim actually
+    # started in the queued case and is held for the line below, which names
+    # it).  `remove` cannot finish an ambiguous identity, so name it and drop
+    # it: it is this check's own fixture, and leaving it makes every later run
+    # see an identity collision it did not create.
+    if [ -e "$ambiguous_record" ]; then
+        printf 'cleanup: dropping the planted %s record\n' "${ambiguous_record##*/}" >&2
+        rm -f -- "${ambiguous_record:?}"
     fi
+    record_still_active "$id" && cleanup_remaining="$cleanup_remaining $id"
 done
 if [ -n "$cleanup_remaining" ]; then
     printf 'cleanup left an active request record for task(s):%s\n' "$cleanup_remaining" >&2
