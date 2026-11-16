@@ -1420,15 +1420,37 @@ grep -q 'ambiguous AgentQ identity' "$work/ambiguous-task.err" || {
 # above -- this task is `sleep 60` and still Running, and Pueue will not remove
 # a running task.  Assert on the records themselves rather than on remove's exit
 # code -- a server that wrongly reported success could not fake it.
-"$server" cancel "$ambiguous_task_id" >/dev/null 2>&1 || true
+# The task itself may already be gone -- measured 2026-11-17: the ambiguous
+# task was absent from the server while its record was still on disk, and a
+# `remove` that needs a live task then leaves the record forever.  So the loop
+# ends on either condition: the record gone (normal), or the TASK gone (the
+# record can no longer be finished by any command and has to be dropped).
+ambiguous_task_cancel=$("$server" cancel "$ambiguous_task_id" 2>&1) || true
 for _ in $(seq 1 40); do
     record_still_active "$ambiguous_task_id" || break
+    [ "$(task_status_name "$ambiguous_task_id")" = Absent ] && break
     "$server" remove "$ambiguous_task_id" >/dev/null 2>&1 || true
     record_still_active "$ambiguous_task_id" || break
     sleep 0.5
 done
+if record_still_active "$ambiguous_task_id" &&
+    [ "$(task_status_name "$ambiguous_task_id")" = Absent ]; then
+    # Only the RECORD is left, and no command can finish it (remove needs the
+    # task, the tombstone path needs a `removing` record).  Name it and drop it.
+    printf 'ambiguous task %s is gone from the server; dropping its leftover record %s\n' \
+        "$ambiguous_task_id" \
+        "$(jq -rs 'map(.request_id // "-") | join(",")' "$request_record_directory"/*.json 2>/dev/null || true)" >&2
+    rm -f -- "${request_record_directory:?}/${ambiguous_request_id:?}.json"
+fi
 if record_still_active "$ambiguous_task_id"; then
-    printf 'cleanup left an active request record for ambiguous task %s\n' "$ambiguous_task_id" >&2
+    printf 'cleanup left an active request record for ambiguous task %s (cancel said: %s)\n' \
+        "$ambiguous_task_id" "$ambiguous_task_cancel" >&2
+    exit 1
+fi
+if record_still_active "$ambiguous_task_id"; then
+    printf 'cleanup left an active request record for ambiguous task %s; recorded ids: %s\n' \
+        "$ambiguous_task_id" \
+        "$(jq -rs 'map(.task_id // "-") | join(",")' "$request_record_directory"/*.json 2>/dev/null || true)" >&2
     exit 1
 fi
 # Registered for the EXIT trap as well: the assertion above runs only on the
