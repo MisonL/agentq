@@ -906,18 +906,22 @@ for try in 1 2; do
     if [ "$(task_status_name "$victim_task_id")" != Running ]; then
         break
     fi
-    # Started: end the victim with `remove` (never `cancel`) and wait its record
-    # out -- not delete it -- so the next submit on the same id is a fresh one.
+    # Started: end the victim with `remove` (never `cancel`) and let the server
+    # finish it -- waiting for both the record AND the tombstone to clear, not
+    # deleting either.  A finished removal writes a tombstone, and a request id
+    # with a tombstone is `already consumed` for every later submit (exit 2) --
+    # measured here once: the retry died on exactly that.
     agentq_task_harness remove "$victim_task_id"
     record_left="$request_record_directory/$victim_request_id.json"
+    tombstone_left="$runtime_home/data/agentq-requests/.tombstones/$victim_request_id.json"
     for _ in $(seq 1 60); do
-        [ -e "$record_left" ] || break
+        [ -e "$record_left" ] || [ -e "$tombstone_left" ] || break
         agentq_task_harness remove "$victim_task_id"
         sleep 0.5
     done
-    if [ -e "$record_left" ]; then
-        printf 'the queued victim record %s did not clear after remove; cannot retry safely\n' \
-            "$record_left" >&2
+    if [ -e "$record_left" ] || [ -e "$tombstone_left" ]; then
+        printf 'the queued victim record/tombstone did not clear after remove (%s%s); cannot retry safely\n' \
+            "$record_left" "$tombstone_left" >&2
         exit 1
     fi
 done
