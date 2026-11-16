@@ -1,7 +1,7 @@
 ---
 name: agentq
 description: 将任意授权命令提交到已配置的远程主机并持久化跟踪进度、日志、结果、失败或取消。用户要求远程执行、后台执行、SSH 断线后继续、获取目标机任务进度或结果时使用；用户需要人类交互 SSH 会话保活和重连时使用随 Skill 提供的 sshp。本地调用端覆盖 Windows CMD、PowerShell、Git Bash 与 POSIX sh、bash、zsh；目标机支持 Windows、WSL、Linux、macOS；不在目标机运行 Codex。
-version: 0.1.30
+version: 0.1.31
 ---
 
 # AgentQ Remote Queue
@@ -75,7 +75,7 @@ agentq [--host <ssh-host>] doctor [--full]
   `logs` / `wait` 重新确认。只有确认的传输故障（`255`）才用**同一 request ID** `lookup` 对账——绝不换新 ID 重提同一命令。
 - **多行脚本走 `submit --stdin-script`**，不要手工拼引号：stdin 内容被 base64 成单个 argv，
   远端按 `printf %s <b64> | base64 -d | sh` 解码；脚本必须是 POSIX sh 文本（Debian/Ubuntu 上远端是 dash）。
-  unix 目标上限 100000 个 base64 字符；**Windows 目标上限 7800**（Pueue 执行时 8191 字符存储命令上限，
+  unix 目标上限 100000 个 base64 字符（POSIX 客户端；Windows 客户端因载荷二次编码更小——unix 目标约 97700，Windows 宿主上约 24000，见 `references/contract.md`）；**Windows 目标上限 7800**（Pueue 执行时 8191 字符存储命令上限，
   cmd 与 Git Bash 目标同样适用），超过时客户端在本地退 `2`——超出上限的脚本先 scp 成文件，再提交读取它的短命令。
 - **Windows 目标上运行原生命令**时写成 `-- cmd /c <command>` 或 `-- powershell.exe -NoProfile -Command <command>`，
   不要把 CMD 或 PowerShell 引号拼进一个未经验证的大字符串。三种 sshd `DefaultShell` 的差异见

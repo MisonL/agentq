@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.30'
+agentq_version='0.1.31'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -2648,23 +2648,40 @@ request_record_path() {
 # request_id was the uppercase spelling, and status/lookup of either id exited
 # 2 with reason=protocol_error.  Detect the aliasing instead of guessing: a
 # record exists under a DIFFERENT spelling of this id.
-request_record_has_case_alias() {
-    local request_id=$1
-    local record_path
+# Shared by the record and tombstone readers.  Both used to answer a
+# case-insensitive filesystem the same wrong way in different words: the record
+# reader refused (`request id differs only in case ...`, exit 2) while the
+# tombstone reader found the aliased file and answered `5 / state: removed` --
+# a TERMINAL answer for an id the caller never used.  Measured 2026-11-16 by
+# the review: `lookup` for the upper-case spelling of a lower-case tombstone
+# returned 5/removed; the record side of the same shape returned 2.  Two readers
+# must not disagree about what an id means (rule E), so the check lives here.
+request_metadata_has_case_alias() {
+    local alias_directory=$1
+    local request_id=$2
+    local alias_path
     local entries=()
     local entry
 
-    record_path="$request_directory/$request_id.json"
-    [ -e "$record_path" ] || [ -L "$record_path" ] || return 1
+    alias_path="$alias_directory/$request_id.json"
+    [ -e "$alias_path" ] || [ -L "$alias_path" ] || return 1
     # Collect in the parent shell (the repo's usual nullglob idiom): a glob that
     # matches nothing must mean "nothing", not the literal pattern.
     shopt -s nullglob
-    entries=("$request_directory"/*.json)
+    entries=("$alias_directory"/*.json)
     shopt -u nullglob
     for entry in "${entries[@]}"; do
         [ "${entry##*/}" = "$request_id.json" ] && return 1
     done
     return 0
+}
+
+request_record_has_case_alias() {
+    request_metadata_has_case_alias "$request_directory" "$1"
+}
+
+request_tombstone_has_case_alias() {
+    request_metadata_has_case_alias "$request_tombstone_directory" "$1"
 }
 
 request_tombstone_path() {
@@ -3303,6 +3320,11 @@ read_request_tombstone() {
     local tombstone_status
 
     is_request_id "$request_id" || fail "invalid AgentQ request tombstone id: $request_id"
+    # Same verdict as the record reader, in the same words: a differently-cased
+    # id must not resolve to somebody else's tombstone and be reported as this
+    # id's REMOVED state.
+    request_tombstone_has_case_alias "$request_id" &&
+        fail "request id differs only in case from an existing AgentQ tombstone; use the recorded spelling: $request_id"
     tombstone_path=$(request_tombstone_path "$request_id")
     if [ ! -e "$tombstone_path" ] && [ ! -L "$tombstone_path" ]; then
         return 1
@@ -4399,7 +4421,16 @@ reconcile_accepted_request() {
     local observed_task_created_at
 
     [ "$(jq -r '.state' <<<"$record")" = accepted ] || fail "cannot reconcile a non-accepted AgentQ request: $request_id"
-    task_label=$(jq -r '.task_label' <<<"$record")
+    # Guarded, and the reason is measured (2026-11-16, Codex review): this
+    # function runs as an `if` condition, so errexit is OFF.  An unguarded
+    # `$( )` whose jq read failed left `task_label` empty, `find_request_task`
+    # then matched nothing, and the caller archived a still-Running request as
+    # `removed` (record deleted, tombstone written, lookup answered 5) after a
+    # SINGLE injected `.task_label` read failure.  An empty label can only come
+    # from a failed read here: the record's own filter pins task_label to
+    # "agentq:" + request_id, and a client can never submit the empty label.
+    task_label=$(jq -r '.task_label' <<<"$record") ||
+        fail "cannot read the AgentQ request record task label: $request_id"
     expected_task_id=$(jq -r '.task_id' <<<"$record")
     expected_task_created_at=$(jq -r '.task_created_at' <<<"$record")
     is_task_id "$expected_task_id" || fail "invalid task id in AgentQ request record: $request_id"
@@ -4462,7 +4493,11 @@ reconcile_removing_request() {
     local observed_task_created_at
 
     [ "$(jq -r '.state' <<<"$record")" = removing ] || fail "cannot reconcile a non-removing AgentQ request: $request_id"
-    task_label=$(jq -r '.task_label' <<<"$record")
+    # Guarded for the same measured reason as the accepted twin above: with
+    # errexit off, an unguarded read failure archived a live request as
+    # `removed`.
+    task_label=$(jq -r '.task_label' <<<"$record") ||
+        fail "cannot read the AgentQ removing request task label: $request_id"
     expected_task_id=$(jq -r '.task_id' <<<"$record")
     expected_task_created_at=$(jq -r '.task_created_at' <<<"$record")
     is_task_id "$expected_task_id" || fail "invalid task id in AgentQ removing request: $request_id"

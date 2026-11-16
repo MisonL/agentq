@@ -232,7 +232,7 @@ SSH 走 **2222** 端口
 **所以要做的是「量」而不是「找机器」**：2026-11-15 用本仓 0.1.30 POSIX 客户端经**真实 ssh**
 对那台机跑了只读协议——`status --summary` 退 0（291 条任务、全 `Done`、组
 `parallel_tasks=1`，286 条 request record），`logs 306 --tail 5` 退 0 并回
-`\?\C:\Windows\Temp` 形态的路径与两份日志行。这两条**确实走进了 Windows 上的路径处理与
+`\\?\C:\Windows\Temp` 形态的路径与两份日志行。这两条**确实走进了 Windows 上的路径处理与
 jq 分支**，是本检查从来没有过的**执行证据**（`08` 仍只是间接证据）。
 
 **仍未覆盖的**：`submit`/`remove`/`cancel`/锁竞争等其余 windows-only 分支在本机没有用例；
@@ -400,6 +400,68 @@ jq 分支**，是本检查从来没有过的**执行证据**（`08` 仍只是间
      文件承载，不要放 argv。
   **修复后契约形状**：≤约 8.1K 单参数全链路逐字回环；8.1K–32.5K 任务会被
   cmd 截断（stdin/env 层不再失败）；>32.5K 显式 rc=2 + `reason=protocol_error`。
+
+### 2026-11-16 终审（7 个只读 agent + Orca Codex）——修 5 处、记 6 条边界
+
+**已修（每条都先自己复现，再改，再拿红证）**：
+
+1. **P0：一次 `jq` 读取失败把仍在跑的任务归档成 removed。** `reconcile_accepted_request` /
+   `reconcile_removing_request` 里的 `task_label=$(jq -r '.task_label' <<<"$record")` 无守卫，
+   而这两个函数跑在 `if` 条件里（errexit 关闭）。注入一次 `.task_label` 读取失败（rc=5、无输出）
+   即可复现：`lookup` 对 Pueue 里仍是 `Running` 的任务返回 `5 / state:removed`，**删掉活记录、
+   写入 removed 墓碑、一次 Pueue 都没有动**。修法是两处都改成 `|| fail`。锁：`smoke/26`
+   新增 L9/L10（含一条不注入的正控，否则分不清「注入生效」与「夹具本来就坏」），红证跑过——
+   回退修复后 L9 报 `expected exit 2, got 5` 并 rc=1。
+2. **`install-client.sh` 的共址守卫 fail-open。** `grep -q ... &&` 把 rc=1（不匹配）与 rc=2
+   （读不出）当成同一个「不是服务端 wrapper」，一次瞬时读失败就覆盖活 wrapper。改成捕获
+   grep 的退出码、只认 rc=1 为「继续」，其余具名拒绝。锁：`smoke/21` 新增一条（PATH 里放一个
+   「只把本该匹配的调用变成读失败」的 grep 桩），红证跑过——回退后四条断言各自报错、rc=1。
+3. **tombstone 读器缺大小写别名守卫（两个读器对同一 id 给两种答案）。** 大小写不敏感宿主上，
+   小写文件名 + 大写拼写的 `lookup` 在 record 侧退 2（有守卫），在 tombstone 侧却**命中别人的
+   墓碑并回答 `5 / state:removed`**——一个调用方从未用过的 id 得到「已移除」这个终态答案。
+   已把别名检查抽成 `request_metadata_has_case_alias`（两个读器共用），tombstone 读器补上同名
+   拒绝。锁：`smoke/26` 的 L8b（只在大小写不敏感宿主上跑），红证跑过。
+4. **`smoke/01` 的 `.ps1` 编码臂对「带 BOM」的文件等于不检查。** 原来 BOM 分支是无条件
+   `continue`，于是给保留 BOM 的 launcher 末尾追加 `\xff\xfe` 仍报 `ps1_encoding=checked`
+   全绿（smoke 审查复现）。现在 BOM 分支继续要求 BOM 之后是**合法 UTF-8**（`iconv` 往返），
+   双向校准过：正常资产通过、追加坏字节的副本被拒。
+5. **`smoke/12` 的本地命令预算静态锁可由注释满足。** 原来的 `grep -q '32767'` 被文件里多处
+   引用该数字的**注释**满足，把真实赋值改成 65535 仍全绿。改为匹配「Win32NT 分支里的独行
+   32767」，并加双向校准（出货资产必须通过、把赋值抬高而注释不动的副本必须被拒）。
+
+**记边界、本轮不修（都有实测，都不是「已覆盖」）**：
+
+1. **两份客户端的 `--stdin-script` 上界在 unix 目标上不一致。** POSIX 接受 100000 个 base64
+   字符；Windows 客户端把远端命令**再 base64 一次**（PS 5.1 的引号问题所致），同一 argv 元素
+   里是二次编码的载荷，因此本地预算更紧：实测 74000 字节脚本 → POSIX 退 0、Windows 客户端
+   本地退 2（`base64 length 97756 exceeds 97753`）；而同一个客户端跑在 **Windows 宿主**上时
+   本机命令行上限是 32767，可发送量降到约 24000。已把两个数写进 `SKILL.md` /
+   `references/contract.md`（并给出可移植的 24000），但**孪生等价性在这条上不成立**——要拉平
+   得改 Windows 客户端的传输层（去掉外层编码），那是一次独立的重构，不在本轮范围。
+2. **Windows 客户端渲染会去掉模板的 BOM**，非 ASCII 的 Git 安装路径在 PS 5.1（非 UTF-8 ANSI
+   代码页）下会被读成另一条路径，安装因此失败（**推断**：渲染与解码两半各自实测，未在真
+   Windows PS 5.1 上跑完整安装）。
+3. **macOS LaunchDaemon 形态下 `~/.agentq` 的凭据只靠父目录 ACL**；SKILL.md 已在 Windows 侧
+   记为 A28 边界，macOS 侧同样记为边界，不另加机制。
+4. **POSIX 安装器每次安装/升级都对 `$HOME/.local` 与 `$HOME/.local/bin` 执行 `chmod 700`**
+   （`replace_wrapper`），收紧后不回滚；若用户原本是 0755、或其下 `~/.local/share` 被别的
+   工具共享，这是可见副作用。改法是「只建不收紧」或「记录原模式、回滚恢复」，属于安装策略
+   决定（收紧本身是安全意图），交 owner 定。
+5. **`smoke/01` 另有两条检查质量问题未修**：`zsh`/`xmllint` 只探「在不在 PATH 上」、
+   不探「跑不跑得起来」（与 `pwsh-unusable` 同形，但还没踩过）；`[[ ... ]]` 的用法落在所有
+   POSIX 静态锁之外（当前 9 个 shell 资产都是 `#!/bin/sh`，`[[ ]]` 在 dash 上是运行时错误）。
+
+**审查做法本身的两条**：① 7 个 Claude agent 全部跑在**独立 worktree**里（历史教训：提示里写
+「只读」挡不住 `cat >`，曾有审查 agent 把 222 KB 资产截成 0 字节）；② 每条发现都由我在主
+检出里独立复现或证伪之后才落地——本轮里「`TMPDIR` 未设会让客户端退 2」这条就被证伪（实测
+`resolve_agentq_temp_directory` 用 `pwd -P` 把 `/tmp` 解析成 `/private/tmp`，未设与设了行为
+相同）。
+
+另一类**同形但未修、也未实测**：`AGENTQ_ASKPASS` 指向一个没有执行位（POSIX）/无法启动
+（Windows 上的 `.ps1` 之类）的文件时，POSIX 客户端本地退 2（有 `-x` 守卫），Windows 客户端
+放行、到 ssh 才退 255。Windows 没有 POSIX 执行位的对应物，要判「能否启动」得照 `AGENTQ_SSH`
+那条 10 秒探针再做一份——代价与收益本轮未评估，记为边界而不是定论。（`AGENTQ_PASSWORD` /
+`AGENTQ_PASSWORD_PROMPT` 在 Windows 客户端上明确不支持并具名拒绝，那是有意的平台差异。）
 
 ## 六、执行状态
 

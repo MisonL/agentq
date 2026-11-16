@@ -256,9 +256,26 @@ assert_regular_directory_path "$destination_directory" 'destination directory'
 # is recognizable: it is the one asset whose body execs agentq/agentq-server,
 # and no client or server asset contains that fragment (measured: 1 / 0 / 0).
 client_conflict_path="$destination_directory/agentq"
-if [ -f "$client_conflict_path" ] && [ ! -L "$client_conflict_path" ] &&
-    grep -q 'agentq/agentq-server' "$client_conflict_path" 2>/dev/null; then
-    fail "destination holds the AgentQ server wrapper, not a client (a co-located server install owns this path); install the clients elsewhere with --bin-dir: $client_conflict_path"
+if [ -f "$client_conflict_path" ] && [ ! -L "$client_conflict_path" ]; then
+    # The grep's status is captured, not swallowed: `grep -q ... &&` collapses
+    # rc=1 (no match) and rc=2 (the file could not be read) into the same
+    # "not a wrapper" verdict, so ONE transient read failure replaced a live
+    # server wrapper with the client -- the exact silent-clobber this guard
+    # exists to prevent, and the same rc=1-is-the-only-"absent" rule the server
+    # applies to its own readers (PLAN A6 / 第八十一类 ④).  Measured by the
+    # 2026-11-16 review: with a grep that fails once, the old guard continued
+    # and staged the clients.
+    client_conflict_status=0
+    grep -q 'agentq/agentq-server' "$client_conflict_path" 2>/dev/null || client_conflict_status=$?
+    case "$client_conflict_status" in
+        1) : ;;
+        0)
+            fail "destination holds the AgentQ server wrapper, not a client (a co-located server install owns this path); install the clients elsewhere with --bin-dir: $client_conflict_path"
+            ;;
+        *)
+            fail "cannot inspect the existing AgentQ client destination (grep exit $client_conflict_status); refusing to overwrite it without knowing what it is: $client_conflict_path"
+            ;;
+    esac
 fi
 
 # Stage BOTH clients before moving EITHER.  A per-client stage+move installs

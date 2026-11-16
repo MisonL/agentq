@@ -218,6 +218,18 @@ ps1_encoding_failures=0
 while IFS= read -r file; do
     bom=$(head -c 3 "$file" | od -An -tx1 | tr -d ' \n')
     if [ "$bom" = "efbbbf" ]; then
+        # The BOM half used to be an unconditional `continue`: a BOM-carrying
+        # .ps1 was never looked at again, so appending `\xff\xfe` to the
+        # launcher (BOM intact) left `ps1_encoding=checked` green (measured
+        # 2026-11-16 by the smoke review).  A BOM only promises 5.1 will TRY
+        # UTF-8; invalid bytes still decode to U+FFFD, silently.  So: strip the
+        # BOM and require the rest to be valid UTF-8 that contains no invalid
+        # byte -- validity via iconv round trip (macOS iconv is not a validity
+        # probe on its own, see the twin-parity notes).
+        if ! tail -c +4 "$file" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+            printf 'BOM-carrying .ps1 is not valid UTF-8 after the BOM: %s\n' "${file#"$root"/}" >&2
+            ps1_encoding_failures=$((ps1_encoding_failures + 1))
+        fi
         continue
     fi
     if LC_ALL=C grep -q '[^[:print:][:space:]]' "$file"; then

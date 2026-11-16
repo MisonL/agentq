@@ -1399,6 +1399,114 @@ if [ ! -e "$work/runtime/agentq-operation.lock/unexpected-entry" ]; then
 fi
 rm -rf -- "$work/runtime/agentq-operation.lock"
 
+# L8b. The TOMBSTONE reader must answer a differently-cased id the same way the
+#      record reader does: exit 2 naming the alias, never `5 / state: removed`
+#      for an id the caller never used.  Before the fix the tombstone reader had
+#      no alias check at all (the record side has had one since 2026-11-10).
+if [ "$(uname -s)" = "Darwin" ] || [ -n "${AGENTQ_CASE_INSENSITIVE_FS:-}" ]; then
+    clear_runtime
+    put_tombstone aqread-aliastomb-0001 1001
+    run_case l8b lookup AQREAD-ALIASTOMB-0001
+    assert_rc l8b 2
+    assert_err_has l8b 'differs only in case'
+    assert_reason l8b
+    assert_counts l8b 0 1
+fi
+
+# ------------------------------------- one jq read failure must not archive
+# L9/L10.  `reconcile_accepted_request` / `reconcile_removing_request` run as
+# `if` conditions, so errexit is OFF inside them.  Their `.task_label` read was
+# unguarded: ONE injected jq failure left the label empty, find_request_task
+# matched nothing, and the reconcile path archived a STILL-RUNNING request as
+# `removed` (record deleted, tombstone written, lookup answered 5) with no
+# Pueue mutation at all.  Found by the 2026-11-16 Codex review and reproduced
+# here before the fix; this case is the lock.
+#
+# The shim runs the REAL jq and fails exactly one argv (`-r` followed by the
+# task_label program), the first time, so the case cannot pass by breaking jq
+# generally.  It is armed per case by touching $jq_fail_flag, so every other
+# case in this file is unaffected.  (The literal argv is kept OUT of this
+# comment on purpose: a script the check itself executes would break at it.)
+jq_fail_directory="$work/bin-jq-failing"
+mkdir -p "$jq_fail_directory"
+jq_fail_flag="$work/jq-fail.armed"
+cat > "$jq_fail_directory/jq" <<SH
+#!/bin/sh
+# Fail ONLY the first exact "-r .task_label" call while the flag exists; every
+# other call goes to the real jq resolved before this shim existed.
+# (No backticks anywhere in this body: the heredoc is unquoted because it must
+# expand the two paths, so a backtick would be executed by the OUTER shell --
+# measured while writing this case, the suite printed "-r: command not found".)
+if [ -f "$jq_fail_flag" ] && [ "\$*" = "-r .task_label" ]; then
+    rm -f "$jq_fail_flag"
+    printf 'read-paths probe: injected one .task_label jq read failure (rc=5)\n' >&2
+    exit 5
+fi
+exec "$real_jq" "\$@"
+SH
+chmod 700 "$jq_fail_directory/jq"
+run_case_with_failing_jq() {
+    local label=$1
+    shift
+    local rc=0
+    ( cd "$work" && PATH="$jq_fail_directory:$PATH" "$work/agentq-server" "$@" ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+assert_file_unchanged() {
+    local label=$1 path=$2 want=$3
+    cases=$((cases + 1))
+    local have
+    have=$(shasum -a 256 "$path" 2>/dev/null | cut -d' ' -f1)
+    if [ "$have" != "$want" ]; then
+        printf 'read-paths %s: %s changed (%s -> %s)\n' "$label" "$path" "$want" "$have" >&2
+        failures=$((failures + 1))
+    fi
+}
+
+# Positive control FIRST, and the flag is deliberately NOT armed: the same
+# record and task must yield the clean answer with the shim on PATH.  Without
+# this, "the injection produced exit 2 and the record survived" could be an
+# artifact of a shim that breaks the lookup outright.  (An armed control cannot
+# serve: the FIRST `.task_label` read is the one the reconcile path itself
+# needs, so an armed run can only exercise the refusal.)
+clear_runtime
+put_record AQREAD-JQFAIL-0000001 accepted 1001 '"2026-09-29T00:00:00Z"'
+cat > "$work/tasks.json" <<'TASKS'
+{"tasks":{"1001":{"id":1001,"created_at":"2026-09-29T00:00:00Z","command":"true","label":"agentq:AQREAD-JQFAIL-0000001","status":{"Running":{}},"group":"agentq"}},"groups":{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}}
+TASKS
+run_case_with_failing_jq l9control lookup AQREAD-JQFAIL-0000001
+assert_rc l9control 0
+assert_json l9control '.reused == true and .task_id == 1001'
+
+# L9. Same record, a VISIBLE running task, one jq read failure: exit 2, the
+#     record byte-identical, and NO tombstone.  Before the fix: exit 5,
+#     state removed, record gone, tombstone written.
+clear_runtime
+put_record AQREAD-JQFAIL-0000001 accepted 1001 '"2026-09-29T00:00:00Z"'
+record_before=$(shasum -a 256 "$work/data/agentq-requests/AQREAD-JQFAIL-0000001.json" | cut -d' ' -f1)
+: > "$jq_fail_flag"
+run_case_with_failing_jq l9 lookup AQREAD-JQFAIL-0000001
+assert_rc l9 2
+assert_err_has l9 'cannot read the AgentQ request record task label'
+assert_reason l9
+assert_file_unchanged l9 "$work/data/agentq-requests/AQREAD-JQFAIL-0000001.json" "$record_before"
+assert_counts l9 1 0
+
+# L10. The removing twin: same injection, same refusal (exit 2 via the guarded
+#      label read, not the bare 4 a healthy removing record answers), record
+#      intact, no tombstone.
+clear_runtime
+put_record AQREAD-JQFAIL-REMOVING removing 1001 '"2026-09-29T00:00:00Z"'
+record_before=$(shasum -a 256 "$work/data/agentq-requests/AQREAD-JQFAIL-REMOVING.json" | cut -d' ' -f1)
+: > "$jq_fail_flag"
+run_case_with_failing_jq l10 lookup AQREAD-JQFAIL-REMOVING
+assert_rc l10 2
+assert_err_has l10 'cannot read the AgentQ removing request task label'
+assert_file_unchanged l10 "$work/data/agentq-requests/AQREAD-JQFAIL-REMOVING.json" "$record_before"
+assert_counts l10 1 0
+rm -f "$work/tasks.json" "$jq_fail_flag"
+
 # --------------------------------------------------------------- summary
 if [ "$failures" -ne 0 ]; then
     printf 'read-paths checks FAILED: cases=%s failures=%s\n' "$cases" "$failures" >&2

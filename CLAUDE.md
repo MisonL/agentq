@@ -366,7 +366,7 @@ diff -rq "$AGENTQ_REPO_ROOT/skill" "$SKILL_DIR"   # 必须无输出
   经 `recover_removing_requests` 改写 request record。要只读地探查一台机器，就别
   走 AgentQ 协议：直接 ssh 过去看 `~/.local/bin/agentq` 在不在、版本多少。
   同理，对真实远端跑 `doctor`/`status`/`lookup` 前，先确认该机 `pueued` 已在运行，
-  这样第一次 `status --json` 就返回，永远走不到启动服务那一步。
+  这样第一次 `status --summary`（或 `status --task <id>`；**没有** `--json` 这个旗标）就返回，永远走不到启动服务那一步。
 - **`07` 的沙箱 sshd 不读 `~/.ssh/config`**（全新 host key、高端口、只监听 127.0.0.1）。所以 `07` 通过**不**代表用户 `~/.ssh/config` 提供的选项（ProxyJump、IdentityFile、`Host` 别名等）可用——那是另一件事，没有证据。
 - SSHP 只承载人类交互会话，不用来代替 AgentQ 任务。
 - **`~/.local/bin/agentq` 在服务端主机上是 wrapper，不是客户端。** 服务端安装器把它写成

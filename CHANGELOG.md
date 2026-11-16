@@ -4,6 +4,7 @@
 版本（tag）是**部署单元的版本**，与 Pueue 版本无关（见 README）。
 
 ## 版本索引（Releases）
+- **[v0.1.31](https://github.com/MisonL/agentq/releases/tag/v0.1.31)**（2026-11-16）— 第八十六类：终审修 5 处（见日志区 2026-11-16 条目）
 
 每个 `v0.1.x` tag 指向该版本落地时版本常量所在的提交（**仍在并入修复的当前版本例外**：tag 随每次修复前移，指向当时的最新提交）；`.github/workflows/release.yml` 核对的是 tag 与**每一处**版本记录一致（两个安装器、服务端与它的 canonical 孪生、README、两份客户端）（[运行记录](https://github.com/MisonL/agentq/actions/workflows/release.yml)）。详细变更与实测证据看下方日志区对应日期的条目。
 
@@ -57,6 +58,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 **格式约定（2026-10-15 起）**：新条目用**短格式**——一行说清改了什么与对行为的影响，验证只留退出码与关键计数；排查过程、变异证明、教训写进 `docs/PLAN.md`，不进这里。2026-10-14 及之前的长条目按当时约定写成，**保留原样**（它们现在都在下面的升序段里）。
 
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
+
+2026-11-16  **终审（7 个只读 agent + Orca Codex）修五处**——① **P0：一次 `jq` 读取失败把仍在跑的任务归档成 removed**。`reconcile_accepted_request` / `reconcile_removing_request` 里的 `task_label=$(jq -r '.task_label' <<<"$record")` 无守卫，而两个函数都跑在 `if` 条件里（errexit 关闭）；注入一次 `.task_label` 读取失败（rc=5、无输出）即复现：`lookup` 对 Pueue 里仍 `Running` 的任务回 `5 / state:removed`，删掉活记录、写入 removed 墓碑、Pueue 一次没动。两处改成 `|| fail`。② `install-client.sh` 的共址守卫把 `grep` 的 rc=2（读不出）与 rc=1（不是 wrapper）当成同一个「继续」，一次瞬时读失败就覆盖活的服务端 wrapper；改为只认 rc=1 为继续、其余具名拒绝。③ tombstone 读器补上大小写别名守卫（此前对一个大写拼写的 id **命中别人的墓碑并回答 `5 / state:removed`**，而 record 侧同一形状退 2——两个读器对同一 id 给两种答案）；别名检查抽成 `request_metadata_has_case_alias` 由两个读器共用。④ `smoke/01` 的 `.ps1` 编码臂对**带 BOM** 的文件等于不检查（BOM 分支无条件 `continue`），给保留 BOM 的 launcher 追加 `\xff\xfe` 仍全绿；现在 BOM 之后必须是合法 UTF-8。⑤ `smoke/12` 的本地命令预算静态锁可被文件里引用 32767 的**注释**满足（把真实赋值改成 65535 仍全绿）；改为匹配 Win32NT 分支里的独行 32767，并带双向校准。锁：`smoke/26` L9/L10/L8b（L9 带不注入的正控）、`smoke/21` 新增一条 grep 桩用例、`smoke/12` 双向校准；五条都做过「回退修复→必须红」的证明。**未修、如实记为边界**：两份客户端的 `--stdin-script` 上界在 unix 目标上不一致（Windows 客户端二次编码，实测 74000 字节脚本 POSIX 收、Windows 客户端拒；Windows 宿主上进一步降到约 24000），已写进 `SKILL.md`/`references/contract.md`，拉平需要改传输层，不在本轮。版本 0.1.30 → 0.1.31；`smoke/26` 用例数 122 → 137
+  |  `AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq ./run-tests.sh` → exit 0（31 ran / 0 failed）；`smoke/26` → `cases=137 reason-gaps=0`；`smoke/21` → `cases=15`；`smoke/12` → `cases=213 ps51=NOT-covered`；`smoke/31` → `index=32 tags=31 entries=233`（tag 在提交后打，见下一条验证）
 
 2026-11-15  **文档订正三处过时断言，并补记一处观测**——① `docs/PLAN.md` 与 `docs/verification-status.md` 的「没有 Windows 机器就关不掉 Windows 专有分支这个缺口」改写——**先说错的、再说订正的**：本条目初稿写的是「2026-11-14 核实过那台 Windows 10 主机只装了客户端」，当天稍后盘点发现**服务端就在那台机上**（`C:\ProgramData\AgentQ`，2026-11-13 起常驻；`agentq`/`agentq-durable-move.ps1`/`agentq-start-daemon.ps1` 与仓库 0.1.30 字节相同，launcher 只差渲染的 Git Bash 路径与 BOM，`pueued.exe` 以 `--config C:\ProgramData\AgentQ\config\pueue.yml` 运行）。所以我 2026-11-14 的「只装了客户端」是**盘点错了**（只看了 `~/.local/bin`）。同样当天用本仓 0.1.30 POSIX 客户端经真实 ssh 对该机跑了只读协议：`status --summary` 退 0（291 条任务全 `Done`、组 `parallel_tasks=1`、30s）、`logs 306 --tail 5` 退 0（77s，回 `\\?\C:\Windows\Temp` 形态路径）——**Windows 上的路径处理与 jq 分支真被执行过**，`08` 的间接证据之外第一次有执行证据；但 `submit`/`remove`/`cancel`/锁竞争仍无用例，缺口**未关闭**；② `docs/HANDOFF.md` 的「`smoke/` 下 30 项」改为 31（`smoke/31-changelog-and-tags` 加入后没跟上，现附 `ls smoke/*.sh | wc -l` 的自验方式）；③ `docs/PLAN.md`/`docs/performance.md`/本文件里「实现留在分支 `perf/batch-record-read`」改为「已随分支删除、不可找回」，与 2026-11-15 的清理一致；④ `docs/PLAN.md` 记下 `smoke/29` 双计数器第二次在全量套件里报 `134/135`（单独连跑 30 次皆 `135/135`，判为检查自身的已知记录竞争），以及试图给 shim 改单次写入 `printf %b` + `LC_ALL=C tr` 后稳定变成 `144/135`（NUL 编码表示不了空参数）故整体回退。资产与 `smoke/` 零改动
   |  `./run-tests.sh --quick` → exit 0（1 ran / 0 failed）；`smoke/31` → `index=31 tags=31 entries=231`；`smoke/16` → `files=135 violations=0`；`ls smoke/*.sh | wc -l` = 31

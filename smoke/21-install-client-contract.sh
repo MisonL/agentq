@@ -331,6 +331,60 @@ if [ -n "$residue" ]; then
     failures=$((failures + 1))
 fi
 
+# --- the conflict guard must fail CLOSED on an unreadable destination ---------
+# `grep -q ... &&` reads rc=2 (the file could not be read) exactly like rc=1
+# (not a wrapper), so one transient read error let the installer replace a live
+# server wrapper with the client -- the silent clobber the guard above exists to
+# prevent.  The lock: with a grep that fails, the install MUST refuse, name the
+# inspection failure, and leave the destination byte-identical with no residue.
+# A PATH shim is the tool here because the failure is in the installer's own
+# external command, not in its arguments.
+grep_shim_directory="$work/bin-grep-failing"
+mkdir -p "$grep_shim_directory"
+real_grep=$(command -v grep)
+cat > "$grep_shim_directory/grep" <<SH
+#!/bin/sh
+# Faithful to the failure, not to a guess: the REAL grep runs first, and only a
+# call that would have MATCHED is turned into a read failure.  A shim that
+# failed every grep would also break the installer's unrelated greps and prove
+# nothing about this guard.
+"$real_grep" "\$@" 2>/dev/null >/dev/null
+status=\$?
+if [ "\$status" -eq 0 ]; then
+    exit 2
+fi
+exec "$real_grep" "\$@"
+SH
+chmod 700 "$grep_shim_directory/grep"
+
+co_fail_destination="$work/co-located-grep-failure"
+mkdir -p "$co_fail_destination"
+cp "$root/skill/assets/unix/agentq" "$co_fail_destination/agentq"
+wrapper_before=$(shasum -a 256 <"$co_fail_destination/agentq")
+cases=$((cases + 1))
+co_fail_status=0
+PATH="$grep_shim_directory:$PATH" HOME="$HOME" "$installer" --bin-dir "$co_fail_destination" \
+    >"$work/out" 2>"$work/err" || co_fail_status=$?
+if [ "$co_fail_status" -eq 0 ]; then
+    printf 'install-client (unreadable wrapper): expected a refusal, got exit 0\n' >&2
+    failures=$((failures + 1))
+fi
+if ! grep -qF 'cannot inspect the existing AgentQ client destination' "$work/err"; then
+    printf 'install-client (unreadable wrapper): stderr did not name the inspection failure\n' >&2
+    head -2 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+wrapper_after=$(shasum -a 256 <"$co_fail_destination/agentq")
+if [ "$wrapper_before" != "$wrapper_after" ]; then
+    printf 'install-client (unreadable wrapper): overwrote the wrapper it could not inspect\n' >&2
+    failures=$((failures + 1))
+fi
+residue=$(find "$co_fail_destination" -mindepth 1 ! -name agentq -print -quit)
+if [ -n "$residue" ]; then
+    printf 'install-client (unreadable wrapper): left files beside the refused destination\n' >&2
+    failures=$((failures + 1))
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'install-client-contract: %s failure(s)\n' "$failures" >&2
     exit 1

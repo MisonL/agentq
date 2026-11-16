@@ -69,3 +69,8 @@ __pycache__/
 
 # Sandbox leftovers, in case sandbox.sh is ever pointed at the repo.
 /aqsb/
+
+# Claude Code's per-repo state: agent worktrees, transcripts, tool results.
+# None of it is the product; a worktree committed here would also nest a full
+# copy of the repo inside itself.
+.claude/

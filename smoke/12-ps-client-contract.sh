@@ -3384,12 +3384,40 @@ fi
 # The static lock pins the WINDOWS value: the platform branch is chosen at
 # runtime, so a case run under pwsh on macOS exercises the POSIX limit, and
 # only the constant can carry the Windows one.
+#
+# The Windows value is matched as the BRANCH BODY, not as a token anywhere in
+# the file: a whole-file `grep -q 32767` is satisfied by the many COMMENTS that
+# quote the limit (there are several -- `# CreateProcess caps the WHOLE command
+# line at 32767 characters`), so raising the real assignment to 65535 while
+# leaving the comments alone used to stay GREEN.  Measured by the 2026-11-16
+# review; the calibration below keeps that mutant red.
+local_command_line_budget_carries_windows_limit() {
+    # True when the Win32NT arm of the LocalCommandLineLimit assignment is the
+    # literal 32767.  From the `= if` line, the first lone-number line is that
+    # arm on the shipped shape; comments never produce one, which is what makes
+    # this insensitive to the comments that quote the limit in prose.
+    grep -q 'LocalCommandLineLimit' "$1" &&
+        awk '/\$script:LocalCommandLineLimit = if/ {inside = 1} inside && /^[[:space:]]*32767[[:space:]]*$/ {found = 1} END {exit !found}' "$1"
+}
 grep -q 'LocalCommandLineLimit' "$client" ||
     { printf '%s\n' 'ps-client: no local command-line budget for the ssh payload' >&2; mode_static_failures=$((mode_static_failures + 1)); }
-grep -q '32767' "$client" ||
-    { printf '%s\n' 'ps-client: the local command-line budget does not carry the Windows CreateProcess limit (32767)' >&2; mode_static_failures=$((mode_static_failures + 1)); }
+local_command_line_budget_carries_windows_limit "$client" ||
+    { printf '%s\n' 'ps-client: the local command-line budget does not carry the Windows CreateProcess limit (32767) in its platform branch' >&2; mode_static_failures=$((mode_static_failures + 1)); }
 grep -q 'LocalCommandLineFixedOverhead' "$client" ||
     { printf '%s\n' 'ps-client: the local command-line budget has no measured fixed overhead' >&2; mode_static_failures=$((mode_static_failures + 1)); }
+
+# Calibration, in both directions: the shipped asset must satisfy the predicate,
+# and a copy whose ASSIGNMENT is raised (comments untouched) must not.
+budget_calibration_directory="$work/budget-calibration"
+mkdir -p "$budget_calibration_directory"
+sed 's/^    32767$/    65535/' "$client" > "$budget_calibration_directory/raised.ps1"
+if ! grep -q '^    65535$' "$budget_calibration_directory/raised.ps1"; then
+    printf '%s\n' 'ps-client: budget calibration could not raise the assignment (fixture broken, not the asset)' >&2
+    mode_static_failures=$((mode_static_failures + 1))
+elif local_command_line_budget_carries_windows_limit "$budget_calibration_directory/raised.ps1"; then
+    printf '%s\n' 'ps-client: the budget predicate accepted a raised assignment because a comment still quotes 32767' >&2
+    mode_static_failures=$((mode_static_failures + 1))
+fi
 failures=$((failures + mode_static_failures))
 
 # The behavioural half: a payload beyond the local budget must be REFUSED with
