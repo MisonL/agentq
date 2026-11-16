@@ -597,7 +597,8 @@ jq 分支**，是本检查从来没有过的**执行证据**（`08` 仍只是间
      消失。另：ambiguous 用例的任务若已从服务端消失，它的记录没有任何命令能收尾（`remove`
      要活任务、墓碑路径要 `removing` 记录），此时按形状（本次 request id）直接删并打印一行；
      上一次运行留下的本检查形状的记录（标签是 `smoke` / `smoke-<case>` 之一）在启动时被点名
-     清掉，不再拒绝运行。
+     清掉，不再拒绝运行。**主沙箱的全量套件**（2026-11-17 06:41 起跑）随后以同一版本走到
+     `cancel-queued=queued_removed/5`——即在那台 pueued 已运行两天多的机器上也是真的 Queued。
   4. **第四版：基于 `pueue status` 的「Running」门槛在本机沙箱里不成立。** 端到端跑
      `smoke/03` 时报「only 0 of 1 blocker task(s) reached Running」，而队列里那个阻塞
      任务显示 `Done`、耗时近 60 秒——`sleep 60` 被提前结束。此前手工探测时，同样的读取
