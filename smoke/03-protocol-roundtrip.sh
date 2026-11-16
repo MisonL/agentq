@@ -728,9 +728,16 @@ fi
 # 2026-11-17, Pueue 4.0.4: `parallel 0`, then `pueue add -- sleep 3`, and the
 # task reached Running within a second).
 #
-# Lowering the group is still worth doing around the submit: it keeps a blocker
-# from STARTING in the window, so the victim queues rather than racing.  It is a
-# guard, not the mechanism.
+# A task added while the group is at `parallel_tasks 0` stays Queued -- but only
+# until the group is raised, at which point it starts too (measured 2026-11-17 on
+# a freshly created group).  So the lowering has to hold from the last blocker's
+# add all the way through the victim's submit, and a retry that needs one more
+# blocker has to raise the group: the blockers queued under it are as good as
+# the Running ones, because they hold the slot from the moment they start.
+#
+# `ensure_group` re-asserts `parallel 1` at every `submit`, which is fine -- what
+# holds the victim back is that each already-queued blocker starts the instant a
+# slot frees, in its own dispatch round, before the victim reaches the front.
 pueue_harness() {
     PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" \
         "$runtime_home/pueue" "$@" >/dev/null 2>&1 || true
