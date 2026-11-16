@@ -222,10 +222,27 @@ done
 # or about the contract that went unexercised.  Report it as what it is.
 # Every id this check builds starts with `smoke-` and carries its pid and a UTC
 # stamp, so matching the prefix cannot hit a real deployment's records.
+# A record whose remaining owner is a task that has since finished cannot be
+# finished by the server (its `remove` needs a live task, and the tombstone
+# path only continues `removing`), so the check that created it -- under a
+# DIFFERENT pid and stamp, which is why it must be recognised by shape -- has
+# no way to take it back.  Measured 2026-11-17: an interrupted run left five
+# such records and every later run was refused.  They are matched by the exact
+# label this check gives its fixtures (`smoke` / `smoke-<case>`), never by a
+# user's label, and dropped with a line saying so.
 own_leftovers=''
 if [ -d "$runtime_home/data/agentq-requests" ]; then
     for candidate in "$runtime_home"/data/agentq-requests/smoke-*.json; do
         [ -e "$candidate" ] || [ -L "$candidate" ] || continue
+        leftover_label=$(jq -r '.task_label // empty' "$candidate" 2>/dev/null || true)
+        case "$leftover_label" in
+            smoke|smoke-run|smoke-fail|smoke-bin|smoke-fullwording|smoke-line|smoke-literal|smoke-queued|smoke-ambiguous|smoke-ambiguous-old)
+                printf 'dropping a record left by an earlier run of this check: %s (label %s)\n' \
+                    "${candidate##*/}" "$leftover_label" >&2
+                rm -f -- "$candidate"
+                continue
+                ;;
+        esac
         own_leftovers="$own_leftovers ${candidate##*/}"
     done
 fi
