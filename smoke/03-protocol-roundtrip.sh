@@ -976,6 +976,7 @@ start_victim() {
     # End it with `remove` (never `cancel`, which would leave a cancellation
     # marker for the replay case below) and wait until the server no longer
     # lists it, so the slot it held is really free for the next try.
+    agentq_task_harness cancel "$victim_task_id"
     agentq_task_harness remove "$victim_task_id"
     for _ in $(seq 1 60); do
         [ "$(task_status_name "$victim_task_id")" = Absent ] && break
