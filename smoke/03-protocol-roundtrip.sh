@@ -736,22 +736,25 @@ if [ "$deleted_log_status" -ne 6 ]; then
     exit 1
 fi
 
-# Queued means "no slot free", so the case needs the group saturated with TASKS
-# that are Running when the victim is submitted.  A `submit` passes
-# `ensure_group`, which re-asserts `parallel 1`, so the group SETTING cannot do
-# it alone.
+# Queued means "no slot free": the victim has to be behind a task that is
+# Running when it is submitted.
 #
-# The case does not predict Pueue -- it submits and looks.  Attempt n adds a
-# `sleep 60` blocker, submits the victim, and asks the SERVER whether the victim
-# is Queued.  `pueue status` is not used as evidence: measured twice on 2026-11-17
-# it reported tasks as Running that never started (two tasks shown Running while
-# the group said `1 parallel`), and once reported a `sleep 60` as Done after
-# about a second.
+# The case does not predict Pueue -- it looks.  The first try puts ZERO blockers
+# and submits alone.  If the victim is Queued anyway, it is queued in the sense
+# the contract cares about, and the case proceeds (that is the normal state of a
+# freshly created group, and the one CI starts from).  If it starts, the case
+# adds ONE blocker, waits until the server reports it Running, lowers the group
+# to 0 (`submit` re-asserts `parallel 1`, but the submit happens while the group
+# is at 0), submits again, and looks again; a victim that started on that try is
+# removed (never `cancel`: a cancellation marker would poison the replay case
+# below) and the loop stops -- it never adds a second blocker, because a
+# previously started group can dispatch every queued task in one step (measured
+# 2026-11-17: 8 blockers queued and the victim submitted next still ran first).
 #
-# Every observation comes from the server, so the case never assumes a slot
-# count or a dispatch rule.  When no attempt queues the victim it FAILS and
-# says how far it got -- it never passes without having exercised the
-# `queued_removed` branch.
+# Every observation comes from the server.  `pueue status` is not evidence: it
+# reported tasks as Running that never started, and a `sleep 60` as done after a
+# second.  When no try queues the victim the case FAILS and says what it saw --
+# it never passes without having exercised `queued_removed`.
 blocker_started_id=''
 task_status_name() {
     local id=$1
@@ -762,8 +765,7 @@ task_status_name() {
     }
     # An id Pueue no longer holds, and one whose row says Removed, are both "not
     # there"; a snapshot that will not parse is neither -- reporting it as
-    # "Absent" would let a broken read pass for a completed removal (measured
-    # shape: the restored-victim wait below would then succeed on nothing).
+    # "Absent" would let a broken read pass for a completed removal.
     jq -r --argjson id "$id" \
         '.tasks[($id|tostring)] // "Absent"
          | if type != "object" then "Absent"
@@ -814,18 +816,20 @@ add_blocker() {
     # ended up inside a parsed JSON value).
     blocker_started_id=$blocker_id
 }
+pueue_parallel() {
+    PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" \
+        "$runtime_home/pueue" parallel --group agentq "$1" >/dev/null 2>&1 || true
+}
 
 victim_request_id="${request_id}-queued"
 
-# A pueued that came back up (crash, operator restart) restores its task list,
-# and restored tasks hold the group's slots before this run adds anything --
-# measured 2026-11-17 in the shared sandbox: one restored blocker was enough to
-# make every attempt race.  What is ended here, and only this: tasks whose
-# command carries this check's blocker marker (a blocker that outlived a killed
-# run of this check), and a restored victim carrying this request id's own
-# AgentQ label.  Waited for: the record below is removed only once the victim
-# task is really gone, because deleting the record first leaves a live task
-# under no record, and the next submit on the id answers `ambiguous`.
+# A pueued that came back up (restart, crash) restores its task list, and a
+# blocker that outlived a killed run of THIS check holds a slot before this run
+# adds anything -- measured 2026-11-17 in the shared sandbox.  Only tasks that
+# carry this check's own blocker marker are ended here, and a restored victim
+# carrying this request id's own label; the record below is dropped only once
+# the victim task is really gone, because a record deleted under a live task is
+# how a later submit on the id answers `ambiguous`.
 stale_victim_absent=1
 if stale_snapshot=$("$server" status 2>/dev/null); then
     stale_victim_ids=$(jq -r --arg victim "$victim_request_id" \
@@ -838,8 +842,6 @@ if stale_snapshot=$("$server" status 2>/dev/null); then
                       or (.value.label // "") == ("agentq:" + $victim))
              | .key' <<<"$stale_snapshot" 2>/dev/null || true); do
         printf 'ending a task left by an earlier run of this check: %s\n' "$stale_id" >&2
-        # Not this run's task -- it outlived a killed earlier run of THIS
-        # check, which is why it carries this check's marker.
         agentq_task_harness cancel "$stale_id"
         agentq_task_harness remove "$stale_id"
     done
@@ -853,35 +855,40 @@ if stale_snapshot=$("$server" status 2>/dev/null); then
         done
     fi
 fi
-# The id is FIXED across attempts, which is the point -- a launched victim's
-# record must be replaced, not duplicated -- so anything an interrupted earlier
-# run left on it has to go first.  Every record this check plants carries the
+# The id is FIXED across tries, which is the point -- a started victim's record
+# must be replaced, not duplicated -- so anything an interrupted earlier run
+# left on it has to go first.  Every record this check plants carries the
 # `$request_id` prefix, so this cannot reach a deployment's own requests.  A
-# stale victim whose task would not go away keeps the record: deleting it would
-# be the bookkeeping hazard the stale_victim_ids loop above exists to avoid.
+# stale victim whose task would not go away keeps its record.
 if [ "$stale_victim_absent" -eq 1 ]; then
     rm -f -- "${request_record_directory:?}/$victim_request_id.json"
 fi
+
 victim_queued=0
 victim_task_id=''
 victim_states=''
-for _ in $(seq 1 8); do
-    add_blocker
-    blocker_pending=$blocker_started_id
-    for _ in $(seq 1 20); do
-        [ "$(task_status_name "$blocker_pending")" = Running ] && break
-        sleep 0.5
-    done
-    if [ "$(task_status_name "$blocker_pending")" != Running ]; then
-        printf 'blocker task %s never reached Running; cannot exercise the queued path\n' \
-            "$blocker_pending" >&2
-        exit 1
+for try in 1 2; do
+    if [ "$try" -eq 2 ]; then
+        add_blocker
+        for _ in $(seq 1 20); do
+            [ "$(task_status_name "$blocker_started_id")" = Running ] && break
+            sleep 0.5
+        done
+        if [ "$(task_status_name "$blocker_started_id")" != Running ]; then
+            pueue_parallel 1
+            printf 'blocker task %s never reached Running; cannot exercise the queued path\n' \
+                "$blocker_started_id" >&2
+            exit 1
+        fi
+        pueue_parallel 0
     fi
     if ! victim_submit=$("$server" submit --workdir "$work" --label smoke-queued \
             --request-id "$victim_request_id" -- sleep 60); then
+        pueue_parallel 1
         printf '%s\n' 'submit for the queued-cancel case failed' >&2
         exit 1
     fi
+    pueue_parallel 1
     if ! victim_task_id=$(jq -er '.task_id' <<<"$victim_submit"); then
         printf 'queued-cancel submit returned no task_id: %s\n' "$victim_submit" >&2
         exit 1
@@ -896,21 +903,13 @@ for _ in $(seq 1 8); do
     done
     [ "$victim_queued" -eq 1 ] && break
     victim_states="$victim_states $(task_status_name "$victim_task_id")"
-    # It started, so the Running blocker above did not hold the slot.  One more
-    # attempt is worth it (the Running count is measured again, not assumed), but
-    # the loop stops at the FIRST state that is neither Queued nor Running -- a
-    # task that already finished cannot become Queued by adding blockers.
-    last_state=$(task_status_name "$victim_task_id")
-    case "$last_state" in
-        Running) ;;
-        *) break ;;
-    esac
-    # A victim still Running is ended with `remove` -- never `cancel`, which
-    # would leave a cancellation marker for the replay case below -- and its
-    # record is waited out, not deleted: deleting an active record while the
-    # task is live is how a submit on the same id later answers `ambiguous`.
+    if [ "$(task_status_name "$victim_task_id")" != Running ]; then
+        break
+    fi
+    # Started: end the victim with `remove` (never `cancel`) and wait its record
+    # out -- not delete it -- so the next submit on the same id is a fresh one.
     agentq_task_harness remove "$victim_task_id"
-    record_left=$request_record_directory/$victim_request_id.json
+    record_left="$request_record_directory/$victim_request_id.json"
     for _ in $(seq 1 60); do
         [ -e "$record_left" ] || break
         agentq_task_harness remove "$victim_task_id"
@@ -923,7 +922,7 @@ for _ in $(seq 1 8); do
     fi
 done
 if [ "$victim_queued" -ne 1 ]; then
-    printf 'a submitted task was never Queued (attempts: %s); the queued-cancel path was NOT exercised\n' \
+    printf 'a submitted task was never Queued (states: %s); the queued-cancel path was NOT exercised\n' \
         "${victim_states:-none}" >&2
     exit 1
 fi
