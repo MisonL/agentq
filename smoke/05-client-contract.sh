@@ -2086,18 +2086,33 @@ fi
 # exactly the kind this case exists for.
 posix_probe_sh=''
 for candidate in dash /bin/dash /usr/bin/dash busybox sh /bin/sh /bin/ksh ksh; do
-    command -v "$candidate" >/dev/null 2>&1 || continue
+    # PATH names AND absolute paths: a host that carries a real POSIX shell off
+    # PATH (a minimal image, a busybox binary in /bin) went uncovered as
+    # `not-covered` while the shell was right there on disk (measured
+    # 2026-11-16: `command -v /bin/dash` fails on macOS 15 even though the file
+    # exists and refuses ${x//pat/}).  Absolute candidates are tested with -x.
+    case $candidate in
+        /*)
+            [ -x "$candidate" ] || continue
+            ;;
+        *)
+            command -v "$candidate" >/dev/null 2>&1 || continue
+            ;;
+    esac
     if ! "$candidate" -c 'h=a; h=${h//[!b]/}' >/dev/null 2>&1; then
         posix_probe_sh=$candidate
         break
     fi
 done
 if [ -z "$posix_probe_sh" ]; then
-    # Lowercase "not-covered", never the skip word/PART: run-tests.sh classifies
-    # the whole check by those words, and 18 other cases in this file DID run --
-    # reporting the check skipped would understate it.  The repo's own idiom for
-    # this is the summary token (e.g. windows-api=NOT-covered(needs-Windows)).
-    printf '%s\n' 'client-unsupported-platform: not-covered (no strict POSIX shell on PATH; the dash defect cannot be reached here)' >&2
+    # The skip word keeps this visible in run-tests (PART, and the summary
+    # then says NOT A FULL PASS).  A lowercase `not-covered` used to be
+    # printed here, and run-tests matches SKIPPED and `skipped` CASE-
+    # INSENSITIVELY -- so it printed as an ordinary SKIP on exactly the hosts
+    # where the dash defect is unreachable, and the case silently vanished
+    # (measured reading run-tests.sh:74/79, 2026-11-16).  The token names what
+    # was not verified; the PART bucket is what makes it count.
+    printf '%s\n' 'client-unsupported-platform: skipped(no-strict-posix-shell) -- no shell on this host refuses ${x//pat/}, so the dash bad-substitution defect cannot be reached here' >&2
 else
     platform_stub="$work/bin/ssh-unsupported-platform"
     cat > "$platform_stub" <<'STUB'

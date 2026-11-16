@@ -255,6 +255,16 @@ assert_regular_directory_path "$destination_directory" 'destination directory'
 # file that can clobber the wrapper, so this is where it must stop.  The wrapper
 # is recognizable: it is the one asset whose body execs agentq/agentq-server,
 # and no client or server asset contains that fragment (measured: 1 / 0 / 0).
+# One indirection, so the guard's own decision can be exercised: the grep is
+# resolved through this variable, and smoke/21 points it at a recording copy to
+# prove BOTH of the guard's arms are reachable.  A guard that cannot be reached
+# is not a guard -- measured 2026-11-17: neither a PATH shim nor a chmod-000
+# wrapper can make the real grep exit 2 here (the installer already required
+# the file to be readable), so the rc=2 arm had never been entered by a case,
+# and a mutation folding `0` with `*` survived the whole check.
+# Same override convention as AGENTQ_*: a test harness may name the grep, and
+# in a normal install the name is resolved from PATH.
+grep_command=${AGENTQ_INSTALL_CLIENT_GREP:-grep}
 client_conflict_path="$destination_directory/agentq"
 if [ -f "$client_conflict_path" ] && [ ! -L "$client_conflict_path" ]; then
     # The grep's status is captured, not swallowed: `grep -q ... &&` collapses
@@ -266,7 +276,7 @@ if [ -f "$client_conflict_path" ] && [ ! -L "$client_conflict_path" ]; then
     # 2026-11-16 review: with a grep that fails once, the old guard continued
     # and staged the clients.
     client_conflict_status=0
-    grep -q 'agentq/agentq-server' "$client_conflict_path" 2>/dev/null || client_conflict_status=$?
+    "$grep_command" -q 'agentq/agentq-server' "$client_conflict_path" 2>/dev/null || client_conflict_status=$?
     case "$client_conflict_status" in
         1) : ;;
         0)

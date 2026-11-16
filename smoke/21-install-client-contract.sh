@@ -331,57 +331,124 @@ if [ -n "$residue" ]; then
     failures=$((failures + 1))
 fi
 
-# --- the conflict guard must fail CLOSED on an unreadable destination ---------
+# --- the conflict guard's rc=2 arm must be REACHABLE and fail CLOSED -----------
 # `grep -q ... &&` reads rc=2 (the file could not be read) exactly like rc=1
 # (not a wrapper), so one transient read error let the installer replace a live
 # server wrapper with the client -- the silent clobber the guard above exists to
-# prevent.  The lock: with a grep that fails, the install MUST refuse, name the
-# inspection failure, and leave the destination byte-identical with no residue.
-# A PATH shim is the tool here because the failure is in the installer's own
-# external command, not in its arguments.
-grep_shim_directory="$work/bin-grep-failing"
-mkdir -p "$grep_shim_directory"
+# prevent.  The rc=2 arm refuses instead.
+#
+# But a case has to be able to GET there.  Measured 2026-11-17: neither a PATH
+# shim that fails the matching grep nor a chmod-000 wrapper reaches this arm --
+# the installer already required the destination to be a readable file, so the
+# real grep exits 1 on anything a case can construct.  The previous version of
+# this block was that PATH shim: it went green for the wrong reason (the archive
+# grep in the drift check), and a mutation folding the `0` arm with the `*` arm
+# survived it.  The guard now resolves its grep through
+# AGENTQ_INSTALL_CLIENT_GREP, so each arm is driven directly.
+#
+# One destination, one file, three verdicts.  The `absent` arm must INSTALL --
+# without it, "refused" would just mean "this installer never installs".
+guard_destination="$work/guard-arms"
+guard_grep_directory="$work/bin-guard-grep"
+mkdir -p "$guard_grep_directory"
 real_grep=$(command -v grep)
-cat > "$grep_shim_directory/grep" <<SH
+# make_guard_grep <exit-status>: matches the wrapper marker through the REAL
+# grep, then reports the wanted status.  Falling back to the real verdict when
+# the marker is absent keeps the shim faithful to the guard's question.
+make_guard_grep() {
+    cat > "$guard_grep_directory/grep" <<EOF
 #!/bin/sh
-# Faithful to the failure, not to a guess: the REAL grep runs first, and only a
-# call that would have MATCHED is turned into a read failure.  A shim that
-# failed every grep would also break the installer's unrelated greps and prove
-# nothing about this guard.
 "$real_grep" "\$@" 2>/dev/null >/dev/null
-status=\$?
-if [ "\$status" -eq 0 ]; then
-    exit 2
+matched=\$?
+if [ "\$matched" -eq 0 ]; then
+    exit $1
 fi
 exec "$real_grep" "\$@"
-SH
-chmod 700 "$grep_shim_directory/grep"
-
-co_fail_destination="$work/co-located-grep-failure"
-mkdir -p "$co_fail_destination"
-cp "$root/skill/assets/unix/agentq" "$co_fail_destination/agentq"
-wrapper_before=$(shasum -a 256 <"$co_fail_destination/agentq")
+EOF
+    chmod 700 "$guard_grep_directory/grep"
+}
+run_guard_arm() { # <label> <grep-status> -> sets guard_rc
+    local label=$1 status=$2
+    make_guard_grep "$status"
+    rm -rf -- "$guard_destination"
+    mkdir -p "$guard_destination"
+    cp "$root/skill/assets/unix/agentq" "$guard_destination/agentq"
+    guard_before=$(shasum -a 256 <"$guard_destination/agentq")
+    cases=$((cases + 1))
+    guard_rc=0
+    AGENTQ_INSTALL_CLIENT_GREP="$guard_grep_directory/grep" HOME="$HOME" \
+        "$installer" --bin-dir "$guard_destination" >"$work/out" 2>"$work/err" || guard_rc=$?
+}
+# The shim itself must work: if it silently never fires, every arm below reads
+# the real grep and the three verdicts collapse into two.
+make_guard_grep 2
+printf 'agentq: exec agentq/agentq-server\n' > "$work/guard-probe"
+printf '%s\n' 'a plain client body without the wrapper marker' > "$work/guard-probe-without-marker"
+probe_status=0
+"$guard_grep_directory/grep" -q 'agentq/agentq-server' "$work/guard-probe" || probe_status=$?
 cases=$((cases + 1))
-co_fail_status=0
-PATH="$grep_shim_directory:$PATH" HOME="$HOME" "$installer" --bin-dir "$co_fail_destination" \
-    >"$work/out" 2>"$work/err" || co_fail_status=$?
-if [ "$co_fail_status" -eq 0 ]; then
-    printf 'install-client (unreadable wrapper): expected a refusal, got exit 0\n' >&2
+if [ "$probe_status" -ne 2 ]; then
+    printf 'install-client (guard arms): the grep override did not report the wanted status (got %s); the arms below would test the real grep\n' "$probe_status" >&2
     failures=$((failures + 1))
 fi
-if ! grep -qF 'cannot inspect the existing AgentQ client destination' "$work/err"; then
-    printf 'install-client (unreadable wrapper): stderr did not name the inspection failure\n' >&2
+probe_status=0
+"$guard_grep_directory/grep" -q 'agentq/agentq-server' "$work/guard-probe-without-marker" || probe_status=$?
+cases=$((cases + 1))
+if [ "$probe_status" -eq 0 ]; then
+    printf '%s\n' 'install-client (guard arms): the grep override matched a file that does not contain the marker' >&2
+    failures=$((failures + 1))
+fi
+
+# wrapper arm: grep says "this IS the wrapper", exit 0 -> refusal.
+run_guard_arm wrapper 0
+if [ "$guard_rc" -eq 0 ]; then
+    printf 'install-client (guard arms, wrapper): expected a non-zero exit from the wrapper verdict, got 0\n' >&2
+    failures=$((failures + 1))
+fi
+if ! grep -qF 'holds the AgentQ server wrapper' "$work/err"; then
+    printf 'install-client (guard arms, wrapper): stderr did not name the wrapper conflict\n' >&2
     head -2 "$work/err" >&2 || true
     failures=$((failures + 1))
 fi
-wrapper_after=$(shasum -a 256 <"$co_fail_destination/agentq")
-if [ "$wrapper_before" != "$wrapper_after" ]; then
-    printf 'install-client (unreadable wrapper): overwrote the wrapper it could not inspect\n' >&2
+if [ "$guard_before" != "$(shasum -a 256 <"$guard_destination/agentq")" ]; then
+    printf '%s\n' 'install-client (guard arms, wrapper): modified the wrapper it refused' >&2
     failures=$((failures + 1))
 fi
-residue=$(find "$co_fail_destination" -mindepth 1 ! -name agentq -print -quit)
+
+# unreadable arm: grep says "I could not read it", exit 2 -> refusal naming it.
+run_guard_arm unreadable 2
+if [ "$guard_rc" -eq 0 ]; then
+    printf 'install-client (guard arms, unreadable): expected a refusal, got exit 0\n' >&2
+    failures=$((failures + 1))
+fi
+if [ "$guard_rc" -ne 2 ]; then
+    printf 'install-client (guard arms, unreadable): expected the contract code 2, got %s\n' "$guard_rc" >&2
+    failures=$((failures + 1))
+fi
+if ! grep -qF 'cannot inspect the existing AgentQ client destination' "$work/err"; then
+    printf 'install-client (guard arms, unreadable): stderr did not name the inspection failure\n' >&2
+    head -2 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+if [ "$guard_before" != "$(shasum -a 256 <"$guard_destination/agentq")" ]; then
+    printf '%s\n' 'install-client (guard arms, unreadable): overwrote the wrapper it could not inspect' >&2
+    failures=$((failures + 1))
+fi
+residue=$(find "$guard_destination" -mindepth 1 ! -name agentq -print -quit)
 if [ -n "$residue" ]; then
-    printf 'install-client (unreadable wrapper): left files beside the refused destination\n' >&2
+    printf 'install-client (guard arms, unreadable): left files beside the refused destination\n' >&2
+    failures=$((failures + 1))
+fi
+
+# absent arm (positive control): grep exits 1 -> the install must PROCEED.
+run_guard_arm absent 1
+if [ "$guard_rc" -ne 0 ]; then
+    printf 'install-client (guard arms, absent): a non-wrapper destination was refused (exit %s): %s\n' \
+        "$guard_rc" "$(head -2 "$work/err" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+fi
+if ! cmp -s "$guard_destination/agentq" "$source_directory/agentq"; then
+    printf '%s\n' 'install-client (guard arms, absent): the install did not produce the canonical client' >&2
     failures=$((failures + 1))
 fi
 

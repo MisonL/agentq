@@ -752,6 +752,18 @@ fi
 # to the SKIP column, and the summary line then adds NOT A FULL PASS.  Measured:
 # without this, dropping the memory scan entirely printed
 # `ok ... memory=absent(NOT-verified)` and the run still exited 0.
+#
+# But SKIPPED was the WHOLE output of the check, and run-tests reports the FIRST
+# line containing the word -- so this exit swallowed the self-test gate above
+# and the canary: measured 2026-11-16 on an unmodified copy with the rule-wiring
+# self-check disabled, and on a copy that only ADDED a harmless `&& true`, BOTH
+# printed exactly this line and exited 0.  A failed self-test must never be
+# skippable, so it is now its own, ungated-refusal line.
+if [ "$selftest_failures" -ne 0 ]; then
+    printf 'no-host-identifiers: %s self-test failure(s); the scan above must not be reported as a skip\n' \
+        "$selftest_failures" >&2
+    exit 1
+fi
 if [ "$memory_state" != scanned ]; then
     printf 'no-host-identifiers: SKIPPED (memory directory at %s reports %s; the repo scan ran but that part of the memory half is NOT verified)\n' \
         "$memory_dir" "$memory_state"

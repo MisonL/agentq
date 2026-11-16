@@ -199,7 +199,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFOR
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.31"
+$script:ClientVersion = "0.1.32"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's Pueue command ceiling, not this machine's platform: a
 # unix target takes up to 100000 base64 characters (the POSIX twin's
@@ -2275,10 +2275,10 @@ function Test-AgentQJsonResponse {
             $states = @("not_found", "not_started", "accepted", "ambiguous", "removing", "removed")
             $stateTaskIdValid = if (Test-JsonObjectProperty -Object $response -Name "state") {
                 switch ([string]$response.state) {
-                    { $_ -eq "not_found" -or $_ -eq "not_started" -or $_ -eq "ambiguous" } {
+                    { $_ -ceq "not_found" -or $_ -ceq "not_started" -or $_ -ceq "ambiguous" } {
                         $null -eq $taskIdValue
                     }
-                    { $_ -eq "accepted" -or $_ -eq "removing" -or $_ -eq "removed" } {
+                    { $_ -ceq "accepted" -or $_ -ceq "removing" -or $_ -ceq "removed" } {
                         Test-JsonNumber -Value $taskIdValue
                     }
                     default {
@@ -2291,7 +2291,7 @@ function Test-AgentQJsonResponse {
             $hasState = (Test-JsonObjectProperty -Object $response -Name "state") -and
                 !(Test-JsonObjectProperty -Object $response -Name "reused") -and
                 ($response.state -is [string]) -and
-                ($states -contains $response.state) -and
+                ($states -ccontains $response.state) -and
                 (Test-JsonObjectProperty -Object $response -Name "request_id") -and
                 ($response.request_id -is [string]) -and
                 ($response.request_id.Length -gt 0) -and
@@ -2381,7 +2381,7 @@ function Test-AgentQJsonResponse {
                     (Test-JsonNumber -Value $response.task_id) -and
                     (Test-TaskIdMatch -Actual $response.task_id -Expected $ExpectedTaskId) -and
                     (Test-JsonObjectProperty -Object $response -Name "state") -and
-                    (($response.state -eq "removed") -or ($response.state -eq "unavailable"))
+                    (($response.state -ceq "removed") -or ($response.state -ceq "unavailable"))
             }
         }
         "cancel" {
@@ -2389,18 +2389,18 @@ function Test-AgentQJsonResponse {
                 (Test-JsonNumber -Value $response.task_id) -and
                 (Test-TaskIdMatch -Actual $response.task_id -Expected $ExpectedTaskId) -and
                 (Test-JsonObjectProperty -Object $response -Name "action") -and
-                ($response.action -eq "cancel_requested") -and
+                ($response.action -ceq "cancel_requested") -and
                 (Test-JsonObjectProperty -Object $response -Name "cancellation_requested_at") -and
                 (Test-JsonTimestamp -Value $response.cancellation_requested_at) -and
                 (!(Test-JsonObjectProperty -Object $response -Name "cancellation_mode") -or
-                    ($response.cancellation_mode -eq "queued_removed"))
+                    ($response.cancellation_mode -ceq "queued_removed"))
         }
         "cancel_pending" {
             $valid = (Test-JsonObjectProperty -Object $response -Name "task_id") -and
                 (Test-JsonNumber -Value $response.task_id) -and
                 (Test-TaskIdMatch -Actual $response.task_id -Expected $ExpectedTaskId) -and
                 (Test-JsonObjectProperty -Object $response -Name "state") -and
-                ($response.state -eq "cancellation_pending") -and
+                ($response.state -ceq "cancellation_pending") -and
                 (Test-JsonObjectProperty -Object $response -Name "cancellation_requested_at") -and
                 (Test-JsonTimestamp -Value $response.cancellation_requested_at)
         }
@@ -2445,7 +2445,7 @@ function Test-AgentQWaitContract {
             $Output | ConvertFrom-Json -ErrorAction Stop
         }
         if ($ExitCode -eq 0) {
-            return $parsed.task.status.Done.result -eq "Success"
+            return $parsed.task.status.Done.result -ceq "Success"
         }
         if ($ExitCode -eq 1) {
             return (Test-JsonObjectProperty -Object $parsed -Name "task") -and
@@ -2461,10 +2461,10 @@ function Test-AgentQWaitContract {
                 ($parsed.task.status.Done.result -ne "Success")
         }
         if ($ExitCode -eq 5) {
-            return ($parsed.state -eq "removed") -and (Test-JsonNumber -Value $parsed.task_id)
+            return ($parsed.state -ceq "removed") -and (Test-JsonNumber -Value $parsed.task_id)
         }
         if ($ExitCode -eq 6) {
-            return ($parsed.state -eq "unavailable") -and (Test-JsonNumber -Value $parsed.task_id)
+            return ($parsed.state -ceq "unavailable") -and (Test-JsonNumber -Value $parsed.task_id)
         }
         return $true
     } catch {

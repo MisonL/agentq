@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.31'
+agentq_client_version='0.1.32'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072), and the unix bound keeps a
 # safety margin under it.
@@ -1950,7 +1950,11 @@ validate_json_response() {
             # label}}, "group", "summary": true}.  The summary marker is what
             # keeps this shape from being mistaken for the full decorated dump
             # when a caller compares responses.
-            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.summary == true) and ($response.tasks | type == "object") and ($response.tasks | to_entries | all(.[]; ((.value | type) == "object") and (.value.id | nonnegative_integer) and ((.value.state | type) == "string") and ((.value.state | length) > 0))) then true else false end'
+            # The MAP KEY must be the same task id the VALUE carries: without
+            # that binding a summary keyed "01" or "abc" with value {id: 1}
+            # passed here while the Windows twin refused it (measured
+            # 2026-11-16 by the independent review's client differential).
+            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.summary == true) and ($response.tasks | type == "object") and ($response.tasks | to_entries | all(.[]; ((.value | type) == "object") and (.value.id | nonnegative_integer) and (.key == (.value.id | tostring)) and ((.value.state | type) == "string") and ((.value.state | length) > 0))) then true else false end'
             ;;
         status_task)
             # The single-task peek: {"task": {...}} with the decorated task

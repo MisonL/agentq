@@ -58,20 +58,30 @@ work=$(unset CDPATH; cd -- "$work" && pwd -P)
 # So the runtime's own copy is swapped for the duration and restored by the
 # EXIT trap; the original is kept beside it under a name a crashed run cannot
 # mistake for the real one.
+#
+# The backup is `cp -p` of the original, taken ONCE (the `if [ ! -f ]` guard):
+# a hard link was considered and rejected, because `mv -f backup server` in the
+# EXIT trap would then restore by RENAME, and a second interrupted run would
+# find the backup name gone while the live copy is still the staged one.
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 server="$runtime_home/agentq-server"
 server_backup="$runtime_home/agentq-server.smoke-original"
+server_staging="$runtime_home/.agentq-server.smoke-staging.$$"
 if [ ! -f "$server_backup" ]; then
     cp -p "$server" "$server_backup" || {
         printf '%s\n' 'protocol-roundtrip: cannot back up the runtime server before staging the repo asset' >&2
         exit 2
     }
 fi
-cp "$root/skill/assets/unix/agentq-server" "$server" || {
+# Stage beside the live name, then rename over it: a reader between the two
+# steps sees the old file or the new one, never a truncated one.
+if ! cp "$root/skill/assets/unix/agentq-server" "$server_staging" ||
+    ! chmod 700 "$server_staging" ||
+    ! mv -f -- "$server_staging" "$server"; then
+    rm -f -- "$server_staging"
     printf '%s\n' 'protocol-roundtrip: cannot stage the repo server into the runtime home' >&2
     exit 2
-}
-chmod 700 "$server"
+fi
 request_id="smoke-$$-$(date -u '+%Y%m%dT%H%M%SZ')"
 
 # Every task this check creates is tidied on EXIT, so a failure in the middle of
@@ -110,6 +120,25 @@ record_still_active() {
 cleanup_task_ids=''
 cleanup_registered_tasks() {
     local id
+    local record
+    local record_task_id
+    # A recorded id whose task is ALREADY gone cannot be removed at all, so the
+    # record must be dropped directly:
+    # tasks ("unknown AgentQ task id"), so its record must be dropped directly:
+    # otherwise the next run submits onto the same recycled id and finds two
+    # accepted records on it.  Only records of ids this check just tried to
+    # remove are considered, so nothing else in the runtime is touched.
+    if [ -d "$request_record_directory" ]; then
+        for record in "$request_record_directory"/smoke-*.json; do
+            [ -e "$record" ] || continue
+            record_task_id=$(jq -r '.task_id // empty' "$record" 2>/dev/null || true)
+            for id in $cleanup_task_ids; do
+                if [ "$record_task_id" = "$id" ]; then
+                    rm -f -- "$record"
+                fi
+            done
+        done
+    fi
     # Land anything still alive in a terminal state first: Pueue refuses to
     # remove a Running task instantly, so a remove-only loop would spin for its
     # whole budget (see the cancel-case cleanup comment below).
@@ -587,6 +616,71 @@ jq -e '(.output == "alpha\nPueue: Failed to read line.\nomega") and (has("output
     exit 1
 }
 
+# The marker/secondary reads in `compact_log` run inside `logs`, which is
+# called in an `if`/assignment context where errexit is OFF.  Each one used to
+# end `|| var=''`: ONE jq failure left the marker empty and the substituted
+# Pueue text was passed through as the task's own output with exit 0.  That is
+# the FALL-OPEN direction, the opposite of the re-encode arm above, and none of
+# the cases here could see it because a healthy jq never fails.
+#
+# The shim resolves the real jq first and fails exactly ONE argv -- the
+# marker read's program -- so the case cannot pass by breaking jq generally.
+# The argv is matched by its LITERAL source text, not by "some jq call after
+# the Pueue read": two later reads share the same `< file` form, and a shim
+# keyed on order would fire on the wrong one if the code were reordered.
+logs_jq_shim_dir="$work/bin-jq-logs"
+mkdir -p "$logs_jq_shim_dir"
+logs_jq_real=$(command -v jq)
+# The shim's own "already fired" flag lives in a file, not a shell variable: the
+# variable was assigned here and only read inside the heredoc, which shellcheck
+# reports as SC2034 -- and the state has to be visible to the shim process
+# anyway, which a variable in this shell is not.
+cat > "$logs_jq_shim_dir/jq" <<SH
+#!/bin/sh
+# Fail ONLY the compact_log marker read, once.  Every other call (including
+# the ones inside the server that render the final JSON) goes to the real jq.
+for a in "\$@"; do
+    case "\$a" in
+    *'contains("(Pueue error) Failed to read local log output file:")'*)
+        if [ ! -f "$work/jq-logs-fired" ]; then
+            : > "$work/jq-logs-fired"
+            printf 'protocol-roundtrip probe: injected one compact_log jq read failure\n' >&2
+            exit 5
+        fi
+        ;;
+    esac
+done
+exec "$logs_jq_real" "\$@"
+SH
+chmod 700 "$logs_jq_shim_dir/jq"
+fallopen_status=0
+PATH="$logs_jq_shim_dir:$PATH" "$server" logs "$line_task_id" >"$work/fallopen.out" 2>"$work/fallopen.err" || fallopen_status=$?
+if [ "$fallopen_status" -eq 0 ]; then
+    printf '%s\n' 'a jq failure while reading the log marker was answered as success (exit 0): the substituted Pueue text may have been passed off as the task output' >&2
+    exit 1
+fi
+if [ "$fallopen_status" -ne 2 ]; then
+    printf 'a jq failure while reading the log marker exited %s, expected 2 (a loud refusal)\n' \
+        "$fallopen_status" >&2
+    exit 1
+fi
+if ! grep -q 'reason=protocol_error' "$work/fallopen.err"; then
+    printf '%s\n' 'a jq failure while reading the log marker did not carry reason=protocol_error' >&2
+    head -5 "$work/fallopen.err" >&2
+    exit 1
+fi
+# And the refusal must also CLEAN UP.  `fail` runs inside the assignment's
+# command substitution, so its `exit 2` ends only that subshell: a fix that
+# forgets the parent's `return` passes every assertion above and still leaks
+# the runtime temporary file -- one per failure, forever.  Anchored on the
+# refusal's OWN path: the suffix is what compact_log's first argument creates,
+# so this cannot see a temporary file another command happened to leave.
+if compgen -G "$runtime_home/runtime/*.agentq-log*" >/dev/null; then
+    printf '%s\n' 'the jq-failure refusal left its runtime temporary file behind: the guarded read fails loudly but does not clean up' >&2
+    ls -1 "$runtime_home"/runtime/*.agentq-log* >&2
+    exit 1
+fi
+
 # A FINISHED task whose log file is gone (rotation, cleanup) must not be
 # reported as output either: the log is unavailable, which the contract already
 # spells as `{"task_id":N,"state":"unavailable"}` with exit 6 (the same shape
@@ -612,13 +706,28 @@ if [ "$deleted_log_status" -ne 6 ]; then
     exit 1
 fi
 
-# A task is Queued only when no slot is free, so fill the slots FIRST and only
-# then submit the victim -- submitting the victim first would let it take the
-# free slot and run, and the case would silently test nothing.  How many slots a
-# runtime has is its own config's business, so keep adding blockers until a
-# freshly submitted task is observed Queued rather than assuming a number.
+# Two facts make this case's setup non-obvious, both measured on the runtime:
+#
+#   * `submit` calls ensure_group, which RESETS the agentq group to
+#     `--parallel 1` on EVERY call.  So a loop that submits blockers and waits
+#     for one to queue can never fill anything: each submit puts the group back
+#     to 1 and the next blocker simply queues behind the one running.  The
+#     `pueue parallel` below raises the group AFTER submit forced it, which is
+#     a test-harness action, not a client one.
+#   * a victim is Queued only when no slot is free, so the slots must be filled
+#     FIRST (a victim submitted first takes the free slot and runs, and the case
+#     silently tests nothing).
+#
+# The loop therefore raises the group by one before each blocker, then PROVES
+# the condition with one probe submission that must itself land Queued.
+task_shows_queued() {
+    local id=$1
+    local snapshot
+    snapshot=$("$server" status 2>/dev/null) || return 1
+    jq -e --argjson id "$id" '.tasks[($id|tostring)].status | has("Queued")' \
+        <<<"$snapshot" >/dev/null 2>&1
+}
 blockers=''
-slots_full=0
 for attempt in $(seq 1 12); do
     blocker_request_id="${request_id}-blk${attempt}"
     if ! blocker_submit=$("$server" submit --workdir "$work" --label smoke-blocker \
@@ -629,14 +738,31 @@ for attempt in $(seq 1 12); do
     [ -n "$blocker_id" ] || break
     blockers="$blockers $blocker_id"
     cancel_cleanup_ids="$cancel_cleanup_ids $blocker_id"
+    # Submit just reset the group to 1; put it above the number of live blockers
+    # so the NEXT submission has a free slot to run in.
+    blocker_parallel=$((attempt + 1))
+    "$runtime_home/pueue" parallel --group agentq "$blocker_parallel" >/dev/null 2>&1 || true
     sleep 1
-    if "$server" status 2>/dev/null \
-        | jq -e --argjson id "$blocker_id" \
-            '.tasks[($id|tostring)].status | has("Queued")' >/dev/null 2>&1; then
-        slots_full=1
-        break
-    fi
 done
+slots_full=0
+probe_request_id="${request_id}-probe"
+if probe_submit=$("$server" submit --workdir "$work" --label smoke-blocker \
+        --request-id "$probe_request_id" -- sleep 60); then
+    probe_id=$(jq -r '.task_id' <<<"$probe_submit") || probe_id=''
+    if [ -n "$probe_id" ]; then
+        # The probe is a full task as far as the runtime is concerned: cancel the
+        # task and let `remove` archive its REQUEST record too.  Cancel-only left
+        # the record behind, and Pueue handed the same numeric id to the victim,
+        # so the next run found two accepted records on one id.
+        cancel_cleanup_ids="$cancel_cleanup_ids $probe_id"
+        cleanup_task_ids="$cleanup_task_ids $probe_id"
+        sleep 1
+        if task_shows_queued "$probe_id"; then
+            slots_full=1
+        fi
+        "$server" cancel "$probe_id" >/dev/null 2>&1 || true
+    fi
+fi
 if [ "$slots_full" -ne 1 ]; then
     printf '%s\n' 'could not fill the runtime slots; cannot exercise the queued_removed path' >&2
     exit 1
@@ -657,9 +783,7 @@ cleanup_task_ids="$cleanup_task_ids $victim_task_id"
 
 victim_queued=0
 for _ in $(seq 1 20); do
-    if "$server" status 2>/dev/null \
-        | jq -e --argjson id "$victim_task_id" \
-            '.tasks[($id|tostring)].status | has("Queued")' >/dev/null 2>&1; then
+    if task_shows_queued "$victim_task_id"; then
         victim_queued=1
         break
     fi
@@ -668,6 +792,13 @@ done
 if [ "$victim_queued" -ne 1 ]; then
     printf 'task %s never reached Queued; cannot exercise the queued_removed path\n' \
         "$victim_task_id" >&2
+    # A task that STARTED means the blockers did not hold a slot, and this case
+    # then cannot be exercised at all -- say which it was, because "never reached
+    # Queued" alone reads as a timing problem for every cause.
+    "$server" status 2>/dev/null \
+        | jq -c --argjson id "$victim_task_id" \
+            '.tasks[($id|tostring)].status | if type == "object" then (keys | join(",")) else "absent" end' >&2 \
+        || printf '%s\n' "the victim's status row could not be read" >&2
     exit 1
 fi
 
@@ -707,7 +838,12 @@ if [ "$queued_cancel_status" -ne 0 ]; then
     exit 1
 fi
 jq -e '.cancellation_mode == "queued_removed"' <<<"$queued_cancel" >/dev/null || {
-    printf 'cancel of a queued task did not report queued_removed: %s\n' "$queued_cancel" >&2
+    # Name the operation that actually ran, so a wrong branch is not mistaken
+    # for a missing field: `kill`-shaped answers carry neither `state` nor
+    # `cancellation_mode`, and this is the only place that can tell.
+    queued_cancel_shape=$(jq -r '"action=" + (.action // "-") + " mode=" + (.cancellation_mode // "-") + " state=" + (.state // "-")' <<<"$queued_cancel" 2>/dev/null || true)
+    printf 'cancel of a queued task did not report queued_removed (%s): %s\n' \
+        "${queued_cancel_shape:-unparseable answer}" "$queued_cancel" >&2
     exit 1
 }
 jq -e '.action == "cancel_requested"' <<<"$queued_cancel" >/dev/null || {

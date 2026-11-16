@@ -165,9 +165,14 @@ jobs:
           # a known name DROPPING OUT (e.g. 12 when pwsh happens to be 5.1) means
           # the platform covered more, which is good, not a red build.  An
           # unknown name appearing is red in every direction.
-          # 05 self-reports a lowercase not-covered when no strict-POSIX shell
-          # (dash/busybox/ksh refusing ${x//pat/}) is on PATH -- a runner
+          # 05 self-reports `skipped(no-strict-posix-shell)` when no shell on
+          # the host refuses ${x//pat/} (dash/busybox/ksh) -- a runner
           # property, so it is a legitimate platform-gap declaration here too.
+          # It used to print a lowercase `not-covered`, which run-tests matches
+          # case-insensitively as the SKIP word: the gap counted against nobody
+          # (measured reading run-tests.sh:74/79, 2026-11-16).  It is now the
+          # PART bucket, so the `0 partial` assertion above is what makes the
+          # declaration visible; this job always has a strict shell.
           # The known set lives in smoke/not-covered-known.txt, which
           # run-tests.sh reads for its LOCAL gate too -- one list, two
           # consumers, so a name added for one cannot be missing from the

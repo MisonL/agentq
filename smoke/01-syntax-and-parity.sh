@@ -2047,22 +2047,87 @@ else
     version_summary=$version_posix
 fi
 
-version_posix_success=$(grep -m1 -F 'installed at' "$root/skill/assets/unix/install-agentq.sh" || true)
-case $version_posix_success in
-    *'${agentq_version}'*) ;;
-    *)
-        printf '%s\n' 'version FAILED: install-agentq.sh success line does not interpolate ${agentq_version} -- the 2026-10-08 defect printed Pueue release_version there' >&2
-        failures=$((failures + 1))
-        ;;
-esac
-version_windows_success=$(grep -m1 -F 'installed at' "$root/skill/assets/windows-git-bash/install-agentq.ps1" || true)
-case $version_windows_success in
-    *'$agentqVersion'*) ;;
-    *)
-        printf '%s\n' 'version FAILED: install-agentq.ps1 success line does not interpolate $agentqVersion -- the 2026-10-08 defect printed Pueue releaseVersion there' >&2
-        failures=$((failures + 1))
-        ;;
-esac
+# The "success line interpolates the version" rule.  It matched the token
+# ANYWHERE in the first line containing `installed at`, so appending the token
+# in a trailing # comment satisfied it while the printf printed something else,
+# and a SECOND `installed at` line could carry the token while the real one did
+# not (the 2026-10-08 defect was about the line the user SEES).  Measured
+# 2026-11-16: both were green on the shipped rule.
+#
+# The verdict is now per-line over ALL printed success lines, with trailing
+# comments stripped the way the shell strips them (only outside quotes), and
+# every candidate must interpolate the version.  The self-check at the bottom
+# runs the same function on the two escape shapes and refuses to report a pass
+# if either of them is accepted.
+version_success_lines_unversioned() {
+    # $1 = file, $2 = version token, $3 = "posix" | "windows"
+    awk -v token="$2" -v kind="$3" '
+        function strip_comment(s,   i, c, q, out, prev) {
+            out = ""; q = ""
+            for (i = 1; i <= length(s); i++) {
+                c = substr(s, i, 1)
+                if (q != "") {
+                    out = out c
+                    if (c == q && substr(s, i - 1, 1) != "\\") q = ""
+                } else if (c == "\047" || c == "\"") {
+                    q = c; out = out c
+                } else if (c == "#" && (i == 1 || prev ~ /[ \t]/)) {
+                    break
+                } else {
+                    out = out c
+                }
+                prev = c
+            }
+            return out
+        }
+        {
+            if (index($0, "installed at") == 0) next
+            line = strip_comment($0)
+            if (index(line, "installed at") == 0) next
+            printed++
+            if (index(line, token) == 0) bad++
+        }
+        END {
+            if (printed == 0) { print "none"; exit }
+            if (bad > 0) { printf "%d/%d", bad, printed; exit }
+            print "ok"
+        }
+    ' "$1"
+}
+version_posix_verdict=$(version_success_lines_unversioned "$root/skill/assets/unix/install-agentq.sh" '${agentq_version}' posix)
+if [ "$version_posix_verdict" != ok ]; then
+    printf 'version FAILED: install-agentq.sh success line does not interpolate ${agentq_version} in its own printf (%s) -- the 2026-10-08 defect printed Pueue release_version there, and a token in a comment does not count\n' "$version_posix_verdict" >&2
+    failures=$((failures + 1))
+fi
+version_windows_verdict=$(version_success_lines_unversioned "$root/skill/assets/windows-git-bash/install-agentq.ps1" '$agentqVersion' windows)
+if [ "$version_windows_verdict" != ok ]; then
+    printf 'version FAILED: install-agentq.ps1 success line does not interpolate $agentqVersion in its own WriteLine (%s) -- the 2026-10-08 defect printed Pueue releaseVersion there, and a token in a comment does not count\n' "$version_windows_verdict" >&2
+    failures=$((failures + 1))
+fi
+# Two-way calibration: the rule must RED on the comment escape and on the
+# two-line escape, and GREEN on the real assets (already asserted above).
+version_calib=$(mktemp -d "${TMPDIR:-/tmp}/agentq-version-calib.XXXXXX") || {
+    printf '%s\n' 'version FAILED: cannot create the calibration directory' >&2
+    exit 2
+}
+printf '%s\n' 'printf "%s\n" "AgentQ $release_version installed at $agentq_home"  # AgentQ ${agentq_version} installed at' \
+    > "$version_calib/comment-escape.sh"
+printf '%s\n' 'printf "%s\n" "AgentQ ${agentq_version} installed at $agentq_home"' \
+    'printf "%s\n" "AgentQ ${agentq_version} installed at $agentq_home"' \
+    'printf "%s\n" "AgentQ $release_version installed at $agentq_home"' \
+    > "$version_calib/second-line-escape.sh"
+for version_calib_case in comment-escape second-line-escape; do
+    version_calib_verdict=$(version_success_lines_unversioned "$version_calib/$version_calib_case.sh" '${agentq_version}' posix)
+    case $version_calib_verdict in
+        none|ok)
+            printf 'version FAILED: the success-line rule accepted the %s shape (%s); it cannot tell an interpolated version from a quoted one\n' \
+                "$version_calib_case" "$version_calib_verdict" >&2
+            failures=$((failures + 1))
+            ;;
+    esac
+done
+rm -rf -- "$version_calib"
+
 
 # --- the release gate must read EVERY version record -------------------------
 # release.yml is the only check that compares a pushed tag with what the tree

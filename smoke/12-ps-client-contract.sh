@@ -1125,6 +1125,16 @@ if [ "$twin_ws_rows" -lt 9 ]; then
         "$twin_ws_rows" >&2
     failures=$((failures + 1))
 fi
+# An UPPER bound as well: the counter is incremented inside twin_ws_case, but a
+# hand-written `twin_ws_rows=9` after the block satisfies the floor without any
+# case running (measured 2026-11-16: all nine calls deleted, the assignment
+# added, the check green).  Above the floor the only honest way to raise this
+# number is to run another case, so a jump is the tampering signature.
+if [ "$twin_ws_rows" -gt 20 ]; then
+    printf 'ps-client twin whitespace-env: %s cases ran, above the plausible bound of 20; the counter was written outside twin_ws_case\n' \
+        "$twin_ws_rows" >&2
+    failures=$((failures + 1))
+fi
 # --- whitespace-only STRING environment variables ---------------------------
 # The block above fixed this class for the seven NUMERIC variables on
 # 2026-11-04 (IsNullOrWhiteSpace -> IsNullOrEmpty) -- but that fix was scoped to
@@ -3403,8 +3413,16 @@ grep -q 'LocalCommandLineLimit' "$client" ||
     { printf '%s\n' 'ps-client: no local command-line budget for the ssh payload' >&2; mode_static_failures=$((mode_static_failures + 1)); }
 local_command_line_budget_carries_windows_limit "$client" ||
     { printf '%s\n' 'ps-client: the local command-line budget does not carry the Windows CreateProcess limit (32767) in its platform branch' >&2; mode_static_failures=$((mode_static_failures + 1)); }
-grep -q 'LocalCommandLineFixedOverhead' "$client" ||
-    { printf '%s\n' 'ps-client: the local command-line budget has no measured fixed overhead' >&2; mode_static_failures=$((mode_static_failures + 1)); }
+local_command_line_budget_carries_fixed_overhead() {
+    # The overhead is a LITERAL integer assignment, matched on the assignment
+    # line itself.  A whole-file grep for the NAME is satisfied by any comment
+    # that mentions it, and by the two USE sites even after the definition is
+    # gone -- measured 2026-11-16: commenting out all three occurrences left
+    # this check green.
+    awk '/^[[:space:]]*\$script:LocalCommandLineFixedOverhead[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]*$/ {overhead = 1} /^\$script:LocalCommandLineLimit = if/ {limit = 1} END {exit !(overhead && limit)}' "$1"
+}
+local_command_line_budget_carries_fixed_overhead "$client" ||
+    { printf '%s\n' 'ps-client: the local command-line budget has no measured fixed overhead (a literal $script:LocalCommandLineFixedOverhead = <integer> assignment)' >&2; mode_static_failures=$((mode_static_failures + 1)); }
 
 # Calibration, in both directions: the shipped asset must satisfy the predicate,
 # and a copy whose ASSIGNMENT is raised (comments untouched) must not.
@@ -3416,6 +3434,18 @@ if ! grep -q '^    65535$' "$budget_calibration_directory/raised.ps1"; then
     mode_static_failures=$((mode_static_failures + 1))
 elif local_command_line_budget_carries_windows_limit "$budget_calibration_directory/raised.ps1"; then
     printf '%s\n' 'ps-client: the budget predicate accepted a raised assignment because a comment still quotes 32767' >&2
+    mode_static_failures=$((mode_static_failures + 1))
+fi
+# The overhead predicate, same two directions: a copy whose assignment line is
+# commented out (every occurrence, exactly the mutant the review ran) must be
+# REFUSED, and the calibration fixture must have really removed the definition.
+sed 's/^\$script:LocalCommandLineFixedOverhead = 734$/# commented out by the calibration/' "$client" \
+    > "$budget_calibration_directory/no-overhead.ps1"
+if ! grep -q '^# commented out by the calibration$' "$budget_calibration_directory/no-overhead.ps1"; then
+    printf '%s\n' 'ps-client: overhead calibration could not remove the assignment (fixture broken, not the asset)' >&2
+    mode_static_failures=$((mode_static_failures + 1))
+elif local_command_line_budget_carries_fixed_overhead "$budget_calibration_directory/no-overhead.ps1"; then
+    printf '%s\n' 'ps-client: the overhead predicate accepted an asset whose overhead assignment is commented out' >&2
     mode_static_failures=$((mode_static_failures + 1))
 fi
 failures=$((failures + mode_static_failures))
