@@ -728,16 +728,22 @@ fi
 # 2026-11-17, Pueue 4.0.4: `parallel 0`, then `pueue add -- sleep 3`, and the
 # task reached Running within a second).
 #
-# A task added while the group is at `parallel_tasks 0` stays Queued -- but only
-# until the group is raised, at which point it starts too (measured 2026-11-17 on
-# a freshly created group).  So the lowering has to hold from the last blocker's
-# add all the way through the victim's submit, and a retry that needs one more
-# blocker has to raise the group: the blockers queued under it are as good as
-# the Running ones, because they hold the slot from the moment they start.
+# Lowering the group around each blocker's `add` is a safety margin, not the
+# mechanism: a task added under `parallel_tasks 0` starts as soon as the group
+# is raised again, and each blocker's add raises it one call later, so those
+# tasks start in their own dispatch rounds.
 #
-# `ensure_group` re-asserts `parallel 1` at every `submit`, which is fine -- what
-# holds the victim back is that each already-queued blocker starts the instant a
-# slot frees, in its own dispatch round, before the victim reaches the front.
+# Both facts below were measured; the second one is why an attempt can be lost.
+# - A retry raises the group after its last blocker, so one of THOSE can take
+#   the slot the victim would have taken (measured: 1 Running blocker, then an
+#   add, and the newly added task took the next start while the victim already
+#   held a place behind it).
+# - The number of available slots is not necessarily 1: a group counts as
+#   "manually started" once anything starts in it, and from then on every queued
+#   task is dispatched in order in one step -- the victim loses no matter how
+#   many blockers precede it (measured: 8 blockers queued, then the victim
+#   submitted and the victim ran first).
+# So the case does not assume a slot count; it measures, and says how far it got.
 pueue_harness() {
     PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" \
         "$runtime_home/pueue" "$@" >/dev/null 2>&1 || true
@@ -788,8 +794,11 @@ victim_queued=0
 victim_task_id=''
 for attempt in $(seq 1 8); do
     add_blocker
-    # Wait until every blocker is Running: a blocker still Queued would let the
-    # victim occupy the free slot instead.
+    pueue_harness parallel --group agentq 0
+    # Wait until every blocker is Running: a blocker still Queued would be
+    # dispatched in the same step as the victim.  Gating on the count rather
+    # than on time: a test of exactly this ran a submit against TWO Running
+    # blockers plus a Queued one and the victim STARTED (measured).
     blockers_started=0
     for _ in $(seq 1 20); do
         running=0
@@ -842,6 +851,15 @@ for attempt in $(seq 1 8); do
         sleep 0.5
     done
     rm -f -- "${request_record_directory:?}/$victim_request_id.json"
+    # The blocker that took the slot from the victim is Running now, and it
+    # would hold the slot the next attempt counts on.  End it too, so the next
+    # attempt starts from the same state this one assumed.
+    for blocker in $blocker_ids; do
+        if [ "$(task_state_name "$blocker")" = Running ]; then
+            pueue_harness remove "$blocker"
+            break
+        fi
+    done
 done
 if [ "$victim_queued" -ne 1 ]; then
     printf 'task %s never reached Queued; cannot exercise the queued_removed path\n' \
