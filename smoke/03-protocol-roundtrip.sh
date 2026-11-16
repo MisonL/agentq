@@ -913,19 +913,28 @@ fi
 printf 'queued-cancel setup: blockers running=%s group=%s\n' "$blockers_running" \
     "$(PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" "$runtime_home/pueue" status --json 2>/dev/null \
         | jq -r '.groups.agentq.parallel_tasks // "?"' 2>/dev/null || printf '?')" >&2
-for try in 1 2; do
-    if [ "$try" -eq 2 ]; then
-        # A new id per try: the first try's victim has a tombstone once removed,
-        # and `submit` answers `already consumed` (exit 2) for any id that has
-        # one (measured twice).
+# A victim this case ended has a tombstone once the removal finishes, and
+# `submit` answers `already consumed` (exit 2) for an id that has one --
+# measured twice.  So each try submits under its OWN id; only the id of the
+# victim that stayed Queued is used by the assertions below.
+victim_try=0
+victim_try_ids=''
+start_victim() {
+    victim_try=$((victim_try + 1))
+    victim_try_ids="$victim_try_ids $victim_try"
+    victim_request_id="${request_id}-queued"
+    [ "$victim_try" -gt 1 ] && victim_request_id="${request_id}-queued${victim_try}"
+    if [ "$victim_try" -ge 3 ]; then
+        # Third and later: a blocker that has definitely started by now.
+        add_blocker
+    fi
+    if [ "$victim_try" -ge 2 ]; then
         pueue_parallel 0
     fi
-    victim_request_id="${request_id}-queued"
-    [ "$try" -eq 2 ] && victim_request_id="${request_id}-queued2"
     if ! victim_submit=$("$server" submit --workdir "$work" --label smoke-queued \
             --request-id "$victim_request_id" -- sleep 60); then
         pueue_parallel 1
-        printf '%s\n' 'submit for the queued-cancel case failed' >&2
+        printf 'submit for the queued-cancel case failed (try %s)\\n' "$victim_try" >&2
         exit 1
     fi
     pueue_parallel 1
@@ -942,22 +951,30 @@ for try in 1 2; do
         fi
         sleep 0.5
     done
-    [ "$victim_queued" -eq 1 ] && break
-    victim_states="$victim_states $(task_status_name "$victim_task_id")"
-    if [ "$(task_status_name "$victim_task_id")" != Running ]; then
-        # Not Queued and already finished: whatever was in the way finished
-        # too.  One try on an idle queue is not a failure of the contract, so
-        # give the next try one blocker to sit behind.
-        add_blocker
-        continue
+    if [ "$victim_queued" -eq 1 ]; then
+        victim_state=$(task_status_name "$victim_task_id")
+        return 0
     fi
-    # Started: end the victim with `remove` (never `cancel`, which would leave a
-    # cancellation marker for the replay case below).
+    victim_state=$(task_status_name "$victim_task_id")
+    # End it with `remove` (never `cancel`, which would leave a cancellation
+    # marker for the replay case below) and wait until the server no longer
+    # lists it, so the slot it held is really free for the next try.
     agentq_task_harness remove "$victim_task_id"
+    for _ in $(seq 1 60); do
+        [ "$(task_status_name "$victim_task_id")" = Absent ] && break
+        sleep 0.5
+    done
+    return 0
+}
+start_victim
+while [ "$victim_queued" -ne 1 ] && [ "$victim_try" -lt 5 ]; do
+    victim_states="$victim_states $victim_state"
+    start_victim
 done
+[ "$victim_queued" -eq 1 ] && victim_states="$victim_states $(task_status_name "$victim_task_id")"
 if [ "$victim_queued" -ne 1 ]; then
-    printf 'a submitted task was never Queued (states: %s); the queued-cancel path was NOT exercised\n' \
-        "${victim_states:-none}" >&2
+    printf 'a submitted task was never Queued (tries: %s; states: %s); the queued-cancel path was NOT exercised\n' \
+        "${victim_try_ids# }" "${victim_states:-none}" >&2
     exit 1
 fi
 victim_request_id=$victim_request_id_used
