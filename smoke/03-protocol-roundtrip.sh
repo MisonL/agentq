@@ -787,11 +787,18 @@ task_shows_queued() {
 # The check's own end/drop primitive: these are tasks this run created, and every
 # call is a harness action.  Deliberately the only way this block ends a task --
 # together with `add_blocker`, it is the whole surface where the queue is
-# mutated.
+# mutated.  The failure is PRINTED rather than swallowed: measured 2026-11-17,
+# a `remove` that failed here left a record behind, and the run went on to a
+# less informative "ambiguous" failure later (it also took minutes longer,
+# because the victim was still Running).
 agentq_task_harness() {
     local subcommand=$1
     local id=$2
-    "$server" "$subcommand" "$id" >/dev/null 2>&1 || true
+    local status=0
+    "$server" "$subcommand" "$id" >/dev/null 2>&1 || status=$?
+    [ "$status" -eq 0 ] ||
+        printf 'task %s %s exited %s\n' "$id" "$subcommand" "$status" >&2
+    return 0
 }
 add_blocker() {
     local output
@@ -1216,7 +1223,20 @@ for id in $cancel_cleanup_ids; do
         record_still_active "$id" || break
         sleep 0.5
     done
-    record_still_active "$id" && cleanup_remaining="$cleanup_remaining $id"
+    # The id in the held record is a plain id (without the bare prefix); a
+    # held record is an ambiguous identity by definition -- `remove` cannot
+    # finish it -- so name it and drop it: it is this check's own request (it
+    # carries this run's id), and leaving it makes every later run see an
+    # identity collision it did not create.
+    held_record=$(jq -rs --argjson id "$id" \
+        'first(.[] | select(.task_id == $id) | .request_id) // empty' \
+        "$request_record_directory"/*.json 2>/dev/null || true)
+    if [ -n "$held_record" ]; then
+        cleanup_remaining="$cleanup_remaining $id"
+        printf 'cleanup: held record %s %s\n' "$held_record" \
+            "$(jq -c . "$request_record_directory/$held_record.json" 2>/dev/null || true)" >&2
+        rm -f -- "${request_record_directory:?}/$held_record.json"
+    fi
 done
 if [ -n "$cleanup_remaining" ]; then
     printf 'cleanup left an active request record for task(s):%s\n' "$cleanup_remaining" >&2
