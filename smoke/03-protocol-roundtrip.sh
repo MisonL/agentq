@@ -832,14 +832,17 @@ victim_request_id="${request_id}-queued"
 # how a later submit on the id answers `ambiguous`.
 stale_victim_absent=1
 if stale_snapshot=$("$server" status 2>/dev/null); then
-    stale_victim_ids=$(jq -r --arg victim "$victim_request_id" \
+    # Both of this case's request ids, since the second try uses its own.
+    stale_victim_ids=$(jq -r --arg v1 "$victim_request_id" --arg v2 "${request_id}-queued2" \
         '.tasks | to_entries[]
-         | select((.value.label // "") == ("agentq:" + $victim)) | .key' \
+         | select((.value.label // "") == ("agentq:" + $v1)
+                  or (.value.label // "") == ("agentq:" + $v2)) | .key' \
         <<<"$stale_snapshot" 2>/dev/null || true)
-    for stale_id in $(jq -r --arg victim "$victim_request_id" \
+    for stale_id in $(jq -r --arg v1 "$victim_request_id" --arg v2 "${request_id}-queued2" \
             '.tasks | to_entries[]
              | select((.value.command // "") | contains("AGENTQ_SMOKE_BLOCKER=1")
-                      or (.value.label // "") == ("agentq:" + $victim))
+                      or (.value.label // "") == ("agentq:" + $v1)
+                      or (.value.label // "") == ("agentq:" + $v2))
              | .key' <<<"$stale_snapshot" 2>/dev/null || true); do
         printf 'ending a task left by an earlier run of this check: %s\n' "$stale_id" >&2
         agentq_task_harness cancel "$stale_id"
@@ -862,6 +865,7 @@ fi
 # stale victim whose task would not go away keeps its record.
 if [ "$stale_victim_absent" -eq 1 ]; then
     rm -f -- "${request_record_directory:?}/$victim_request_id.json"
+    rm -f -- "${request_record_directory:?}/${request_id}-queued2.json"
 fi
 
 victim_queued=0
