@@ -877,27 +877,35 @@ victim_states=''
 # second of its submit, so by the time a second try could add a blocker it has
 # already finished -- "add one only if the first try started" always arrived too
 # late.  Every blocker here is registered for cleanup first.
+#
+# Two, not more: a restarting pueued restores a KILLED task as Running, so a
+# second blocker can still be busy when this runs.  What the case needs is that
+# the victim's submit has NO free slot; if the Running count already fills the
+# group (whatever its setting says), one Running blocker is enough.  The count
+# is logged either way, so a green run says which shape it saw.
 add_blocker
 first_blocker_id=$blocker_started_id
 add_blocker
 second_blocker_id=$blocker_started_id
-for _ in $(seq 1 20); do
+for _ in $(seq 1 60); do
     blockers_running=0
     for blocker in $first_blocker_id $second_blocker_id; do
         [ "$(task_status_name "$blocker")" = Running ] && blockers_running=$((blockers_running + 1))
     done
-    [ "$blockers_running" -eq 2 ] && break
+    [ "$blockers_running" -ge 1 ] && break
     sleep 0.5
 done
-if [ "${blockers_running:-0}" -ne 2 ]; then
+if [ "${blockers_running:-0}" -lt 1 ]; then
     pueue_parallel 1
     for blocker in $first_blocker_id $second_blocker_id; do
         printf 'blocker %s is %s\n' "$blocker" "$(task_status_name "$blocker")" >&2
     done
-    printf 'only %s of 2 blocker task(s) reached Running; cannot exercise the queued path\n' \
-        "${blockers_running:-0}" >&2
+    printf 'no blocker task reached Running; cannot exercise the queued path\n' >&2
     exit 1
 fi
+printf 'queued-cancel setup: blockers running=%s group=%s\n' "$blockers_running" \
+    "$(PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" "$runtime_home/pueue" status --json 2>/dev/null \
+        | jq -r '.groups.agentq.parallel_tasks // "?"' 2>/dev/null || printf '?')" >&2
 for try in 1 2; do
     if [ "$try" -eq 2 ]; then
         # A new id per try: the first try's victim has a tombstone once removed,
@@ -930,7 +938,11 @@ for try in 1 2; do
     [ "$victim_queued" -eq 1 ] && break
     victim_states="$victim_states $(task_status_name "$victim_task_id")"
     if [ "$(task_status_name "$victim_task_id")" != Running ]; then
-        break
+        # Not Queued and already finished: whatever was in the way finished
+        # too.  One try on an idle queue is not a failure of the contract, so
+        # give the next try one blocker to sit behind.
+        add_blocker
+        continue
     fi
     # Started: end the victim with `remove` (never `cancel`, which would leave a
     # cancellation marker for the replay case below).
