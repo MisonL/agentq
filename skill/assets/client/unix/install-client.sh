@@ -256,8 +256,9 @@ assert_regular_directory_path "$destination_directory" 'destination directory'
 # is recognizable: it is the one asset whose body execs agentq/agentq-server,
 # and no client or server asset contains that fragment (measured: 1 / 0 / 0).
 # One indirection, so the guard's own decision can be exercised: the grep is
-# resolved through this variable, and smoke/21 points it at a recording copy to
-# prove BOTH of the guard's arms are reachable.  A guard that cannot be reached
+# resolved through this variable, and smoke/21 points it at a recording copy so
+# that every arm of the guard below (continue, wrapper, unreadable) is entered
+# by a case -- one case per arm.  A guard that cannot be reached
 # is not a guard -- measured 2026-11-17: neither a PATH shim nor a chmod-000
 # wrapper can make the real grep exit 2 here (the installer already required
 # the file to be readable), so the rc=2 arm had never been entered by a case,

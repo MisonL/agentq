@@ -169,7 +169,19 @@ cleanup_own_records() {
         rm -f -- "$record"
     done
 }
-trap 'cleanup_registered_tasks || true; cleanup_own_records || true; if [ -f "$server_backup" ]; then mv -f -- "$server_backup" "$server"; fi; rm -rf -- "$work"' EXIT
+# The agentq group's parallelism is restored unconditionally: the queued case
+# lowers it below 1 as its mechanism, and a run that exits between the lowering
+# and the restore would otherwise leave the runtime with a group that never
+# dispatches -- every later check on it fails for a reason that has nothing to
+# do with what it tests.  Done before the task cleanup so those removes do not
+# queue behind a stopped group.
+restore_agentq_group() {
+    [ -d "$runtime_home/config" ] || return 0
+    [ -x "$runtime_home/pueue" ] || return 0
+    PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" \
+        "$runtime_home/pueue" parallel --group agentq 1 >/dev/null 2>&1 || true
+}
+trap 'cleanup_registered_tasks || true; cleanup_own_records || true; restore_agentq_group || true; if [ -f "$server_backup" ]; then mv -f -- "$server_backup" "$server"; fi; rm -rf -- "$work"' EXIT
 
 # The two instance-binding fixtures below plant files into the runtime's data
 # directories.  Their paths are declared here, before any protocol work, so a
@@ -724,34 +736,28 @@ fi
 # Queued means "no slot free", so the case needs the group saturated with TASKS
 # that are Running when the victim is submitted.  A `submit` passes
 # `ensure_group`, which re-asserts `parallel 1`, so the group SETTING cannot do
-# it alone -- and `parallel_tasks 0` does not stop a new task either (measured
-# 2026-11-17, Pueue 4.0.4: `parallel 0`, then `pueue add -- sleep 3`, and the
-# task reached Running within a second).
+# it alone.
 #
-# Lowering the group around each blocker's `add` is a safety margin, not the
-# mechanism: a task added under `parallel_tasks 0` starts as soon as the group
-# is raised again, and each blocker's add raises it one call later, so those
-# tasks start in their own dispatch rounds.
+# The case does not predict Pueue -- it submits and looks.  Attempt n adds a
+# `sleep 60` blocker, submits the victim, and asks the SERVER whether the victim
+# is Queued.  `pueue status` is not used as evidence: measured twice on 2026-11-17
+# it reported tasks as Running that never started (two tasks shown Running while
+# the group said `1 parallel`), and once reported a `sleep 60` as Done after
+# about a second.
 #
-# Both facts below were measured; the second one is why an attempt can be lost.
-# - A retry raises the group after its last blocker, so one of THOSE can take
-#   the slot the victim would have taken (measured: 1 Running blocker, then an
-#   add, and the newly added task took the next start while the victim already
-#   held a place behind it).
-# - The number of available slots is not necessarily 1: a group counts as
-#   "manually started" once anything starts in it, and from then on every queued
-#   task is dispatched in order in one step -- the victim loses no matter how
-#   many blockers precede it (measured: 8 blockers queued, then the victim
-#   submitted and the victim ran first).
-# So the case does not assume a slot count; it measures, and says how far it got.
-pueue_harness() {
-    PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" \
-        "$runtime_home/pueue" "$@" >/dev/null 2>&1 || true
-}
-task_state_name() {
-    "$server" status 2>/dev/null | jq -r --argjson id "$1" \
-        '.tasks[($id|tostring)].status | if type == "object" then (keys[0]) else . end' \
-        2>/dev/null || true
+# Every observation comes from the server, so the case never assumes a slot
+# count or a dispatch rule.  When no attempt queues the victim it FAILS and
+# says how far it got -- it never passes without having exercised the
+# `queued_removed` branch.
+blocker_ids=''
+blocker_started_id=''
+task_status_name() {
+    local id=$1
+    local snapshot
+    snapshot=$("$server" status 2>/dev/null) || return 1
+    jq -r --argjson id "$id" \
+        '.tasks[($id|tostring)].status | if type == "object" then (keys[0]) else "Absent" end' \
+        <<<"$snapshot" 2>/dev/null
 }
 task_shows_queued() {
     local id=$1
@@ -760,17 +766,12 @@ task_shows_queued() {
     jq -e --argjson id "$id" '.tasks[($id|tostring)].status | has("Queued")' \
         <<<"$snapshot" >/dev/null 2>&1
 }
-blocker_ids=''
-# One `pueue add` per call, with no extra bookkeeping: the attempt count IS how
-# many blockers the case wants live, and a blocker that finished early is
-# reported as the condition it breaks rather than quietly topped up.
 add_blocker() {
     local output
     local blocker_id
-    pueue_harness parallel --group agentq 0
     if ! output=$(PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" \
             "$runtime_home/pueue" add --group agentq --working-directory "$work" \
-            -- sleep 60 2>&1); then
+            -- env AGENTQ_SMOKE_BLOCKER=1 sleep 60 2>&1); then
         printf 'could not queue a blocker task: %s\n' "$output" >&2
         exit 1
     fi
@@ -779,41 +780,75 @@ add_blocker() {
         printf 'could not read the blocker task id from: %s\n' "$output" >&2
         exit 1
     fi
+    # Registered before anything else can fail: an unregistered `sleep 60` would
+    # hold a slot, and the trap could only wait it out.
     blocker_ids="$blocker_ids $blocker_id"
     cleanup_task_ids="$cleanup_task_ids $blocker_id"
-    pueue_harness parallel --group agentq 1
+    # No stdout at all -- the caller gets the id through this variable.  This
+    # check captures the output of every command between itself and some later
+    # ones, and a stray line would corrupt them (measured here once: a printed id
+    # ended up inside a parsed JSON value).
+    blocker_started_id=$blocker_id
 }
 
 victim_request_id="${request_id}-queued"
+
+# A pueued that came back up (crash, operator restart) restores its task list,
+# and restored tasks hold the group's slots before this run adds anything --
+# measured 2026-11-17 in the shared sandbox: one restored blocker was enough to
+# make every attempt race.  What is ended here, and only this: tasks whose
+# command carries this check's blocker marker (a blocker that outlived a killed
+# run of this check), and a restored victim carrying this request id's own
+# AgentQ label.  Waited for: the record below is removed only once the victim
+# task is really gone, because deleting the record first leaves a live task
+# under no record, and the next submit on the id answers `ambiguous`.
+stale_victim_absent=1
+if stale_snapshot=$("$server" status 2>/dev/null); then
+    stale_victim_ids=$(jq -r --arg victim "$victim_request_id" \
+        '.tasks | to_entries[]
+         | select((.value.label // "") == ("agentq:" + $victim)) | .key' \
+        <<<"$stale_snapshot" 2>/dev/null || true)
+    for stale_id in $(jq -r --arg victim "$victim_request_id" \
+            '.tasks | to_entries[]
+             | select((.value.command // "") | contains("AGENTQ_SMOKE_BLOCKER=1")
+                      or (.value.label // "") == ("agentq:" + $victim))
+             | .key' <<<"$stale_snapshot" 2>/dev/null || true); do
+        printf 'ending a task left by an earlier run of this check: %s\n' "$stale_id" >&2
+        pueue_harness kill "$stale_id"
+        pueue_harness remove "$stale_id"
+    done
+    if [ -n "$stale_victim_ids" ]; then
+        for stale_id in $stale_victim_ids; do
+            for _ in $(seq 1 20); do
+                [ "$(task_status_name "$stale_id")" = Absent ] && break
+                sleep 0.5
+            done
+            [ "$(task_status_name "$stale_id")" = Absent ] || stale_victim_absent=0
+        done
+    fi
+fi
 # The id is FIXED across attempts, which is the point -- a launched victim's
 # record must be replaced, not duplicated -- so anything an interrupted earlier
 # run left on it has to go first.  Every record this check plants carries the
-# `$request_id` prefix, so this cannot reach a deployment's own requests.
-rm -f -- "${request_record_directory:?}/$victim_request_id.json"
+# `$request_id` prefix, so this cannot reach a deployment's own requests.  A
+# stale victim whose task would not go away keeps the record: deleting it would
+# be the bookkeeping hazard the stale_victim_ids loop above exists to avoid.
+if [ "$stale_victim_absent" -eq 1 ]; then
+    rm -f -- "${request_record_directory:?}/$victim_request_id.json"
+fi
 victim_queued=0
 victim_task_id=''
-for attempt in $(seq 1 8); do
+victim_states=''
+for _ in $(seq 1 8); do
     add_blocker
-    pueue_harness parallel --group agentq 0
-    # Wait until every blocker is Running: a blocker still Queued would be
-    # dispatched in the same step as the victim.  Gating on the count rather
-    # than on time: a test of exactly this ran a submit against TWO Running
-    # blockers plus a Queued one and the victim STARTED (measured).
-    blockers_started=0
+    blocker_pending=$blocker_started_id
     for _ in $(seq 1 20); do
-        running=0
-        for blocker in $blocker_ids; do
-            [ "$(task_state_name "$blocker")" = Running ] && running=$((running + 1))
-        done
-        if [ "$running" -eq "$attempt" ]; then
-            blockers_started=1
-            break
-        fi
+        [ "$(task_status_name "$blocker_pending")" = Running ] && break
         sleep 0.5
     done
-    if [ "$blockers_started" -ne 1 ]; then
-        printf 'only %s of %s blocker task(s) reached Running; cannot exercise the queued path\n' \
-            "$running" "$attempt" >&2
+    if [ "$(task_status_name "$blocker_pending")" != Running ]; then
+        printf 'blocker task %s never reached Running; cannot exercise the queued path\n' \
+            "$blocker_pending" >&2
         exit 1
     fi
     if ! victim_submit=$("$server" submit --workdir "$work" --label smoke-queued \
@@ -834,44 +869,22 @@ for attempt in $(seq 1 8); do
         sleep 0.5
     done
     [ "$victim_queued" -eq 1 ] && break
-    # It started: the `attempt`-th blocker did not hold its slot.  End the
-    # victim with `remove`, not `cancel`: a confirmed cancellation records a
-    # marker, and the replay case below relies on no marker existing for the
-    # final victim's first cancel.  Then take its record away so the next
-    # submit on the same request id is fresh, and try again with one more
-    # blocker.
-    pueue_harness remove "$victim_task_id"
-    rm -f -- "${request_record_directory:?}/$victim_request_id.json"
-    # `remove` on a Running task arms a `removing` record that another explicit
-    # `remove` continues; until that record is gone, `submit` on the same
-    # request id would answer `removing` (exit 4) by design.
-    for _ in $(seq 1 40); do
-        record_still_active "$victim_task_id" || break
-        pueue_harness remove "$victim_task_id"
-        sleep 0.5
-    done
-    rm -f -- "${request_record_directory:?}/$victim_request_id.json"
-    # The blocker that took the slot from the victim is Running now, and it
-    # would hold the slot the next attempt counts on.  End it too, so the next
-    # attempt starts from the same state this one assumed.
-    for blocker in $blocker_ids; do
-        if [ "$(task_state_name "$blocker")" = Running ]; then
-            pueue_harness remove "$blocker"
-            break
-        fi
-    done
+    victim_states="$victim_states $(task_status_name "$victim_task_id")"
+    # It started, so the Running blocker above did not hold the slot.  One more
+    # attempt is worth it (the Running count is measured again, not assumed), but
+    # the loop stops at the FIRST state that is neither Queued nor Running -- a
+    # task that already finished cannot become Queued by adding blockers.
+    last_state=$(task_status_name "$victim_task_id")
+    case "$last_state" in
+        Running) ;;
+        *) break ;;
+    esac
 done
 if [ "$victim_queued" -ne 1 ]; then
-    printf 'task %s never reached Queued; cannot exercise the queued_removed path\n' \
-        "$victim_task_id" >&2
-    "$server" status 2>/dev/null \
-        | jq -c --argjson id "$victim_task_id" \
-            '.tasks[($id|tostring)].status | if type == "object" then (keys | join(",")) else "absent" end' >&2 \
-        || printf '%s\n' "the victim's status row could not be read" >&2
+    printf 'a submitted task was never Queued (attempts: %s); the queued-cancel path was NOT exercised\n' \
+        "${victim_states:-none}" >&2
     exit 1
 fi
-cancel_cleanup_ids="$cancel_cleanup_ids $victim_task_id"
-
 queued_log_status=0
 queued_log=$("$server" logs "$victim_task_id" 2>"$work/queued-log.err") || queued_log_status=$?
 jq -e '.output == "" and (.task | type == "object")' <<<"$queued_log" >/dev/null 2>&1 || {

@@ -3,8 +3,9 @@
 #
 # Why this check exists: it is the LAST installer in the repo with no behavioural
 # coverage at all.  The other two already have contract checks -- install-agentq.sh
-# has smoke/11, install-agentq.ps1 has smoke/13 -- and this one, 251 lines, had
-# only 01's `sh -n`.  It sits in the "no check has ever executed it" table in
+# has smoke/11, install-agentq.ps1 has smoke/13 -- and this one had only 01's
+# `sh -n`.  (No line count in this sentence: an embedded one goes stale, measured
+# 2026-11-17 at 251 against 459.)  It sits in the "no check has ever executed it" table in
 # docs/verification-status.md, and unlike the two Windows-only assets left there it is fully
 # runnable on this machine, so leaving it uncovered was a choice, not a limit.
 #

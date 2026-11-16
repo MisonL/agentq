@@ -551,6 +551,31 @@ jq 分支**，是本检查从来没有过的**执行证据**（`08` 仍只是间
      一次尝试失败时，把「抢了槽位的那个阻塞」也结束掉，下一次从同一状态起步。
   仍记为**未验证**的边界：本机 `pueued` 与 CI 上的 `pueued` 都按 `parallel 1` 配组，
   其他 `pueue.yml`（例如 `daemon` 段起 worker 数不同）下的分派顺序没有证据。
+  5. **第五版（定稿）：只信 AgentQ 服务端自己的 `status`。** 第四版仍以 Pueue 的
+     Running 作为门槛，而在**重启过的主沙箱**里它直接失败：一个本进程之外的任务已占着
+     组里唯一的槽，新加的阻塞排在它后面。沙箱与主沙箱的差别经查是 pueued 的**运行时长**
+     （两边的组设置都是 1）。SIGKILL 掉 pueued 再拉起也复现不了「已启动的组整队在一个
+     tick 内分派」，那一观察因此**没能复现**，不再作为依据。
+     定稿的形态：阻塞任务带 `AGENTQ_SMOKE_BLOCKER=1` 标记（判据只看服务端给出的命令、
+     只结束带本标记的任务），先清掉上一次运行留下的阻塞；每次尝试加一个阻塞、用服务端
+     `status` 等它 Running、提交 victim、再用服务端 `status` 判它是否 Queued；只有
+     victim 仍是 Running 才换一轮重试（它一旦 Done/Failed 就不可能再变 Queued），8 轮
+     仍不成就**失败并说明**。EXIT trap 无条件把组并行度恢复为 1（`restore_agentq_group`），
+     否则一次中断的运行会让该运行时的新任务永远排队，后续每个用例都以看似无关的方式变红
+     ——这是审查 agent 指出的最高优先级问题，已修。
+     这一段的代价：`smoke/03` 变长（每次重试一轮 `sleep 60` 阻塞），主沙箱里单次运行
+     由约 3 分钟增至约 5 分钟；CI 上的 Pueue 是全新沙箱，通常第一轮就成功。
+  4. **第四版：基于 `pueue status` 的「Running」门槛在本机沙箱里不成立。** 端到端跑
+     `smoke/03` 时报「only 0 of 1 blocker task(s) reached Running」，而队列里那个阻塞
+     任务显示 `Done`、耗时近 60 秒——`sleep 60` 被提前结束。此前手工探测时，同样的读取
+     给出过 `[0 Running, 1 Running]` 而组写着 `parallel 1`（即 `pueue status` 把没跑过
+     的任务也算成 Running），一个阻塞被「当 Running 后」又被 `remove` 的收尾路径同样可疑。
+     结论：`pueue status` 的 Running **不能当证据**，门槛删掉。现在的形态不预测 Pueue——
+     第 n 次尝试加 n 个 `sleep 60` 阻塞 → 提交 → 用 **AgentQ 服务端自己的 `status`** 判
+     victim 是否 Queued；不是就 `remove` 掉 victim（不用 `cancel`，否则会给下面的重放
+     用例留下 cancellation marker）与占位阻塞，清掉 record 后加更多阻塞重试；8 次都不成
+     则**失败**并说明，绝不假绿。**未复现、未定位**：`sleep 60` 为何提前结束、`status`
+     为何给 Running，这两件事本身没有根因，只是不再依赖它们。
 
 **未修、如实记为边界**：`agents` 那边报的「共享管理员 Windows 主机：服务端在
 `C:\ProgramData\AgentQ`、客户端在用户目录，同一台机器上不同用户的客户端看不见彼此的
