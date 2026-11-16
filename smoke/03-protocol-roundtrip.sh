@@ -169,19 +169,22 @@ cleanup_own_records() {
         rm -f -- "$record"
     done
 }
-# The agentq group's parallelism is restored unconditionally: the queued case
-# lowers it below 1 as its mechanism, and a run that exits between the lowering
-# and the restore would otherwise leave the runtime with a group that never
-# dispatches -- every later check on it fails for a reason that has nothing to
-# do with what it tests.  Done before the task cleanup so those removes do not
-# queue behind a stopped group.
+# The agentq group's parallelism is restored on every exit path, FIRST in the
+# trap: a run that ends while the queued case has the group below 1 would
+# otherwise leave the runtime with a group that never dispatches, and every
+# later check on it fails for a reason that has nothing to do with what it
+# tests.  First, so the task cleanup below does not queue behind a stopped
+# group; loudly, because a restore that silently failed would leave exactly
+# that state.
 restore_agentq_group() {
-    [ -d "$runtime_home/config" ] || return 0
+    [ -f "$runtime_home/config/pueue.yml" ] || return 0
     [ -x "$runtime_home/pueue" ] || return 0
-    PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" \
-        "$runtime_home/pueue" parallel --group agentq 1 >/dev/null 2>&1 || true
+    if ! PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" \
+            "$runtime_home/pueue" parallel --group agentq 1 >/dev/null 2>&1; then
+        printf 'could not restore the agentq group parallelism to 1; the runtime may need a manual `pueue parallel --group agentq 1`\n' >&2
+    fi
 }
-trap 'cleanup_registered_tasks || true; cleanup_own_records || true; restore_agentq_group || true; if [ -f "$server_backup" ]; then mv -f -- "$server_backup" "$server"; fi; rm -rf -- "$work"' EXIT
+trap 'restore_agentq_group || true; cleanup_registered_tasks || true; cleanup_own_records || true; if [ -f "$server_backup" ]; then mv -f -- "$server_backup" "$server"; fi; rm -rf -- "$work"' EXIT
 
 # The two instance-binding fixtures below plant files into the runtime's data
 # directories.  Their paths are declared here, before any protocol work, so a
@@ -749,15 +752,28 @@ fi
 # count or a dispatch rule.  When no attempt queues the victim it FAILS and
 # says how far it got -- it never passes without having exercised the
 # `queued_removed` branch.
-blocker_ids=''
 blocker_started_id=''
 task_status_name() {
     local id=$1
     local snapshot
-    snapshot=$("$server" status 2>/dev/null) || return 1
+    snapshot=$("$server" status 2>/dev/null) || {
+        printf 'Unreadable'
+        return 0
+    }
+    # An id Pueue no longer holds, and one whose row says Removed, are both "not
+    # there"; a snapshot that will not parse is neither -- reporting it as
+    # "Absent" would let a broken read pass for a completed removal (measured
+    # shape: the restored-victim wait below would then succeed on nothing).
     jq -r --argjson id "$id" \
-        '.tasks[($id|tostring)].status | if type == "object" then (keys[0]) else "Absent" end' \
-        <<<"$snapshot" 2>/dev/null
+        '.tasks[($id|tostring)] // "Absent"
+         | if type != "object" then "Absent"
+           else (.status | if type == "object" and ((keys[0]) == "Removed") then "Absent"
+                           elif type == "object" then (keys[0]) else "Absent" end)
+           end' \
+        <<<"$snapshot" || true
+    if ! jq -e . >/dev/null 2>&1 <<<"$snapshot"; then
+        printf 'Unreadable'
+    fi
 }
 task_shows_queued() {
     local id=$1
@@ -765,6 +781,15 @@ task_shows_queued() {
     snapshot=$("$server" status 2>/dev/null) || return 1
     jq -e --argjson id "$id" '.tasks[($id|tostring)].status | has("Queued")' \
         <<<"$snapshot" >/dev/null 2>&1
+}
+# The check's own end/drop primitive: these are tasks this run created, and every
+# call is a harness action.  Deliberately the only way this block ends a task --
+# together with `add_blocker`, it is the whole surface where the queue is
+# mutated.
+agentq_task_harness() {
+    local subcommand=$1
+    local id=$2
+    "$server" "$subcommand" "$id" >/dev/null 2>&1 || true
 }
 add_blocker() {
     local output
@@ -782,7 +807,6 @@ add_blocker() {
     fi
     # Registered before anything else can fail: an unregistered `sleep 60` would
     # hold a slot, and the trap could only wait it out.
-    blocker_ids="$blocker_ids $blocker_id"
     cleanup_task_ids="$cleanup_task_ids $blocker_id"
     # No stdout at all -- the caller gets the id through this variable.  This
     # check captures the output of every command between itself and some later
@@ -814,8 +838,10 @@ if stale_snapshot=$("$server" status 2>/dev/null); then
                       or (.value.label // "") == ("agentq:" + $victim))
              | .key' <<<"$stale_snapshot" 2>/dev/null || true); do
         printf 'ending a task left by an earlier run of this check: %s\n' "$stale_id" >&2
-        pueue_harness kill "$stale_id"
-        pueue_harness remove "$stale_id"
+        # Not this run's task -- it outlived a killed earlier run of THIS
+        # check, which is why it carries this check's marker.
+        agentq_task_harness cancel "$stale_id"
+        agentq_task_harness remove "$stale_id"
     done
     if [ -n "$stale_victim_ids" ]; then
         for stale_id in $stale_victim_ids; do
@@ -879,6 +905,22 @@ for _ in $(seq 1 8); do
         Running) ;;
         *) break ;;
     esac
+    # A victim still Running is ended with `remove` -- never `cancel`, which
+    # would leave a cancellation marker for the replay case below -- and its
+    # record is waited out, not deleted: deleting an active record while the
+    # task is live is how a submit on the same id later answers `ambiguous`.
+    agentq_task_harness remove "$victim_task_id"
+    record_left=$request_record_directory/$victim_request_id.json
+    for _ in $(seq 1 60); do
+        [ -e "$record_left" ] || break
+        agentq_task_harness remove "$victim_task_id"
+        sleep 0.5
+    done
+    if [ -e "$record_left" ]; then
+        printf 'the queued victim record %s did not clear after remove; cannot retry safely\n' \
+            "$record_left" >&2
+        exit 1
+    fi
 done
 if [ "$victim_queued" -ne 1 ]; then
     printf 'a submitted task was never Queued (attempts: %s); the queued-cancel path was NOT exercised\n' \

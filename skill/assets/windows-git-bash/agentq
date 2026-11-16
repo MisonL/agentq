@@ -3854,6 +3854,7 @@ write_runtime_marker() {
 }
 
 repair_removed_request_records() {
+    local guards_status
     local record_files=()
     local record_path
     local request_id
@@ -3901,7 +3902,14 @@ repair_removed_request_records() {
                 # the length check above would then reject the whole batch --
                 # turning one concurrent removal back into the failure this
                 # whole arm exists to avoid.
+                # Only rc=1 (the file vanished) is a placeholder: any other
+                # non-zero status is the guard's OWN refusal, and writing
+                # `null` here made the batch answer "not found" for a record
+                # it had refused to look at -- the per-file fallback below
+                # fails loudly for exactly this file.
                 if ! request_record_path_guards_or_fail "$record_path"; then
+                    guards_status=$?
+                    [ "$guards_status" -eq 1 ] || exit 2
                     printf 'null\n'
                     continue
                 fi
@@ -4339,6 +4347,7 @@ find_request_task() {
     local raw_status_file
     local matches
     local match_count
+    local guards_status
     local task
 
     raw_status_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-reconcile-status' '.json') ||
@@ -5070,6 +5079,7 @@ task_identity_is_unambiguous() {
 wait_reconcile_missing_task() {
     local task_id=$1
     local allow_untracked=${2:-false}
+    local guards_status
     local tombstone_files=()
     local record_files=()
     local path
@@ -5118,7 +5128,15 @@ wait_reconcile_missing_task() {
         if output=$(
             {
                 for path in "${record_files[@]}"; do
-                    request_record_path_guards_or_fail "$path"
+                    # Same rule as the repair scan: a guard that REFUSED this
+                    # file (any status but the vanished 1) ends the batch, so
+                    # the failure is not folded into "no record has this task".
+                    request_record_path_guards_or_fail "$path" || {
+                        guards_status=$?
+                        [ "$guards_status" -eq 1 ] || exit 2
+                        printf 'null\n'
+                        continue
+                    }
                     printf '%s\n' "$(<"$path")"
                 done | jq -rs --args "$request_records_states_filter" -- "${record_ids[@]}"
             } 2>/dev/null
@@ -5197,7 +5215,12 @@ wait_reconcile_missing_task() {
                         # not abort the whole scan, and a bare `continue` would
                         # drop a line while the positional binding still carries
                         # its id.
+                        # Only rc=1 (the file vanished) gets a placeholder; any
+                        # other non-zero status is the guard's own refusal, and
+                        # `null` would have turned it into "not found".
                         if ! request_tombstone_path_guards_or_fail "$path"; then
+                            guards_status=$?
+                            [ "$guards_status" -eq 1 ] || exit 2
                             printf 'null\n'
                             continue
                         fi
