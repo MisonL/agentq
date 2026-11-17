@@ -599,6 +599,10 @@ jq 分支**，是本检查从来没有过的**执行证据**（`08` 仍只是间
      上一次运行留下的本检查形状的记录（标签是 `smoke` / `smoke-<case>` 之一）在启动时被点名
      清掉，不再拒绝运行。**主沙箱的全量套件**（2026-11-17 06:41 起跑）随后以同一版本走到
      `cancel-queued=queued_removed/5`——即在那台 pueued 已运行两天多的机器上也是真的 Queued。
+  9. **推送后的 CI（Linux，GitHub Actions run 43982913615）同一提交 `PASS 31 ran, 1 skipped,
+     0 partial, 0 failed`，`smoke/03` 摘要同样是 `cancel-queued=queued_removed/5`**——新的
+     queued 用例在 Linux 与全新沙箱上第一次跑就成立；跳过的 1 条是 `16`（CI 上无 memory 目录，
+     `NOT-covered`）。macOS job 只跑 `--quick`。
   4. **第四版：基于 `pueue status` 的「Running」门槛在本机沙箱里不成立。** 端到端跑
      `smoke/03` 时报「only 0 of 1 blocker task(s) reached Running」，而队列里那个阻塞
      任务显示 `Done`、耗时近 60 秒——`sleep 60` 被提前结束。此前手工探测时，同样的读取
