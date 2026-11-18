@@ -402,6 +402,87 @@ jq 分支**，是本检查从来没有过的**执行证据**（`08` 仍只是间
   **修复后契约形状**：≤约 8.1K 单参数全链路逐字回环；8.1K–32.5K 任务会被
   cmd 截断（stdin/env 层不再失败）；>32.5K 显式 rc=2 + `reason=protocol_error`。
 
+### 2026-11-18 第三轮终审（7 个只读 agent + Orca Codex，审的是 v0.1.33）——修 5 处，订正 3 处文档，3 条发现证伪
+
+**已修（每条都先自己复现，再改，再证明锁会红）**：
+
+1. **repair 回退循环的 `read_status` 跨迭代未清零（Codex P2）。** 回退循环里
+   `output=$(…) || read_status=$?` 只在读取**失败**时赋值，`read_status=${read_status:-0}`
+   也不清已有值——一条被拒/消失的记录之后，下一条合法 `removed` 记录沿用上一次的状态，
+   走「已消失」分支 `continue`，**不归档**。在 0.1.33 上实测：构造「第一条是符号链接记录、
+   第二条是合法 removed 记录」，`status` 退出码正常，第二条记录原样留在盘里；只有
+   `read_status=0` 放在每次尝试之前才归档。锁：`smoke/26` 的 V6b（注入的 `rm` 计数门控 +
+   计数器预置，使消失发生在**快路径**、回退得以运行），旧资产报
+   `records=1 tombstones=0, expected 0/1`，修复版 `cases=139`。
+   这一条与 0.1.33 的 tombstone 侧死代码是同一段循环的两半，但**可达性不同**：那两行测试
+   永不被求值，而这里的过期状态确实决定分支。
+2. **平台探测缓存的读取形态两份客户端不一致。** POSIX 用逐行 `sed … | tail -n 1`：JSON
+   数组根 `[{…}]` 命中并给出 `unix`，`{…}{…}` 取**最后**一个对象；Windows 侧反序列化对
+   数组给出空 `platform`、对尾随内容抛错——同一个缓存文件两侧可能得出不同平台。POSIX 改
+   整文件匹配 + 要求 `"platform"` 恰好出现一次 + 拒数组根；Windows 显式拒数组根、
+   `-NoEnumerate` 反序列化并检查结果是对象。锁：`smoke/05` 新增一例，**抽取资产里的
+   `platform_cache_read` 直接驱动**（旧资产 `HIT:unix HIT:unix HIT:windows`，新资产
+   `HIT:unix MISS MISS`）；`smoke/12` 的缓存形态表补数组根与尾随对象两格。
+3. **Windows 客户端的 `removed` / `output_encoding` 仍是宽松比较。** 0.1.32 把
+   `state`/`action`/`result`/`cancellation_mode` 改成了 `-ceq`，漏了这两处：`-eq` 让
+   `"removed":"True"`、`"removed":1`、`"output_encoding":"BASE64"` 全部通过（pwsh 7.5.4
+   实测三种都是 `True`），而 POSIX 的 jq 过滤器要求真布尔与精确小写。改为 `-is [bool]` +
+   `-ceq`。
+4. **`smoke/05` 的块读锁是行级的。** 原断言是 `grep -q 'OpenStandardInput\|\.Read()'`
+   与 `grep -q 'ReadByte\|\.Read()'`，**整文件任意位置**命中即可：把 launcher 的
+   `$Reader.Read()` 循环换成 `$Reader.Read($block, 0, 4096)`（正是要防的块读）、再在一行
+   `param(` 注释里留个 `ReadByte`，三个文件的断言全部通过（实测）。改为锚定读取调用
+   （`OpenStandardInput\(\)|Reader\.Read\(\)` 与 `\.ReadByte\(\)|Reader\.Read\(\)`），
+   同一变异体现在报 1 条失败。
+5. **`smoke/31` 的规则 D 接受空验证行，且临时文件只删主文件。** 单独一行 `  |` 也算
+   「验证行」；校准夹具里没有这种形态，所以它一直是绿的。规则改为
+   `^[[:space:]]*\|[[:space:]]*[^[:space:]]`，校准补一条 bare-bar 夹具。trap 原来只
+   `rm -f "$work"`，`.index`/`.log`/`.tags`/`.newest` 四个派生文件留在 `$TMPDIR`——那是
+   仓库内容的整份副本；改为 `"$work".*`。
+
+**文档订正（不改变行为，但原话与代码不符）**：
+
+1. `SKILL.md` 两处与 `contract.md`/`install.md` 各一处说「队列概览请用 `status --summary`，
+   它没有 doctor 那个副作用」。实测 `status()` 的第一句就是 `ensure_daemon`——pueued 未
+   运行时它同样会 `start_managed_daemon`。正确的说法：**所有**协议命令都不改队列，但都可能
+   启动服务，「只读」只指前者。要真正只读，直接 ssh 过去看文件。
+2. `SKILL.md` 说 tombstone 保留命令文本。`make_request_tombstone` 只投影
+   `version/request_id/task_id/task_created_at/state/removed_at`——不含 `payload`。
+   数据留存的说法改为「记录（含 `payload.argv`）在任务移除并归档前一直在；tombstone 不含
+   命令文本」。
+3. `README.md` 的示例 `--request-id nightly-01`（10 字符）违反自己文档的 16–128 规则，
+   改为 `nightly-build-01`。
+
+**证伪、未修（各自实测或读码确认）**：
+
+1. **「`wait --timeout` 的预算在传输重试时重置」**（Codex P2-3，称实测 4.11s 超了 2s 预算）。
+   源码里预算取自 `wait_timeout_seconds`，重试循环（`agentq_operation_attempt`）不重置它。
+   我实测（桩 ssh 睡 30s、预算 2s、重试 3 次）：exit 6，`--timeout 2` 用时 3–4s，
+   `AGENTQ_WAIT_TIMEOUT=2` 两次都是 4s——超出的 1–2s 是本地预算的**整秒轮询粒度**
+   （`sleep 1` 后判、加上 kill/wait 与进程启动），不是重试把预算重算了一遍。没有改。
+2. **「客户端接受 `lookup` 的 `accepted` 状态」**（协议 agent P2-1）。服务端确实从不产生它，
+   但客户端**容忍**一个未定义状态不等于缺陷：拒绝它会让未来服务端新增状态时旧客户端硬失败。
+   记录为边界，不改。
+3. **「维护锁元数据不可读时静默退出 2、没有 reason」**（服务器 agent P1）。读码：
+   `ensure_not_in_maintenance` 的 `unowned)` 分支调 `maintenance_lock_unowned`，后者以
+   `deployment_state` 失败；该 agent 自己贴的实验输出也是带 `reason=deployment_state` 的
+   退出 2。判为误报，**未实测**（它给的路径需要把维护锁目录做成不可读，本轮只读了控制流）。
+
+另有 **7 条来自 Windows/安全/POSIX 三个 agent 的发现未逐条落地**（PowerShell 5.1 下
+`& $script:SshPath` 对含 `=` 结尾的 base64 参数的处理、`sshp.ps1` 的码点与码元上界、
+`File.Replace` 的 ACL 继承、Windows 客户端 65536 字符的流读取上限、远端 `~/.local` 可写
+即等价于代码执行、`submit --workdir` 的 TOCTOU、响应体无长度上限）：它们要么**只能在
+真实 Windows 5.1/真机上验证**（本机 pwsh 7 无法复现参数绑定行为），要么是**设计边界**
+（提交者本来就能指定任意目录；能通过 ssh 以某账户登录本来就能执行命令）。记为边界，
+不在本轮改——按本仓规则，没有复现证据的改动不进资产。
+
+**我自己的一处错向改动（已撤回，记录以免重犯）**：曾把 Windows 侧七个数值/路径变量的
+`![string]::IsNullOrEmpty($env:…)` 改成 `$null -ne $env:…`，理由是「POSIX 的 `${VAR-default}`
+把空值当已设置」。`smoke/12` 的 `empty-means-default` 与 `config-empty` 两行**立刻变红**——
+这两行就是那条契约的锁：空值在两侧都表示「未设置、用默认值」，`IsNullOrEmpty` 才是对的
+一半。改动与随之写下的注释已全部撤回；`smoke/05` 里我一度加进去的「空值必须被拒」用例也
+一并撤掉（它会把错误方向钉成契约）。
+
 ### 2026-11-17 补红证（0.1.33）——0.1.32 的 ⑯ 无法证伪，还原为 0.1.31 形态，只删死代码
 
 用户要求给 0.1.32 的 ⑯（批量扫描「只有 rc=1 才写占位」）补红证。结论是**它在可达世界里
@@ -648,14 +729,23 @@ jq 分支**，是本检查从来没有过的**执行证据**（`08` 仍只是间
 **第三批（终审后的复核，2026-11-17 深夜）：** 一个只读 agent 报「`wait`/repair 的批量
 扫描把路径守卫的拒绝（exit 2）和文件消失（return 1）折叠成同一件事」。核对到三处调用点
 （`repair_removed_request_records`、`wait_reconcile_missing_task` 的 record 与 tombstone
-扫描）：两处写 `null` 占位、一处 `request_record_path_guards_or_fail "$path"` 直接进管道
-——守卫的拒绝在 `2>/dev/null` 后变成「这一批没有这个文件」，批量因此回答 `not found`/
-`removed`，而逐文件回退对同一文件是 `fail` 的。改为只把 rc=1 当消失，其余中止批量落回
-逐文件路径。**未写用例（但有变异证据）**：构造「record 被换成符号链接」的夹具要改动运行时数据目录
+扫描），**其中两处**（wait 的 record 扫描与 tombstone 扫描）被改成了写 `null` 占位的形式；
+第三处（`repair_removed_request_records` 的批量扫描）当时**没有**进管道的那种形态，
+`request_record_path_guards_or_fail "$path"` 那行是它改到一半时的读法（2026-11-18 复核：
+`git diff` 里只有两处新增 `guards_status`，repair 的批量扫描直到 0.1.33 都是原样）。
+**2026-11-18 补记**：这个「守卫拒绝被 `2>/dev/null` 吞掉」的缺陷**真实存在**，但可观测性
+与当时的说法不同——在 `if ! guard; then …; printf null; continue; fi` 这个形状里，
+`| jq` 收到的是 `null` 占位而不是空输入，批量**成功**并把被拒记录当作「没有这个文件」，
+批量因此回答 `not found`/`removed`；把它改成 `exit 2` 或 `true` 才逐字节不可区分。
+原始说法（「变成这一批没有这个文件」）在 `||` 形状下成立，在 `if !` 形状下不成立。**未写用例（但有变异证据）**：构造「record 被换成符号链接」的夹具要改动运行时数据目录
 的形态，本轮没有做。**还没有红证**：符号链接夹具与「回退守卫 → 变红」的变异证明都应当补上，
 **2026-11-17 补记**：上面这段的修复在 0.1.33 被还原——补红证时实测它「只有 rc=1
 才写占位」的那两行测试写在 `if !` 块里，`$?` 恒为 0、`|| exit 2` 求值不到，换成
-`exit 2`/`exit 7`/`true` 同一夹具答案逐字节相同，见本文件 2026-11-17 节。以下保留原文作当时判断。
+`exit 2`/`exit 7`/`true` 同一夹具答案逐字节相同，见本文件 2026-11-17 节。**2026-11-18 再补记**：
+wait 的 record 批量扫描（`request_record_path_guards_or_fail "$path" || { guards_status=$?; … }`）
+里那两行**仍在**，0.1.33 只删了 tombstone 侧同样的两行；保留的这一侧在守卫拒绝时同样到不了
+`exit 2`（`$?` 读到的是取反后的值），行为上与删除前等价，同样只是死代码——这次没有一并删，
+以免把这轮「只动 tombstone 侧」的变更面再扩大。以下保留原文作当时判断。
 
 本轮**没有做**，所以这一条按「已修、未证明」记——`smoke/26` 的注入点全部落在
 `.task_label` 读取，`repair` 与 `wait` 的批量扫描都不经过那里，不能拿来当它的锁。该 agent 的另一条（`repair` 回退循环预读下一行、`fail` 覆盖前一条

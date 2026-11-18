@@ -1488,6 +1488,11 @@ for variable in AGENTQ_SUBMIT_RETRY_ATTEMPTS AGENTQ_SUBMIT_RETRY_DELAY \
     # Windows client accepted was refused here and vice versa.  Both now take
     # exactly `^[1-9][0-9]*$` up to 2147483647, and this case is what keeps them
     # there: a leading zero is not a positive integer in either client.
+    #
+    # A PRESENT-BUT-EMPTY value is NOT among these shapes on purpose: both
+    # clients treat it as "unset, use the default" (sh's `${VAR:-default}` here,
+    # IsNullOrEmpty on the Windows twin), and smoke/12's `empty-means-default`
+    # row is that direction's lock.
     for env_value in 0 99999999999999999999 05; do
         env_rejections=$((env_rejections + 1))
         status=0
@@ -1499,6 +1504,63 @@ for variable in AGENTQ_SUBMIT_RETRY_ATTEMPTS AGENTQ_SUBMIT_RETRY_DELAY \
         fi
     done
 done
+
+# The platform-probe cache is read by BOTH clients against the SAME file, so
+# the shapes they refuse must be the same shapes.  Measured 2026-11-18: a JSON
+# ARRAY root and a second trailing object were read as platform=unix/windows by
+# this client's line-wise sed while the Windows twin's deserializer refused
+# them -- one cache file, two platforms.  The functions are extracted from the
+# shipped asset (not re-spelled here) and driven directly, so the case cannot
+# pass on a copy that drifted from the client.
+posix_cache_fns="$work/posix-cache-fns.sh"
+cache_fn_list='is_bounded_positive_integer() {
+platform_cache_enabled() {
+platform_cache_path_for_host() {
+platform_cache_read() {'
+while IFS= read -r cache_fn; do
+    awk -v fn="$cache_fn" 'index($0, fn) == 1 { f = 1 } f { print } f && /^}$/ { exit }' \
+        "$client" >>"$posix_cache_fns"
+done <<<"$cache_fn_list"
+cases=$((cases + 1))
+posix_cache_dir=$work/posix-platform-cache
+mkdir -p "$posix_cache_dir/platform-cache"
+posix_cache_now=$(date +%s)
+posix_cache_verdicts=$(
+    # shellcheck disable=SC1090  # extracted from the asset under test, by design
+    . "$posix_cache_fns"
+    program=agentq
+    host=smoke-cache-host
+    remote_platform=auto
+    # The check exports AGENTQ_PLATFORM_PROBE_CACHE=off for the probing cases
+    # above; this case drives the READER directly, so the switch must be on.
+    # (Measured 2026-11-18: without this the reader answers MISS for a valid
+    # entry -- the case would have asserted the wrong thing on a correct asset.)
+    AGENTQ_PLATFORM_PROBE_CACHE=on
+    # Both names are read by the extracted functions (dynamic scope), which
+    # shellcheck cannot see.
+    # shellcheck disable=SC2034
+    cache_state_directory=$posix_cache_dir
+    # shellcheck disable=SC2034
+    platform_probe_cache_ttl=604800
+    posix_cache_file=$(platform_cache_path_for_host) || exit 3
+    cache_bodies='{"platform":"unix","probed_at":__NOW__}
+[{"platform":"unix","probed_at":__NOW__}]
+{"platform":"unix","probed_at":__NOW__}{"platform":"windows","probed_at":__NOW__}'
+    while IFS= read -r body; do
+        body=${body//__NOW__/$posix_cache_now}
+        printf '%s\n' "$body" >"$posix_cache_file"
+        remote_platform=auto
+        if platform_cache_read; then
+            printf 'HIT:%s ' "$remote_platform"
+        else
+            printf 'MISS '
+        fi
+    done <<<"$cache_bodies"
+)
+if [ "$posix_cache_verdicts" != 'HIT:unix MISS MISS ' ]; then
+    printf 'client-contract: the platform-cache reader answered [%s] for (object / array root / trailing object); expected [HIT:unix MISS MISS ] -- the Windows twin refuses the last two\n' "$posix_cache_verdicts" >&2
+    failures=$((failures + 1))
+fi
 
 # AGENTQ_WAIT_TIMEOUT is validated on the WAIT path, not at startup (both
 # clients do it there, so the loop above cannot see it: `--help` never reaches
@@ -2331,9 +2393,15 @@ fi
 cases=$((cases + 1))
 windows_wrapper_asset="$root/skill/assets/client/windows/agentq.ps1"
 launcher_asset="$root/skill/assets/windows-git-bash/agentq-launcher.ps1"
+# The two patterns name the READ CALLS, not any mention of them.  The first
+# version used bare `OpenStandardInput` / `ReadByte` / `.Read()` anywhere in the
+# file, so a block read plus ONE unrelated mention in a comment passed -- the
+# whole-file property it claimed to check.  Measured 2026-11-18: replacing the
+# launcher's `$Reader.Read()` loop with `$Reader.Read($block, 0, 4096)` and
+# leaving the word `ReadByte` in a `param(` comment kept all three checks green.
 for wrapper_file in "$client" "$windows_wrapper_asset" "$launcher_asset"; do
-    if ! grep -q 'OpenStandardInput\|\.Read()' "$wrapper_file" || \
-       ! grep -q 'ReadByte\|\.Read()' "$wrapper_file"; then
+    if ! grep -qE 'OpenStandardInput\(\)|Reader\.Read\(\)' "$wrapper_file" || \
+       ! grep -qE '\.ReadByte\(\)|Reader\.Read\(\)' "$wrapper_file"; then
         printf 'client-contract: %s no longer reads the Windows argument payload per byte (the block read hangs on real Windows ssh)\n' "$wrapper_file" >&2
         failures=$((failures + 1))
     fi

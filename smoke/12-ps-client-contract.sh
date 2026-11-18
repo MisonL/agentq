@@ -3653,7 +3653,14 @@ $env:AGENTQ_PLATFORM_PROBE_CACHE = "on"
 [void](New-Item -ItemType Directory -Path (Join-Path $dir "platform-cache") -Force)
 $path = Get-PlatformProbeCachePath
 $bad = 0
-foreach ($body in @('{}', 'null', '{"platform":"unix"}', '{"platform":"bogus","probed_at":1}', 'not json at all')) {
+# The last two shapes are the twin-alignment ones (2026-11-18): a JSON ARRAY
+# root and a SECOND trailing object both expose .platform to a lenient reader,
+# while the POSIX twin used to answer platform=unix for both.  Both sides must
+# treat them as misses now.
+$nowShape = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+foreach ($body in @('{}', 'null', '{"platform":"unix"}', '{"platform":"bogus","probed_at":1}', 'not json at all',
+        ('[{"platform":"unix","probed_at":' + $nowShape + '}]'),
+        ('{"platform":"unix","probed_at":' + $nowShape + '}{"platform":"unix","probed_at":' + $nowShape + '}'))) {
     [System.IO.File]::WriteAllText($path, $body)
     $script:RemotePlatform = "auto"
     try {

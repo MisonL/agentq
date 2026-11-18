@@ -4,6 +4,7 @@
 版本（tag）是**部署单元的版本**，与 Pueue 版本无关（见 README）。
 
 ## 版本索引（Releases）
+- **[v0.1.34](https://github.com/MisonL/agentq/releases/tag/v0.1.34)**（2026-11-18）— 第八十八类：第三轮终审（审 v0.1.33）——repair 回退循环的 `read_status` 跨迭代不清零（拒绝一条就静默跳过后续合法记录）、平台缓存的读取形态两份客户端相反、Windows 客户端两处协议值仍是宽松比较，外加两条检查自身的假绿（块读锁行级、空验证行）
 - **[v0.1.33](https://github.com/MisonL/agentq/releases/tag/v0.1.33)**（2026-11-17）— 给 0.1.32 的 ⑯ 补红证失败：那段批量扫描守卫在可达世界里不产生差别（`if !` 块里的 `$?` 恒为 0，`|| exit 2` 求值不到），还原为 0.1.31 形态并删去死代码；其余与 0.1.32 逐字节相同
 - **[v0.1.32](https://github.com/MisonL/agentq/releases/tag/v0.1.32)**（2026-11-17）— 第八十七类：第二轮终审（审 v0.1.31 本身）——服务端 47 处持久化字段读取的 fail-open、两份客户端的协议校验不等价、`smoke/21` 的 rc=2 分支从未被执行
 - **[v0.1.31](https://github.com/MisonL/agentq/releases/tag/v0.1.31)**（2026-11-16）— 第八十六类：终审修 5 处（见日志区 2026-11-16 条目）
@@ -61,6 +62,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
 
+
+2026-11-18  **第三轮终审（7 个只读 agent + Orca Codex，审的是 v0.1.33），版本 0.1.33 → 0.1.34，修 5 处**——① **服务端 repair 回退循环的 `read_status` 跨迭代不清零**（Codex P2，唯一一处真缺陷）：`|| read_status=$?` 只在失败时赋值，一条被拒/消失的记录之后，下一条合法 `removed` 记录沿用旧状态、走「已消失」分支跳过、**不归档**；实测同一夹具 0.1.33 留下记录、修复版归档。② **平台探测缓存的读取形态两份客户端不一致**：POSIX 逐行 `sed | tail -1` 把 JSON 数组根读成命中、`{…}{…}` 取最后一个对象，Windows 侧反序列化两者都给 miss/抛错——同一缓存文件两个平台。两侧统一为「数组根与尾随对象都是 miss、`platform` 必须恰好一次」，并各加锁（`smoke/05` 抽资产函数直驱、`smoke/12` 缓存形态表 +2 格）。③ **Windows 客户端的 `removed` / `output_encoding` 仍是宽松比较**（0.1.32 漏改两处）：`"True"`、`1`、`"BASE64"` 全部通过（pwsh 实测），改为 `-is [bool]` + `-ceq`。④ **`smoke/05` 的块读锁是行级的**：整文件任意位置出现 `ReadByte` 即可，把 launcher 换成 4096 块读、注释里留一个词，三份资产仍全绿；改为锚定读取调用。⑤ **`smoke/31` 的规则 D 接受空验证行（单独一行 `  |`），且 trap 只删主临时文件**、留下四份仓库内容副本；两处都修并加校准夹具。文档订正四处：`SKILL.md`/`contract.md`/`install.md` 原称 `status --summary` 没有 `doctor` 的副作用——实测 `status()` 第一句就是 `ensure_daemon`，pueued 未运行时同样会启动服务；`SKILL.md` 原称 tombstone 保留命令文本——`make_request_tombstone` 只投影六个字段、不含 `payload`；`README.md` 的示例 request id `nightly-01` 只有 10 字符、违反 16–128 规则。**三条发现证伪/记为边界**：`wait --timeout` 预算在重试时重置（实测 2s 预算用时 3–4s，多出的是整秒轮询粒度，不是重算）；`lookup` 的 `accepted` 状态被客户端容忍（服务端从不产生，容忍未定义状态是前向兼容，不是缺陷）；维护锁不可读时无 `reason=`（控制流走 `maintenance_lock_unowned`，带 `deployment_state`，误报）。另 7 条需要真实 Windows 5.1/真机或属设计边界的发现记为边界，不改资产（见 `docs/PLAN.md`）。
+  |  `AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq ./run-tests.sh` → **31 ran, 0 skipped, 0 partial, 0 failed**、exit 0（真实 pueue 沙箱）；`smoke/26` → `cases=139`（新 V6b 在旧资产上报 `records=1 tombstones=0, expected 0/1`）；`smoke/05` → `cases=109 shellcheck=checked(9)`（缓存对齐用例在旧资产上报 `HIT:unix HIT:unix HIT:windows`）；`smoke/12` 全绿含 `empty-means-default` / `config-empty` 两格；`smoke/31` → `index=35 tags=35`；`cmp` 两份 canonical server 资产 = 0
 
 2026-11-17  **0.1.32 的 ⑯ 无法证伪，还原为 0.1.31 形态（版本 0.1.32 → 0.1.33；资产只删死代码）**——用户要求补红证。实测：守卫拒绝执行的是 `fail`（`exit 2`），而它所在的 `if ! guard; then` 块里 `$?` 读到的是取反后的 `0`，`|| exit 2` 分支永不被求值；把两行换成 `exit 2`、`exit 7`、`true`，同一夹具（墓碑路径是目录）的答案逐字节相同。把测试挪出 `if !` 后也不可观测：`wait`/`repair` 的批量失败会回退到逐文件循环，而它对同一文件本来就响亮失败，批量的状态落在 jq 的报错之后。`PIPESTATUS`、`||` 臂里的 `exit`、组内 `pipefail` 三种承载方式逐个试过，都不传播（细节见 `docs/PLAN.md` 2026-11-17 节）。决定：不写永远绿的锁，资产 = 0.1.32 − 那两段死代码（逐字节比对，除版本常量），`smoke/26` 保持 137 例。
   |  `./run-tests.sh` → **31 ran, 6 skipped, 0 partial, 0 failed (1364s)**、exit 0（6 个 skipped 是未提供 `AGENTQ_SMOKE_HOME` 的运行时检查）；`smoke/26` → `cases=137 reason-gaps=0`；`smoke/05` → `shellcheck=checked(9)`；`smoke/31` → `index=34 tags=34`；`cmp` 两份 canonical server 资产 = 0；与 0.1.32 的资产逐字节比对：只有版本常量与两处墓碑批量死代码的差异

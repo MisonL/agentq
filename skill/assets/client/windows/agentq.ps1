@@ -141,16 +141,21 @@ function Test-NonReparseWindowsFilePath {
 }
 
 $script:UserProfileDirectory = Resolve-CurrentWindowsUserProfile
-# IsNullOrEmpty, NOT IsNullOrWhiteSpace, for every AGENTQ_* variable that names
-# a value (a path, a program, an enumerated switch).  The POSIX twin resolves
-# these with `[ -n ]` / `${VAR:-default}`, which substitute only for EMPTY: a
-# whitespace-only value is SET there and goes on to its normal validation.  With
-# IsNullOrWhiteSpace the same environment meant "unset, use the default" here
-# and "set, refuse" there -- measured 2026-11-05 on the 0.1.19 assets, and the
-# sharpest row is AGENTQ_CONFIG=' ': POSIX said "no SSH host configured" while
-# this client read the DEFAULT config and connected to the host it named.  Same
-# class as the seven numeric variables fixed 2026-11-04 (IsNullOrEmpty there
-# too); that fix was scoped to the variables in hand, and these were left.
+# IsNullOrEmpty, NOT IsNullOrWhiteSpace and NOT a `$null -ne` test, for every
+# AGENTQ_* variable that names a value (a path, a program, an enumerated
+# switch).  The POSIX twin resolves these with `[ -n ]` / `${VAR:-default}`,
+# which substitute for EMPTY: a whitespace-only value is SET there and goes on
+# to its normal validation, an empty one means "use the default".  This client
+# must match both halves.  With IsNullOrWhiteSpace the same environment meant
+# "unset" here and "set, refuse" there -- measured 2026-11-05 on the 0.1.19
+# assets, the sharpest row being AGENTQ_CONFIG=' ': POSIX said "no SSH host
+# configured" while this client read the DEFAULT config and connected to the
+# host it named.  A `$null -ne` test would swing the other way and treat EMPTY
+# as set -- smoke/12's `empty-means-default` / `config-empty` rows are the lock
+# for that direction (measured 2026-11-18: they went red on exactly that
+# change).  AGENTQ_HOST is the one deliberate exception: both clients document
+# a whitespace-only host as UNSET (it falls back to the configured host), which
+# is why its read site below keeps IsNullOrWhiteSpace and smoke/12 locks it.
 # AGENTQ_HOST is the one deliberate exception: both clients document a
 # whitespace-only host as UNSET (it falls back to the configured host), which is
 # why its read site below keeps IsNullOrWhiteSpace and smoke/12 locks it.
@@ -199,7 +204,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFOR
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.33"
+$script:ClientVersion = "0.1.34"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's Pueue command ceiling, not this machine's platform: a
 # unix target takes up to 100000 base64 characters (the POSIX twin's
@@ -1853,8 +1858,20 @@ function Read-PlatformProbeCache {
         if (!(Test-NonReparseWindowsFilePath -Path $path)) {
             return $false
         }
-        $entry = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
-        if ($null -eq $entry) {
+        $rawCacheText = Get-Content -LiteralPath $path -Raw
+        # An ARRAY root is a MISS, and so is a second trailing object.  Both
+        # sides used to disagree (measured 2026-11-18 on pwsh 7.5.4): the POSIX
+        # twin's line-wise sed read an array entry as platform=unix and took
+        # the LAST object of a `{...}{...}` file, while this side's
+        # ConvertFrom-Json produced $null platform for the array and threw on
+        # the trailing content.  Two clients, one cache file, two answers.  The
+        # writer only ever emits one object, so refusing these shapes never
+        # loses a real entry.
+        if ($rawCacheText -match '^\s*\[') {
+            return $false
+        }
+        $entry = $rawCacheText | ConvertFrom-Json -NoEnumerate -ErrorAction Stop
+        if (($null -eq $entry) -or ($entry -isnot [System.Management.Automation.PSCustomObject])) {
             return $false
         }
         $platformProperty = $entry.PSObject.Properties["platform"]
@@ -1918,7 +1935,10 @@ function Write-PlatformProbeCache {
             }
         }
         $entry = @{ platform = $script:RemotePlatform; probed_at = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); probe_ms = 0 }
-        $json = $entry | ConvertTo-Json -Compress
+        # -InputObject, because the HASH TABLE pipelines as one object -- `$entry
+        # | ConvertTo-Json` sends its dictionary entries to the pipeline and a
+        # two-key table wrote TWO concatenated JSON objects into one file.
+        $json = ConvertTo-Json -InputObject $entry -Compress
         $temporary = "$path.$PID.tmp"
         [System.IO.File]::WriteAllText($temporary, $json + [Environment]::NewLine)
         # An overwrite is only atomic through File.Replace: the three-argument
@@ -2353,7 +2373,8 @@ function Test-AgentQJsonResponse {
             $hasBase64Output = (Test-JsonObjectProperty -Object $response -Name "output") -and
                 ($null -eq $response.output) -and
                 (Test-JsonObjectProperty -Object $response -Name "output_encoding") -and
-                ($response.output_encoding -eq "base64") -and
+                ($response.output_encoding -is [string]) -and
+                ($response.output_encoding -ceq "base64") -and
                 (Test-JsonObjectProperty -Object $response -Name "output_base64") -and
                 (Test-Base64String -Value $response.output_base64)
             $valid = (Test-JsonObjectProperty -Object $response -Name "task") -and
@@ -2408,7 +2429,13 @@ function Test-AgentQJsonResponse {
             $valid = (Test-JsonObjectProperty -Object $response -Name "task_id") -and
                 (Test-JsonNumber -Value $response.task_id) -and
                 (Test-TaskIdMatch -Actual $response.task_id -Expected $ExpectedTaskId) -and
-                (Test-JsonObjectProperty -Object $response -Name "removed") -and ($response.removed -eq $true)
+                # A BOOLEAN, not PowerShell's loose -eq: `-eq` turns the
+                # strings "True" and the number 1 into $true (measured
+                # 2026-11-18 on pwsh 7.5.4), while the POSIX twin's jq filter
+                # requires a real boolean and contract.md says every protocol
+                # value is matched in its canonical form.  Same for
+                # output_encoding below ("BASE64" -eq "base64" is $true).
+                (Test-JsonObjectProperty -Object $response -Name "removed") -and ($response.removed -is [bool]) -and ($response.removed -eq $true)
         }
         default {
             $valid = ($response -is [pscustomobject])

@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.33'
+agentq_client_version='0.1.34'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072), and the unix bound keeps a
 # safety margin under it.
@@ -3349,12 +3349,30 @@ platform_cache_read() {
     esac
     platform_cache_file=$(platform_cache_path_for_host) || return 1
     [ -f "$platform_cache_file" ] && [ ! -L "$platform_cache_file" ] || return 1
-    platform_cache_platform=$(LC_ALL=C sed -n 's/.*"platform":"\([a-z]*\)".*/\1/p' "$platform_cache_file" | tail -n 1)
+    # WHOLE-FILE match, not a line-wise search: the Windows twin deserializes
+    # the file, so a JSON ARRAY root (or a second trailing object) is a MISS
+    # there.  `sed -n s/.../p | tail -n 1` accepted both -- two clients, one
+    # cache file, two platforms (measured 2026-11-18 on pwsh 7.5.4).
+    platform_cache_text=$(LC_ALL=C tr -d '\r\n' < "$platform_cache_file") || return 1
+    # An ARRAY ROOT and a second object are misses on BOTH sides: this side
+    # counted occurrences, the Windows twin deserializes (ConvertFrom-Json
+    # rejects trailing content, and its array root is refused explicitly).
+    # Measured 2026-11-18: before this, `[{...}]` was a HIT only in some
+    # sed shapes and `{...}{...}` was a HIT here but a MISS there.
+    case "$platform_cache_text" in
+        *'['*) return 1 ;;
+    esac
+    platform_cache_count=$(printf '%s' "$platform_cache_text" | LC_ALL=C grep -o '"platform"' | wc -l | tr -d ' ')
+    [ "$platform_cache_count" = 1 ] || return 1
+    # Optional whitespace around the colon, because the other reader is a JSON
+    # deserializer and would accept a pretty-printed file this client's writer
+    # never produces (`-Compress` on both sides today).
+    platform_cache_platform=$(printf '%s' "$platform_cache_text" | LC_ALL=C sed -n 's/^.*"platform"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*$/\1/p')
     case "$platform_cache_platform" in
         unix|windows) ;;
         *) return 1 ;;
     esac
-    platform_cache_age=$(LC_ALL=C sed -n 's/.*"probed_at":\([0123456789]*\).*/\1/p' "$platform_cache_file" | tail -n 1)
+    platform_cache_age=$(printf '%s' "$platform_cache_text" | LC_ALL=C sed -n 's/^.*"probed_at"[[:space:]]*:[[:space:]]*\([0123456789]*\).*$/\1/p')
     # is_bounded_positive_integer, not a bare charset test: a leading-zero
     # value passes `[ !0-9 ]` and `[ -le ]` (test parses decimal), then dies
     # INSIDE `$((now - age))` -- dash parses `0…` as octal, "Illegal number:

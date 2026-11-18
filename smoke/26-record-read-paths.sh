@@ -641,6 +641,7 @@ fi
 #     is what makes the fallback run at all.  Assertion: the vanished record
 #     must NOT be the one named by the recovery failure -- the failure must be
 #     the directory's, which is the genuinely unsafe one.
+#
 clear_runtime
 put_record AQREAD-VFALLBACK-0001 accepted 1001 '"2026-09-29T00:00:00Z"'
 mkdir -p "$work/data/agentq-requests/AQREAD-VFBDIR-00000002.json"
@@ -686,6 +687,24 @@ if ! grep -qF 'AQREAD-VFBDIR-00000002' "$work/v6.err"; then
     failures=$((failures + 1))
 fi
 rmdir "$work/data/agentq-requests/AQREAD-VFBDIR-00000002.json"
+
+# V6b. The repair FALLBACK's `read_status` was never cleared between records.
+#     `|| read_status=$?` assigns only when the read FAILS, so a VANISHED
+#     record left 1 behind and the next (valid) record took the vanish arm:
+#     skipped silently, never archived.  Measured 2026-11-18 on 0.1.33.
+#     The vanish is the count-gated rm reaching its threshold on the FAST
+#     path: the guard passes VFALLBACK, the file disappears before the read,
+#     the batch dies and the per-file fallback runs.  Counter seeding is the
+#     mechanism that moves the rm from the fallback call to the fast-path one.
+clear_runtime
+put_record AQREAD-VFALLBACK-0001 accepted 1001 '"2026-09-29T00:00:00Z"'
+put_record AQREAD-ZCLEAN-00000003 removed 3003 '"2026-09-29T00:00:00Z"'
+printf '1' > "$work/.v6cnt"
+run_forced3 v6b status
+assert_rc v6b 0
+assert_counts v6b 0 1
+rm -f "$work/.v6cnt"
+clear_runtime
 
 # V7. The cancellation-marker reader is the third copy of the same race, and
 #     its symptom was worse: the marker loop's `fail` made the pipeline fail,

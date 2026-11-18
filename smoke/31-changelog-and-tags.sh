@@ -41,7 +41,11 @@ if [ ! -f "$changelog" ]; then
 fi
 
 work=$(mktemp "${TMPDIR:-/tmp}/agentq-changelog.XXXXXX")
-trap 'rm -f -- "$work"' EXIT
+# The trap removes every temp this script derives from $work (`.index`, `.log`,
+# `.tags`, `.newest`), not only the bare name: the index/log/tag files are
+# full copies of repo content, and leaving them in $TMPDIR after a run is a
+# leak of exactly the files this check reads.  Measured 2026-11-18.
+trap 'rm -f -- "$work" "$work".*' EXIT
 
 # --- extract the version index --------------------------------------------
 # An index line is "  - **[vX.Y.Z](<url>)** ...".  Extracted with sed rather than
@@ -145,7 +149,12 @@ else
         }
         started { print }' "$work.log")
     printf '%s\n' "$newest_block" >"$work.newest"
-    if ! grep -qE '^[[:space:]]*\|' "$work.newest"; then
+    # A verification line must carry a RECORD after the marker: a bare `  |`
+    # satisfies "a line whose first non-space character is '|'" while saying
+    # nothing.  Measured 2026-11-18: with the plain `^[[:space:]]*\|` form an
+    # entry whose only verification line was `  |` passed this rule and every
+    # calibration fixture, because none of them held a bare bar.
+    if ! grep -qE '^[[:space:]]*\|[[:space:]]*[^[:space:]]' "$work.newest"; then
         fail "the newest log entry ($newest_date) has no '|  <verification>' line; the short format requires one on every new entry"
     fi
     # The newest date must be the newest DATE too: a back-dated entry inserted
@@ -181,15 +190,18 @@ newest_has_verification() {
             next
         }
         started { print }' "$1" >"$1.block"
-    grep -qE '^[[:space:]]*\|' "$1.block"
+    grep -qE '^[[:space:]]*\|[[:space:]]*[^[:space:]]' "$1.block"
 }
 cal_dir=$(mktemp -d "${TMPDIR:-/tmp}/agentq-changelog-cal.XXXXXX")
 printf '2026-11-14  entry\n  |  ./run-tests.sh -> exit 0\n\n2026-11-13  older\n' >"$cal_dir/good.log"
 printf '2026-11-14  entry without verification\n\n2026-11-13  older\n  |  ok\n' >"$cal_dir/no-verify.log"
 printf '2026-11-14  entry\n  |  ok\n' >"$cal_dir/only.log"
+# A bare `  |` is not a verification line: it has the marker and no record.
+printf '2026-11-14  entry\n  |\n\n2026-11-13  older\n' >"$cal_dir/bare-bar.log" 
 if newest_has_verification "$cal_dir/good.log"; then :; else cal=bad; printf 'calibration: good fixture was flagged\n' >&2; fi
 if newest_has_verification "$cal_dir/no-verify.log"; then cal=bad; printf 'calibration: an entry with no verification line passed\n' >&2; fi
 if newest_has_verification "$cal_dir/only.log"; then :; else cal=bad; printf 'calibration: single-entry fixture was flagged\n' >&2; fi
+if newest_has_verification "$cal_dir/bare-bar.log"; then cal=bad; printf 'calibration: an empty verification line ("  |") passed\n' >&2; fi
 rm -rf "$cal_dir"
 check_cal "$cal" ok 'rule predicates'
 
