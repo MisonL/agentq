@@ -1531,17 +1531,22 @@ posix_cache_verdicts=$(
     program=agentq
     host=smoke-cache-host
     remote_platform=auto
+    # Consumed through dynamic scope by the extracted functions; named here so
+    # the locked SC2034 rule can see they are used (no `disable=` directive --
+    # this check treats one as a violation).
+    : "$program" "$host"
     # The check exports AGENTQ_PLATFORM_PROBE_CACHE=off for the probing cases
     # above; this case drives the READER directly, so the switch must be on.
     # (Measured 2026-11-18: without this the reader answers MISS for a valid
     # entry -- the case would have asserted the wrong thing on a correct asset.)
     AGENTQ_PLATFORM_PROBE_CACHE=on
-    # Both names are read by the extracted functions (dynamic scope), which
-    # shellcheck cannot see.
-    # shellcheck disable=SC2034
+    # Both names are read by the extracted functions through dynamic scope,
+    # which the linter cannot follow; referencing them here is what keeps the
+    # file clean under the locked SC2034 rule WITHOUT a narrowing directive
+    # (this check's own rule treats a `disable=` line as a violation).
     cache_state_directory=$posix_cache_dir
-    # shellcheck disable=SC2034
     platform_probe_cache_ttl=604800
+    : "$cache_state_directory" "$platform_probe_cache_ttl"
     posix_cache_file=$(platform_cache_path_for_host) || exit 3
     cache_bodies='{"platform":"unix","probed_at":__NOW__}
 [{"platform":"unix","probed_at":__NOW__}]
