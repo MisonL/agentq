@@ -369,6 +369,17 @@ AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq ./run-tests.sh
 发现检查，放进去会被当成检查执行。只动 `/tmp`，不碰真实 `~/.agentq` 与 launchd 域；
 `down` 只删带 marker 的目录（无 marker 则拒绝删除）。
 
+**调用形态本身也是前提**（2026-11-18 实测）：按上面的命令直接跑（前台或普通后台），
+不要套 `script`、也不要套 `nohup`——两种包装各打红一个检查，且都不是资产缺陷：
+
+- `script -q /dev/null …` 会给检查一个 **pty**，`05` 的「prompt 无 tty 必须拒绝」用例
+  前提不再成立，该用例失败（同日单独复测：`client prompt without a tty: stderr does
+  not contain requires a terminal`，共 1 例失败；同一形态下 28 全绿）。
+- `nohup …` 会改变信号处置：`nohup` 把 SIGHUP 设为 ignore，而被 ignore 的处置无法再被
+  trap，`28` 的 **SIGHUP 用例**据此失败（同日单独复测：`SIGHUP did not stop the client
+  (exit 255, expected 130)`）；同日一次 `nohup script …` 的全量里 05 红即属上一条。
+- 普通调用则 31 项全绿：`PASS checks: 31 ran, 0 skipped, 0 partial, 0 failed`（2555s）。
+
 手动搭建的等价步骤：
 
 ```sh
