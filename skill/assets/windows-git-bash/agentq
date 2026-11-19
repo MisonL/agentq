@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.34'
+agentq_version='0.1.35'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -607,6 +607,35 @@ is_positive_integer() {
         ''|*[!0123456789]*|0) return 1 ;;
         *) return 0 ;;
     esac
+}
+
+# A positive integer that fits 2^31-1.
+#
+# This bound is NEW (2026-11-19) and the two clients do NOT share it -- both of
+# them accept any number of digits for `--tail` and forward the value.  What the
+# bound buys is the ANSWER: without it, `logs <id> --tail 99999999999999999999`
+# reached BSD `tail -n` ("illegal offset"), failed as a Pueue log read, and came
+# back as exit 1 / "Pueue could not read the log" -- an infrastructure-sounding
+# failure for what is simply an argument a human typed wrong.  With it the server
+# answers 2 / protocol_error, which is what the exit-code table promises for bad
+# arguments, and no log path is touched.
+#
+# Leading zeros stay ACCEPTED: the server canonicalizes them today, so refusing
+# them here would reject input that works.  They are stripped first so the
+# magnitude test sees the real value.  Length is checked before any numeric
+# comparison: a 20-digit operand makes `[ -le ]` overflow or compare as a string
+# depending on the shell.
+is_bounded_line_count() {
+    is_positive_integer "$1" || return 1
+    local bounded_value=$1
+    while :; do
+        case "$bounded_value" in
+            0?*) bounded_value=${bounded_value#0} ;;
+            *) break ;;
+        esac
+    done
+    [ "${#bounded_value}" -le 10 ] || return 1
+    [ "$bounded_value" -le 2147483647 ]
 }
 
 # Spelled out, not `A-Za-z`: bracket ranges are collation-dependent, and under
@@ -6635,6 +6664,14 @@ logs() {
             tail_lines=all
         else
             is_positive_integer "$2" || fail '--tail must be a positive integer or all'
+            # An UPPER BOUND, matching the clients' 2^31-1: `is_positive_integer`
+            # accepts any number of digits, and BSD `tail -n` rejects a value
+            # beyond its offset range with "illegal offset" -- which surfaced as
+            # the generic "Pueue could not read the log" / exit 1, not as a
+            # protocol answer, for a value both clients refuse at parse time.
+            # The server is reachable directly over ssh, so it enforces its own
+            # bound instead of trusting the client to have done it.
+            is_bounded_line_count "$2" || fail '--tail must be a positive integer no greater than 2147483647, or all'
             tail_lines=$(canonical_task_id "$2")
         fi
     fi
@@ -7272,6 +7309,7 @@ remove_task() {
     local removable_task
     local request_id
     local record
+    local record_read_status
     local removable_status=0
 
     ensure_daemon
@@ -7297,7 +7335,31 @@ remove_task() {
     else
         return $?
     fi
-    if [ -n "$request_id" ] && record=$(read_request_record "$request_id"); then
+    if [ -n "$request_id" ]; then
+        # The read's status is CAPTURED, not left to `&&`: `[ ... ] && x=$( … )`
+        # treats BOTH rc=1 (no record, the ordinary vanished case) and rc=2
+        # (the record exists but cannot be read) as "condition false", so a
+        # fail() inside the substitution only killed its own subshell and the
+        # `|| fail` never ran -- the caller fell through to "Pueue removal did
+        # not complete", printed a second reason line, and returned exit 1 with
+        # a reason=protocol_error already on stderr, contradicting the code
+        # whose whole point was to say "a read failure is not 'not removing'".
+        # Measured 2026-11-19 (stub pueue returning 1 plus a mode-000 record):
+        # reason=protocol_error on stderr, exit 1.  Same family as the
+        # `if ! guard; then st=$?` trap this repo has been bitten by before --
+        # the only safe shapes are an explicit rc capture or `|| return $?`
+        # with nothing else on the line.
+        record_read_status=0
+        record=$(read_request_record "$request_id" 2>/dev/null) || record_read_status=$?
+        case "$record_read_status" in
+            0) ;;
+            1) record='' ;;
+            *)
+                fail "cannot read the AgentQ request record while reconciling a removal: $task_id"
+                ;;
+        esac
+    fi
+    if [ -n "$request_id" ] && [ -n "$record" ]; then
         # A failed read here used to make the condition false and fall through
         # to "removal did not complete" -- exit 1, after `pueue remove` had
         # ALREADY succeeded, i.e. the task is gone and the record still says

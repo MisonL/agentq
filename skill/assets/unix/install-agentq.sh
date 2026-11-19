@@ -4,7 +4,7 @@ set -eu
 
 program=${0##*/}
 release_version='4.0.4'
-agentq_version='0.1.34'
+agentq_version='0.1.35'
 asset_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 agentq_home=${AGENTQ_HOME:-"$HOME/.agentq"}
 artifact_source_directory=${AGENTQ_PUEUE_SOURCE_DIR:-}
@@ -608,7 +608,27 @@ remove_installer_file() {
     installer_remove_path=$1
     [ -n "$installer_remove_path" ] || return 0
     installer_regular_file_is_safe "$installer_remove_path" || return 1
-    if [ "$platform_kind" = macos ]; then
+    case "$installer_remove_path" in
+        */*) installer_remove_parent=${installer_remove_path%/*} ;;
+        *) installer_remove_parent=. ;;
+    esac
+    [ -n "$installer_remove_parent" ] || installer_remove_parent=/
+    # Escalate only where the removal genuinely needs it -- the macOS
+    # LaunchDaemon directory is root-owned, everything else this installer
+    # deletes (staging temporaries, the maintenance lock's pid file, the
+    # wrapper) lives under $HOME and is removable by the invoking user.
+    #
+    # This used to escalate on `platform_kind = macos` alone, which made the
+    # EXIT trap's cleanup depend on sudo even for $HOME: when `sudo -v` was
+    # declined, release_maintenance_lock could not delete the lock metadata it
+    # had just written, and the stranded .agentq.maintenance.lock then made
+    # every LATER run refuse with "cannot recover stale ... maintenance lock"
+    # (recovery deletes metadata through this same helper).  One declined
+    # password bricked the installer until the directory was removed by hand.
+    # Measured 2026-11-19 against v0.1.34; smoke/11's declined-sudo cases pin
+    # both directions.
+    if [ "$platform_kind" = macos ] &&
+        [ -n "$(installer_directory_needs_elevation "$installer_remove_parent")" ]; then
         run_as_root rm -f -- "$installer_remove_path"
     else
         rm -f -- "$installer_remove_path"
@@ -2530,8 +2550,22 @@ recover_stale_maintenance_lock() {
         # "the owner is gone" by waiting -- and age is not evidence either.
         maintenance_lock_is_stale || maintenance_lock_fail_unconfirmable
     fi
-    [ ! -e "$maintenance_lock/pid" ] && [ ! -L "$maintenance_lock/pid" ] ||
-        maintenance_lock_fail_unconfirmable
+    # NOTE: there is deliberately no "pid missing" refusal here.  The accused
+    # line used to live at this spot, written as
+    #   [ ! -e "$maintenance_lock/pid" ] && [ ! -L "$maintenance_lock/pid" ] ||
+    #       maintenance_lock_fail_unconfirmable
+    # which fires on exactly the WRONG side: when the pid file IS present the
+    # left side is false, so `||` runs the refusal even though the branch above
+    # just judged the holder dead; when it is absent the left side is true and
+    # the line does nothing.  Net effect: every recoverable dead-holder lock was
+    # refused with "cannot confirm the owner" and left in place -- an installer
+    # killed mid-run bricked the next run until the operator deleted the lock by
+    # hand (measured 2026-11-19 against v0.1.34; the same fixture on v0.1.27 was
+    # reclaimed; smoke/11's dead-holder case now locks it).  A lock with entries
+    # but no pid file is still not removable here: it falls through to the
+    # is_stale test below, which needs metadata to judge, and the caller then
+    # refuses with "maintenance is already in progress" -- fail-closed, and the
+    # message names the real state instead of claiming knowledge it lacks.
     if maintenance_lock_is_stale; then
         maintenance_recovery_expected_pid=$maintenance_lock_observed_pid
         maintenance_recovery_expected_identity=$maintenance_lock_observed_identity
@@ -2905,6 +2939,26 @@ cleanup_on_exit() {
 trap cleanup_on_exit EXIT
 trap 'exit 130' HUP INT TERM
 
+# This installer takes NO arguments, and says so instead of ignoring them.  It
+# used to read none of "$@" at all, so `sh install-agentq.sh --check` -- a flag
+# that DOES exist on the sibling install-client.sh, whose usage sits a few lines
+# from this one in README -- performed a full install: took the maintenance
+# lock, stopped pueued, swapped the tree and restarted the service.  An
+# operator asking for a read-only preflight got an irreversible write.
+# (Found by the 2026-11-19 independent review, reproduced with a stub PATH.)
+case "${1:-}" in
+    '') ;;
+    -h|--help)
+        printf 'Usage: %s\n\nInstalls AgentQ without arguments; everything is configured through the\nenvironment (see skill/references/install.md). Nothing is read from argv.\n' "$program"
+        exit 0
+        ;;
+    *)
+        printf '%s\n' "$program: this installer takes no arguments; ignoring them would perform a full install: $1" >&2
+        printf '%s\n' "try: $program --help" >&2
+        exit 2
+        ;;
+esac
+
 [ "$agentq_home" = "$HOME/.agentq" ] || fail 'AGENTQ_HOME overrides are unsupported because the bundled Pueue config is rooted at ~/.agentq'
 [ ! -L "$agentq_home" ] || fail "AgentQ home must not be a symbolic link: $agentq_home"
 agentq_parent=$(dirname "$agentq_home")
@@ -3023,9 +3077,26 @@ if [ -e "$wrapper_destination" ] || [ -L "$wrapper_destination" ]; then
     # client asset (measured: 32 occurrences there, 0 in the wrapper and 0 in
     # agentq-server).
     if [ "$previous_install" = true ] && [ -f "$wrapper_destination" ] &&
-        [ ! -L "$wrapper_destination" ] &&
-        grep -q 'agentq_client' "$wrapper_destination" 2>/dev/null; then
-        fail "the wrapper path holds an AgentQ client, not the wrapper -- installing over it would discard that client; remove or relocate it (or reinstall the clients with a different --bin-dir), then re-run: $wrapper_destination"
+        [ ! -L "$wrapper_destination" ]; then
+        # The grep's status is captured, not swallowed: `grep -q ... &&`
+        # collapses rc=1 (no match) and rc=2 (the file could not be read) into
+        # the same "not a client" verdict, so ONE transient read failure let an
+        # upgrade replace a live client at this path -- the silent clobber this
+        # guard exists to prevent.  install-client.sh has applied the
+        # rc=1-is-the-only-"absent" rule to its half of the same pair since
+        # 2026-11-16; this half was missed (found by the 2026-11-19 review,
+        # reproduced against a mode-000 file).
+        wrapper_conflict_status=0
+        grep -q 'agentq_client' "$wrapper_destination" 2>/dev/null || wrapper_conflict_status=$?
+        case "$wrapper_conflict_status" in
+            1) : ;;
+            0)
+                fail "the wrapper path holds an AgentQ client, not the wrapper -- installing over it would discard that client; remove or relocate it (or reinstall the clients with a different --bin-dir), then re-run: $wrapper_destination"
+                ;;
+            *)
+                fail "cannot inspect the existing AgentQ wrapper destination (grep exit $wrapper_conflict_status); refusing to overwrite it without knowing what it is: $wrapper_destination"
+                ;;
+        esac
     fi
     if [ "$previous_install" = false ]; then
         fail "refuse to overwrite an existing wrapper without an AgentQ installation: $wrapper_destination"

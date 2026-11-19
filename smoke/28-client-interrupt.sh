@@ -280,6 +280,97 @@ else
     fi
 fi
 
+# --- an in-flight FOREGROUND ssh must be stopped too -----------------------
+# The wait-with-timeout case above covers the one path that backgrounds ssh.
+# Every other operation (`status`, `lookup`, `logs`, `submit`, `cancel`,
+# `remove`, the submit recovery) runs ssh in the FOREGROUND under
+# run_ssh_logged.  A foreground child is the blind spot of a signal trap: the
+# shell's signal handler runs only AFTER the current command returns, so a trap
+# that does not kill the child leaves the client deaf to SIGTERM for as long as
+# ssh takes -- up to ConnectTimeout plus ServerAliveInterval x CountMax, i.e.
+# ~3 minutes on a dead-but-not-refused peer.  Measured 2026-11-19 on this
+# client with a stub that `exec`s `sleep 20`: `kill -TERM` after the SSH call
+# was reached produced exit 130 only after 21s, and the stub had already
+# finished on its own -- "the child is gone" was true for the wrong reason, so
+# the pid assertion below has to be paired with a deadline on the CLIENT.
+#
+# The stub must not be a bare `exec sleep` either: a background job's stdin is
+# /dev/null in a non-interactive shell (measured on bash and dash), so the
+# client has to duplicate the caller's fd 0 into the child to keep a consumable
+# stdin.  That is asserted by comparing what a stub can read against a payload
+# written for it -- see the `status` case's stdin arm below.
+cases=$((cases + 1))
+cat > "$work/ssh-foreground" <<EOF
+#!/bin/sh
+: > "$work/ssh-foreground-invoked"
+printf '%s\n' "\$\$" > "$work/ssh-foreground-pid"
+exec 3<&0
+exec sleep 30
+EOF
+chmod 700 "$work/ssh-foreground"
+rm -f "$work/ssh-foreground-invoked" "$work/ssh-foreground-pid"
+fg_status=0
+fg_started=$(date +%s)
+env -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD_PROMPT \
+    TMPDIR="$client_tmp" \
+    AGENTQ_SSH="$work/ssh-foreground" \
+    AGENTQ_HOST=127.0.0.1 \
+    AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_CONFIG="$work/absent-config" \
+    "$client" status >"$work/fg-out" 2>"$work/fg-err" &
+fg_client_pid=$!
+fg_reached=0
+for _ in $(seq 1 100); do
+    if [ -f "$work/ssh-foreground-invoked" ]; then
+        fg_reached=1
+        break
+    fi
+    kill -0 "$fg_client_pid" 2>/dev/null || break
+    sleep 0.1
+done
+if [ "$fg_reached" -ne 1 ]; then
+    printf '%s\n' 'client-interrupt: status never reached its foreground SSH call, so the in-flight window was not exercised' >&2
+    kill "$fg_client_pid" 2>/dev/null || true
+    wait "$fg_client_pid" 2>/dev/null || true
+    failures=$((failures + 1))
+else
+    kill -TERM "$fg_client_pid" 2>/dev/null || true
+    wait "$fg_client_pid" 2>/dev/null || fg_status=$?
+    fg_elapsed=$(($(date +%s) - fg_started))
+    if [ "$fg_status" -ne 130 ]; then
+        printf 'client-interrupt: SIGTERM during a foreground SSH call exited %s, expected 130\n' "$fg_status" >&2
+        failures=$((failures + 1))
+    fi
+    # The deadline is the assertion the pid check cannot make on its own: the
+    # stub lives 30s, so a client that only reaps after the child finishes
+    # reports 130 and a dead child while still being deaf to the signal.
+    if [ "$fg_elapsed" -ge 10 ]; then
+        printf 'client-interrupt: SIGTERM during a foreground SSH call was not acted on until %ss in (the stub sleeps 30s); the signal handler runs only after the foreground child returns, so the client stays deaf to interrupts for the whole SSH call\n' \
+            "$fg_elapsed" >&2
+        failures=$((failures + 1))
+    fi
+    fg_ssh_pid=$(cat "$work/ssh-foreground-pid" 2>/dev/null || true)
+    if [ -z "$fg_ssh_pid" ]; then
+        printf '%s\n' 'client-interrupt: the foreground stub did not record its pid; the child assertion cannot run' >&2
+        failures=$((failures + 1))
+    else
+        fg_alive=1
+        for _ in $(seq 1 30); do
+            if ! kill -0 "$fg_ssh_pid" 2>/dev/null; then
+                fg_alive=0
+                break
+            fi
+            sleep 0.1
+        done
+        if [ "$fg_alive" -eq 1 ]; then
+            printf 'client-interrupt: the in-flight foreground ssh (pid %s) survived the client exit; the remote command keeps running unattended\n' \
+                "$fg_ssh_pid" >&2
+            kill "$fg_ssh_pid" 2>/dev/null || true
+            failures=$((failures + 1))
+        fi
+    fi
+fi
+
 # A control case with no signal at all.  Without it, a client that simply always
 # exited 130 -- or that never allocated a temporary in the first place -- would
 # satisfy every case above while being broken in the ordinary path.  This is the
@@ -302,6 +393,42 @@ env -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD_PROMPT \
     "$client" status >/dev/null 2>&1 || control_status=$?
 if [ "$control_status" -eq 130 ]; then
     printf '%s\n' 'client-interrupt: an unsignalled run exited 130; the signal cases prove nothing' >&2
+    failures=$((failures + 1))
+fi
+
+# --- the foreground ssh must still carry the caller's stdin ---------------
+# run_ssh_logged now backgrounds its ssh so the signal trap can reach it, and a
+# background job in a non-interactive shell starts with stdin on /dev/null.
+# Several launcher and probe flows feed their payload on stdin, so this
+# regression would silently empty them.  The Windows target is used below
+# because its protocol probe gives the stub something to read without the
+# remote command needing to echo anything.
+cat > "$work/ssh-stdin" <<EOF
+#!/bin/sh
+cat > "$work/stdin-received"
+exit 0
+EOF
+chmod 700 "$work/ssh-stdin"
+cases=$((cases + 1))
+stdin_payload='agentq-stdin-payload-goes-through'
+printf '%s' "$stdin_payload" |
+    env -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD_PROMPT \
+        TMPDIR="$client_tmp" \
+        AGENTQ_SSH="$work/ssh-stdin" \
+        AGENTQ_HOST=127.0.0.1 \
+        AGENTQ_REMOTE_PLATFORM=unix \
+        AGENTQ_CONFIG="$work/absent-config" \
+        "$client" status >/dev/null 2>"$work/stdin-err" || true
+# The exit code is deliberately NOT asserted here: the stub prints nothing, so
+# `status` refuses the empty output with 2, and that refusal is the ordinary
+# contract rather than a property of the stdin channel.  What this case pins is
+# the bytes the stub managed to READ.
+if [ ! -s "$work/stdin-received" ]; then
+    printf '%s\n' 'client-interrupt: the backgrounded ssh received no stdin; the interrupt fix emptied the caller stdin channel' >&2
+    failures=$((failures + 1))
+elif [ "$(cat "$work/stdin-received")" != "$stdin_payload" ]; then
+    printf 'client-interrupt: the backgrounded ssh received [%s], not the caller stdin [%s]\n' \
+        "$(cat "$work/stdin-received")" "$stdin_payload" >&2
     failures=$((failures + 1))
 fi
 

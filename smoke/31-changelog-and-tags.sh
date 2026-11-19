@@ -18,6 +18,7 @@
 #   C  the index is strictly descending (newest first)
 #   D  the newest log entry carries the `|  ...` verification line, and a
 #      "missing verification" region cannot re-enter from the TOP of the log
+#   E  every tag from v0.1.31 on is ANNOTATED (`cat-file -t` says `tag`)
 #
 # D is deliberately bounded to the newest entry.  Measured 2026-11-14: 137 of
 # the 227 descending entries predate the short-format convention (2026-10-15)
@@ -93,6 +94,28 @@ else
         [ -n "$v" ] || continue
         grep -qxF -- "$v" "$work.tags" || fail "version index names $v, but no such tag exists in this checkout"
     done <"$work.index"
+
+    # --- rule E: tags at or after v0.1.31 are ANNOTATED --------------------
+    # CLAUDE.md requires annotated tags ("新 tag 一律带注释") and release.yml only
+    # compares names, so a lightweight tag passes every gate.  Measured
+    # 2026-11-19: nothing checked the object type at all.  The rule starts at
+    # v0.1.31 -- seven of the 35 tags are lightweight, all from before that
+    # version, and rewriting history is not what this check does.
+    annotated_start=31
+    annotated_checked=0
+    while IFS= read -r v; do
+        [ -n "$v" ] || continue
+        minor=$(printf '%s' "$v" | sed -n 's/^v0\.1\.\([0-9][0-9]*\)$/\1/p')
+        [ -n "$minor" ] || continue
+        [ "$minor" -ge "$annotated_start" ] || continue
+        annotated_checked=$((annotated_checked + 1))
+        if [ "$(git -C "$root" cat-file -t "refs/tags/$v" 2>/dev/null || true)" != tag ]; then
+            fail "$v is not an annotated tag (cat-file -t did not say 'tag')"
+        fi
+    done <"$work.tags"
+    if [ "$annotated_checked" -eq 0 ]; then
+        fail "the annotated-tag rule examined 0 tags (v0.1.$annotated_start and later exist in the index, so the enumerator is broken)"
+    fi
 
     # --- rule B: every tag has exactly one index line ----------------------
     while IFS= read -r v; do

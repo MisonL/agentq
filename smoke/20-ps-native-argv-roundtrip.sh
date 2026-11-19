@@ -751,6 +751,14 @@ parity_run 'empty-session' 0 'persistent remote session: Zellij (Windows)' ready
 #    literal-space test.
 parity_run 'host-whitespace' 2 'SSH host must not contain whitespace' ready '' --check 'foo bar'
 parity_run 'host-tab' 2 'SSH host must not contain whitespace' ready '' --check "$(printf 'host\ttab')"
+#    The SET is the ASCII byte list on both clients, so non-ASCII whitespace is
+#    a VALUE: the Windows twin used `\s` (which also contains U+0085, NBSP and
+#    U+3000) while the POSIX twin strips ` \t\n\r\f\v`, and measured 2026-11-19
+#    the same NBSP-only host was probed to READY (0) by one client and refused
+#    (2) by the other.  These rows assert agreement on the accepting side; the
+#    refusal rows above keep the guard from being widened to "reject everything".
+parity_run 'host-nbsp' 0 'persistent remote session: Zellij (Windows)' ready '' --check "$(printf '\302\240')"
+parity_run 'host-ideographic-space' 0 'persistent remote session: Zellij (Windows)' ready '' --check "$(printf '\343\200\200')"
 # 7. The install confirmation must come from a TERMINAL.  SKILL.md promises
 #    "the first connection asks before installing it; with no TTY the client
 #    refuses explicitly and never installs silently", and that had no

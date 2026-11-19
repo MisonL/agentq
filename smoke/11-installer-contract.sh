@@ -81,9 +81,14 @@ home="$work/home"
 stub_bare="$work/bin-bare"
 stub_pkgmgr="$work/bin-pkgmgr"
 stub_full="$work/bin-full"
+stub_sudofail="$work/bin-sudofail"
+# The declined-sudo cases deliberately produce residue on the UNFIXED asset, so
+# they run against a HOME of their own: sharing the main one would make every
+# later case report that residue and turn one defect into ten failures.
+home_sudofail="$work/home-sudofail"
 assets="$work/assets"
 source_dir="$work/src"
-mkdir -p "$home" "$stub_bare" "$stub_pkgmgr" "$stub_full" "$assets" "$source_dir"
+mkdir -p "$home" "$home_sudofail" "$stub_bare" "$stub_pkgmgr" "$stub_full" "$stub_sudofail" "$assets" "$source_dir"
 
 # Three stub PATHs, differing in exactly two things: whether jq resolves, and
 # whether a package manager resolves.  All three symlink the host's real
@@ -146,6 +151,7 @@ build_stub_path() {
 build_stub_path "$stub_bare" no
 build_stub_path "$stub_pkgmgr" no
 build_stub_path "$stub_full" yes
+build_stub_path "$stub_sudofail" yes
 
 # --- write_stub: the construction-level guard (2026-10-25) --------------------
 # Everything below creates stub scripts INSIDE directories that also contain
@@ -185,7 +191,7 @@ write_stub() {
 # the real commands and is unchanged; a Linux host provides neither launchctl nor
 # plutil (chown it has), and every Darwin-platform case stopped at the preamble.
 # A stub is created only where the host has nothing to link.
-for stub in "$stub_bare" "$stub_pkgmgr" "$stub_full"; do
+for stub in "$stub_bare" "$stub_pkgmgr" "$stub_full" "$stub_sudofail"; do
     if [ ! -e "$stub/launchctl" ]; then
         write_stub "$stub/launchctl" <<'STUB'
 #!/bin/sh
@@ -218,7 +224,7 @@ done
 # only into the two PATHs that are meant to have them.
 package_log="$work/package-manager-invocations"
 : >"$package_log"
-for destination in "$stub_pkgmgr" "$stub_full"; do
+for destination in "$stub_pkgmgr" "$stub_full" "$stub_sudofail"; do
     for manager in brew port apt-get dnf yum pacman zypper apk; do
         write_stub "$destination/$manager" <<STUB
 #!/bin/sh
@@ -255,12 +261,33 @@ done
 exec "$command_name" "$@"
 STUB
 
+# The fourth PATH differs from `full` in exactly one binary: sudo --v is
+# REFUSED here.  This is the macOS authorization failure: authorize_macos_root
+# runs `sudo -v` and the user declines (or has no rights).  The installer must
+# exit 2 with "sudo authorization failed" AND leave HOME exactly as it found it.
+# That second half is the defect this case was written for (measured 2026-11-19
+# against v0.1.34): the maintenance lock had already been taken when sudo was
+# asked for, and the EXIT trap's removal goes through `run_as_root rm -f` on
+# macOS, so the failed release left .agentq.maintenance.lock/pid behind -- a
+# residue that makes EVERY later run refuse with "cannot recover stale ...
+# maintenance lock", because recovery deletes metadata through the same
+# root-escalating helper.  One declined password bricked the installer.
+write_stub "$stub_sudofail/sudo" <<'STUB'
+#!/bin/sh
+# sudo -v is the only call this PATH is meant for; answer it as a refusal.
+# Anything else would be an escalation this fixture does not model.
+case "${1:-}" in
+    -v|--validate) exit 1 ;;
+    *) printf '%s\n' 'sudo stub: refusing to escalate; this PATH models a declined authorization' >&2; exit 1 ;;
+esac
+STUB
+
 # uname is stubbed because the installer's platform table is keyed on it, and
 # the table decides which asset names and hashes it expects.  The stub reads a
 # file so a case can flip the platform to exercise the unsupported branch.
 platform_file="$work/platform"
 printf 'Darwin\narm64\n' >"$platform_file"
-for stub in "$stub_bare" "$stub_pkgmgr" "$stub_full"; do
+for stub in "$stub_bare" "$stub_pkgmgr" "$stub_full" "$stub_sudofail"; do
     write_stub "$stub/uname" <<STUB
 #!/bin/sh
 case "\$1" in
@@ -327,12 +354,13 @@ check_case() {
 # a mktemp-named directory under $HOME and takes a maintenance lock, so a
 # rejection that forgot to clean either would show up here.
 home_listing() {
-    find "$home" -mindepth 1 2>/dev/null | LC_ALL=C sort
+    find "${1:-$home}" -mindepth 1 2>/dev/null | LC_ALL=C sort
 }
 assert_home_clean() {
     local label=$1
+    local listing_home=${2:-$home}
     local leftover
-    leftover=$(home_listing)
+    leftover=$(home_listing "$listing_home")
     if [ -n "$leftover" ]; then
         printf 'installer %s: left artifacts in HOME:\n' "$label" >&2
         printf '%s\n' "$leftover" | sed 's/^/      /' >&2
@@ -474,6 +502,36 @@ check_case 'source dir via symlink' \
     'source directory is unsafe' "$status"
 assert_home_clean 'source dir via symlink'
 
+# --- a declined macOS authorization must not leave the maintenance lock -------
+# See the `stub_sudofail` comment: the lock is taken BEFORE sudo is asked for,
+# and on macOS every removal goes through `run_as_root`, so a declined password
+# used to strand .agentq.maintenance.lock with its pid file.  The second run
+# below is the load-bearing half -- residue that merely sat there would be
+# tolerable, but this residue makes the NEXT run fail too, which is what turned
+# one declined prompt into a host that cannot install AgentQ until an operator
+# deletes a directory by hand.
+status=0
+env HOME="$home_sudofail" PATH="$stub_sudofail" \
+    /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+check_case 'declined sudo authorization' 'sudo authorization failed' "$status"
+assert_home_clean 'declined sudo authorization' "$home_sudofail"
+
+# And the poisoned-home direction: whatever the first run leaves behind, a
+# second run must still be able to install.  Asserted as "does not fail with the
+# stale-lock message" rather than "succeeds", because this offline fixture
+# cannot complete an install; the property under test is that the lock does not
+# block the next attempt.
+cases=$((cases + 1))
+status=0
+env HOME="$home_sudofail" PATH="$stub_sudofail" \
+    /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+if grep -qF 'cannot recover stale AgentQ maintenance lock' "$work/err"; then
+    printf '%s\n' 'installer [second run after a declined sudo]: a leftover maintenance lock blocked the next install' >&2
+    sed 's/^/      /' "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+assert_home_clean 'second run after a declined sudo' "$home_sudofail"
+
 printf 'FreeBSD\namd64\n' >"$platform_file"
 status=0
 env HOME="$home" PATH="$stub_bare" \
@@ -506,6 +564,29 @@ for missing in agentq-server pueue.yml agentq; do
     assert_home_clean "missing asset $missing"
     mv "$assets/$missing.saved" "$assets/$missing"
 done
+
+# --- arguments are REFUSED, not ignored --------------------------------------
+# The installer reads no argv at all, so before this case `--check` -- a flag
+# the sibling install-client.sh really has, documented a few README lines away
+# -- silently performed a full install.  An operator asking for a preflight got
+# an irreversible write.  The assertion is that the run STOPS: a refused argv
+# must not take the maintenance lock, and must not touch HOME.
+status=0
+env HOME="$home" PATH="$stub_full" \
+    /bin/sh "$assets/install-agentq.sh" --check >"$work/out" 2>"$work/err" || status=$?
+check_case 'unknown argument' \
+    'this installer takes no arguments' "$status"
+assert_home_clean 'unknown argument'
+status=0
+env HOME="$home" PATH="$stub_full" \
+    /bin/sh "$assets/install-agentq.sh" --help >"$work/out" 2>"$work/err" || status=$?
+cases=$((cases + 1))
+if [ "$status" -ne 0 ] || ! grep -qF 'Installs AgentQ without arguments' "$work/out"; then
+    printf 'installer --help: expected exit 0 and the usage text, got %s\n' "$status" >&2
+    sed 's/^/      /' "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+assert_home_clean '--help'
 
 # --- existing state that must not be clobbered -------------------------------
 # An unrelated file at the wrapper destination, with no AgentQ installation to
@@ -791,6 +872,50 @@ check_case 'stale wrapper on upgrade is not refused' \
 rm -rf "$home/.agentq" "$home/.local"
 assert_home_clean 'stale wrapper on upgrade is not refused'
 
+# --- a CONFIRMED-DEAD holder's lock must still be recovered ------------------
+# The sibling refusal cases above (corrupt metadata, unknown child, live holder)
+# are all "do not steal this lock".  This one is the opposite direction, and it
+# is the one a user actually meets: an installer killed by Ctrl-C, OOM or a
+# closed terminal leaves `pid<TAB>identity` of a process that is provably gone.
+# Without this case, a mutation that turned the whole recovery into a blanket
+# "cannot confirm the owner" refusal passed every other case in this file --
+# measured 2026-11-19 against v0.1.34: a dead-pid lock was refused with exit 2
+# and left in place, while the same fixture on v0.1.27 was reclaimed.  The
+# assertion is on the LOCK, not on a message: getting past it is only visible in
+# that the run proceeded far enough to fail on the offline binary stage.
+dead_holder_lock="$home/.agentq.maintenance.lock"
+mkdir -p "$dead_holder_lock"
+( exit 0 ) &
+dead_holder_pid=$!
+wait "$dead_holder_pid" 2>/dev/null || true
+printf '%s\t%s\n' "$dead_holder_pid" 'Mon Jan  1 00:00:00 2001' >"$dead_holder_lock/pid"
+status=0
+env HOME="$home" PATH="$stub_full" AGENTQ_PUEUE_SOURCE_DIR="$source_dir" \
+    /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+cases=$((cases + 1))
+if grep -qF 'cannot confirm the owner of the AgentQ maintenance lock' "$work/err"; then
+    printf '%s\n' 'installer dead-holder-lock case: refused to recover a lock whose holder is confirmed dead' >&2
+    sed 's/^/      /' "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+# Reaching the binary stage is the proof the run got PAST the lock; the stage
+# itself fails offline (exit 2), which is the same anchor the neighbouring cases
+# use.
+if ! grep -qF 'sha256 mismatch for staged asset' "$work/err"; then
+    printf '%s\n' 'installer dead-holder-lock case: the run did not reach the binary stage, so the lock was not recovered' >&2
+    sed 's/^/      /' "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+# And the lock this run took must be released again on the way out.
+if [ -e "$dead_holder_lock" ] || [ -L "$dead_holder_lock" ]; then
+    printf '%s\n' 'installer dead-holder-lock case: the installer did not release the lock it created' >&2
+    failures=$((failures + 1))
+fi
+rm -rf "$home/.agentq" "$home/.local" "$dead_holder_lock"
+assert_home_clean 'dead-holder maintenance lock is recovered'
+
 # --- a stale maintenance lock that cannot be recovered -----------------------
 # A lock whose holder is confirmed dead, but whose directory cannot be removed
 # (an unexpected extra entry).  Recovery must fail loudly rather than proceed to
@@ -806,8 +931,14 @@ printf 'unexpected\n' >"$home/.agentq.maintenance.lock/extra"
 status=0
 env HOME="$home" PATH="$stub_full" \
     /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+# The expected message is "cannot RECOVER", not "cannot confirm the owner":
+# the holder here is provably dead, so the refusal is about the directory it
+# cannot clear.  Until 2026-11-19 the assertion read "cannot confirm the owner"
+# and passed only because a bug made EVERY dead-holder lock report that -- the
+# case was green against the defect (see the dead-holder case above, which now
+# pins the other direction).
 check_case 'unrecoverable stale maintenance lock' \
-    'cannot confirm the owner of the AgentQ maintenance lock' "$status"
+    'cannot recover stale AgentQ maintenance lock' "$status"
 # The lock DIRECTORY must survive: an installer that reported failure but
 # cleared the lock anyway would be lying about the state it left behind, and the
 # next run would then believe the queue was free.  Asserting on the directory
@@ -1440,4 +1571,4 @@ if [ "$failures" -ne 0 ]; then
     printf 'installer-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'installer-contract checks passed: cases=%s sandbox-home=yes stub-path=yes download-path=covered toctou-path=covered empty-lock-recovery=covered unconfirmable-owner=covered plist-placeholder=guarded crash-leftover=covered system-service-ownership=pinned\n' "$cases"
+printf 'installer-contract checks passed: cases=%s sandbox-home=yes stub-path=yes download-path=covered toctou-path=covered empty-lock-recovery=covered dead-holder-recovery=covered unconfirmable-owner=covered argv-refused=covered plist-placeholder=guarded crash-leftover=covered system-service-ownership=pinned\n' "$cases"

@@ -128,6 +128,11 @@ case "$command" in
                 exit 2
                 ;;
         esac
+        # AGENTQ_SMOKE_WAIT_HANGS makes the stub model a wait that never returns
+        # (the task is still running): the client's own budget must fire.
+        if [ -n "${AGENTQ_SMOKE_WAIT_HANGS:-}" ]; then
+            sleep "${AGENTQ_SMOKE_WAIT_HANGS}"
+        fi
         printf '{"task":{"id":3,"group":"agentq","created_at":"2026-01-01T00:00:00Z","status":{"Done":{"result":"Success"}}}}\n'
         ;;
     *'--summary'*) printf '{"tasks":{"3":{"id":3,"state":"Done","result":"Success","label":"agentq:x"}},"group":null,"summary":true}\n' ;;
@@ -521,6 +526,61 @@ expect_host_rejected "$no_host" 'env tab'      yes $'\t'
 expect_host_rejected "$no_host" 'env cr'       yes $'\r'
 expect_host_accepted 'argv embedded-space' no 'a b'
 expect_host_accepted 'argv leading-space'  no ' a'
+
+# --- non-ASCII whitespace is a VALUE, in EVERY locale ------------------------
+# The blank/shape tests above asked with `*[![:space:]]*`, whose set follows
+# the caller's locale.  Measured 2026-11-19 on macOS: NBSP (U+00A0) and U+3000
+# are VALUES under LC_ALL=C and BLANK under en_US.UTF-8 (bash 3.2 and zsh; dash
+# ignores the locale in both directions), and U+0085 was never blank -- so the
+# SAME argv exited 255 (host handed to ssh: the RETRYABLE transport class) on
+# one host and 2 on another, while the Windows twin (IsNullOrWhiteSpace)
+# refused all three with 2.  The rule is now the ASCII byte set that `--workdir`
+# adopted in 0.1.27, on both twins: anything outside it is a VALUE.  The pairs
+# are asserted under BOTH locales because a single-locale row is a coin flip.
+host_locale_rows=0
+for host_locale in C en_US.UTF-8; do
+    for host_cp in a0 3000 85; do
+        cases=$((cases + 1)); host_shape_cases=$((host_shape_cases + 1))
+        host_locale_rows=$((host_locale_rows + 1))
+        host_value=$(python3 -c 'import sys; sys.stdout.write(chr(int(sys.argv[1], 16)))' "$host_cp")
+        # AGENTQ_HOST: the value is SET and goes to ssh (255 with the counting
+        # stub); the config-fallback face is asserted at the end of this block.
+        : > "$work/ssh-count.log"
+        host_status=0
+        LC_ALL="$host_locale" AGENTQ_SSH_COUNT="$work/ssh-count.log" \
+            AGENTQ_SSH="$work/bin/ssh-count" AGENTQ_HOST="$host_value" \
+            AGENTQ_CONFIG="$work/absent-config" AGENTQ_REMOTE_PLATFORM=unix \
+            AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+            "$client" status >"$work/out" 2>"$work/err" || host_status=$?
+        if [ "$host_status" -ne 255 ] || [ ! -s "$work/ssh-count.log" ]; then
+            printf 'client host [AGENTQ_HOST=U+%s under LC_ALL=%s]: expected the value to reach ssh (255), got exit %s, ssh invoked %s time(s): %s\n' \
+                "$host_cp" "$host_locale" "$host_status" \
+                "$(tr -d ' ' < "$work/ssh-count.log" | wc -l)" "$(head -1 "$work/err")" >&2
+            failures=$((failures + 1))
+        fi
+        # --host <value>: same verdict, so the shape guard agrees with the
+        # environment read (they are two separate sites in the client).
+        : > "$work/ssh-count.log"
+        host_status=0
+        LC_ALL="$host_locale" AGENTQ_SSH_COUNT="$work/ssh-count.log" \
+            AGENTQ_SSH="$work/bin/ssh-count" AGENTQ_HOST=smoke-host \
+            AGENTQ_CONFIG="$work/absent-config" AGENTQ_REMOTE_PLATFORM=unix \
+            AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+            "$client" --host "$host_value" status >"$work/out" 2>"$work/err" || host_status=$?
+        if [ "$host_status" -ne 255 ] || [ ! -s "$work/ssh-count.log" ]; then
+            printf 'client host [--host U+%s under LC_ALL=%s]: expected the value to reach ssh (255), got exit %s, ssh invoked %s time(s): %s\n' \
+                "$host_cp" "$host_locale" "$host_status" \
+                "$(tr -d ' ' < "$work/ssh-count.log" | wc -l)" "$(head -1 "$work/err")" >&2
+            failures=$((failures + 1))
+        fi
+    done
+done
+# A loop that stopped enumerating is a green table (the blind-enumerator class).
+if [ "$host_locale_rows" -ne 6 ]; then
+    printf 'client host [non-ASCII whitespace]: only %s row(s) ran (expected 6); the enumeration broke\n' \
+        "$host_locale_rows" >&2
+    failures=$((failures + 1))
+fi
 
 # The "different machines" face: a config file naming cfg-host, with
 # AGENTQ_HOST holding only whitespace.  IsNullOrWhiteSpace falls back to the
@@ -952,6 +1012,38 @@ if ! grep -qF 'AGENTQ_WAIT_BUDGET=60s;' "$work/modes.argv.cmd"; then
 fi
 if ! grep -qF 'exec timeout "$AGENTQ_WAIT_BUDGET" "$agentq_server" "$@"' "$client"; then
     printf '%s\n' 'client wait --timeout: the remote wrapper does not exec the server under timeout with the budget, so the remote wait is unbounded' >&2
+    failures=$((failures + 1))
+fi
+
+# wait --timeout, the BUDGET ITSELF: when the remote wait never returns inside
+# the budget, the client must answer with the contract's "final state could not
+# be confirmed" code -- 6 -- plus the message that says the task may still be
+# running.  Nothing asserted this before 2026-11-19: changing the `return 6` in
+# the budget-elapsed branch to `return 0` left every check green (found by the
+# independent review; verified there by mutation).  The stub hangs for longer
+# than the budget, so the client must kill it and return on its own.
+cases=$((cases + 1))
+wait_budget_status=0
+wait_budget_started=$(date +%s)
+AGENTQ_SMOKE_WAIT_HANGS=20 AGENTQ_ARGV_CAPTURE="$work/modes.argv" \
+    AGENTQ_SSH="$work/bin/ssh-modes" AGENTQ_HOST=smoke-host \
+    AGENTQ_CONFIG="$work/absent-config" \
+    "$client" wait 3 --timeout 2 >"$work/waitbudget.out" 2>"$work/waitbudget.err" || wait_budget_status=$?
+wait_budget_elapsed=$(( $(date +%s) - wait_budget_started ))
+if [ "$wait_budget_status" -ne 6 ]; then
+    printf 'client wait --timeout: an elapsed budget must exit 6, got %s: %s\n' \
+        "$wait_budget_status" "$(head -1 "$work/waitbudget.err")" >&2
+    failures=$((failures + 1))
+fi
+if ! grep -qF 'may still be running' "$work/waitbudget.err"; then
+    printf '%s\n' 'client wait --timeout: the elapsed-budget message is missing (stderr did not say the task may still be running)' >&2
+    failures=$((failures + 1))
+fi
+# The budget must actually BOUND the wait: a client that ignored it would sit
+# for the stub's full 20s.  Allow generous slack for slow hosts.
+if [ "$wait_budget_elapsed" -ge 15 ]; then
+    printf 'client wait --timeout: the budget did not bound the wait (%s seconds elapsed for a 2 second budget)\n' \
+        "$wait_budget_elapsed" >&2
     failures=$((failures + 1))
 fi
 

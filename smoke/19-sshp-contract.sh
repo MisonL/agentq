@@ -461,6 +461,45 @@ run_case 'whitespace host is refused' 2 'SSH host must not contain whitespace' -
 # that only looked for ' '.
 run_case 'host with an embedded space is refused' 2 'SSH host must not contain whitespace' -- --check 'foo bar'
 run_case 'host with an embedded tab is refused' 2 'SSH host must not contain whitespace' -- --check "$(printf 'host\ttab')"
+# The set is the ASCII BYTE list on both clients, so anything outside it is a
+# VALUE and the probe runs.  Measured 2026-11-19: with `[[:space:]]`/`\s` this
+# guard answered differently per locale on POSIX and refused NBSP outright on
+# the Windows twin, while the same argv reached ssh under LC_ALL=C -- the twins
+# now agree, and this is the acceptance half of the rule (refusal-only cases
+# would also pass a guard that rejected every non-ASCII byte).  The bytes come
+# from `printf` octal escapes rather than an interpreter: this check's PATH is
+# the sandbox stub plus /usr/bin:/bin, and every case here must run on a host
+# with no python3 (measured 2026-11-19: c2a0 / e38080 from printf under sh,
+# bash, dash and zsh alike).
+#
+# BOTH locales are asserted, because one locale is a coin flip: the mutation
+# proof for this row (replace the `tr -d` byte list with the old
+# `case "$host" in *[[:space:]]*)` guard) gives rc=0 under LC_ALL=C and rc=2
+# under en_US.UTF-8 -- a C-only row would call that mutant green.  On a host
+# with no en_US.UTF-8 the shell falls back to C silently, so that cell
+# degenerates into a second C row rather than failing.
+run_case_locale() { # <name> <locale> <host-value>
+    local name=$1 locale=$2 value=$3 status=0
+    cases=$((cases + 1))
+    LC_ALL="$locale" \
+    SSHP_STUB_DIR="$stub_dir" \
+    SSHP_SSH="$work/bin/ssh" \
+    HOME="$home" TMPDIR="$work/tmp" \
+    PATH="$work/bin:/usr/bin:/bin" \
+        /bin/sh "$client" --check "$value" >"$work/out" 2>"$work/err" || status=$?
+    if [ "$status" -ne 0 ]; then
+        printf 'sshp-contract: %s [LC_ALL=%s]: expected exit 0 (the value reaches ssh), got %s\n' \
+            "$name" "$locale" "$status" >&2
+        sed 's/^/    stderr: /' "$work/err" >&2
+        failures=$((failures + 1))
+    fi
+}
+for ssbp_locale in C en_US.UTF-8; do
+    plan_stub '0	__SSHP_READY__:Linux'
+    run_case_locale 'host with a non-breaking space is a value' "$ssbp_locale" "$(printf '\302\240')"
+    plan_stub '0	__SSHP_READY__:Linux'
+    run_case_locale 'host with an ideographic space is a value' "$ssbp_locale" "$(printf '\343\200\200')"
+done
 
 # The reconnect delay is a 32-bit non-negative integer on BOTH clients.  The
 # charset-only check here accepted a 20-digit value and the failure surfaced

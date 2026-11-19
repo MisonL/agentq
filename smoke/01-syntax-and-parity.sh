@@ -1553,6 +1553,7 @@ def wiring_problems(name, data):
                 )
 
     advisory = []
+    step_advisory = []
     runs = []
     for job_name, job in jobs.items():
         if not isinstance(job, dict):
@@ -1560,12 +1561,24 @@ def wiring_problems(name, data):
         if job.get("continue-on-error") is True:
             advisory.append(str(job_name))
         for step in job.get("steps") or []:
+            if isinstance(step, dict) and step.get("continue-on-error") is True:
+                # A STEP-level continue-on-error is the same hole one level
+                # down: GitHub treats the step as advisory, so the job (and the
+                # workflow) stays green when it fails.  Measured 2026-11-19 by
+                # the independent review: `continue-on-error: true` on ci.yml's
+                # "Assert the full suite really ran" step left this check green.
+                step_advisory.append("%s/%s" % (job_name, step.get("name") or step.get("uses") or "<unnamed>"))
             if isinstance(step, dict) and isinstance(step.get("run"), str):
                 runs.append(step["run"])
     if advisory:
         problems.append(
             "job(s) marked continue-on-error: true -- a failure would not fail the workflow: %s"
             % ", ".join(sorted(advisory))
+        )
+    if step_advisory:
+        problems.append(
+            "step(s) marked continue-on-error: true -- a failing step would not fail its job: %s"
+            % ", ".join(sorted(step_advisory))
         )
     if not any(r.strip() for r in runs):
         problems.append("no job runs a non-empty shell command")
@@ -1953,6 +1966,23 @@ while IFS= read -r file; do
     fi
 done < <(find "$root/skill/assets" -type f -name '*.cmd' | sort)
 
+# --- .cmd: the exit code must be PROPAGATED -------------------------------
+# A .cmd shim that ends in `exit /b 0` (or no explicit exit at all after the
+# delegation) reports success for a client that failed.  Measured 2026-11-19:
+# changing `exit /b %ERRORLEVEL%` to `exit /b 0` in client/windows/agentq.cmd
+# left every check green.  This is the same class as the bare
+# `exit $LASTEXITCODE` that reported a failed install as exit 0 (round 46).
+cmd_exit_violations=0
+while IFS= read -r file; do
+    if ! awk '!/^[[:space:]]*(@?[Rr][Ee][Mm]([[:space:]]|$)|::)/ && /[Ee][Rr][Rr][Oo][Rr][Ll][Ee][Vv][Ee][Ll]/ { found = 1; exit } END { exit !found }' "$file"; then
+        printf 'cmd FAILED (does not propagate %%ERRORLEVEL%%): %s\n' "${file#"$root"/}" >&2
+        cmd_exit_violations=$((cmd_exit_violations + 1))
+    fi
+done < <(find "$root/skill/assets" -type f -name '*.cmd' | sort)
+if [ "$cmd_exit_violations" -gt 0 ]; then
+    failures=$((failures + cmd_exit_violations))
+fi
+
 if ! cmp -s "$root/skill/assets/unix/agentq-server" "$root/skill/assets/windows-git-bash/agentq"; then
     printf '%s\n' 'canonical server parity FAILED: assets/unix/agentq-server != assets/windows-git-bash/agentq' >&2
     failures=$((failures + 1))
@@ -1973,6 +2003,47 @@ fi
 # as rule E for the launcher protocol: one mechanism copied into several files
 # stays consistent only if a check compares the copies.
 version_summary=0
+# A SECOND assignment of any of these constants is invisible to `grep -m1`,
+# which is what every reader here (and release.yml) uses, while the shell
+# executes the LAST one.  Measured 2026-11-19: inserting
+# `agentq_client_version='9.9.9'` below the real one made `agentq --version`
+# print 9.9.9 while this check still reported version=0.1.34 and release.yml
+# still matched the tag.  Every record below must therefore occur EXACTLY once.
+version_duplicate_violations=0
+version_expect_single() { # $1 = file, $2 = literal prefix of the assignment
+    version_occurrences=$(grep -cE -- "$2" "$1" || true)
+    if [ "$version_occurrences" -ne 1 ]; then
+        printf 'version record FAILED (expected exactly one %s, found %s): %s\n' \
+            "$2" "$version_occurrences" "${1#"$root"/}" >&2
+        version_duplicate_violations=$((version_duplicate_violations + 1))
+    fi
+}
+version_expect_single "$root/skill/assets/unix/install-agentq.sh" '^agentq_version='
+version_expect_single "$root/skill/assets/windows-git-bash/install-agentq.ps1" '^\$agentqVersion = '
+version_expect_single "$root/skill/assets/unix/agentq-server" '^agentq_version='
+version_expect_single "$root/skill/assets/client/unix/agentq" '^agentq_client_version='
+version_expect_single "$root/skill/assets/client/windows/agentq.ps1" '^\$script:ClientVersion = '
+version_expect_single "$root/README.md" '^\*\*Version:\*\* '
+# The Skill's frontmatter record: exactly one `version:` line inside the first
+# frontmatter block (the awk reader further down takes the first one).
+version_skill_occurrences=$(awk 'NR == 1 { next } /^---$/ { exit } /^version: / { count += 1 } END { print count + 0 }' "$root/skill/SKILL.md")
+if [ "$version_skill_occurrences" -ne 1 ]; then
+    printf 'version record FAILED (expected exactly one version: line in SKILL.md frontmatter, found %s)\n' \
+        "$version_skill_occurrences" >&2
+    version_duplicate_violations=$((version_duplicate_violations + 1))
+fi
+# Self-test: the duplicate predicate must FIRE on a two-assignment fixture --
+# a comparison that cannot fail is the false green this file keeps finding.
+version_dup_fixture=$(mktemp "${TMPDIR:-/tmp}/agentq-version-dup.XXXXXX")
+printf "agentq_client_version='1.0.0'\nagentq_client_version='9.9.9'\n" > "$version_dup_fixture"
+if [ "$(grep -cE -- '^agentq_client_version=' "$version_dup_fixture" || true)" -ne 2 ]; then
+    printf 'version record FAILED: the duplicate self-test fixture is not what it claims\n' >&2
+    version_duplicate_violations=$((version_duplicate_violations + 1))
+fi
+rm -f -- "$version_dup_fixture"
+if [ "$version_duplicate_violations" -gt 0 ]; then
+    failures=$((failures + version_duplicate_violations))
+fi
 version_posix_line=$(grep -m1 '^agentq_version=' "$root/skill/assets/unix/install-agentq.sh" || true)
 version_posix=${version_posix_line#agentq_version=}
 version_posix=${version_posix#\'}

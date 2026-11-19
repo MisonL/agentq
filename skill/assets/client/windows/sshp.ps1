@@ -1397,10 +1397,16 @@ $script:TargetHost = $arguments[0]
 # the other -- the divergence class this version set out to end.  The
 # whitespace test runs BEFORE the empty test so a whitespace-only name reports
 # the same message as the POSIX side.
-if ($script:TargetHost -match '\s') {
+# The set is the ASCII byte set, NOT `\s` or IsNullOrWhiteSpace: .NET's set also
+# contains U+0085, NBSP and U+3000, and the POSIX twin strips the explicit byte
+# list ` \t\n\r\f\v`.  With `\s` here, a NBSP-only host was refused (2) while
+# the POSIX twin probed it and answered 0 when the target was ready -- measured
+# 2026-11-19, same argv, both clients.  Anything outside the ASCII set is a
+# VALUE on both sides, and ssh decides.
+if ($script:TargetHost -match '[ \t\n\r\f\v]') {
     Stop-Sshp "SSH host must not contain whitespace"
 }
-if ([string]::IsNullOrWhiteSpace($script:TargetHost)) {
+if ([string]::IsNullOrEmpty($script:TargetHost)) {
     Stop-Sshp "SSH host must not be empty"
 }
 if ($script:TargetHost.StartsWith("-", [System.StringComparison]::Ordinal)) {

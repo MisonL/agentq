@@ -335,6 +335,67 @@ for file in "$server_installer" "$client_installer"; do
     rule_sites "D(${file##*/})" "$setacl_sites" || true
 done
 
+# --- RULE D2: the ACL read-back must be USED, not merely present ------------
+# Rule D only asks that a Get-Acl follows the Set-Acl in the same function.
+# Measured 2026-11-19: inserting a bare `return` between the read-back and the
+# condition that consumes it left smoke/10 green (`violations=0`) -- the check
+# was asserting a token, not the verification.  This rule asks the second
+# question: after the read-back assignment, the variable it assigns must be
+# READ again in the same function (a condition, a throw, a comparison).
+rules_checked=$((rules_checked + 1))
+for file in "$server_installer" "$client_installer"; do
+    d2_sites=0
+    while IFS=$'\t' read -r lineno where; do
+        [ -n "$lineno" ] || continue
+        case "$lineno" in
+            __SITES__*) d2_sites=$((d2_sites + ${lineno#__SITES__})); continue ;;
+        esac
+        fail "$file" "line $lineno assigns an ACL read-back that is never read again in the same function ($where)"
+    done < <(awk '
+        FNR == NR {
+            if ($0 ~ /^function [A-Za-z0-9_-]+[ \t]*\{/) { name = $2; start = FNR; infunc = 1 }
+            else if (infunc && $0 ~ /^\}/) { n++; fname[n] = name; fstart[n] = start; fend[n] = FNR; infunc = 0 }
+            next
+        }
+        /^[ \t]*\$[A-Za-z0-9_]+[ \t]*=[^=]*Get-Acl[ \t(]/ {
+            na++
+            line = $0
+            sub(/^[ \t]*\$/, "", line)
+            sub(/[ \t]*=.*/, "", line)
+            avar[na] = line
+            aline[na] = FNR
+        }
+        { text[FNR] = $0 }
+        END {
+            for (i = 1; i <= na; i++) {
+                s = aline[i]; owner = 0
+                for (j = 1; j <= n; j++) if (s > fstart[j] && s <= fend[j]) owner = j
+                looks = "$" avar[i]
+                used = 0
+                for (k = s + 1; k <= (owner ? fend[owner] : NR); k++) {
+                    line = text[k]
+                    # A MENTION counts only outside quotes-free contexts is too
+                    # clever; the failure this catches is a dead assignment, so
+                    # any later reference to the variable in the function body
+                    # is enough, EXCEPT another assignment to it.
+                    if (index(line, looks) > 0) {
+                        if (line ~ /^[ \t]*\$[A-Za-z0-9_]+[ \t]*=[^=]/) {
+                            sub(/^[ \t]*/, "", line)
+                            sub(/[ \t]*=.*/, "", line)
+                            if (line == looks) continue
+                        }
+                        used = 1
+                        break
+                    }
+                }
+                if (!used) print s "\t" (owner ? fname[owner] : "top level")
+            }
+            printf "__SITES__%d\n", na
+        }
+    ' "$file" "$file")
+    rule_sites "D2(${file##*/})" "$d2_sites" || true
+done
+
 # --- RULE F: ACL property names must exist on the .NET type ------------------
 # `AccessRulesProtected` is not a property of FileSecurity/DirectorySecurity; the
 # real name is `AreAccessRulesProtected`.  The typo is invisible to every other
@@ -896,10 +957,11 @@ fi
 
 # Every gated rule must actually call the gate, or a rule silently goes back to
 # reading as verified when it examined nothing.  The arithmetic: B(1 file) +
-# D(2) + F(2) + G(2) + H(1 total) = 8 calls.  A new enumerating rule must add
-# its call here too, which is the point: the count is a reminder, not a census.
-if [ "$rule_sites_checked" -ne 8 ]; then
-    printf 'installer-invariants: the coverage gate ran %s time(s), expected 8 (B 1, D 2, F 2, G 2, H 1); a rule lost its gate call and is back to reporting green on zero sites\n' \
+# D(2) + D2(2) + F(2) + G(2) + H(1 total) = 10 calls.  A new enumerating rule
+# must add its call here too, which is the point: the count is a reminder, not a
+# census.
+if [ "$rule_sites_checked" -ne 10 ]; then
+    printf 'installer-invariants: the coverage gate ran %s time(s), expected 10 (B 1, D 2, D2 2, F 2, G 2, H 1); a rule lost its gate call and is back to reporting green on zero sites\n' \
         "$rule_sites_checked" >&2
     exit 1
 fi

@@ -746,11 +746,19 @@ done
 
 # --- the host VALUE's shape: argv cannot carry a whitespace-only word ---------
 # `read -ra` word-splits, so the table above can express `--host -x` but never
-# `--host ' '`.  The whitespace family goes through AGENTQ_HOST instead -- which
-# is also the env path where the twin resolves the value with
-# IsNullOrWhiteSpace.  A whitespace-only host is a permanent argument error,
-# not a transport failure: measured 2026-10-27, the POSIX client exited 255
-# (the RETRYABLE class) on every one of these while the twin exited 2.
+# `--host ' '`.  The whitespace family goes through AGENTQ_HOST instead.  A
+# whitespace-only host is a permanent argument error, not a transport failure:
+# measured 2026-10-27, the POSIX client exited 255 (the RETRYABLE class) on
+# every one of these while the twin exited 2.  The SET is the ASCII byte set on
+# both sides (` \t\n\r\f\v`), the same rule `--workdir` adopted in 0.1.27:
+# anything outside it -- NBSP (U+00A0), U+3000, U+0085 -- is a VALUE, and the
+# non-ASCII rows below are asserted as such.  Before 0.1.35 each side answered
+# that question with a predicate whose set followed something else (POSIX:
+# `[![:space:]]`, whose set follows the caller's locale; Windows:
+# IsNullOrWhiteSpace, whose set is Unicode), so the same argv got three
+# different answers -- measured 2026-11-19: POSIX 255 under LC_ALL=C, 2 under
+# en_US.UTF-8, Windows 2 always.  Both sides now strip the explicit byte list
+# and ask whether anything changed.
 twin_host_run() {
     local posix_copy=$1 host_value=$2
     twin_p_status=0
@@ -790,6 +798,58 @@ twin_host_case tab $'\t'
 twin_host_case carriage-return $'\r'
 twin_host_case space-newline $' \n'
 twin_host_case vertical-tab $'\v'
+# The other half of the set rule: non-ASCII whitespace characters are VALUES on
+# BOTH clients.  Asserting only the ASCII refusals would pass a rule of "refuse
+# every non-empty host", which is not the contract.  Each row must reach ssh
+# (255 with this stub) with no local refusal, and the POSIX side is measured
+# under BOTH C and en_US.UTF-8 because a single-locale row is a coin flip for a
+# `[[:space:]]` guard: measured 2026-11-19, that guard said "blank" for U+00A0
+# and U+3000 under the UTF-8 locale and "value" under C.  If the host has no
+# `en_US.UTF-8` the shell falls back to C SILENTLY, so that cell degenerates to
+# a second C row instead of failing -- a weaker but never-false cell (the C row
+# still asserts the rule; only the locale-sensitivity half is unexercised).
+twin_host_value_rows=0
+twin_host_value_case() { # <label> <host-value>
+    local label=$1 host_value=$2 problems='' status=0 twin_locale
+    twin_host_value_rows=$((twin_host_value_rows + 1))
+    cases=$((cases + 1))
+    for twin_locale in C en_US.UTF-8; do
+        status=0
+        LC_ALL="$twin_locale" AGENTQ_HOST="$host_value" AGENTQ_REMOTE_PLATFORM=unix \
+        AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+        AGENTQ_SSH="$twin_stub_posix" AGENTQ_CONFIG="$work/absent-config" \
+            /bin/sh "$twin_posix" status >"$work/twin-p.out" 2>"$work/twin-p.err" || status=$?
+        [ "$status" -eq 255 ] || problems="$problems posix[$twin_locale]-exit=$status"
+    done
+    status=0
+    AGENTQ_HOST="$host_value" AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SSH="$twin_stub_arg" AGENTQ_CONFIG="$work/absent-config" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" status \
+        >"$work/twin-w.out" 2>"$work/twin-w.err" || status=$?
+    [ "$status" -eq 255 ] || problems="$problems windows-exit=$status"
+    if [ -n "$problems" ]; then
+        printf 'ps-client twin host-value [%s]: expected 255 (a non-ASCII whitespace char is a VALUE, handed to ssh);%s\n' \
+            "$label" "$problems" >&2
+        head -2 "$work/twin-p.err" "$work/twin-w.err" >&2 || true
+        failures=$((failures + 1))
+    fi
+}
+# Constructed from code points, not literal bytes: a bare NBSP in the source is
+# invisible in review and dies to any editor that normalizes whitespace.  The
+# bytes come from `printf` octal escapes, not from an interpreter: this check
+# does gate on python3 running, but its stdout encoding is a SECOND premise
+# (under a C locale Python may fail to encode U+00A0 at all), and the escape is
+# byte-exact in every shell this suite runs (measured 2026-11-19: c2a0 and
+# e38080 from sh, bash, dash and zsh alike).
+twin_host_value_case nbsp "$(printf '\302\240')"
+twin_host_value_case ideographic-space "$(printf '\343\200\200')"
+twin_host_value_case next-line "$(printf '\302\205')"
+if [ "$twin_host_value_rows" -lt 3 ]; then
+    printf 'ps-client twin host-value: only %s non-ASCII row(s) ran (expected 3); the enumeration broke\n' \
+        "$twin_host_value_rows" >&2
+    failures=$((failures + 1))
+fi
 # A block that stopped enumerating reports green on nothing (the
 # blind-enumerator class), so the executed count has its own floor.
 if [ "$twin_host_rows" -lt 5 ]; then
@@ -1058,8 +1118,22 @@ twin_config_case "$client_arg" key-mixedcase 2   -        'AgentQ_Host=lower-hos
 '
 twin_config_case "$client_arg" key-exact     255 cfg-host 'AGENTQ_HOST=cfg-host
 '
-if [ "$twin_config_rows" -lt 8 ]; then
-    printf 'ps-client twin config: only %s row(s) ran (expected 8); the enumeration broke\n' \
+# The VALUE's character class, the config-file face of the host set rule above.
+# A non-ASCII whitespace character inside the value is part of the host on BOTH
+# clients (the ASCII byte list ` \t\n\r\f\v` is what disqualifies a line), and
+# the host that reached ssh is asserted, not just the exit code.  Measured
+# 2026-11-19: with `[^\s]` here and `[^[:space:]]` there, the SAME config file
+# resolved to `a<NBSP>b` on POSIX (255) and to "no SSH host configured" (2) on
+# Windows.  The ASCII-space row is the other direction, so "accept every line"
+# cannot pass this pair.
+twin_config_case "$client_arg" value-nbsp 255 "a$(printf '\302\240')b" "AGENTQ_HOST=a$(printf '\302\240')b
+"
+twin_config_case "$client_arg" value-ideographic-space 255 "a$(printf '\343\200\200')b" "AGENTQ_HOST=a$(printf '\343\200\200')b
+"
+twin_config_case "$client_arg" value-ascii-space 2 - 'AGENTQ_HOST=a b
+'
+if [ "$twin_config_rows" -lt 11 ]; then
+    printf 'ps-client twin config: only %s row(s) ran (expected 11); the enumeration broke\n' \
         "$twin_config_rows" >&2
     failures=$((failures + 1))
 fi
@@ -1814,8 +1888,14 @@ else
         failures=$((failures + 1))
     fi
 fi
+# 2026-11-19: the blank guard is no longer an inline `case` arm -- both twins
+# now call a named predicate with the ASCII byte set -- so the mutation moves
+# with it: make the POSIX predicate answer "not blank" unconditionally and
+# require the whitespace row to disagree.  This is the same anchor the fix
+# touched; a mutation aimed at the OLD `case` arm now finds nothing, which is
+# why the "not found" branch stays fatal instead of passing on nothing.
 twin_host_mutant_blank="$work/twin-posix-noblank"
-sed "s/^    \*) fail 'no SSH host configured; pass --host or set AGENTQ_HOST' ;;/    *) : ;;/" \
+sed 's/^    \[ -z "\$stripped" \]$/    return 1  # mutant: never blank/' \
     "$twin_posix" > "$twin_host_mutant_blank"
 if cmp -s "$twin_posix" "$twin_host_mutant_blank"; then
     printf '%s\n' 'ps-client twin self-test: the POSIX blank-host guard was not found; the host rows cannot be proven able to fail' >&2
@@ -1863,10 +1943,12 @@ fi
 # Same for the config grammar this round aligned: put the `+` back in a copy of
 # the WINDOWS client and require the empty-last row to disagree.  The sed anchor
 # is the quantifier itself; if it cannot be found the mutation never happened,
-# and saying so beats passing on nothing.
+# and saying so beats passing on nothing.  (The anchor moved with the character
+# class in 0.1.35: the value's set is now the ASCII byte list ` \t\n\r\f\v`
+# instead of `\s`, so the old `[^\s]` anchor found nothing and the self-test
+# correctly went red -- it was aimed at a line the fix had replaced.)
 twin_config_mutant="$work/twin-windows-plus"
-sed "s/AGENTQ_HOST=(\[^\\\\s\]\*)/AGENTQ_HOST=([^\\\\s]+)/" \
-    "$client" > "$twin_config_mutant"
+sed 's/\\f\\v\]\*)/\\f\\v]+)/' "$client" > "$twin_config_mutant"
 if cmp -s "$client" "$twin_config_mutant"; then
     printf '%s\n' 'ps-client twin self-test: the Windows config-value quantifier was not found; the config rows cannot be proven able to fail' >&2
     failures=$((failures + 1))
@@ -2041,7 +2123,7 @@ else
         failures=$((failures + 1))
     fi
 fi
-twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+exec($twin_exec_rows/1)+bom($twin_bom_rows/7)+config($twin_config_rows/8)+cfgpath($twin_cfgpath_rows/4)+ws($twin_ws_rows/9)+wsstr($twin_strblank_rows/9)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
+twin_state="checked($twin_rows/$twin_table_rows)+host($twin_host_rows/5)+hostvalue($twin_host_value_rows/3)+exec($twin_exec_rows/1)+bom($twin_bom_rows/7)+config($twin_config_rows/11)+cfgpath($twin_cfgpath_rows/4)+ws($twin_ws_rows/9)+wsstr($twin_strblank_rows/9)+stream($stream_rows/9)+remotecmd($remotecmd_rows/10)"
 else
 twin_state=$twin_platform_state
 fi
@@ -3059,10 +3141,22 @@ cases=$((cases + 1))
 # cannot be deleted unnoticed either (a raw `grep -c` over the whole file would
 # count COMMENT mentions too -- there are two -- so the count is taken over
 # reader lines only).
-exit_readers=$(grep -F '[regex]::Matches' "$client" | grep -cF 'agentq-exit:' || true)
-exit_readers_bounded=$(grep -F '[regex]::Matches' "$client" | grep -cF 'agentq-exit:(\d{1,3})' || true)
-if [ "$exit_readers" -ne 3 ]; then
-    printf 'ps-client-contract: expected 3 exit-token readers, found %s\n' "$exit_readers" >&2
+# The pattern is `[0-9]{1,3}`, not `\d{1,3}`: PowerShell's `\d` also matches
+# Unicode digits (Arabic-Indic and friends), which the [int] cast below it
+# throws on -- measured 2026-11-19, that throw escaped as an uncaught error
+# where the POSIX twin answered 1.  Both spellings are bound here so a reader
+# that regresses to `\d` is reported.
+# Readers in the ASSET only: probe/driver fixtures generated by this check carry
+# the pattern too (one is built from Get-FileTextOrEmpty below), and counting
+# those made the "expected 3" pin fail on a correct asset (measured 2026-11-19).
+# `^[[:space:]]*\$` keeps comment lines out for the same reason as before.
+exit_readers=$(grep -E '^[[:space:]]*\$.*\[regex\]::Matches.*agentq-exit:' "$client" | grep -c . || true)
+exit_readers_bounded=$(grep -E '^[[:space:]]*\$.*\[regex\]::Matches.*agentq-exit:\(' "$client" | grep -cE 'agentq-exit:\((\\d|\[0-9\])\{1,3\}' || true)
+# 4 since 2026-11-19: Resolve-ProbeExitToken re-scans after dropping a
+# non-protocol token (256-999), so it holds two matches calls; the count is
+# still pinned so a reader cannot disappear unnoticed.
+if [ "$exit_readers" -ne 4 ]; then
+    printf 'ps-client-contract: expected 4 exit-token readers, found %s\n' "$exit_readers" >&2
     failures=$((failures + 1))
 fi
 if [ "$exit_readers_bounded" -ne "$exit_readers" ]; then
@@ -3102,6 +3196,8 @@ $fullJson = "{`"tasks`":{},`"group`":null}"
 $batchEmptyJson = "[]"
 $batchOneJson = "[{`"task_id`":3,`"removed`":true}]"
 $batchTwoJson = "[{`"task_id`":3,`"removed`":true},{`"task_id`":4,`"removed`":false,`"state`":`"failed`"}]"
+$summaryStringMarkerJson = "{`"tasks`":{},`"summary`":`"true`"}"
+$upperCaseSubmitJson = "{`"TASK_ID`":3,`"REQUEST_ID`":`"aaaaaaaaaaaaaaaa`",`"REUSED`":false}"
 $cases = @(
     @{ n = "summary-ok";      op = "status_summary"; v = $summaryJson; id = ""; want = $true },
     @{ n = "summary-marker";  op = "status_summary"; v = $fullJson;    id = ""; want = $false },
@@ -3122,7 +3218,19 @@ $cases = @(
     @{ n = "batch-empty";     op = "remove_batch";   v = $batchEmptyJson; id = ""; want = $true },
     @{ n = "batch-one";       op = "remove_batch";   v = $batchOneJson;   id = ""; want = $true },
     @{ n = "batch-two";       op = "remove_batch";   v = $batchTwoJson;   id = ""; want = $true },
-    @{ n = "batch-bad-entry"; op = "remove_batch";   v = "[{`"task_id`":3}]"; id = ""; want = $false }
+    @{ n = "batch-bad-entry"; op = "remove_batch";   v = "[{`"task_id`":3}]"; id = ""; want = $false },
+    # A JSON `null` body is NOT an empty batch: the POSIX filter requires a real
+    # array, and before 2026-11-19 this client accepted null (ConvertFrom-Json
+    # maps null and [] alike to $null).  Measured on pwsh 7.5.4.
+    @{ n = "batch-null-body"; op = "remove_batch";  v = "null"; id = ""; want = $false },
+    # The summary marker must be a real BOOLEAN.  `-eq $true` accepted the
+    # STRING "true" (loose comparison, measured 2026-11-19) while the POSIX
+    # twin requires a real boolean and refused it (measured 2026-11-19).
+    @{ n = "summary-string-marker"; op = "status_summary"; v = $summaryStringMarkerJson; id = ""; want = $false },
+    # Protocol field names are case-SENSITIVE: jq has() is exact, and
+    # PSObject member access is not, so a body spelled TASK_ID used to pass
+    # here and fail there (measured 2026-11-19).
+    @{ n = "submit-uppercase-keys"; op = "submit"; v = $upperCaseSubmitJson; id = ""; want = $false }
 )
 $bad = 0
 foreach ($case in $cases) {
@@ -3314,15 +3422,20 @@ grep -q -- '--summary' "$client" || { printf '%s\n' 'ps-client: missing status -
 # _PASSWORD_PROMPT / _PASSWORD (both-set guards) / _PLATFORM_CACHE_DIR.  The
 # seven NUMERIC variables had the identical class fixed 2026-11-04; that fix was
 # scoped to the variables in hand.  This rule is the general form, so the NEXT
-# variable cannot repeat it.  AGENTQ_HOST is the one documented exception:
-# whitespace-only means UNSET on BOTH clients (it falls back to the configured
-# host -- smoke/12's twin host-value row pins that), so its read site keeps the
-# whitespace-aware predicate.  Self-calibrated below: a rule that reported every
-# occurrence, or none, fails its own fixture.
+# variable cannot repeat it.  AGENTQ_HOST used to be exempt here: both clients
+# DO treat a whitespace-only host as UNSET (falling back to the configured
+# host), so its read site kept a whitespace-aware predicate.  Since 0.1.35 that
+# predicate must be the ASCII byte set on BOTH sides -- `Test-AsciiWhitespaceOnly`
+# here, `ascii_whitespace_only` on POSIX -- because IsNullOrWhiteSpace's set is
+# WIDER than the POSIX one ("anything outside ` \t\n\r\f\v` is a value"), and the
+# difference was measurable on NBSP-only hosts (smoke/12's twin host-value rows).
+# So the exemption is gone: an IsNullOrWhiteSpace read of AGENTQ_HOST is now a
+# violation, and the twin host-value rows are the behavioural lock beside this
+# static one.  Self-calibrated below: a rule that reported every occurrence, or
+# none, fails its own fixture.
 ws_env_offenders() { # <file> -> one variable name per disallowed read site
     /usr/bin/grep -n 'IsNullOrWhiteSpace(\$env:AGENTQ_' "$1" 2>/dev/null \
-        | sed -E 's/.*IsNullOrWhiteSpace\(\$env:(AGENTQ_[A-Za-z0-9_]*)\).*/\1/' \
-        | /usr/bin/grep -v -x 'AGENTQ_HOST' || true
+        | sed -E 's/.*IsNullOrWhiteSpace\(\$env:(AGENTQ_[A-Za-z0-9_]*)\).*/\1/' || true
 }
 ws_env_fixture="$work/twin-ws-env-fixture.ps1"
 {
@@ -3331,21 +3444,21 @@ ws_env_fixture="$work/twin-ws-env-fixture.ps1"
     printf '%s\n' 'if (![string]::IsNullOrEmpty($env:AGENTQ_CONFIG)) { }'
     printf '%s\n' 'if ([string]::IsNullOrWhiteSpace($env:NOT_AN_AGENTQ_VAR)) { }'
 } > "$ws_env_fixture"
-ws_env_calibration=$(ws_env_offenders "$ws_env_fixture")
-if [ "$ws_env_calibration" != 'AGENTQ_SSH' ]; then
-    printf 'ps-client: the whitespace-env static rule is miscalibrated (fixture reported [%s], expected [AGENTQ_SSH])\n' \
+ws_env_calibration=$(ws_env_offenders "$ws_env_fixture" | tr '\n' ' ')
+if [ "$ws_env_calibration" != 'AGENTQ_SSH AGENTQ_HOST ' ]; then
+    printf 'ps-client: the whitespace-env static rule is miscalibrated (fixture reported [%s], expected [AGENTQ_SSH AGENTQ_HOST])\n' \
         "$ws_env_calibration" >&2
     mode_static_failures=$((mode_static_failures + 1))
 fi
 ws_env_violations=$(ws_env_offenders "$client")
 if [ -n "$ws_env_violations" ]; then
-    printf 'ps-client: these AGENTQ_* reads treat a whitespace-only value as UNSET (%s); the POSIX twin treats it as SET and validates it, so use IsNullOrEmpty:\n' \
+    printf 'ps-client: these AGENTQ_* reads treat a whitespace-only value as UNSET (%s); the POSIX twin treats it as SET and validates it, so use IsNullOrEmpty (AGENTQ_HOST: Test-AsciiWhitespaceOnly, so its set matches the POSIX ASCII byte set):\n' \
         "$(printf '%s ' $ws_env_violations)" >&2
     mode_static_failures=$((mode_static_failures + 1))
 fi
 # The same rule for the SSHP_* pair.  There is no allowed exception here: no
-# SSHP_* variable has a documented "whitespace means unset" contract (the
-# AGENTQ_HOST exemption exists because BOTH clients define it that way).  The
+# SSHP_* variable has a documented "whitespace means unset" contract (AGENTQ_HOST
+# has one, but its read site implements it with the ASCII byte set above).  The
 # POSIX sshp resolves both with `${VAR:-default}` / `[ -n ]`, so whitespace is
 # SET there.  Measured 2026-11-05: SSHP_SSH=' ' and SSHP_RECONNECT_DELAY=' '
 # were named refusals (2) on POSIX and fell through to PATH ssh / the default

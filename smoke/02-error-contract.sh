@@ -74,6 +74,14 @@ expect_rejected remove-label-no-confirm 'remove --label requires exactly a label
 expect_rejected remove-label-missing-flag 'remove --label requires --confirm' protocol_error remove --label smoke --nope
 expect_rejected remove-label-empty 'remove --label requires a non-empty label' protocol_error remove --label '' --confirm
 expect_rejected doctor-extra-arg 'doctor accepts --full or no arguments' protocol_error doctor --bogus
+# `--tail` gets an UPPER BOUND at the server as well (2026-11-19).  Both clients
+# accept any number of digits, and without the bound the value reached BSD
+# `tail -n` ("illegal offset"), failed as a Pueue log READ, and answered exit 1
+# "Pueue could not read the log" -- an infrastructure-sounding failure for an
+# argument a human typed wrong.  The server is reachable directly over ssh, so it
+# enforces its own bound instead of trusting the client.
+expect_rejected logs-tail-too-large 'no greater than 2147483647' protocol_error logs 1 --tail 99999999999999999999
+expect_rejected logs-tail-not-number '--tail must be a positive integer or all' protocol_error logs 1 --tail 5x
 
 # A non-ASCII request id must be rejected here too.  The guard used a bracket
 # RANGE (`A-Za-z`) until 2026-11-06; under bash with a collating locale

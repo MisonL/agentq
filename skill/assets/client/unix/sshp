@@ -495,13 +495,18 @@ case "$host" in
         ;;
 esac
 
-# Whitespace-only matches the Windows twin's IsNullOrWhiteSpace: a name ssh
-# would have to quote its way through is not a name at all.
-case "$host" in
-    *[[:space:]]*)
-        fail 'SSH host must not contain whitespace'
-        ;;
-esac
+# ANY ASCII whitespace anywhere in the name is refused: a name ssh would have to
+# quote its way through is not a name at all.  The set is ASCII
+# BYTES, not `[[:space:]]`: that class follows the caller's locale, so a host
+# containing NBSP (U+00A0) was accepted under LC_ALL=C and refused under a
+# UTF-8 locale (measured 2026-11-19: C went on to ssh, en_US.UTF-8 refused
+# with exit 2) -- the same locale-dependent answer the main client removed from
+# its workdir check in 2026-11-09.  `tr -d` with an explicit byte list gives
+# every locale the same verdict, so the test is "did stripping change it?".
+host_without_spaces=$(printf '%s' "$host" | LC_ALL=C tr -d ' \t\n\r\f\v')
+if [ "$host_without_spaces" != "$host" ]; then
+    fail 'SSH host must not contain whitespace'
+fi
 
 # Split the way the Windows twin splits: charset first, leading hyphen second,
 # each with the message that actually describes it.  The single lumped pattern

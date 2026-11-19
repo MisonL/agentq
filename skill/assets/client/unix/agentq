@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.34'
+agentq_client_version='0.1.35'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072), and the unix bound keeps a
 # safety margin under it.
@@ -128,6 +128,15 @@ agentq_recovery_output_file=''
 agentq_operation_log_file=''
 agentq_operation_output_file=''
 agentq_operation_ssh_pid=''
+# run_ssh_logged's in-flight ssh.  It used to be a plain FOREGROUND command, and
+# that made the client deaf to HUP/INT/TERM for the whole call: a shell defers a
+# trapped signal until the current foreground command returns, so the handler
+# ran only after ssh itself exited.  Measured 2026-11-19 on bash, dash and zsh:
+# with a child sleeping 20-30s in the foreground, `kill -TERM` was acted on only
+# when that child finished (21s and 31s runs), while the same child backgrounded
+# and `wait`ed was interrupted within 1s.  Running ssh with `&` + `wait` lets the
+# existing signal trap kill it without changing which status the caller sees.
+agentq_foreground_ssh_pid=''
 wait_timeout_seconds=''
 # The response shape the safe-operation loop validates against.  Defaults to
 # the operation name; status --summary/--task and doctor --full set a specific
@@ -165,6 +174,28 @@ agentq_askpass_program=''
 agentq_askpass_temporary=''
 agentq_askpass_temporary_identity=''
 agentq_number_of_password_prompts=1
+
+
+# True when the value is empty or consists only of ASCII whitespace (space,
+# TAB, LF, CR, FF, VT).  Defined up here because the FIRST callers are the
+# AGENTQ_HOST read and the host-shape guard, which run before the
+# argument-parsing helpers below.  The set is an explicit BYTE list, for the
+# same reason `workdir_is_blank` uses one: a `case` bracket class follows the
+# caller's locale.  Measured 2026-11-19 -- NBSP (U+00A0) and U+3000 are VALUES
+# under LC_ALL=C and BLANK under en_US.UTF-8, only TWO of four shell x locale
+# cells honoured the locale at all (macOS /bin/sh=bash 3.2 and zsh did; dash
+# ignored it in both directions), and U+0085 was never blank.  So the host-shape
+# sites that asked with `*[![:space:]]*` refused a NBSP-only host under a UTF-8
+# locale and handed it to ssh under C (exit 255, the RETRYABLE transport class,
+# after paying a probe), while the Windows twin's IsNullOrWhiteSpace refused it
+# in both -- the same argv, two answers, decided by the caller's locale.
+# Anything outside the ASCII set is a VALUE on both twins, exactly as
+# `workdir_is_blank` decided for `--workdir` in 0.1.27.
+ascii_whitespace_only() {
+    local stripped
+    stripped=$(printf '%s' "$1" | LC_ALL=C tr -d ' \t\n\r\f\v')
+    [ -z "$stripped" ]
+}
 
 
 # Every identity helper below needs the same thing from stat, and each call
@@ -607,18 +638,19 @@ if [ -r "$config_path" ]; then
     fi
 fi
 
-# Whitespace-only counts as UNSET, matching the Windows twin's
-# IsNullOrWhiteSpace: a value that is nothing but spaces is not a host.  The
-# `:-` substitution below covers only the EMPTY case, so a whitespace-only
-# AGENTQ_HOST used to be kept verbatim and handed to ssh -- measured
-# 2026-10-27, with a config file naming `cfg-host` and AGENTQ_HOST=' ' the two
-# clients reached DIFFERENT machines.  Locale caveat: `[![:space:]]` agrees
-# with .NET on NBSP and U+3000 under a UTF-8 locale; under LC_ALL=C it does not
-# treat them as space.  Same rule as the host-shape guard below.
-case "${AGENTQ_HOST:-}" in
-    *[![:space:]]*) default_host=$AGENTQ_HOST ;;
-    *) default_host=$configured_host ;;
-esac
+# Whitespace-only counts as UNSET: a value that is nothing but spaces is not a
+# host.  The `:-` substitution below covers only the EMPTY case, so a
+# whitespace-only AGENTQ_HOST used to be kept verbatim and handed to ssh --
+# measured 2026-10-27, with a config file naming `cfg-host` and AGENTQ_HOST=' '
+# the two clients reached DIFFERENT machines.  The blank test is the ASCII byte
+# set, NOT `[![:space:]]`, so the answer no longer depends on the caller's
+# locale (see `ascii_whitespace_only`); it is the same rule as the host-shape
+# guard below, so the two sites cannot disagree about the same value.
+if [ -n "${AGENTQ_HOST:-}" ] && ! ascii_whitespace_only "$AGENTQ_HOST"; then
+    default_host=$AGENTQ_HOST
+else
+    default_host=$configured_host
+fi
 
 # ---------------------------------------------------------------------------
 # Password authentication sources
@@ -1479,11 +1511,18 @@ agentq_stop_background_ssh() {
     # until the task ends.  Only the wait-with-timeout path backgrounds an ssh
     # (the platform probe does too, but it runs inside a $( ) subshell, so its
     # pid never reaches this shell -- that path is bounded by its own 30s probe
-    # timeout instead).
+    # timeout instead).  The foreground-ssh pid below is the same orphan for
+    # every OTHER operation: run_ssh_logged backgrounds its ssh precisely so
+    # this trap can reach it (see agentq_foreground_ssh_pid).
     if [ -n "${agentq_operation_ssh_pid:-}" ]; then
         kill "$agentq_operation_ssh_pid" >/dev/null 2>&1 || true
         wait "$agentq_operation_ssh_pid" >/dev/null 2>&1 || true
         agentq_operation_ssh_pid=''
+    fi
+    if [ -n "${agentq_foreground_ssh_pid:-}" ]; then
+        kill "$agentq_foreground_ssh_pid" >/dev/null 2>&1 || true
+        wait "$agentq_foreground_ssh_pid" >/dev/null 2>&1 || true
+        agentq_foreground_ssh_pid=''
     fi
 }
 
@@ -3733,7 +3772,7 @@ run_ssh_logged() {
             fi
         fi
         agentq_ssh_input_require_existing_file "$ssh_input_file" || return $?
-        if "$ssh_binary" \
+        "$ssh_binary" \
             -E "$ssh_log_file" \
             -o LogLevel=ERROR \
             $ssh_credential_option_lines \
@@ -3741,24 +3780,66 @@ run_ssh_logged() {
             -o ServerAliveInterval=15 \
             -o ServerAliveCountMax=12 \
             -o TCPKeepAlive=yes \
-            -- "$host" "$ssh_remote_command" < "$ssh_input_file" 2>"$ssh_stderr_redirection"; then
+            -- "$host" "$ssh_remote_command" < "$ssh_input_file" 2>"$ssh_stderr_redirection" &
+        agentq_foreground_ssh_pid=$!
+        if wait "$agentq_foreground_ssh_pid"; then
             ssh_status=0
         else
             ssh_status=$?
         fi
+        agentq_foreground_ssh_pid=''
     else
-        if "$ssh_binary" \
-            -E "$ssh_log_file" \
-            -o LogLevel=ERROR \
-            $ssh_credential_option_lines \
-            -o ConnectTimeout=10 \
-            -o ServerAliveInterval=15 \
-            -o ServerAliveCountMax=12 \
-            -o TCPKeepAlive=yes \
-            -- "$host" "$ssh_remote_command" 2>"$ssh_stderr_redirection"; then
+        # `0<&0` is NOT enough to preserve the caller's stdin: in a
+        # non-interactive shell a background job starts with stdin on /dev/null
+        # BEFORE its own redirections are applied, so naming fd 0 explicitly
+        # still delivers an empty stream (measured 2026-11-19 on dash: the
+        # `0<&0` form read nothing, while dup-and-restore via a high fd read
+        # the file on bash, dash and zsh alike).  The duplicate is what keeps
+        # the child's stdin the caller's, as it was when this call was
+        # foreground; the fallback keeps a closed fd 0 from turning into a
+        # launch failure.  The probe must run in a SUBSHELL: measured
+        # 2026-11-19, a bare `exec 9<&0` with fd 0 closed makes bash and dash
+        # abandon the whole script (exit 2, no message -- it looked exactly
+        # like a protocol refusal), so an "is fd 0 open" test that is not
+        # confined to a subshell is itself the bug.
+        ssh_stdin_duplicated=0
+        if ( exec 9<&0 ) 2>/dev/null; then
+            # Re-do it in THIS shell: fd 0 could in principle close between the
+            # two, and a bare `exec` failure here would abort under `set -e`.
+            if exec 9<&0; then
+                ssh_stdin_duplicated=1
+            fi
+        fi
+        if [ "$ssh_stdin_duplicated" -eq 1 ]; then
+            "$ssh_binary" \
+                -E "$ssh_log_file" \
+                -o LogLevel=ERROR \
+                $ssh_credential_option_lines \
+                -o ConnectTimeout=10 \
+                -o ServerAliveInterval=15 \
+                -o ServerAliveCountMax=12 \
+                -o TCPKeepAlive=yes \
+                -- "$host" "$ssh_remote_command" 0<&9 2>"$ssh_stderr_redirection" &
+        else
+            "$ssh_binary" \
+                -E "$ssh_log_file" \
+                -o LogLevel=ERROR \
+                $ssh_credential_option_lines \
+                -o ConnectTimeout=10 \
+                -o ServerAliveInterval=15 \
+                -o ServerAliveCountMax=12 \
+                -o TCPKeepAlive=yes \
+                -- "$host" "$ssh_remote_command" 2>"$ssh_stderr_redirection" &
+        fi
+        agentq_foreground_ssh_pid=$!
+        if wait "$agentq_foreground_ssh_pid"; then
             ssh_status=0
         else
             ssh_status=$?
+        fi
+        agentq_foreground_ssh_pid=''
+        if [ "$ssh_stdin_duplicated" -eq 1 ]; then
+            exec 9<&-
         fi
     fi
 
@@ -4516,12 +4597,12 @@ done
 # caller following the contract would retry a permanent typo forever after
 # paying an SSH round trip.  Measured 2026-10-27 for `--host -x`, `--host ' '`
 # and the rest of the whitespace family.  Order is the twin's: blank, then
-# hyphen.  Locale caveat: `[![:space:]]` matches NBSP and U+3000 under a UTF-8
-# locale (as .NET does) but not under LC_ALL=C.
-case "$host" in
-    *[![:space:]]*) : ;;
-    *) fail 'no SSH host configured; pass --host or set AGENTQ_HOST' ;;
-esac
+# hyphen.  The blank test is the ASCII byte set, NOT `[![:space:]]`, so a
+# NBSP-only or U+3000-only host is a VALUE in every locale instead of flipping
+# its verdict with the caller's locale (see `ascii_whitespace_only`).
+if ascii_whitespace_only "$host"; then
+    fail 'no SSH host configured; pass --host or set AGENTQ_HOST'
+fi
 case "$host" in
     -*) fail 'SSH host must not begin with a hyphen' ;;
 esac

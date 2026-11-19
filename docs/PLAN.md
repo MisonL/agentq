@@ -402,6 +402,97 @@ jq 分支**，是本检查从来没有过的**执行证据**（`08` 仍只是间
   **修复后契约形状**：≤约 8.1K 单参数全链路逐字回环；8.1K–32.5K 任务会被
   cmd 截断（stdin/env 层不再失败）；>32.5K 显式 rc=2 + `reason=protocol_error`。
 
+### 2026-11-19 第四轮终审（7 个只读 agent + Orca Codex，审的是 v0.1.34）——修 12 处，其中 1 条 P1 是客户端的中断语义（编号里有 13 条：第 3 条是本轮我自己的修复引入的回归，不算独立发现）
+
+**已修（每条都先自己复现，再改，再证明锁会红）**：
+
+1. **P1：在途的「前台」ssh 让 POSIX 客户端对 HUP/INT/TERM 全程失聪。** `run_ssh_logged`
+   直接前台起 ssh；shell 只在当前前台命令**返回后**才跑 trap，所以 Ctrl-C 要等 ssh 自己
+   结束才生效。实测（桩 `exec sleep 30`）：`kill -TERM` 后客户端 **31 秒**才退 130，期间
+   完全没有反应；同一子进程改成后台 + `wait` 后 **1 秒**内响应（bash/dash/zsh 三种都
+   实测）。对一个 ConnectTimeout=10 + ServerAliveInterval=15×12 的死连接，这等于三分钟
+   不可中断。修法：ssh 一律 `&` + `wait`，pid 记进 `agentq_foreground_ssh_pid`，
+   `agentq_stop_background_ssh` 一并 kill。锁：`smoke/28` 第 10 例，**两个独立断言**
+   （客户端 10 秒内退出 + 桩 pid 已消失）——只断言 pid 会漏：子进程 30 秒后自己结束，
+   pid 也「消失」。红证实测：撤销资产改动即报 `was not acted on until 31s in`。
+2. **后台化会吞掉调用方 stdin（同一改动的反向风险，已实测并加锁）。** 非交互 shell 的
+   后台作业以 /dev/null 作 stdin（bash/dash 实测），而 `0<&0` 救不回来——dash 上读不到字节，
+   必须先把 fd 0 dup 到高位 fd 再 `0<&9`。锁：`smoke/28` 第 11 例，桩把 stdin 读进文件与
+   payload 逐字比对；删 `0<&9` 即报 `the backgrounded ssh received no stdin`。
+3. **「fd 0 是否可 dup」的探测本身会杀死脚本。** 第一版写成裸 `exec 9<&0 2>/dev/null`；
+   fd 0 关闭时 bash 与 dash **整个脚本退出 2 且无 stderr**（实测），在 `smoke/05` 里表现为
+   「`AGENTQ_SSH cannot be launched` 不见了、只剩一个光秃秃的 exit 2」——看起来像协议拒绝。
+   改为在子 shell 里探测、父 shell 内再 dup 一次（两次之间 fd 0 理论上可关闭，所以第二次
+   也放进 `if` 里而不是裸语句）。这一条是本轮我自己的修复引入的回归，`smoke/05` 抓到。
+4. **安装器的维护锁对「死持有者」永久拒绝（0.1.28 引入，影响生产）。** 两行把极性写反：
+   `[ ! -e pid ] && [ ! -L pid ] || maintenance_lock_fail_unconfirmable`——pid 文件**不存在**
+   时右侧触发，于是**死持有者留下的锁永远无法恢复**，只能人工删目录。删掉该分支让控制流
+   落到后续 `is_stale` 判断（fail-closed）。原先那条 `unrecoverable stale maintenance lock`
+   用例断言的是 `cannot confirm the owner`，**它一直靠缺陷变绿**——已订正期望消息。
+5. **安装器静默忽略 argv。** `install-agentq.sh --check` 会**完整安装**一遍：所有路径都由
+   环境变量决定，argv 从未被读过。现在 `--help` 打印用法退 0，其余任何 argv 拒绝退 2；
+   `smoke/11` 两例（`argv-refused=covered`）。
+6. **安装器 `grep` 的 rc 折叠可静默覆盖客户端。** 共址守卫把 rc=2（读不出）与 rc=1（不是
+   wrapper）当同一「继续」，一次瞬时读失败就覆盖仍在服务的客户端。改为 rc 0/1/其余三分支。
+7. **两份客户端的协议值比较不等价（六处）**：Windows 侧 `"success" -ne "Success"` 为 False
+   （`-eq` 不分大小写）、`$x -eq $true` 接受字符串 `"true"`、`PSObject.Properties[…]` 索引器
+   与成员访问都不分大小写、探针 token 正则 `\d` 匹配 Unicode 数字、`.Trim() -eq` 与
+   `-like "MINGW*"` 同理；`sshp` 的主机空白判定用 `[[:space:]]`（随 locale 变：NBSP 在 C 下
+   非空白、UTF-8 下是空白）。分别改 `-ceq`/`-cne`/`-clike`、`-is [bool]`、精确属性遍历、
+   `[0-9]`、`LC_ALL=C tr -d ' \t\n\r\f\v'`。锁分布在 `smoke/12` 与 `smoke/19`。
+8. **PS 5.1 上平台缓存永不命中**：`ConvertFrom-Json -NoEnumerate` 在 5.1 不存在，参数绑定
+   直接抛错，被 catch 吞成 miss。改为按 `Parameters.ContainsKey("NoEnumerate")` 分支。
+9. **服务端 `remove_task` 的 request-record 读取 fail-open**：`record=$(read_request_record …)`
+   没有 `local record_read_status`，rc=2（读不出）与 rc=1（不存在）走同一分支，一次瞬时
+   读失败就把「已移除」报成别的结果。补 `case 0/1/*` 三分支，`*` 即 `fail`。
+10. **服务端 `logs --tail` 无上界**：`--tail 99999999999999999999` 被原样交给 Pueue。新增
+    `is_bounded_line_count()`（剥前导零、长度 ≤10、≤2147483647），超出按**参数错误**退 2
+    （不是误导性的 exit 1）。锁：`smoke/02` 两例，变异（去掉上界）实测红。
+11. **五处检查自身的假绿**：`smoke/01` 的 step 级 `continue-on-error`、`.cmd` 的
+    `%ERRORLEVEL%` 传播、版本常量重复赋值（`grep -m1` 读第一处而 shell 用最后一处）；
+    `smoke/10` 规则 D2（ACL 读回必须被读）；`smoke/31` 规则 E（v0.1.31 起 tag 必须
+    annotated）；`smoke/12` 的 exit-token 读取器枚举过窄；`smoke/05` 的 wait 预算耗尽用例。
+
+12. **macOS 上 `sudo -v` 被拒会把安装器永久锁死（Codex 报告，已复现并修复）。** 维护锁在
+   `authorize_macos_root` **之前**就已取得，而 `remove_installer_file` 在 macOS 上**一律**经
+   `run_as_root rm -f`——包括 `$HOME` 下的锁元数据。于是「用户拒绝 sudo / 没有权限」这一
+   完全正常的输入，会让 EXIT trap 的释放失败、把 `.agentq.maintenance.lock/pid` 留下；
+   而**陈旧锁的恢复走同一个提权助手**，所以**之后每一次**安装都报
+   `cannot recover stale AgentQ maintenance lock`，只能人工删目录。实测（沙箱 HOME +
+   拒绝型 sudo 桩，v0.1.34）：第一次 `sudo authorization failed` 且 HOME 留锁，第二次
+   `cannot recover stale ...`。修法：只在**目标目录确实需要提权**时才走 `run_as_root`
+   （复用既有的 `installer_directory_needs_elevation`），`$HOME` 下的删除回到普通 `rm`。
+   锁：`smoke/11` 两例，红证实测 3 处失败、修复后 `cases=46`。
+
+13. **非 ASCII 空白主机名的孪生分歧（本轮复审后自查发现，已修）。** 第 7 条只把 `sshp` POSIX 侧的空白判定改成 ASCII 字节集，
+    但同一条规则的两个方向都没对齐：`agentq` 的两处主机判据（`AGENTQ_HOST` 读点、host-shape 守卫）在 POSIX 侧仍是
+    `*[![:space:]]*`（**随 locale 变**），Windows 侧是 `IsNullOrWhiteSpace`（**Unicode 集**）；配置文件值的字符类两侧是
+    `[^[:space:]]`（LC_ALL=C）vs `[^\s]`（.NET）；`sshp.ps1` 用 `\s`。实测（2026-11-19，同一台 macOS）：
+    - `AGENTQ_HOST` = 纯 NBSP 或 U+3000：`LC_ALL=C` 下 POSIX 退 **255**（值真的交给 ssh，可重试类）、`en_US.UTF-8` 下退 **2**、
+      Windows 恒退 **2** —— **同一 argv 三个答案，其中两个在同一台机器上**。
+    - 配置文件 `AGENTQ_HOST=a<NBSP>b`：POSIX 连到 `a<NBSP>b`（255），Windows 报「no SSH host configured」（2）。
+    - `sshp --check <纯 NBSP>`：POSIX 在探针 READY 时退 **0**（完全放行），Windows 退 **2**。
+    修法：两侧统一为 **ASCII 字节集 ` \t\n\r\f\v`**（与 0.1.27 给 `--workdir` 定的同一规则）——POSIX 新增
+    `ascii_whitespace_only()`（在 `AGENTQ_HOST` 读点之前定义；首个调用者比参数解析早得多），Windows 新增
+    `Test-AsciiWhitespaceOnly`；配置行字符类两侧都改为 `[^ \t\n\r\f\v]`；`sshp.ps1` 改为 `-match '[ \t\n\r\f\v]'`。
+    锁：`smoke/05` +12 例（3 码点 × 2 locale × 2 路）、`smoke/12` 孪生 host 表 +3、config 表 +3（并去掉
+    `ws_env_offenders` 的 AGENTQ_HOST 豁免）、`smoke/19` +4（两码点 × 两 locale 的**接受**方向）、`smoke/20` +2。
+    两处变异自测的锚点随之搬家（旧 `case` 分支的 sed 锚点改成谓词里的那行；配置量词的锚点从 `[^\s]` 改成新字符类），
+    锚点找不到时自测**报红**而不是静默跳过——实测旧锚点在改名后立刻报「not found」。
+    **边界**：`sshp` POSIX 侧仍拒绝**任何位置**的 ASCII 空白而 `agentq` 只拒绝纯空白值，这是两套契约，未变。
+
+**记为边界（不修，理由见下）**：
+
+- **`sshp` 同样前台起 ssh，且有 `-tt` 交互会话**。它不在 `run-tests.sh` 的中断覆盖里，
+  而交互会话的中断语义（用户按 Ctrl-C 期望的是**把 SIGINT 交给远端**，不是本地退出 130）
+  与客户端根本不同——把客户端的 `&`+`wait` 形态照搬进 `sshp` 会改变交互行为。未在真机
+  验证之前不动它。
+- **POSIX 信号不 kill 在途 ssh 的远端一侧**：本地 kill 掉 ssh **不会**终止远端命令
+  （2026-10-28 实测，真实 sshd）。本轮修的是**本地**失聪，远端仍由 `AGENTQ_WAIT_BUDGET`
+  兜底；Windows 目标没有这个兜底，已在 SKILL.md 记为边界。
+- **`ps51=NOT-covered`**：本机只有 pwsh 7.5.4，PS 5.1 上的行为（含第 8 条的参数绑定）没有
+  执行证据，只有静态规则保证没有用 7 专有 API。
+
 ### 2026-11-18 第三轮终审（7 个只读 agent + Orca Codex，审的是 v0.1.33）——修 5 处，订正 3 处文档，3 条发现证伪
 
 **已修（每条都先自己复现，再改，再证明锁会红）**：

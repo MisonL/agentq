@@ -109,7 +109,7 @@ workflow，超出部分静默不触发**）、在版本索引加一行并在日�
   插倒填日期的条目）。规则只保护**下一条**要写的条目：2026-11-15 之前的 137 条历史条目没有
   验证行，那是长条目时期的既有形态，**不检查、不重写**。
 - 该检查读检出里的 tag，浅克隆会报 `NOT-covered(no-tags-in-checkout)` 而不是通过；`ci.yml`
-  的 linux job 用 `fetch-depth: 0` 检出让规则每次都真的跑（实测：浅克隆 `tags=0`、全量 `tags=31`）。
+  的 linux job 用 `fetch-depth: 0` 检出让规则每次都真的跑（实测：浅克隆 `tags=0`、全量 `tags=35`，2026-11-19）。
 - 六向变异红证（幽灵 tag / 缺索引 / 重复索引 / 顺序颠倒 / 最新条目缺验证行 / 顶部倒填日期）都
   跑过并还原。
 - **tag 用 annotated**：`git tag -a vX.Y.Z -m "..."`。`release.yml` 只比名字、轻量 tag 也能过，
@@ -143,7 +143,7 @@ doctor
 | `4` | `ambiguous` 或 `removing` / `cancellation_pending`——服务端无法安全判断，**必须停止**，不得自动重试 |
 | `5` | 已移除（`wait`/`lookup` 的 `state: "removed"`；tombstone 保留期内可重复读到，不是一次性） |
 | `6` | 无法给出可信答案（`state: "unavailable"`）：`wait` 是终态不可确认（含**客户端预算耗尽**）；`logs` 是任务身份歧义或**任务已终态但日志文件不可用**；`status --task` 是任务身份歧义（0.1.24 起三者对同一状态给同一答案） |
-| `42-45` | Windows launcher（`agentq.ps1` / `sshp` 客户端） |
+| `42-45` | Windows launcher（`agentq.ps1`；`sshp` 不产生这一组——它只有 2/127/130/255 与探针状态透传） |
 | `124` | 平台探测超时（客户端） |
 
 `wait` 必须同时核对**调用退出码**和 `task.status.Done.result`——两者都不能省略。
@@ -155,10 +155,12 @@ doctor
 response loss 只能用**同一 request ID** lookup/reconcile；
 `cancel`/`remove` 响应丢失时不要自动重试，先读 status/logs/wait 重新确认。
 
-### 并发：`2` 有三种含义
+### 并发：`2` 有四个 `reason` 类别
 
-`2` 是"协议/参数错误"，但服务端把它复用在了三类完全不同的情况上。客户端
-只对传输故障（`255`）重试，这三者都**原样透传**给调用方。
+`2` 是"协议/参数错误"，但服务端把它复用在了几类语义完全不同的情况上，用
+`reason=` 区分（见下表：`protocol_error` / `lock_contention` / `task_not_running` /
+`deployment_state` 四类；锁竞争与安装器维护锁同属 `lock_contention`）。客户端
+只对传输故障（`255`）重试，这些都**原样透传**给调用方。
 
 **判类别读 `reason`，不要匹配消息文本。** 服务端每条以 `2` 退出的路径都会在
 消息之后多打一行 `<程序名>: reason=<class>`：
