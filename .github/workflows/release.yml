@@ -33,12 +33,24 @@ jobs:
         # whose triggers do not include tag pushes -- so without this step the
         # rule is never evaluated at the moment a tag is published.  Measured
         # 2026-11-20: `git cat-file -t refs/tags/<name>` answers `tag` for an
-        # annotated tag and `commit` for a lightweight one.  smoke/01 pins that
-        # this workflow carries the assertion (`git cat-file -t` + `refs/tags/`
-        # on one non-comment line), so deleting it turns the suite red.
+        # annotated tag and `commit` for a lightweight one -- but only if the
+        # ref points at the TAG OBJECT.  actions/checkout on a tag push fetches
+        # the COMMIT the push names into refs/tags/<name> (its first release run
+        # for v0.1.37 answered `commit` for a tag that is annotated in the
+        # repository), so the step re-fetches the tag REF first.  Measured in a
+        # throwaway clone of this repo: fetch-by-sha into refs/tags/<name> ->
+        # `commit`; fetch of the tag refspec -> `tag`.  smoke/01 pins that this
+        # workflow carries both the cat-file assertion and the ref fetch
+        # (`refs/tags/` + `git cat-file -t`, and `refs/tags/` + `git fetch`, each
+        # on one non-comment line), so deleting either turns the suite red.
         run: |
           set -eu
-          object_type=$(git cat-file -t "refs/tags/$GITHUB_REF_NAME" 2>/dev/null || true)
+          if ! git fetch --no-tags --depth=1 origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"; then
+            echo "cannot fetch refs/tags/${GITHUB_REF_NAME} to inspect its object type" >&2
+            echo "The release gate inspects the ref itself; retry the tag push." >&2
+            exit 1
+          fi
+          object_type=$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}" 2>/dev/null || true)
           if [ "$object_type" != tag ]; then
             echo "tag $GITHUB_REF_NAME is not an annotated tag (git cat-file -t answered '${object_type:-unknown}')." >&2
             echo "Create it with \`git tag -a\` and push it again: the annotation carries the release notes and the back-link." >&2

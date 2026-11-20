@@ -2333,13 +2333,36 @@ fi
 # lightweight tag passed release.yml green and would have been reported only on
 # the NEXT branch push, if one ever came.  Same matcher as the records, so a
 # comment that merely describes the check does not satisfy it.
+#
+# The assertion alone is not enough: `git cat-file -t refs/tags/<name>` reads
+# the object the REF points at, and actions/checkout on a tag push points that
+# ref at the COMMIT (measured 2026-11-20: the first v0.1.37 release run
+# answered `commit` for an annotated tag; in a throwaway clone, fetch-by-sha
+# into refs/tags/<name> -> `commit`, fetch of the tag refspec -> `tag`).  So
+# the workflow must re-fetch the tag ref itself; both constructs are required.
 release_gate_annotation=missing
-if release_gate_reads "$release_gate_workflow" 'refs/tags/' 'git cat-file -t'; then
+if release_gate_reads "$release_gate_workflow" 'refs/tags/' 'git cat-file -t' &&
+    release_gate_reads "$release_gate_workflow" 'refs/tags/' 'git fetch'; then
     release_gate_annotation=asserted
 else
-    printf '%s\n' 'release-gate FAILED (release.yml never asserts that the pushed tag is ANNOTATED: smoke/31 rule E only runs on branch pushes, so a lightweight tag would release green)' >&2
+    printf '%s\n' 'release-gate FAILED (release.yml either never asserts that the pushed tag is ANNOTATED, or never re-fetches the tag ref first -- actions/checkout points refs/tags/<name> at the COMMIT, so cat-file alone answers commit for a correct annotated tag; smoke/31 rule E only runs on branch pushes, so a lightweight tag would release green)' >&2
     release_gate_gaps=$((release_gate_gaps + 1))
 fi
+# Two-way calibration for the fetch half: the comment-only shape must NOT count
+# (the same "prose is not a read" lesson as the records above), and the real
+# refspec line must.
+release_gate_fetch_fixture=$(mktemp "${TMPDIR:-/tmp}/agentq-release-fetch.XXXXXX")
+printf '%s\n' '# git fetch refs/tags/v0.1.37 in a comment must not count' >"$release_gate_fetch_fixture"
+if release_gate_reads "$release_gate_fetch_fixture" 'refs/tags/' 'git fetch'; then
+    printf '%s\n' 'release-gate FAILED (its fetch matcher accepts a comment-only mention: prose would satisfy the annotated-tag lock)' >&2
+    release_gate_gaps=$((release_gate_gaps + 1))
+fi
+printf '%s\n' 'git fetch --no-tags --depth=1 origin "+refs/tags/v0.1.37:refs/tags/v0.1.37"' >>"$release_gate_fetch_fixture"
+if ! release_gate_reads "$release_gate_fetch_fixture" 'refs/tags/' 'git fetch'; then
+    printf '%s\n' 'release-gate FAILED (its fetch matcher rejects a real tag-refspec fetch: the calibration would fail correct code)' >&2
+    release_gate_gaps=$((release_gate_gaps + 1))
+fi
+rm -f -- "$release_gate_fetch_fixture"
 if [ "$release_gate_gaps" -ne 0 ]; then
     failures=$((failures + 1))
 fi

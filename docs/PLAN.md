@@ -594,6 +594,31 @@ jq 分支**，是本检查从来没有过的**执行证据**（`08` 仍只是间
 **覆盖边界**：`smoke/12` 新增用例在 Windows 宿主上的计数未实测（94 是新增之前的数）；
 `smoke/02` 的新用例在本机走 `NOT-covered`，实际执行只在非 macOS 宿主上（CI 的 linux job）。
 
+### 2026-11-20 发布后（v0.1.37）：release 首跑红——annotated 断言在 checkout 里读到的不是 tag 对象
+
+**现象**：release run 44698210515 的 `Require an annotated tag` 步骤退 1，回答
+`tag v0.1.37 is not an annotated tag (git cat-file -t answered 'commit')`——而同一个 tag
+在本地 `git cat-file -t refs/tags/v0.1.37` 是 `tag`（`git tag -a` 创建，推送日志是
+`* [new tag]`）。**不是轻量 tag，是 checkout 的形状。**
+
+**根因（实测，不是推断）**：actions/checkout 在 tag push 上把 **GITHUB_SHA（那个
+commit）** 取进 `refs/tags/<name>`，于是该 ref 指向 commit 对象，`git cat-file -t`
+忠实回答 `commit`。在抛掷克隆里复现（remote 指向本仓）：
+`git fetch origin +<commit-sha>:refs/tags/v0.1.37` → `cat-file -t` 答 **commit**；
+再 `git fetch origin +refs/tags/v0.1.37:refs/tags/v0.1.37` → 答 **tag**。
+
+**修法**：步骤先取 tag **ref 本身**再问类型——
+`git fetch --no-tags --depth=1 origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"`，
+fetch 失败单独报错退出（不把取不到误报成「不是 annotated」）。`smoke/01` 的
+release_gate 规则现在要求**两个**构造各自在同一条非注释行上：`refs/tags/` +
+`git cat-file -t`，以及 `refs/tags/` + `git fetch`；fetch 半边带双向夹具（注释行不算、
+真实 refspec 行算）。红证：把 fetch 块删掉，`smoke/01` 退 1 并点名该原因；还原 → 退 0。
+tag 按「当前版本例外」前移到修复提交并重推，release 重跑。
+
+**教训**（与上一条同族）：**断言要在它真正运行的环境里量**。静态规则能钉住
+「workflow 里有这句话」，钉不住「这句话在那个 checkout 里看到的是什么」——所以钉法是
+先复现 checkout 的取法，再把两个构造一起写进规则。
+
 ### 2026-11-19 第四轮终审（7 个只读 agent + Orca Codex，审的是 v0.1.34）——修 12 处，其中 1 条 P1 是客户端的中断语义（编号里有 13 条：第 3 条是本轮我自己的修复引入的回归，不算独立发现）
 
 **已修（每条都先自己复现，再改，再证明锁会红）**：
