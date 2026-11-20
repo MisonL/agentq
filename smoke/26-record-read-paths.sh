@@ -331,15 +331,20 @@ assert_json w3 '.state == "removed" and .task_id == 1001'
 assert_err_has w3 'was removed before wait'
 assert_counts w3 0 1
 
-# W4. THE SAFETY CASE: two records both claim task id 1001.  wait must refuse --
-#     exit 2 -- rather than silently resolve to one of them.
+# W4. THE SAFETY CASE: two records both claim task id 1001.  wait must refuse to
+#     resolve to one of them.  Since 0.1.38 that refusal is 6/unavailable -- the
+#     same answer wait gives for the SAME ambiguity on the VISIBLE-task path,
+#     and the same class `status --task` has answered with since 0.1.24: the id
+#     is known, the FINAL STATE is not.  Until 0.1.38 this reconcile arm
+#     answered 2/protocol_error, telling the caller its arguments were wrong
+#     (measured 2026-11-20: the two paths disagreed on the same input).
 clear_runtime
 put_record AQREAD-AMBIG-A-00001 accepted 1001 '"2026-09-29T00:00:00Z"'
 put_record AQREAD-AMBIG-B-00002 accepted 1001 '"2026-09-29T00:00:00Z"'
 run_case w4 wait 1001
-assert_rc w4 2
-assert_err_has w4 'multiple AgentQ request records match task id: 1001'
-assert_reason w4
+assert_rc w4 6
+assert_json w4 '.state == "unavailable" and .task_id == 1001'
+assert_err_has w4 'multiple AgentQ request records match task id 1001; the final state is unavailable'
 
 # W5. Record takes precedence over tombstone in wait's scan.  With BOTH a
 #     matching `accepted` record and a matching tombstone present, wait takes the

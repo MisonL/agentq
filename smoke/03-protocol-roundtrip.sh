@@ -169,13 +169,14 @@ cleanup_own_records() {
         rm -f -- "$record"
     done
 }
-# The agentq group's parallelism is restored on every exit path, FIRST in the
-# trap: a run that ends while the queued case has the group below 1 would
-# otherwise leave the runtime with a group that never dispatches, and every
-# later check on it fails for a reason that has nothing to do with what it
-# tests.  First, so the task cleanup below does not queue behind a stopped
-# group; loudly, because a restore that silently failed would leave exactly
-# that state.
+# The agentq group's parallelism is set back to 1 on every exit path, FIRST in
+# the trap.  The server's `verify_group` refuses to work on a group whose
+# parallel_tasks is not 1 (`deployment_state`), so any other value left behind
+# makes every later AgentQ command on this sandbox fail for a reason that has
+# nothing to do with what the later check tests.  The queued case asserts the
+# value it depends on, and this trap puts it back even when an earlier
+# assertion dies; loudly, because a restore that silently failed would leave
+# exactly that state.
 restore_agentq_group() {
     [ -f "$runtime_home/config/pueue.yml" ] || return 0
     [ -x "$runtime_home/pueue" ] || return 0
@@ -237,6 +238,25 @@ if [ -d "$runtime_home/data/agentq-requests" ]; then
         leftover_label=$(jq -r '.task_label // empty' "$candidate" 2>/dev/null || true)
         case "$leftover_label" in
             smoke|smoke-run|smoke-fail|smoke-bin|smoke-fullwording|smoke-line|smoke-literal|smoke-queued|smoke-ambiguous|smoke-ambiguous-old)
+                printf 'dropping a record left by an earlier run of this check: %s (label %s)\n' \
+                    "${candidate##*/}" "$leftover_label" >&2
+                rm -f -- "$candidate"
+                continue
+                ;;
+            # …but every record this check's server writes carries
+            # `task_label = "agentq:" + request id`, and the request id is
+            # `smoke-<pid>-<UTC stamp>` plus a case suffix (`-run`, `-blk12`,
+            # `-queued`, …) -- so NONE of the fixed words above can ever match
+            # a live record.  Measured 2026-11-20: a run interrupted (SIGTERM
+            # from stopping the suite) right after the first submit left
+            # `agentq:smoke-<pid>-<stamp>-run`, this guard could not recognise
+            # it, and EVERY later run was refused -- the permanent self-brick
+            # the fixed-word arm was written to prevent, still reachable
+            # through the one label it left out.  Match the shape the check
+            # builds (this file's own id comment: `smoke-` + pid + UTC stamp),
+            # never a bare `smoke-*`: a user label that merely starts with
+            # "smoke" is not this check's.
+            agentq:smoke-[0-9]*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-*)
                 printf 'dropping a record left by an earlier run of this check: %s (label %s)\n' \
                     "${candidate##*/}" "$leftover_label" >&2
                 rm -f -- "$candidate"
@@ -822,7 +842,7 @@ add_blocker() {
     local blocker_id
     if ! output=$(PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" \
             "$runtime_home/pueue" add --group agentq --working-directory "$work" \
-            -- env AGENTQ_SMOKE_BLOCKER=1 sleep 60 2>&1); then
+            -- env AGENTQ_SMOKE_BLOCKER=1 sleep 300 2>&1); then
         printf 'could not queue a blocker task: %s\n' "$output" >&2
         exit 1
     fi
@@ -831,8 +851,8 @@ add_blocker() {
         printf 'could not read the blocker task id from: %s\n' "$output" >&2
         exit 1
     fi
-    # Registered before anything else can fail: an unregistered `sleep 60` would
-    # hold a slot, and the trap could only wait it out.
+    # Registered before anything else can fail: an unregistered blocker would
+    # hold a slot for 300 seconds, and the trap could only wait it out.
     cleanup_task_ids="$cleanup_task_ids $blocker_id"
     # No stdout at all -- the caller gets the id through this variable.  This
     # check captures the output of every command between itself and some later
@@ -896,6 +916,26 @@ victim_queued=0
 victim_task_id=''
 victim_request_id_used=''
 victim_states=''
+# The case needs the group's ONLY slot busy when the victim is submitted: with
+# two blockers queued under the deployment's parallelism of 1, at most one can
+# run, so the victim has nowhere to go.  Normalise first -- an interrupted run
+# of this check may have left the group at another value -- and assert the
+# value took, because the rest of the case is meaningless otherwise.
+# NOTE: 0 is NOT a pause.  `pueue parallel 0` means UNLIMITED (pueue 4.0.4
+# `parallel --help`: "Setting this to 0 means an unlimited amount of parallel
+# tasks"), and an earlier revision of this case used it as if it paused the
+# group -- measured 2026-11-21: with 0 set, the two blockers ran concurrently
+# (327 02:15:09-02:20:10 next to 328 02:16:25-02:21:25) and the victim was
+# dispatched instead of Queued.
+pueue_parallel 1
+queued_group_parallel=$(PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" \
+    "$runtime_home/pueue" status --json 2>/dev/null \
+    | jq -r '.groups.agentq.parallel_tasks // "?"' 2>/dev/null || printf '?')
+if [ "$queued_group_parallel" != 1 ]; then
+    printf 'cannot put the agentq group at parallelism 1 (live value: %s); the queued-cancel case needs its only slot busy\n' \
+        "$queued_group_parallel" >&2
+    exit 1
+fi
 # The blocker set is fixed before the first submit.  Measured 2026-11-17 on a
 # pueued that had been running for days: the victim reaches Running within a
 # second of its submit, so by the time a second try could add a blocker it has
@@ -920,7 +960,6 @@ for _ in $(seq 1 60); do
     sleep 0.5
 done
 if [ "${blockers_running:-0}" -lt 1 ]; then
-    pueue_parallel 1
     for blocker in $first_blocker_id $second_blocker_id; do
         printf 'blocker %s is %s\n' "$blocker" "$(task_status_name "$blocker")" >&2
     done
@@ -945,16 +984,19 @@ start_victim() {
         # Third and later: a blocker that has definitely started by now.
         add_blocker
     fi
-    if [ "$victim_try" -ge 2 ]; then
-        pueue_parallel 0
-    fi
     if ! victim_submit=$("$server" submit --workdir "$work" --label smoke-queued \
             --request-id "$victim_request_id" -- sleep 60); then
-        pueue_parallel 1
         printf 'submit for the queued-cancel case failed (try %s)\\n' "$victim_try" >&2
         exit 1
     fi
-    pueue_parallel 1
+    # No pause after the submit, and none before it either: the blockers hold
+    # the group's only slot for the whole window (two queued 300-second
+    # sleepers at parallelism 1 -- when the first ends, the second takes the
+    # slot), so the victim stays Queued until the cancel runs.  An earlier
+    # revision paused here instead, writing `pueue_parallel 0`; that set the
+    # group to UNLIMITED (see the normalisation above), dispatched both the
+    # queued blocker and the victim, and the cancel then answered
+    # task_not_running (measured 2026-11-21: "task 329 cancel exited 2").
     if ! victim_task_id=$(jq -er '.task_id' <<<"$victim_submit"); then
         printf 'queued-cancel submit returned no task_id: %s\n' "$victim_submit" >&2
         exit 1
@@ -1074,6 +1116,45 @@ jq -e '.reused == true' <<<"$replay_output" >/dev/null || {
         "$(jq -r '.cancellation_requested_at' <<<"$queued_cancel")" >&2
     exit 1
 }
+# The queued-cancel window is over.  End the blockers NOW rather than leaving
+# them to the EXIT trap: they are 300-second sleepers, the second starts the
+# moment the first ends, and the cases below submit tasks and wait for them
+# (ambiguous identity, batch round-trip, cancel-while-running).  A blocker
+# still holding the group's only slot starves every one of them until it
+# expires -- measured 2026-11-21: the second blocker was still Running when
+# this line was reached.  Both are already registered for the trap, so ending
+# them here only moves the cleanup earlier.
+# A kill is asynchronous and `remove` refuses a task that is still Running
+# (measured 2026-11-21: removing immediately after the cancel answered exit 2
+# for both blockers), so cancel both first, wait for them to leave Running,
+# only then remove -- and wait for the removal, because the cases below need
+# the slot for real.
+pueue_task_state() { # $1=id; the Pueue status key, Absent when the id is gone
+    PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" "$runtime_home/pueue" status --json 2>/dev/null \
+        | jq -r --arg id "$1" \
+            '.tasks[$id].status // "Absent" | if type == "object" then keys[0] else "Absent" end' \
+                2>/dev/null || printf 'Unreadable'
+}
+for blocker in $first_blocker_id $second_blocker_id; do
+    agentq_task_harness cancel "$blocker"
+done
+for blocker in $first_blocker_id $second_blocker_id; do
+    for _ in $(seq 1 60); do
+        case "$(pueue_task_state "$blocker")" in
+            Running|Queued) sleep 0.5 ;;
+            *) break ;;
+        esac
+    done
+    agentq_task_harness remove "$blocker"
+done
+for blocker in $first_blocker_id $second_blocker_id; do
+    for _ in $(seq 1 60); do
+        case "$(pueue_task_state "$blocker")" in
+            Absent|Removed) break ;;
+            *) sleep 0.5 ;;
+        esac
+    done
+done
 
 # The replay must be pinned to the same task INSTANCE.  Pueue reuses numeric
 # task ids, so a cancellation marker left behind by an earlier task that had
@@ -1228,7 +1309,9 @@ jq -e '.state == "removed"' <<<"$queued_lookup" >/dev/null || {
 # But Pueue REFUSES to remove a task that is still Running (measured on the
 # local sandbox: `pueue remove <id>` against a Running task returns
 # `The command failed for tasks: <id>`, exit 1, instantly -- it is not a slow
-# path that a retry loop can wait out).  The long-running tasks here are `sleep 60`, so a
+# path that a retry loop can wait out).  The long-running tasks here are `sleep 60`
+# (and the queued-case blockers `sleep 300`, so the queue window cannot be
+# outlived by its own slot holder), so a
 # remove-only loop keeps re-attempting an impossible removal for its whole
 # budget while the task is alive, then reports "cleanup left an active request
 # record".  That is how the Linux CI job flaked (2026-10-10: one record still

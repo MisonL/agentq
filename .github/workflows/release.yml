@@ -28,6 +28,16 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        with:
+          # smoke/31 runs below and needs this checkout's tags, not just the
+          # pushed one: a depth-1 checkout lists no tags and smoke/31 degrades
+          # to NOT-covered(no-tags-in-checkout) -- the same measured state that
+          # made ci.yml fetch the full history (2026-11-14).
+          fetch-depth: 0
+          # The one step that talks to the remote fetches tags anonymously;
+          # this repository is public, and no step pushes, so the credential
+          # checkout would leave in .git/config has no consumer.
+          persist-credentials: false
       - name: Require an annotated tag
         # smoke/31 rule E asserts the same thing, but smoke/31 runs in ci.yml,
         # whose triggers do not include tag pushes -- so without this step the
@@ -111,3 +121,25 @@ jobs:
             exit 1
           fi
           echo "tag $GITHUB_REF_NAME matches all $checked recorded versions"
+      - name: Enforce the changelog and tag discipline at the tag
+        # smoke/31 is the machine enforcement of the three-layer release
+        # contract (index names a tag, every tag has one index line, index is
+        # descending, the newest entry carries its verification line, and every
+        # tag since v0.1.31 is annotated).  ci.yml runs it on branch pushes,
+        # whose triggers exclude tag pushes -- so without this step the rules
+        # are never evaluated at the moment that can violate them.  Measured
+        # 2026-11-20 (F7): release.yml checked only the version constants.
+        run: |
+          set -eu
+          status=0
+          ./smoke/31-changelog-and-tags.sh >smoke31.log 2>&1 || status=$?
+          cat smoke31.log
+          if [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
+          # A NOT-covered pass here means the checkout could not enumerate the
+          # tags -- which is exactly the input this step exists to compare.
+          if grep -q 'NOT-covered' smoke31.log; then
+            echo 'smoke/31 degraded to NOT-covered at a tag push; the tag set is what it must compare' >&2
+            exit 1
+          fi

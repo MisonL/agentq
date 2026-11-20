@@ -897,7 +897,20 @@ fi
 # Counted from the call sites above, not typed: the summary used to claim
 # `lastexitcode-guards=5/5` as a literal, so deleting a call left the coverage
 # claim intact (the same dead-count class this repo fixed elsewhere).
-lastexitcode_guards=$(( $(grep -c '^assert_last_exitcode_alias ' "$0") + $(grep -c '^assert_last_exitcode_guard ' "$0") ))
+lastexitcode_guards=$(( $(grep -cE '^assert_last_exitcode_(alias|guard) "?\$' "$0" || true) ))
+# ...but counting alone still lets a deletion lower the number silently (12 -> 11
+# exited 0, and with that call gone a real `exit 2` -> `exit 3` regression in
+# start-daemon went unseen -- measured 2026-11-20).  The expected count is
+# fixed by the CENSUS: every asserted path needs one alias and one guard call.
+# Deleting a call now fails here; deleting the path AND the call still fails the
+# census above (the guard-shaped assets are derived from the tree).
+lastexitcode_asserted_paths=$(printf '%s\n' "$lastexitcode_root_asserted" | grep -c . || true)
+cases=$((cases + 1))
+if [ "$lastexitcode_guards" -ne $((2 * lastexitcode_asserted_paths)) ]; then
+    printf 'launcher-contract: %s aliased/guarded call(s) for %s asserted asset(s); expected 2 per asset -- a call site was removed or moved, so its per-file fail-closed check no longer runs\n' \
+        "$lastexitcode_guards" "$lastexitcode_asserted_paths" >&2
+    failures=$((failures + 1))
+fi
 
 # Behavioural half for the installer's helper: it is a pure function, so it can
 # be extracted from the REAL asset and driven in a real child pwsh.  The static

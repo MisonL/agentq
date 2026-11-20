@@ -619,6 +619,113 @@ tag 按「当前版本例外」前移到修复提交并重推，release 重跑�
 「workflow 里有这句话」，钉不住「这句话在那个 checkout 里看到的是什么」——所以钉法是
 先复现 checkout 的取法，再把两个构造一起写进规则。
 
+### 2026-11-20 第七轮审查（全维度：只读 agent + Orca Codex，审的是 v0.1.37）——修服务端并发收敛、协议一致性与检查自身假绿，版本 0.1.37 → 0.1.38
+
+**范围与边界**：安全 agent 只做防御性静态分析，未构造或运行利用载荷；所有发现均在主检出
+独立复现后才改。生产主机一台未碰；测试机真远端的既有证据不因本轮扩展。以下区分已实测
+与未覆盖，未实测的一律写在边界里。
+
+**服务端（真实并发复现，不是推理）**：
+1. **墓碑并发写入把一个正常并发读报成 2**。一个免锁的 `status`/`lookup` 归档 removed
+   记录，与另一个持锁的写者同时安装同一墓碑，后者的 rename 被 `install_temporary_file`
+   的原子身份检查拒绝，`fail` 退 2；实测 24 个并发 status 中 21 个失败（另一轮：20 个
+   orphan `removing` + 24 个 status，20 个退 2）。修法不是「重试用同一字节比较」——
+   `removed_at` 按秒生成，两个进程差一秒就有 5/24 仍失败；收敛判据改为
+   `jq -cS 'del(.removed_at)'` 语义相等，实测 24/24 rc=0、12 个墓碑、0 残留。
+2. **pruner 在 glob 与 `[ -f ]` 之间的「文件已消失」窗口退 2**（三类临时文件：runtime、
+   request tombstone、cancellation marker）。原先 220 次零命中，改用 200 个候选文件 +
+   延迟 50ms 批量删除后确定性复现（submit rc=2、`invalid AgentQ runtime temporary file
+   path`）；消失即收敛 `continue`，对不安全文件仍保留失败。
+3. **无法识别的 `.*.json` 名字阻塞所有写操作**。记录目录里一个 `.notes.json` 让 pruner
+   `fail`，普通 submit 退 2；改为跳过（`.notes.json`/`.stray.json` 保留、submit 成功）。
+   `smoke/27` S6d 的新用例在 HEAD 服务端上实测 rc=2，修复后 rc=0。
+4. **`wait` 的 reconcile 歧义答案与可见任务路径相反**。两条记录都声称同一 task id 时，
+   旧实现退 2/`protocol_error`（「参数错了」），而同一歧义在可见任务路径上退 6，
+   `status --task` 自 0.1.24 起也是 6；统一为 6/`unavailable`，`smoke/26` W4 改期望并在
+   HEAD 实测红（got 2）、修复后绿。
+5. `write_request_tombstone` 新加的三个变量没有 `local`，写进了调用方的同名局部变量
+   （`smoke/01` 静态规则点名）；已补 `local`，两份 canonical 服务端 `cmp=0`。
+
+**客户端与 Twin**：
+- Windows `ConvertFrom-Json` 在 pwsh 7 上把 ISO-8601 字符串强制转成 DateTime，令同一
+  JSON 在两个 Windows 引擎上不等价；按能力传 `-DateKind String`。**边界**：7.0–7.4 无此
+  参数，未实测；5.1 本来不转换；`-AsHashtable` 实测不阻止转换。
+- Windows 的 reason 提取取**第一**条，POSIX 取最后一条；同一两行 stderr 给出不同分类，
+  改为取最后一条。`$matches` 的赋值撞上 PowerShell 自动变量（`$lastExitCode` 那个 P0
+  同族），改名后被 `smoke/01` AST 规则抓到并修掉。
+- POSIX `doctor` 默认响应的过滤器接受两种形状，Windows 只接受严格摘要；收紧后发现
+  `doctor --full`（ decorated dump，两实现本应同形）被自己误拒，`smoke/05` 实测红，
+  补 `doctor_full` profile 后绿。POSIX 平台缓存读不再接受嵌套对象；`sshp` 的 Windows
+  标记路由按完全匹配；F9：`wait --timeout` 是第二个 ssh funnel，补上 `run_ssh_logged`
+  已有的 Windows 参数临时文件身份复核与 reason 清零（此前该路径的本地守卫失败会转发
+  上一次的 reason）。
+
+**检查/门禁自身的假绿（每个都先做空目录或变异红证）**：
+- `smoke/16` 的 `*/.claude/*` 在绝对路径工作树下把整树排除，worktree 里 `enumerated 0
+  files` 仍 rc=0；锚定 `$root` 后 rc=0、`files=140`。
+- `smoke/09` 枚举归零时仍 rc=0（空目录实测）；补 `call_sites=0` 闸门，真实树 `files=7
+  call_sites=5`。
+- `smoke/22` 的计数把两个函数定义也算进去，删掉一处调用仍 rc=0；改成只数调用，删行后
+  `11 vs 12` 红，还原 `cases=88 lastexitcode-guards=12` 绿。
+- `smoke/31`：`version_gt` 定义在规则 E 之后（实测 `command not found`，函数上移）；tag
+  列表用 `git tag --list` 显式判失败；规则 E 泛化到任意 `vX.Y.Z`；`printf | grep -q` 在
+  pipefail 下把找到的匹配报成没找到（`smoke/01` 点名），改 here-string；自校准只打印不红
+  的 `cal_bad` 改为失败。
+- `smoke/02` 桩的双重 `printf` 把 `%s` 吃掉，`id` 桩输出空行；改 `%%s` 后 `cases=46`。
+- `smoke/03` 的排队取消用例在**读路径慢的运行时**上有一个无法赢的时序假设：它依赖「阻塞
+  任务仍占着唯一槽位」，而实测（2026-11-21，本仓共享沙箱 224 条记录）`status` ~14s、
+  `logs` ~28s——受害者（`sleep 60`）能在「看到 Queued」与 `cancel` 之间真的跑完，于是
+  cancel 答 2/`task_not_running`（实测连续两次，`cancel of a queued task exited 2`）。
+  修的过程里有一步是错的，必须记下来：我先按「`pueue parallel 0` = 暂停」的假设改成
+  「提交后把组置 0」。**Pueue 4.0.4 的 `parallel --help` 原话是
+  “Setting this to 0 means an unlimited amount of parallel tasks”**——0 是不限并发，
+  不是暂停。实测（2026-11-21，本仓沙箱）：置 0 之后两个 blocker 并发运行
+  （327 `02:15:09–02:20:10` 与 328 `02:16:25–02:21:25` 重叠），受害者在提交后直接
+  被派发，`cancel` 答 `task_not_running`（日志原话 `task 329 cancel exited 2`）。
+  此前看到的「`parallel=0` 旁边任务仍在 Running」我也曾解释成「提交窗口内已派发、
+  事后暂停召回不了」——那也是误读，真实原因就是同一个：0 不限制任何东西。
+  **最终修法不用暂停**：blocker 提到 `sleep 300`、固定入队两个（并行度 1 下第一个
+  结束后第二个立刻接上，槽位连续被占约 10 分钟），受害者提交时必然没有空槽；
+  用例开头把组归一到 1 并**断言生效**（`groups.agentq.parallel_tasks == 1`），
+  否则整个用例的前提不成立、应当直接红。`submit` 的 `ensure_group` 也会把并行度
+  写成 1，归一是幂等的（实测 `parallel 0 -> submit -> parallel 1`）。
+  **300 秒 blocker 带来一个新风险并已实测**：第二个 blocker 会一直占着唯一槽位
+  直到它自然结束，而队列用例之后还有会提交并 `wait` 的用例（ambiguous identity、
+  contains-label 正控、batch round-trip）——它们会被饿住（实测 2026-11-21：
+  replay 断言通过时第二个 blocker 仍在 Running，结束时间还有约 4 分钟）。所以
+  队列用例的断言一结束就**立即** `cancel`+`remove` 两个 blocker 并等它们从队列
+  消失；EXIT trap 里那份登记保留，两条路径都结束它们是无害的。EXIT trap 的
+  `restore_agentq_group` 也改了理由：它现在不是「撤销我们降下的并行度」，而是
+  保证沙箱回到 `parallel_tasks=1`（服务端 `verify_group` 对其它值一律
+  `deployment_state` 拒绝，任何后续命令都会失败）。
+- `smoke/03` 的残留守卫认不出它**自己**的主提交记录：`.task_label` 是
+  `agentq:<request-id>`，request id 为 `smoke-<pid>-<UTC 戳>` 加用例后缀，而白名单只列了
+  `smoke`/`smoke-<case>` 这类裸标签——**一个都匹配不上**。实测（2026-11-20/21：我中断
+  一轮套件时留下的 `smoke-47637-…-run.json`）此后**每次**运行都在守卫处退 1，正是这段
+  守卫要防的永久自锁。补上按形状匹配（`agentq:smoke-<数字>-<戳>-*`），并实测两种方向：
+  遗留记录在 → 丢弃并继续（绿），非本检查形状（`smoke-stale-instance-…`）不被误删。
+- `smoke/01` 的 case 判空分支 `*" $tok="|*" $tok= "*` 的第一支不可能匹配（SC2195；
+  bash/dash 实测），删死后仍区分空值。**门禁**：ci.yml 的 `reported_count` 按名字去重（合成
+  PART+NCOV 日志旧 8 行/6 名，新 6），三处 checkout 加 `persist-credentials: false`；
+  release.yml 全量 fetch tag 并在 tag push 上运行 `smoke/31`（F7：此前只在 branch push
+  跑）， refuses NOT-covered；`smoke/01` 用双向夹具钉住新门禁。
+- 覆盖债数字与失真文档已更正：`docs/verification-status.md` 的 W4 与 27 例数、
+  `skill/references/contract.md` 的非 UTF-8 拒绝范围（补 `--workdir`、`remove --label`）、
+  `windows-installer-invariants.md` 删掉「32 条每条都有 smoke 守护」的假承诺（实测
+  `grep -r 'Get-Item -Force' smoke/` 为 0）。
+
+**新锁的红证（两条）**：`smoke/12` 的 ISO 时间戳用例在去掉 `-DateKind String`
+的客户端副本上实测 1 failure（`an ISO-8601 task output is not kept as a string`），
+原资产 `cases=227` 全绿；`smoke/01` 的 release-gate 新锁在把 `release.yml` 的
+`./smoke/31-changelog-and-tags.sh` 一行注释掉后实测红（点名「does not RUN
+smoke/31」），还原后绿。
+
+**未修边界（不声称覆盖）**：pwsh 7.0–7.4 无 `-DateKind`（7.5 之前的任何 pwsh
+都会把 ISO-8601 字符串转成 `DateTime`，`-AsHashtable` 实测也不阻止——`smoke/12`
+在该引擎上声明 `NOT-covered(engine-has-no-datekind)` 而不是假绿）；POSIX 侧 `wait` 预算路径的
+Windows 目标身份复核只做静态/桩验证，未在真 Windows + 真 SSH 上端到端运行；本轮所有
+并发与诊断测试都在本机合成运行时上，生产 Pueue/远端/凭证未验证。
+
 ### 2026-11-19 第四轮终审（7 个只读 agent + Orca Codex，审的是 v0.1.34）——修 12 处，其中 1 条 P1 是客户端的中断语义（编号里有 13 条：第 3 条是本轮我自己的修复引入的回归，不算独立发现）
 
 **已修（每条都先自己复现，再改，再证明锁会红）**：

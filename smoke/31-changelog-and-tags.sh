@@ -36,6 +36,19 @@ changelog="$root/CHANGELOG.md"
 failures=0
 fail() { printf 'FAIL %s\n' "$*" >&2; failures=$((failures + 1)); }
 
+# Component-wise integer comparison, not string: v0.1.9 must sort BELOW
+# v0.1.10, and a string comparison puts it above.  Defined BEFORE the rules --
+# rule E compares against v0.1.31 and ran above the old definition (measured
+# 2026-11-20: `version_gt: command not found` on every tag).
+version_gt() { # $1 newer, $2 older -> 0 when $1 is strictly newer
+    local a=${1#v} b=${2#v}
+    local a1=${a%%.*} ar=${a#*.} b1=${b%%.*} br=${b#*.}
+    local a2=${ar%%.*} a3=${ar#*.} b2=${br%%.*} b3=${br#*.}
+    if [ "$a1" -ne "$b1" ]; then [ "$a1" -gt "$b1" ]; return; fi
+    if [ "$a2" -ne "$b2" ]; then [ "$a2" -gt "$b2" ]; return; fi
+    [ "$a3" -gt "$b3" ]
+}
+
 if [ ! -f "$changelog" ]; then
     printf 'FAIL CHANGELOG.md is missing; the three-layer release contract cannot be read\n' >&2
     exit 1
@@ -80,7 +93,16 @@ fi
 # separate oracle -- an empty list with a non-empty index means the checkout
 # is not the repository's.
 if git_tip=$(git -C "$root" rev-parse --is-inside-work-tree 2>/dev/null) && [ "$git_tip" = true ]; then
-    git -C "$root" tag --list 'v[0-9]*' | sort >"$work.tags"
+    # `git tag --list | sort` under `pipefail` would abort the script with NO
+    # diagnostic if git failed, and folding the exit code into "no tags" would
+    # turn a failed listing into NOT-covered.  A work tree git cannot list tags
+    # in is a broken checkout: say so.
+    if ! git -C "$root" tag --list 'v[0-9]*' >"$work.tags.raw" 2>/dev/null; then
+        fail 'git tag --list failed inside a checkout git calls a work tree; the tag/index rules cannot run on an unreadable tag list'
+        : >"$work.tags.raw"
+    fi
+    sort "$work.tags.raw" >"$work.tags"
+    rm -f -- "$work.tags.raw"
 else
     : >"$work.tags"
 fi
@@ -105,9 +127,23 @@ else
     annotated_checked=0
     while IFS= read -r v; do
         [ -n "$v" ] || continue
-        minor=$(printf '%s' "$v" | sed -n 's/^v0\.1\.\([0-9][0-9]*\)$/\1/p')
-        [ -n "$minor" ] || continue
-        [ "$minor" -ge "$annotated_start" ] || continue
+        # Any vX.Y.Z, not just v0.1.*: the rule is "tags at or after v0.1.31
+        # are annotated", and a future v0.2.0 lightweight tag used to fall
+        # through the v0.1-only parse and be skipped (measured 2026-11-20 with
+        # a git stub: v0.2.0 answered `commit` and the check stayed green).
+        case "$v" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) continue ;;
+        esac
+        # Here-string, not `printf | grep -q`: under pipefail a quiet grep
+        # that matches EARLY closes the pipe, the writer takes SIGPIPE, and
+        # the pipeline reports a found match as absent (smoke/01's repository
+        # rule caught this exact line, 2026-11-20 -- the tag would have been
+        # skipped as unparseable while the check stayed green).
+        grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$' <<<"$v" || continue
+        if version_gt v0.1."$annotated_start" "$v"; then
+            continue
+        fi
         annotated_checked=$((annotated_checked + 1))
         if [ "$(git -C "$root" cat-file -t "refs/tags/$v" 2>/dev/null || true)" != tag ]; then
             fail "$v is not an annotated tag (cat-file -t did not say 'tag')"
@@ -137,15 +173,8 @@ fi
 
 # --- rule C: the index is strictly descending ------------------------------
 # Compared component-wise as integers, not as strings: v0.1.9 must sort BELOW
-# v0.1.10, and a string comparison puts it above.
-version_gt() { # $1 newer, $2 older -> 0 when $1 is strictly newer
-    local a=${1#v} b=${2#v}
-    local a1=${a%%.*} ar=${a#*.} b1=${b%%.*} br=${b#*.}
-    local a2=${ar%%.*} a3=${ar#*.} b2=${br%%.*} b3=${br#*.}
-    if [ "$a1" -ne "$b1" ]; then [ "$a1" -gt "$b1" ]; return; fi
-    if [ "$a2" -ne "$b2" ]; then [ "$a2" -gt "$b2" ]; return; fi
-    [ "$a3" -gt "$b3" ]
-}
+# v0.1.10, and a string comparison puts it above.  (version_gt is defined at
+# the top: rule E needs it before this point.)
 prev=''
 while IFS= read -r v; do
     [ -n "$v" ] || continue
@@ -227,6 +256,13 @@ if newest_has_verification "$cal_dir/only.log"; then :; else cal=bad; printf 'ca
 if newest_has_verification "$cal_dir/bare-bar.log"; then cal=bad; printf 'calibration: an empty verification line ("  |") passed\n' >&2; fi
 rm -rf "$cal_dir"
 check_cal "$cal" ok 'rule predicates'
+# The calibration must be load-bearing.  It used to only print: mutating the
+# verification-line predicate to accept a bare `  |` made the four lines above
+# report `calibration: ...` and the check still exited 0 (measured 2026-11-20),
+# so the only regression detector for rule D could not turn anything red.
+if [ "$cal" != ok ]; then
+    failures=$((failures + 1))
+fi
 
 if [ "$failures" -ne 0 ]; then
     printf 'changelog-and-tags: %s failure(s)\n' "$failures" >&2

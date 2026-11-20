@@ -203,7 +203,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFOR
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.37"
+$script:ClientVersion = "0.1.38"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's Pueue command ceiling, not this machine's platform: a
 # unix target takes up to 100000 base64 characters (the POSIX twin's
@@ -1928,6 +1928,14 @@ function Read-PlatformProbeCache {
         # reproduced by inspecting the bound parameters; not run on a real 5.1
         # host in that review (the code path is identical to the -Depth guard
         # that WAS measured).
+        # Exactly one "platform" key, the same rule the POSIX twin applies by
+        # counting occurrences.  ConvertFrom-Json keeps the LAST duplicate and
+        # throws on none, so without this a corrupt cache
+        # ({"platform":"unix","platform":"windows"}) pinned "windows" here
+        # while POSIX re-probed and self-healed (measured 2026-11-20).
+        if (([regex]::Matches($rawCacheText, '"platform"')).Count -ne 1) {
+            return $false
+        }
         $convertFromJsonForCache = Get-Command ConvertFrom-Json -ErrorAction Stop
         if ($convertFromJsonForCache.Parameters.ContainsKey("NoEnumerate")) {
             $entry = $rawCacheText | ConvertFrom-Json -NoEnumerate -ErrorAction Stop
@@ -2082,11 +2090,16 @@ function Get-RemoteFailureReason {
     if ([string]::IsNullOrEmpty($Diagnostics)) {
         return $null
     }
-    $match = [regex]::Match(($Diagnostics -replace "`r", ""), "(?m)^[^:]*: reason=([a-z][a-z_]*)$")
-    if (!$match.Success) {
+    $reasonMatches = [regex]::Matches(($Diagnostics -replace "`r", ""), "(?m)^[^:]*: reason=([a-z][a-z_]*)$")
+    if ($reasonMatches.Count -eq 0) {
         return $null
     }
-    return $match.Groups[1].Value
+    # The LAST token, like the POSIX twin (`sed ... | tail -n 1`) and like the
+    # exit-code reader in both clients: the final reason is the one the server
+    # exited with, an earlier one belongs to a nested/subshell failure.
+    # Measured 2026-11-20: the same two-line stderr gave
+    # lock_contention (first) here and protocol_error (last) on POSIX.
+    return $reasonMatches[$reasonMatches.Count - 1].Groups[1].Value
 }
 
 function Write-Diagnostics {
@@ -2352,6 +2365,29 @@ function Test-JsonTimestamp {
         ($Value -is [datetime]) -or ($Value -is [datetimeoffset]))
 }
 
+function ConvertFrom-AgentQJsonText {
+    # One parser for every RESPONSE body, so the date-coercion rule cannot
+    # drift between the validators.  pwsh coerces a string that looks like an
+    # ISO-8601 timestamp into [DateTime] unless told otherwise; a task output
+    # that IS exactly a timestamp then fails the [string] checks and `logs`
+    # exits 2 where the POSIX twin prints the line (measured 2026-11-20:
+    # `{"task":...,"output":"2026-11-20T10:00:00Z"}` with no trailing newline,
+    # POSIX rc=0 / Windows rc=2).  -DateKind exists from pwsh 7.5; Windows
+    # PowerShell 5.1 does not coerce at all, and 7.0-7.4 offer no opt-out
+    # (recorded boundary in docs/PLAN.md).
+    param([string]$Text)
+
+    $convertFromJson = Get-Command ConvertFrom-Json -ErrorAction Stop
+    $arguments = @{ ErrorAction = "Stop" }
+    if ($convertFromJson.Parameters.ContainsKey("Depth")) {
+        $arguments.Depth = 100
+    }
+    if ($convertFromJson.Parameters.ContainsKey("DateKind")) {
+        $arguments.DateKind = "String"
+    }
+    return ($Text | ConvertFrom-Json @arguments)
+}
+
 function Test-AgentQJsonResponse {
     param(
         [string]$Operation,
@@ -2366,12 +2402,7 @@ function Test-AgentQJsonResponse {
     }
 
     try {
-        $convertFromJson = Get-Command ConvertFrom-Json -ErrorAction Stop
-        if ($convertFromJson.Parameters.ContainsKey("Depth")) {
-            $response = $Output | ConvertFrom-Json -Depth 100 -ErrorAction Stop
-        } else {
-            $response = $Output | ConvertFrom-Json -ErrorAction Stop
-        }
+        $response = ConvertFrom-AgentQJsonText -Text $Output
     } catch {
         [Console]::Error.WriteLine("$($script:Program): remote $Operation response failed the AgentQ JSON protocol validation: invalid JSON response")
         Write-ResponseMetadata -Output $Output
@@ -2605,11 +2636,7 @@ function Test-AgentQWaitContract {
         if ([string]::IsNullOrWhiteSpace($Output)) {
             return $false
         }
-        $parsed = if ((Get-Command ConvertFrom-Json).Parameters.ContainsKey("Depth")) {
-            $Output | ConvertFrom-Json -Depth 100 -ErrorAction Stop
-        } else {
-            $Output | ConvertFrom-Json -ErrorAction Stop
-        }
+        $parsed = ConvertFrom-AgentQJsonText -Text $Output
         if ($ExitCode -eq 0) {
             return $parsed.task.status.Done.result -ceq "Success"
         }
@@ -3417,7 +3444,13 @@ function Invoke-Mutation {
         }
         return 4
     }
-    Write-OperationOutput -Output $result.Output
+    # Exit 2 means "protocol/parameter error" and the server writes no body on
+    # that path; the POSIX twin suppresses whatever a non-conforming remote
+    # put on stdout there (measured 2026-11-20: the same stub gave an empty
+    # stdout on POSIX and the JSON body here).  Keep the suppression twin-equal.
+    if ($result.ExitCode -ne 2) {
+        Write-OperationOutput -Output $result.Output
+    }
     return $result.ExitCode
 }
 

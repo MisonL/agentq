@@ -1354,7 +1354,15 @@ prepare_remote() {
         windows_probe_required=false
 
         if probe_output=$(probe_remote_unix "$probe_diagnostic_file"); then
-            if probe_reports_marker "$probe_output" '^__SSHP_WINDOWS_SHELL__:(MINGW|MSYS|CYGWIN).*$'; then
+            if probe_reports_marker "$probe_output" '^__SSHP_WINDOWS_SHELL__:(MINGW|MSYS|CYGWIN).*$' ||
+                # The Windows twin routes a ready/install-required marker that
+                # names `Windows` to the Windows path even when it arrives on
+                # the unix probe (Get-ProbeOutcome checks `:Windows$` FIRST).
+                # This side used to fall through to the generic unix branch and
+                # answer "tmux/screen/Zellij" where the twin answered "Zellij
+                # (Windows)" -- two answers for one remote payload (measured
+                # 2026-11-20 with a stub).
+                probe_reports_marker "$probe_output" '^__SSHP_READY__:Windows$'; then
                 remote_platform=windows
                 windows_probe_required=true
             elif probe_reports_marker "$probe_output" '^__SSHP_READY__:.+$'; then
@@ -1375,6 +1383,7 @@ prepare_remote() {
             fi
 
             if probe_reports_marker "$probe_output" '^__SSHP_WINDOWS_SHELL__:(MINGW|MSYS|CYGWIN).*$' ||
+                probe_reports_marker "$probe_output" '^__SSHP_INSTALL_REQUIRED__:Windows$' ||
                 probe_reports_marker "$probe_output" '^__SSHP_INSTALL_REQUIRED__:(MINGW|MSYS|CYGWIN).*$' ||
                 probe_reports_marker "$probe_output" '^__SSHP_INSTALL_UNAVAILABLE__:(MINGW|MSYS|CYGWIN).*$'; then
                 remote_platform=windows

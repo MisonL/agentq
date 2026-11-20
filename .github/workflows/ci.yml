@@ -36,6 +36,9 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
         with:
+          # No step here pushes or calls an API: the token checkout leaves in
+          # .git/config is unused surface.  Reads do not need it (public repo).
+          persist-credentials: false
           # smoke/31 compares the CHANGELOG version index against the tags this
           # checkout can see.  The default fetch-depth of 1 fetches neither the
           # history nor the tags, so the check would degrade to
@@ -132,7 +135,15 @@ jobs:
             exit 1
           fi
           expected_count=$(printf '%s\n' $expected_checks | grep -c . || true)
-          reported_count=$(grep -cE '^(ok|SKIP|PART|NCOV|FAIL) +[0-9]{2}-' smoke.log || true)
+          # Count DISTINCT check names, not lines: run-tests prints a second
+          # `NCOV` line for a check that is also SKIP or PART (a whole-check
+          # skip or a partial that also declares a NOT-covered platform gap),
+          # so a line count would exceed the pinned list's name count and the
+          # job would go red on a suite that ran exactly the pinned checks.
+          # Latent on today's linux run (no check combines the two buckets);
+          # measured 2026-11-20 on a synthetic log with two double-reported
+          # checks: old line count 8 vs 6 distinct names, new count 6.
+          reported_count=$(grep -E '^(ok|SKIP|PART|NCOV|FAIL) +[0-9]{2}-' smoke.log | awk '{print $2}' | sort -u | grep -c . || true)
           if [ "$reported_count" != "$expected_count" ]; then
             echo "reported $reported_count check lines, pinned list has $expected_count" >&2
             exit 1
@@ -202,6 +213,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        with:
+          persist-credentials: false
       - name: Ensure pyyaml for the .yml assets
         # smoke/01's tool inventory reports skipped(tool-pyaml) without it and
         # the summary assertion below turns red -- which is the point of the
@@ -258,6 +271,8 @@ jobs:
       AGENTQ_SMOKE_PWSH: powershell.exe
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        with:
+          persist-credentials: false
       - name: PowerShell 5.1 client contracts
         shell: bash
         run: |
@@ -324,7 +339,7 @@ jobs:
             # LOCAL parity rule (smoke/01) can stay a plain "every reason a script
             # can print is allowed" check instead of modelling branch reachability
             # statically.
-            bad_tokens=$(grep -o 'NOT-covered([^)]*)' "$log" | grep -vE '^NOT-covered\((needs-Windows|needs-non-Windows|deliberately-not-exercised|needs-POSIX-pipes|needs-non-utf8-filename|needs-unprivileged-user|needs-symlinked-tmp|no-locale-sensitive-sed|no-tags-in-checkout)\)$' || true)
+            bad_tokens=$(grep -o 'NOT-covered([^)]*)' "$log" | grep -vE '^NOT-covered\((needs-Windows|needs-non-Windows|deliberately-not-exercised|needs-POSIX-pipes|needs-non-utf8-filename|needs-unprivileged-user|needs-symlinked-tmp|no-locale-sensitive-sed|no-tags-in-checkout|engine-has-no-datekind)\)$' || true)
             if [ -n "$bad_tokens" ]; then
               echo "$check reported NOT-covered without a named platform reason:" >&2
               echo "$bad_tokens" >&2

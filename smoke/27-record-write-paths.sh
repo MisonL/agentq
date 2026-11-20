@@ -625,6 +625,32 @@ if [ -e "$work/data/agentq-requests/$submit_id.json" ]; then
 fi
 clear_runtime
 
+# S6d. Unrecognized dotted names in the record directories are NOT AgentQ
+#      records.  A stray `.notes.json` (an editor swap file, a user's own
+#      scratch file) used to make the pruner `fail` with `invalid AgentQ
+#      request record path`, so ONE such file turned every locked operation
+#      into exit 2 -- submit could not run until it was deleted.  Measured
+#      2026-11-20 (review round seven): `.notes.json` in
+#      agentq-requests/ made a plain submit answer 2.  Unknown `.*.json` names
+#      are skipped now; this case must show the submit SUCCEEDS with the files
+#      still present (they are removed afterwards so the count assertions and
+#      other cases are unaffected).
+clear_runtime
+rm -f "$work/.added"
+write_stateful_stub 4243
+printf '{"note":"editor swap"}\n' > "$work/data/agentq-requests/.notes.json"
+printf 'not json at all\n' > "$work/data/agentq-requests/.stray.json"
+cases=$((cases + 1))
+if [ ! -f "$work/data/agentq-requests/.notes.json" ]; then
+    printf '%s\n' 'write-paths s6d: the fixture files were not written; the case would prove nothing' >&2
+    failures=$((failures + 1))
+fi
+run_case s6d submit --workdir "$work" --label smoke --request-id "$submit_id" -- true
+assert_rc s6d 0
+assert_json s6d '.task_id == 4243 and .reused == false'
+rm -f -- "$work/data/agentq-requests/.notes.json" "$work/data/agentq-requests/.stray.json"
+clear_runtime
+
 # C4. The task is gone but the marker says the outcome was never confirmed:
 #     that is the degraded contract (4/cancellation_pending), NOT "unknown
 #     AgentQ task id" -- the id IS known (its record and marker are on disk);

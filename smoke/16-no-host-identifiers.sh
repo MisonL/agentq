@@ -692,6 +692,11 @@ scanned=$((scanned - 1))
 # whatever a worktree happened to contain and inflated files= by the whole
 # nested trees -- measured 2026-11-20: six review worktrees put 261 files into
 # the enumeration, while CI clones (which never have the directory) were fine.
+# The excludes are anchored at $root, not written as `*/.claude/*`: a checkout
+# that LIVES under a `.claude/` directory (this repo's own agent worktrees are
+# `<repo>/.claude/worktrees/<name>`, measured 2026-11-20: the unanchored form
+# enumerated 0 files there and tripped the zero guard) must still scan itself;
+# only the nested directory inside it is scratch.
 # The reason lives HERE, outside the command substitution: a backtick inside
 # `$( )` runs as a command, and the first version of this comment tried to
 # execute `.claude/` and `.git` on every run.
@@ -708,7 +713,7 @@ while IFS= read -r file; do
     tree_scanned=$((tree_scanned + 1))
     scan_file "$file"
 done <<EOF
-$(find "$root" -type f -not -path '*/.git/*' -not -path '*/.claude/*' -not -name '*.syntax.*' | sort)
+$(find "$root" -type f -not -path "$root/.git/*" -not -path "$root/.claude/*" -not -name '*.syntax.*' | sort)
 EOF
 # Zero files means the enumeration broke, not that the tree is clean.  Without
 # this guard a bad root reported "files=17 violations=0" (all from the memory

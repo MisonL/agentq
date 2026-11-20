@@ -2363,6 +2363,41 @@ if ! release_gate_reads "$release_gate_fetch_fixture" 'refs/tags/' 'git fetch'; 
     release_gate_gaps=$((release_gate_gaps + 1))
 fi
 rm -f -- "$release_gate_fetch_fixture"
+# The CHANGELOG/tag rules must live where TAGS are pushed too.  smoke/31 is the
+# machine enforcement of the three-layer release contract, but it ran only in
+# ci.yml, whose triggers exclude tag pushes -- so at the one moment that can
+# violate the rules, nothing evaluated them (F7, found by the 2026-11-20
+# documentation review; release.yml compared version constants and nothing
+# else).  Two constructs are required: a non-comment line that RUNS the check
+# (the script path, not just its number in prose), and a non-comment line that
+# refuses its NOT-covered degradation -- a depth-1 checkout lists no tags, so
+# smoke/31 answers NOT-covered and exits 0, which would make the new step a
+# green no-op of exactly the input it exists to compare.
+release_gate_smoke31=missing
+if release_gate_reads "$release_gate_workflow" 'smoke/31-changelog-and-tags.sh' './smoke/' &&
+    release_gate_reads "$release_gate_workflow" 'smoke31' 'NOT-covered'; then
+    release_gate_smoke31=runs
+else
+    printf '%s\n' 'release-gate FAILED (release.yml does not RUN smoke/31-changelog-and-tags.sh at the tag, or does not refuse its NOT-covered degradation: the changelog/tag contract is then evaluated only on branch pushes, which a tag push never triggers)' >&2
+    release_gate_gaps=$((release_gate_gaps + 1))
+fi
+release_gate_smoke31_fixture=$(mktemp "${TMPDIR:-/tmp}/agentq-release-smoke31.XXXXXX")
+printf '%s\n' '# ./smoke/31-changelog-and-tags.sh and NOT-covered smoke31 in a comment must not count' >"$release_gate_smoke31_fixture"
+if release_gate_reads "$release_gate_smoke31_fixture" 'smoke/31-changelog-and-tags.sh' './smoke/'; then
+    printf '%s\n' 'release-gate FAILED (its smoke/31 matcher accepts a comment-only mention: prose would satisfy the tag-push lock)' >&2
+    release_gate_gaps=$((release_gate_gaps + 1))
+fi
+printf '%s\n' './smoke/31-changelog-and-tags.sh >smoke31.log 2>&1 || status=$?' >>"$release_gate_smoke31_fixture"
+if ! release_gate_reads "$release_gate_smoke31_fixture" 'smoke/31-changelog-and-tags.sh' './smoke/'; then
+    printf '%s\n' 'release-gate FAILED (its smoke/31 matcher rejects a real invocation: the calibration would fail correct code)' >&2
+    release_gate_gaps=$((release_gate_gaps + 1))
+fi
+printf '%s\n' "if grep -q 'NOT-covered' smoke31.log; then" >>"$release_gate_smoke31_fixture"
+if ! release_gate_reads "$release_gate_smoke31_fixture" 'smoke31' 'NOT-covered'; then
+    printf '%s\n' 'release-gate FAILED (its NOT-covered matcher rejects a real refusal line)' >&2
+    release_gate_gaps=$((release_gate_gaps + 1))
+fi
+rm -f -- "$release_gate_smoke31_fixture"
 if [ "$release_gate_gaps" -ne 0 ]; then
     failures=$((failures + 1))
 fi
@@ -2371,7 +2406,7 @@ fi
 # (shellcheck does not flag a self-increment; measured 2026-11-04 in this very
 # round: an unused `release_gate_from_tree` was caught by smoke/05's shellcheck
 # lock, which is why the count now has a consumer).
-release_gate_state="checked($release_gate_records)+annotated=$release_gate_annotation"
+release_gate_state="checked($release_gate_records)+annotated=$release_gate_annotation+smoke31=$release_gate_smoke31"
 
 # --- config-file path patterns must still point at real files ----------------
 # .gitattributes and .editorconfig name paths in order to protect them, and a
@@ -4733,8 +4768,16 @@ for tok in $summary_tokens; do
     # key-presence test passed it -- the dead assignment became a blank column
     # that reads like a value nobody filled in.  The value must be non-empty up
     # to the next space.
+    # A case pattern is anchored at BOTH ends of the word, so the form that
+    # detects an empty value is `" $tok= "` -- the literal token, its `=`, and
+    # the space where the value would have started.  A `*" $tok="` alternative
+    # looks like it covers the non-empty case, but with no trailing `*` it
+    # requires the word to END with `tok=`, which a summary followed by a space
+    # never does: shellcheck SC2195 flagged it as dead (2026-11-20) and direct
+    # measurement in bash and dash agreed (empty and non-empty values get the
+    # same verdicts with or without it).
     case " $summary " in
-    *" $tok=" | *" $tok= "*) missing_tokens="$missing_tokens $tok" ;;
+    *" $tok= "*) missing_tokens="$missing_tokens $tok" ;;
     *) ;;
     esac
 done

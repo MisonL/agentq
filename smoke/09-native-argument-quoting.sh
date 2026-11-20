@@ -315,6 +315,18 @@ if [ "$count" -ne 0 ]; then
     printf 'native-argument-quoting: %s violation(s)\n' "$count" >&2
     exit 1
 fi
+# "Examined nothing" is not a pass.  Both call-site shapes are found by
+# pattern; a rewrite that no longer matches either one (or an override that
+# points at the wrong tree) collapsed `sites` to 0 and this check exited 0
+# with `call_sites=0 violations=0` -- measured 2026-11-20 with an empty
+# AGENTQ_SMOKE_PS_DIR and with a bypass-shaped fixture the model does not
+# recognise.  Zero means the enumerator is blind, not that the tree is clean.
+# A PARTIAL shrinkage (4 of the 5 real sites) is still not detected; the floor
+# is deliberately the one value that is never a legitimate result.
+if [ "$sites" -eq 0 ]; then
+    printf 'native-argument-quoting: enumerated 0 call sites across %s file(s); the enumerator is blind, refusing to report a pass\n' "$files" >&2
+    exit 1
+fi
 
 printf 'native-argument-quoting checks passed: files=%s call_sites=%s violations=%s\n' \
     "$files" "$sites" "$count"

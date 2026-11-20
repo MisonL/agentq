@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.37'
+agentq_version='0.1.38'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -3505,6 +3505,13 @@ prune_request_temporary_files_in_directory() {
     for temporary_path in "$directory"/.*.json; do
         path_chain_is_safe "$temporary_path" ||
             fail "invalid AgentQ $kind temporary record path: $temporary_path"
+        # A live owner removes its own temp between the glob and this test
+        # (lock-free readers archive into tombstones and `wait` writes its own
+        # tombstone AFTER releasing the lock).  GONE is convergence; a
+        # dangling symlink is still refused.
+        if [ ! -e "$temporary_path" ] && [ ! -L "$temporary_path" ]; then
+            continue
+        fi
         [ -f "$temporary_path" ] && [ ! -L "$temporary_path" ] ||
             fail "invalid AgentQ $kind temporary record path: $temporary_path"
         temporary_name=${temporary_path##*/}
@@ -3541,15 +3548,19 @@ prune_request_temporary_files_in_directory() {
         if [ -z "$temporary_request_id" ]; then
             case "$temporary_stem" in
                 *.*) ;;
-                *) fail "invalid AgentQ $kind temporary process id: $temporary_path" ;;
+                *) continue ;;
             esac
             temporary_request_id=${temporary_stem%.*}
             temporary_pid=${temporary_stem##*.}
         fi
-        is_request_id "$temporary_request_id" ||
-            fail "invalid AgentQ $kind temporary request id: $temporary_path"
-        is_positive_integer "$temporary_pid" ||
-            fail "invalid AgentQ $kind temporary process id: $temporary_path"
+        # A `.json` file that is not one of OUR temp names is not ours to
+        # delete (an operator or a foreign tool may have put it there).  These
+        # two refusals used to be loud `fail`s: one stray `.notes.json` made
+        # every write command exit 2 while reads stayed green, with no
+        # self-heal (measured 2026-11-20).  Skip instead; the prune only ever
+        # removes files it recognises, so nothing is lost by not recognising one.
+        is_request_id "$temporary_request_id" || continue
+        is_positive_integer "$temporary_pid" || continue
         # These directories are NOT write-only under the operation lock: a
         # lock-free read (status/logs/wait/doctor) archives a removed request
         # into a tombstone while a writer holds the lock, and `wait` writes its
@@ -3587,6 +3598,11 @@ prune_cancellation_temporary_files() {
     for temporary_path in "$cancellation_directory"/.*.json; do
         path_chain_is_safe "$temporary_path" ||
             fail "invalid AgentQ cancellation temporary file path: $temporary_path"
+        # Gone between the glob and this test = a live owner removed its own
+        # temp first (same convergence rule as the other two pruners).
+        if [ ! -e "$temporary_path" ] && [ ! -L "$temporary_path" ]; then
+            continue
+        fi
         [ -f "$temporary_path" ] && [ ! -L "$temporary_path" ] ||
             fail "invalid AgentQ cancellation temporary file path: $temporary_path"
         temporary_name=${temporary_path##*/}
@@ -3597,7 +3613,7 @@ prune_cancellation_temporary_files() {
                 temporary_random=${temporary_stem##*.}
                 temporary_stem=${temporary_stem%.*}
                 case "$temporary_random" in
-                    ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]*) fail "invalid AgentQ cancellation temporary nonce: $temporary_path" ;;
+                    ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]*) continue ;;
                 esac
                 ;;
             .*.*.json)
@@ -3605,21 +3621,22 @@ prune_cancellation_temporary_files() {
                 temporary_stem=${temporary_stem%.json}
                 ;;
             *)
-                fail "invalid AgentQ cancellation temporary task id: $temporary_path"
+                continue
                 ;;
         esac
         case "$temporary_stem" in
             *.*) ;;
-            *) fail "invalid AgentQ cancellation temporary process id: $temporary_path" ;;
+            *) continue ;;
         esac
         temporary_task_id=${temporary_stem%.*}
         temporary_pid=${temporary_stem##*.}
-        is_task_id "$temporary_task_id" ||
-            fail "invalid AgentQ cancellation temporary task id: $temporary_path"
-        [ "$(canonical_task_id "$temporary_task_id")" = "$temporary_task_id" ] ||
-            fail "non-canonical AgentQ cancellation temporary task id: $temporary_path"
-        is_positive_integer "$temporary_pid" ||
-            fail "invalid AgentQ cancellation temporary process id: $temporary_path"
+        # A name this pruner does not recognise is not one of ours; refusing
+        # the whole command on it bricked every write (the same fail-closed
+        # mistake the request/tombstone pruner just lost -- measured
+        # 2026-11-20).  Skip; only recognised, dead-owner temps are deleted.
+        is_task_id "$temporary_task_id" || continue
+        [ "$(canonical_task_id "$temporary_task_id")" = "$temporary_task_id" ] || continue
+        is_positive_integer "$temporary_pid" || continue
         # Same dead-owner rule as the request/tombstone pruner and the runtime
         # pruner: a marker temporary written by a live process must survive a
         # concurrent writer's sweep.
@@ -3652,6 +3669,15 @@ prune_runtime_temporary_files() {
         "$runtime_directory"/.agentq-log.*.json; do
         path_chain_is_safe "$temporary_path" ||
             fail "invalid AgentQ runtime temporary file path: $temporary_path"
+        # A live owner deletes its OWN temp between this glob and the test:
+        # lock-free readers create and remove temp files continuously, so a
+        # candidate that is simply GONE is convergence, not corruption.
+        # Measured 2026-11-20: a benign submit exited 2 here with the candidate
+        # already removed (a 200-file candidate list makes the window
+        # deterministic).  A dangling symlink is still refused below.
+        if [ ! -e "$temporary_path" ] && [ ! -L "$temporary_path" ]; then
+            continue
+        fi
         [ -f "$temporary_path" ] && [ ! -L "$temporary_path" ] ||
             fail "invalid AgentQ runtime temporary file path: $temporary_path"
         temporary_name=${temporary_path##*/}
@@ -3659,8 +3685,7 @@ prune_runtime_temporary_files() {
             .agentq-payload.*)
                 temporary_stem=${temporary_name#.agentq-payload.}
                 temporary_pid=${temporary_stem%%.*}
-                [ "$temporary_stem" != "$temporary_pid" ] ||
-                    fail "invalid AgentQ runtime temporary process id: $temporary_path"
+                [ "$temporary_stem" != "$temporary_pid" ] || continue
                 ;;
             .agentq-status.*.json)
                 temporary_stem=${temporary_name#.agentq-status.}
@@ -3715,8 +3740,12 @@ prune_runtime_temporary_files() {
                 fail "invalid AgentQ runtime temporary file path: $temporary_path"
                 ;;
         esac
-        is_positive_integer "$temporary_pid" ||
-            fail "invalid AgentQ runtime temporary process id: $temporary_path"
+        # A malformed pid cannot be attributed to a dead owner, so it is not
+        # ours to delete.  This used to be a loud `fail`, which let ONE stray
+        # file brick every write command; the prune is about OUR temp files,
+        # and an unrecognisable name is not one (same rule as the record
+        # pruner below).
+        is_positive_integer "$temporary_pid" || continue
         if process_is_confirmed_dead "$temporary_pid"; then
             remove_runtime_temporary_file "$temporary_path" ||
                 fail "cannot remove stale AgentQ runtime temporary file: $temporary_path"
@@ -3757,12 +3786,49 @@ write_request_tombstone() {
     local tombstone=$2
     local tombstone_path
     local temporary
+    # Declared here, not left to dynamic scope: remove_removed_request (or any
+    # other caller) already has a LOCAL of the same name -- an unlocalized write
+    # would land in the CALLER's variable (the static rule in smoke/01 caught
+    # this exact site, 2026-11-20).
+    local converged existing_tombstone existing_identity intended_identity
 
     tombstone_path=$(request_tombstone_path "$request_id")
     temporary=$(umask 077; make_temporary_file "$request_tombstone_directory" ".agentqtmp.${request_id}" '.json') ||
         fail "cannot create temporary AgentQ tombstone: $request_id"
     if ! write_temporary_contents "$temporary" "$tombstone" ||
         ! install_temporary_file "$temporary" "$tombstone_path"; then
+        # Concurrent convergence.  A lock-free reader and a locked writer can
+        # both archive the same removed request: both see "no tombstone", both
+        # install; the second rename loses the atomic identity check in
+        # install_temporary_file and used to `fail` with exit 2 -- a benign
+        # race reported as a protocol error on a fully normal workload
+        # (measured 2026-11-20: 20 orphan `removing` records + 24 concurrent
+        # `status`, 20 exited 2; a natural batch remove + polling read did the
+        # same and once reported `removed:false` for a request that WAS
+        # archived).  Accept the destination only when it is the SAME tombstone
+        # this process was writing -- every field except `removed_at`
+        # (computed independently per process, one-second granularity, which
+        # is why plain byte equality still failed 5 of 24 in the rerun).
+        # Anything else (different request id/task id/task creation time,
+        # non-regular path, unsafe chain) keeps the failure.
+        converged=1
+        if [ -f "$tombstone_path" ] && [ ! -L "$tombstone_path" ] &&
+            path_chain_is_safe "$tombstone_path"; then
+            existing_tombstone=$(cat -- "$tombstone_path" 2>/dev/null) || existing_tombstone=''
+            if [ -n "$existing_tombstone" ]; then
+                existing_identity=$(jq -cS 'del(.removed_at)' <<<"$existing_tombstone" 2>/dev/null) || existing_identity=''
+                intended_identity=$(jq -cS 'del(.removed_at)' <<<"$tombstone" 2>/dev/null) || intended_identity=''
+                if [ -n "$existing_identity" ] && [ "$existing_identity" = "$intended_identity" ]; then
+                    converged=0
+                fi
+            fi
+        fi
+        if [ "$converged" -eq 0 ]; then
+            if [ -e "$temporary" ] || [ -L "$temporary" ]; then
+                remove_runtime_temporary_file "$temporary" 'tombstone temporary file' || return 1
+            fi
+            return 0
+        fi
         if ! remove_runtime_temporary_file "$temporary" 'tombstone temporary file'; then
             fail "cannot write AgentQ tombstone; temporary cleanup failed: $request_id"
         fi
@@ -3979,12 +4045,34 @@ write_runtime_marker() {
     local marker_directory=${marker_path%/*}
     local marker_name=${marker_path##*/}
     local temporary
+    local existing_marker
 
     temporary=$(umask 077; make_temporary_file "$marker_directory" ".${marker_name}" '.new') ||
         fail "cannot create temporary AgentQ runtime marker: $marker_path"
 
     if ! write_temporary_contents "$temporary" "$value" ||
         ! install_temporary_file "$temporary" "$marker_path"; then
+        # Concurrent convergence (same race as write_request_tombstone): two
+        # lock-free reads can both see "no marker" and both install.  Accept a
+        # destination that is safe and already carries a correct value --
+        # byte-equal, or (for the prune-timestamp marker) any positive integer:
+        # the marker records that a prune happened, and another process's
+        # timestamp is that same fact at second granularity.  Measured
+        # 2026-11-20: 10 concurrent `status` on a fresh home, 2 exited 2 writing
+        # agentq-request-tombstones-v2.
+        existing_marker=''
+        if [ -f "$marker_path" ] && [ ! -L "$marker_path" ] &&
+            path_chain_is_safe "$marker_path"; then
+            existing_marker=$(cat -- "$marker_path" 2>/dev/null) || existing_marker=''
+        fi
+        if [ -n "$existing_marker" ] &&
+            { [ "$existing_marker" = "$value" ] ||
+                { is_positive_integer "$value" && is_positive_integer "$existing_marker"; }; }; then
+            if [ -e "$temporary" ] || [ -L "$temporary" ]; then
+                remove_runtime_temporary_file "$temporary" 'runtime marker temporary file' || return 1
+            fi
+            return 0
+        fi
         if ! remove_runtime_temporary_file "$temporary" 'runtime marker temporary file'; then
             fail "cannot write AgentQ runtime marker; temporary cleanup failed: $marker_path"
         fi
@@ -5316,7 +5404,15 @@ wait_reconcile_missing_task() {
                     accepted|removing)
                         validate_task_id_precision "$record_task_id"
                         if [ "$(canonical_task_id "$record_task_id")" = "$(canonical_task_id "$task_id")" ]; then
-                            [ -z "$matched_record" ] || fail "multiple AgentQ request records match task id: $task_id"
+                            if [ -n "$matched_record" ]; then
+                                # Same store state the VISIBLE path answers with
+                                # 6/unavailable (task_identity_is_unambiguous):
+                                # "cannot give a trustworthy answer" must not
+                                # depend on whether Pueue still lists the task.
+                                jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+                                printf '%s: multiple AgentQ request records match task id %s; the final state is unavailable\n' "$program" "$task_id" >&2
+                                return 6
+                            fi
                             matched_request_id=$request_id
                             matched_record=$record
                         fi
@@ -5352,7 +5448,11 @@ wait_reconcile_missing_task() {
                     accepted|removing)
                         validate_task_id_precision "$record_task_id"
                         if [ "$(canonical_task_id "$record_task_id")" = "$(canonical_task_id "$task_id")" ]; then
-                            [ -z "$matched_record" ] || fail "multiple AgentQ request records match task id: $task_id"
+                            if [ -n "$matched_record" ]; then
+                                jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+                                printf '%s: multiple AgentQ request records match task id %s; the final state is unavailable\n' "$program" "$task_id" >&2
+                                return 6
+                            fi
                             matched_request_id=$request_id
                             matched_record=$record
                         fi

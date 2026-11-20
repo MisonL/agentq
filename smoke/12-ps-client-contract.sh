@@ -4292,6 +4292,53 @@ if [ "$cancel4_status" -ne 0 ] || ! grep -qF 'cancel4-ok' <<< "$cancel4_out"; th
     failures=$((failures + 1))
 fi
 
+# --- an ISO-8601 task output must stay a STRING -----------------------------
+# pwsh coerces a JSON string that looks like an ISO-8601 timestamp into
+# [DateTime].  A task whose output IS exactly a timestamp then failed the
+# `output -is [string]` check, so this client reported a protocol error where
+# the POSIX twin printed the line (measured 2026-11-20: `logs` on
+# {"output":"2026-11-20T10:00:00Z"} gave rc=0 on POSIX and rc=2 here).  The fix
+# passes -DateKind String where the engine has it; the RED proof is reverting
+# ConvertFrom-AgentQJsonText to a plain ConvertFrom-Json, which flips this case
+# on any pwsh 7.5 (measured here).
+#
+# `-DateKind` exists from pwsh 7.5 only, and Windows PowerShell 5.1 does not
+# coerce in the first place.  7.0-7.4 therefore cannot opt out -- that is a
+# recorded boundary (docs/PLAN.md round seven), so this case declares it
+# NOT-covered instead of failing a client that cannot do better on that host.
+cases=$((cases + 1))
+iso_output_probe='
+$ErrorActionPreference = "Stop"
+. "__CLIENT__" 2>$null
+if (-not (Get-Command ConvertFrom-Json).Parameters.ContainsKey("DateKind")) {
+    if ($PSVersionTable.PSVersion.Major -ge 6) {
+        [Console]::Out.WriteLine("iso output NOT-covered(engine-has-no-datekind)")
+        exit 0
+    }
+}
+$bad = 0
+$body = "{`"task`":{`"id`":1,`"group`":`"agentq`",`"created_at`":`"2026-01-01T00:00:00Z`",`"status`":{`"Done`":{`"result`":`"Success`"}}},`"output`":`"2026-11-20T10:00:00Z`"}"
+if (-not (Test-AgentQJsonResponse -Operation "logs" -Output $body -ExpectedTaskId "1")) {
+    [Console]::Error.WriteLine("a logs response whose output is an ISO-8601 timestamp was rejected; ConvertFrom-Json coerced it to DateTime")
+    $bad += 1
+}
+if ($bad -ne 0) { exit 1 }
+"iso output ok"
+'
+iso_output_probe=${iso_output_probe//__CLIENT__/$client_arg}
+status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command "$iso_output_probe" \
+    >"$work/out" 2>"$work/err" || status=$?
+if [ "$status" -ne 0 ] || { ! grep -qF 'iso output ok' "$work/out" && ! grep -qF 'iso output NOT-covered' "$work/out"; }; then
+    printf '%s\n' 'ps-client: an ISO-8601 task output is not kept as a string' >&2
+    grep -i 'iso output' "$work/err" >&2 || head -3 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+# A NOT-covered declaration is itself a claim: print it where the runner sees it.
+if grep -qF 'iso output NOT-covered' "$work/out"; then
+    printf 'ps-client: iso output NOT-covered(the pwsh on this host has no ConvertFrom-Json -DateKind, and 7.0-7.4 coerce ISO-8601 strings to DateTime)\n' >&2
+fi
+
 # The success line is printed only AFTER the failure gate: until 2026-10-16 it
 # came first, so a red run printed "checks passed: cases=..." and then the
 # failures on stderr -- a tail of stdout alone read as a green summary.

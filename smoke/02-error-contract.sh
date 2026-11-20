@@ -447,7 +447,7 @@ darwin_stub_uid='aq-smoke-noninteger'
 darwin_shim="$work/darwin-shim"
 mkdir -p "$darwin_shim"
 printf '#!/bin/sh\nprintf "Darwin\\n"\n' > "$darwin_shim/uname"
-printf '#!/bin/sh\nprintf "%s\\n" "$AGENTQ_SMOKE_UID"\n' > "$darwin_shim/id"
+printf '#!/bin/sh\nprintf "%%s\\n" "$AGENTQ_SMOKE_UID"\n' > "$darwin_shim/id"
 chmod 700 "$darwin_shim/uname" "$darwin_shim/id"
 cases=$((cases + 1))
 darwin_status=0

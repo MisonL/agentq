@@ -57,8 +57,10 @@ skill/
 - **`.gitignore` 用机制挡住凭据落库**：askpass 助手、密钥、`.env`、本机 agentq 状态。
   `CLAUDE.md` 的凭据规则此前只是一句话，现在是可执行的。
 
-**不要**把 `skill/assets/` 下的文件设成可执行后提交——`install-agentq.sh` 刻意保持 644，
-因为 `SKILL.md` 用 `sh ./install-agentq.sh` 调用它，不依赖执行位。
+`skill/assets/` 下**恰好 8 个**文件是 755，其余保持 644——这份名单由 `smoke/01` 的
+`skill_modes` 锁逐条比对 git 索引（多一个、少一个、换一个都红），不要随手 `chmod +x`。
+`install-agentq.sh` 刻意保持 644，因为 `SKILL.md` 用 `sh ./install-agentq.sh` 调用它，
+不依赖执行位。
 
 ### 验证
 
@@ -74,8 +76,8 @@ skill/
 `pwsh-unusable` 这一档是 2026-09-28 补的：原先只用 `command -v pwsh` 判断可用性，
 于是 pwsh 因启动缓存损坏而每次 `Abort trap: 6` 时，**7 个正确的 `.ps1` 资产全被报成
 `PowerShell parse FAILED`**——把环境故障说成资产问题，正是本项目反复纠正的那类误导。
-实测该缓存损坏出现过四次（2026-09-26、2026-09-28 ×2、2026-09-29），**四种形态
-各不相同**（`String cannot have zero length` ×2、`Stack overflow`、
+实测该缓存损坏出现过**五次**（2026-09-26、2026-09-28 ×2、2026-09-29、
+2026-10-20），消息形态有四种（`String cannot have zero length` ×2、`Stack overflow` ×2、
 `System.IO.FileLoadException`），所以不能靠匹配消息识别。
 修法是先跑一次 `pwsh -Command 'exit 0'` 探测，探不通就点名环境并给出修法
 （`mv ~/.cache/powershell/StartupProfileData-NonInteractive{,.broken}`，pwsh 会重建）。

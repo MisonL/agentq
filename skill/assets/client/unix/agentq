@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.37'
+agentq_client_version='0.1.38'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072), and the unix bound keeps a
 # safety margin under it.
@@ -1294,6 +1294,14 @@ run_operation_ssh() {
 run_wait_ssh_with_timeout() {
     wait_ssh_command=$1
     wait_ssh_input=${2:-}
+    # Same rule as run_ssh_logged: clear the reason BEFORE any early return, so
+    # a retry that dies on a LOCAL guard cannot report the previous attempt's
+    # server token as this attempt's cause.  This runner had the same hole --
+    # its guards below (the output-file check, the temporary creation, the
+    # Windows identity check) all bail out before ssh, and the recovery loop
+    # forwards whatever reason is left over for any non-zero status.
+    agentq_remote_failure_reason_value=''
+    agentq_remote_failure_reason_status=0
     operation_output_require_file "$agentq_operation_output_file" || return $?
 
     wait_remote_command=$wait_ssh_command
@@ -1335,6 +1343,19 @@ run_wait_ssh_with_timeout() {
 
     if [ -n "$wait_ssh_input" ]; then
         agentq_ssh_input_require_file "$wait_ssh_input" || return $?
+        # A Windows-target wait feeds a Windows argument temporary to ssh as
+        # its stdin script.  run_ssh_logged verifies that temporary is still
+        # the tracked file immediately before consumption; this runner is the
+        # SECOND funnel to ssh and was missing the same check.
+        if [ "$remote_platform" = windows ]; then
+            if wait_ssh_input_identity=$(windows_argument_identity_for_path "$wait_ssh_input"); then
+                windows_argument_verify_identity "$wait_ssh_input" "$wait_ssh_input_identity" 'before SSH consumption' || return $?
+            else
+                printf '%s: refusing to consume an untracked Windows argument temporary: %s\n' "$program" "$wait_ssh_input" >&2
+                return 2
+            fi
+        fi
+        agentq_ssh_input_require_existing_file "$wait_ssh_input" || return $?
         "$ssh_binary" \
             -E "$agentq_operation_log_file" \
             -o LogLevel=ERROR \
@@ -1981,7 +2002,13 @@ validate_json_response() {
         lookup)
             response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.request_id | type == "string") and ($response.request_id | length > 0) and (($expected_request_id_present | not) or $response.request_id == $expected_request_id) and ((($response | has("reused")) and (($response | has("state")) | not) and ($response.task_id | nonnegative_integer) and ($response.reused | type == "boolean")) or (($response | has("state")) and (($response | has("reused")) | not) and ($response.state | type == "string") and ($response | has("task_id")) and (if $response.state == "not_found" or $response.state == "not_started" or $response.state == "ambiguous" then $response.task_id == null elif $response.state == "accepted" or $response.state == "removing" or $response.state == "removed" then ($response.task_id | nonnegative_integer) else false end))) then true else false end'
             ;;
-        status)
+        status|doctor_full)
+            # `doctor --full` answers with the decorated dump, the same shape as
+            # `status`; the Windows twin groups them in one arm too.  The
+            # DEFAULT doctor is the compact summary and uses status_summary's
+            # strict predicate below -- sharing one arm here made --full's
+            # legitimate dump a protocol error on this client only (measured
+            # 2026-11-20: smoke/05 doctor-full went red).
             response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.tasks | type == "object") and ($response.tasks | to_entries | all(.[]; valid_status_task)) then true else false end'
             ;;
         status_summary)
@@ -1993,7 +2020,7 @@ validate_json_response() {
             # that binding a summary keyed "01" or "abc" with value {id: 1}
             # passed here while the Windows twin refused it (measured
             # 2026-11-16 by the independent review's client differential).
-            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.summary == true) and ($response.tasks | type == "object") and ($response.tasks | to_entries | all(.[]; ((.value | type) == "object") and (.value.id | nonnegative_integer) and (.key == (.value.id | tostring)) and ((.value.state | type) == "string") and ((.value.state | length) > 0))) then true else false end'
+            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.summary == true) and ($response.tasks | type == "object") and ($response.tasks | to_entries | all(.[]; valid_status_task and ((.value.state | type) == "string") and ((.value.state | length) > 0))) then true else false end'
             ;;
         status_task)
             # The single-task peek: {"task": {...}} with the decorated task
@@ -2002,10 +2029,14 @@ validate_json_response() {
             response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.task | type == "object") and ($response.task.id | nonnegative_integer) and (if $expected_task_id_present then ($response.task.id | task_id_matches($expected_task_id)) else true end) and (($response.task.status | type) == "object") then true else false end'
             ;;
         doctor)
-            # The default queue section is the compact summary; --full keeps the
-            # historical decorated map.  Both are accepted so a caller can switch
-            # modes without the client refusing one of them.
-            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.tasks | type == "object") and ((($response.tasks | to_entries | all(.[]; valid_status_task)) or (($response.summary == true) and ($response.tasks | to_entries | all(.[]; ((.value | type) == "object") and (.value.id | nonnegative_integer) and ((.value.state | type) == "string") and ((.value.state | length) > 0)))))) then true else false end'
+            # The default queue section is the compact summary, and the Windows
+            # twin validates doctor's default mode with the status_summary
+            # profile (summary:true + key-to-id binding).  Accepting the
+            # decorated map here too made the same remote payload a pass on one
+            # client and a protocol error on the other, and this branch even
+            # skipped the key binding its own status_summary arm enforces
+            # (measured 2026-11-20).  Same predicate, both clients.
+            response_filter="$response_numeric_helpers"' .[0] as $response | if length == 1 and ($response | type == "object") and ($response.summary == true) and ($response.tasks | type == "object") and ($response.tasks | to_entries | all(.[]; valid_status_task and ((.value.state | type) == "string") and ((.value.state | length) > 0))) then true else false end'
             ;;
         remove_batch)
             # One entry per matched task: {"task_id":N,"removed":true} (as a
@@ -3415,6 +3446,23 @@ platform_cache_read() {
     esac
     platform_cache_count=$(printf '%s' "$platform_cache_text" | LC_ALL=C grep -o '"platform"' | wc -l | tr -d ' ')
     [ "$platform_cache_count" = 1 ] || return 1
+    # One FLAT object, closed: the Windows twin deserializes the file, so a
+    # truncated object or valid JSON followed by trailing text is a MISS
+    # there.  This side used to accept both and then trusted the truncated
+    # value (measured 2026-11-20: a cache cut before its closing brace made
+    # POSIX take the Windows launcher path on a Unix host, rc=2, while the
+    # Windows client re-probed, answered, and rewrote the cache).  A nested
+    # object is a MISS here while the twin would accept it -- erring toward
+    # re-probing is the safe direction and the writer never emits one.
+    case "$platform_cache_text" in
+        '{'*'}') ;;
+        *) return 1 ;;
+    esac
+    platform_cache_body=${platform_cache_text#\{}
+    platform_cache_body=${platform_cache_body%'}'}
+    case "$platform_cache_body" in
+        *'{'*|*'}'*) return 1 ;;
+    esac
     # Optional whitespace around the colon, because the other reader is a JSON
     # deserializer and would accept a pretty-printed file this client's writer
     # never produces (`-Compress` on both sides today).
@@ -4913,6 +4961,12 @@ case "$operation" in
         [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')" = '--full' ]; } || fail 'doctor accepts --full or no arguments'
         initialize_remote_invocation
         agentq_operation_profile=$operation
+        if [ "$#" -eq 1 ] && [ "$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')" = '--full' ]; then
+            # The decorated dump answers a different shape; validating it with
+            # the default summary profile would reject every correct response
+            # (the Windows twin uses `doctor_full` here for that reason).
+            agentq_operation_profile=doctor_full
+        fi
         if [ "$#" -eq 0 ]; then
             append_arg doctor
         elif [ "$#" -eq 1 ] && [ "$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')" = '--full' ]; then
