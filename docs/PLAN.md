@@ -603,7 +603,7 @@ jq 分支**，是本检查从来没有过的**执行证据**（`08` 仍只是间
 
 **根因（实测，不是推断）**：actions/checkout 在 tag push 上把 **GITHUB_SHA（那个
 commit）** 取进 `refs/tags/<name>`，于是该 ref 指向 commit 对象，`git cat-file -t`
-忠实回答 `commit`。在抛掷克隆里复现（remote 指向本仓）：
+忠实回答 `commit`。在一次性克隆里复现（remote 指向本仓）：
 `git fetch origin +<commit-sha>:refs/tags/v0.1.37` → `cat-file -t` 答 **commit**；
 再 `git fetch origin +refs/tags/v0.1.37:refs/tags/v0.1.37` → 答 **tag**。
 
