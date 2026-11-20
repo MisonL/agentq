@@ -3747,7 +3747,29 @@ infn && $0 == stacklead[depth] "}" {
         sub(/=.*$/, "", seg)
         sub(/[+]$/, "", seg)
         sub(/.*[^A-Za-z0-9_]/, "", seg)
-        if (seg != "") { assigned[fn, seg] = 1; fns[fn] = 1; names[seg] = 1 }
+        # An ENVIRONMENT-ASSIGNMENT PREFIX (`| LC_ALL=C od ...`) is not a shell
+        # variable assignment at all: POSIX scopes it to that one command's
+        # environment.  Measured 2026-11-20 under both bash and dash -- a callee
+        # running `: | LC_ALL=C od` left its caller's `local LC_ALL` untouched,
+        # while the statement form `FOO=after` did write through.  So reporting
+        # one is a false positive on a correct tree, and it is exactly what the
+        # 0.1.36 UTF-8 validators tripped.
+        #
+        # The discriminator is the VALUE, and it is a real rule, not a heuristic:
+        # in POSIX, a PLAIN word assignment followed by another word is that
+        # word's environment prefix (`FOO=bar cmd`) -- it never assigns.  So
+        # only a plain value (`[A-Za-z0-9_./:+-]*`) followed by whitespace and a
+        # command word is exempt; a value containing `$`, quotes, parentheses or
+        # backticks is left alone, because `FOO=$(cmd) bar` must keep being
+        # reported.  Redirection targets cannot be mistaken for the command
+        # word: `>`, `;` and digits do not start one.  The value is read from
+        # the MATCHED position, not from the line start -- the line's leading
+        # indentation would otherwise satisfy the `[ \t]+` and exempt every
+        # indented assignment in the file.
+        value_rest = substr(line, RSTART + RLENGTH)
+        if (!(value_rest ~ /^[A-Za-z0-9_.\/:+-]*[ \t]+[A-Za-z_]/)) {
+            if (seg != "") { assigned[fn, seg] = 1; fns[fn] = 1; names[seg] = 1 }
+        }
         line = substr(line, RSTART + RLENGTH)
     }
     # `if NAME=...` / `elif` / `while` / `until` are assignment statements too,
@@ -3860,6 +3882,7 @@ awk '
             print "    lock_mtime=planted-plain"
             print "    if lock_holder_age=$(true); then :; fi"
             print "    log_encoded+=(\"appended\")"
+            print "    : | LC_ALL=C od -An -c >/dev/null"
         }
         next
     }
@@ -3867,7 +3890,8 @@ awk '
 ' "$root/skill/assets/unix/agentq-server" >"$local_hazard_selftest"
 if ! grep -q '^    lock_mtime=planted-plain$' "$local_hazard_selftest" ||
     ! grep -q '^    if lock_holder_age=' "$local_hazard_selftest" ||
-    ! grep -q '^    log_encoded+=("appended")$' "$local_hazard_selftest"; then
+    ! grep -q '^    log_encoded+=("appended")$' "$local_hazard_selftest" ||
+    ! grep -q '^    : | LC_ALL=C od -An -c >/dev/null$' "$local_hazard_selftest"; then
     printf '%s\n' 'server FAILED (the local-hazard self-check could not plant its violations: the anchor moved)' >&2
     failures=$((failures + 1))
     local_hazard_count=$((local_hazard_count + 1))
@@ -3902,9 +3926,145 @@ else
             failures=$((failures + 1))
             local_hazard_count=$((local_hazard_count + 1))
         fi
+        # And a NEGATIVE plant: `: | LC_ALL=C od ...` is an environment
+        # ASSIGNMENT PREFIX, not a shell assignment (measured under bash and
+        # dash 2026-11-20: the caller's `local LC_ALL` is untouched), so the
+        # rule must stay silent on it.  This is the plant that pins the
+        # exemption -- without the assertion, deleting the exemption would
+        # redden the real tree (which is how it was found) but a future rewrite
+        # could re-add the false positive without this self-check noticing.  The
+        # name is deliberately one the rule WOULD report (read_lock_metadata
+        # declares `local LC_ALL`), so the silence is the exemption's doing.
+        if grep -qxF -- 'acquire_request_lock: LC_ALL' <<<"$local_hazard_selftest_report"; then
+            printf '%s\n' 'server FAILED (the local-hazard rule reported an env-assignment PREFIX as a shell assignment: that is a false positive)' >&2
+            failures=$((failures + 1))
+            local_hazard_count=$((local_hazard_count + 1))
+        fi
     fi
 fi
 rm -f "$local_hazard_selftest"
+
+# --- shell assets: `$?` under a NEGATED condition is the negation's status ---
+# `if ! cmd; then status=$?` and `elif ! cmd; then status=$?` capture the status
+# of the NEGATION, which is always 0 when the branch is taken -- so a failed
+# command is reported as a success.  Measured 2026-11-20 under both bash and
+# dash: `elif ! failing; then x=$?` left x=0 for rc=7, while the same command in
+# a non-negated `else` arm gave 7.  The form that works is
+# `cmd || { status=$?; ... }`.
+#
+# This is a LIVING trap in this repo, not a textbook one: the identical shape in
+# agentq-server's repair loop made an arm dead code (recorded in the rule for
+# that site), and the installer's operation-lock recovery carried it until
+# 2026-11-20 -- there a failed pid-file removal returned "success", the caller's
+# `while [ -d "$lock" ]` loop retried forever on a lock it could never remove.
+#
+# The rule is STRUCTURAL, not a line window: the condition may span several
+# lines with `||` continuations, and the capture may sit anywhere in the taken
+# branch -- not only on the first line.  It cannot be done as
+# "condition-end + N lines": a window in either direction (too small misses the
+# multi-line condition, too large invents hits) is exactly the class smoke/10
+# rule G already got wrong twice.
+#
+# Honest limit: the scanner tracks a negated if/elif through its `then` and
+# flags every `$?` capture in that branch, including a capture of an UNRELATED
+# command inside the branch.  That direction is a false POSITIVE risk, and it is
+# deliberate -- the fix for either is the same (`||` on the command being
+# measured), and a false positive reddens a tree whose author can look at one
+# line, while a false negative hides a fail-open status.
+negation_capture_prog=$(
+    cat <<'AWK'
+FNR == 1 { armed = 0; startline = 0 }
+/^[[:space:]]*#/ { next }
+# A negated if/elif begins the region.  `! ` after the keyword, nothing else.
+/^[[:space:]]*(if|elif)[[:space:]]+!/ { armed = 1; startline = FNR; next }
+armed {
+    # Continuation lines of the condition, the bare `then`, and comments are
+    # all part of the region.
+    if ($0 ~ /^[[:space:]]*(#.*)?$/) next
+    if ($0 ~ /^[[:space:]]*then[[:space:]]*$/) next
+    # The branch body starts here (a same-line `then cmd` keeps the text after
+    # it).  A `$?` capture anywhere in what follows, until the branch ends, is
+    # the hazard.  The branch ends at the matching-depth `else`/`elif`/`fi`,
+    # which for the shapes in this repo is a line STARTING with one of them.
+    #
+    # The capture is matched with index(), not a regex: in ERE `\?` is a
+    # QUANTIFIER ("zero or one of the preceding"), so the obvious
+    # /=\$\?/ means "= optionally preceded by $" and happily matches `x=y`.
+    # A literal `$?` search is both correct and implementation-independent.
+    if (index($0, "=$?") > 0) {
+        printf "%s:%s\n", FILENAME, startline
+        armed = 0
+        next
+    }
+    if ($0 ~ /^[[:space:]]*(else|elif|fi)([[:space:]]|$)/) armed = 0
+    next
+}
+AWK
+)
+negation_capture_hits=$(
+    awk "$negation_capture_prog" $(printf '%s\n' "$shell_assets") 2>/dev/null || true
+)
+negation_capture_count=0
+if [ -n "$negation_capture_hits" ]; then
+    while IFS= read -r hit; do
+        [ -n "$hit" ] || continue
+        printf 'shell FAILED (a `$?` capture inside a NEGATED if/elif condition reads the negation'"'"'s status, which is always 0 -- use `cmd || { status=$?; ... }`): %s\n' \
+            "$hit" >&2
+        negation_capture_count=$((negation_capture_count + 1))
+    done <<EOF
+$negation_capture_hits
+EOF
+    failures=$((failures + 1))
+fi
+# Both directions on a self-contained fixture: a rule that never fires reads
+# exactly like a clean tree, and a rule that fires on everything would be
+# "fixed" by deleting it.
+negation_capture_selftest=$(mktemp)
+cat > "$negation_capture_selftest" <<'FIXTURE'
+#!/bin/sh
+zz_multi_line_condition() {
+    if ! zz_probe_one ||
+        [ "$zz_a" != "$zz_b" ] ||
+        ! zz_probe_two; then
+        printf 'not the hazard\n'
+        zz_captured=$?
+    fi
+}
+zz_single_line() {
+    elif ! zz_probe_one; then
+        zz_captured=$?
+    fi
+}
+zz_fixed_form() {
+    if ! zz_probe_one; then
+        printf 'no capture here\n'
+    fi
+}
+zz_capture_not_in_branch() {
+    if ! zz_probe_one; then
+        printf 'clean\n'
+    fi
+    zz_captured=$?
+}
+FIXTURE
+negation_capture_selftest_report=$(awk "$negation_capture_prog" "$negation_capture_selftest")
+rm -f "$negation_capture_selftest"
+# The reported line is the CONDITION's line (`if`/`elif`), not the capture's:
+# that is what a reader has to look at to see the negation.  Fixture lines 3
+# (multi-line condition) and 11 (single-line) are the two violations.
+if ! grep -qxF "$negation_capture_selftest:3" <<<"$negation_capture_selftest_report" ||
+    ! grep -qxF "$negation_capture_selftest:11" <<<"$negation_capture_selftest_report"; then
+    printf '%s\n' 'shell FAILED (the negation-capture rule missed a planted multi-line or single-line violation: the detector itself is broken)' >&2
+    failures=$((failures + 1))
+    negation_capture_count=$((negation_capture_count + 1))
+fi
+if grep -q 'zz_fixed_form' <<<"$negation_capture_selftest_report" ||
+    [ "$(printf '%s\n' "$negation_capture_selftest_report" | grep -c .)" -ne 2 ]; then
+    printf 'shell FAILED (the negation-capture rule reported a clean branch or the wrong number of sites: %s)\n' \
+        "$(printf '%s' "$negation_capture_selftest_report" | tr '\n' ' ')" >&2
+    failures=$((failures + 1))
+    negation_capture_count=$((negation_capture_count + 1))
+fi
 
 # --- shell assets: `-x` is not "is a regular executable file" ----------------
 # `test -x` asks whether the EXECUTE/SEARCH bit is set, and EVERY directory has
@@ -4515,8 +4675,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s chr_ranges=%s tool_ranges=%s tr_fold=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s workflow_wiring=%s ncov_reasons=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$chr_range_count" "$tool_range_count" "$tr_fold_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state" "$workflow_wiring_summary" "$ncov_reasons_summary")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s negation_captures=%s chr_ranges=%s tool_ranges=%s tr_fold=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s workflow_wiring=%s ncov_reasons=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$negation_capture_count" "$chr_range_count" "$tool_range_count" "$tr_fold_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state" "$workflow_wiring_summary" "$ncov_reasons_summary")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
@@ -4528,7 +4688,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census release_gate workflow_wiring ncov_reasons'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files negation_captures executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census release_gate workflow_wiring ncov_reasons'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned

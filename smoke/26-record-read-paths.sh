@@ -1367,6 +1367,39 @@ fi
 find "$work/data/task_logs" -maxdepth 1 -name '*.log' -delete
 clear_runtime
 
+# V22. A task log path that is NOT a regular file.  Real Pueue OPENS the path,
+#      so a FIFO there blocks `logs` forever: measured 2026-11-20 against Pueue
+#      4.0.4, `logs 901` held for 20s with no output until the caller's
+#      `timeout` killed it (exit 124).  The server now refuses the shape BEFORE
+#      asking Pueue, answering the documented 6/unavailable.
+#
+#      The stub here deliberately ANSWERS instead of blocking: the assertion is
+#      the ORDER (refuse before the read), and a fixture that reproduces the
+#      hang would only prove that the harness has a timeout.  Pre-fix the same
+#      fixture passes the stub's fabricated output through with exit 0 -- the
+#      wrong verdict for a log this server cannot read.
+clear_runtime
+cat > "$work/pueue.fifo" <<'SH'
+#!/bin/sh
+case "$*" in
+  *"status --json"*) printf '%s\n' '{"tasks":{"1":{"id":1,"group":"agentq","label":"agentq:AQREAD-VFIFO-0000001","created_at":"2026-09-29T00:00:00Z","status":{"Done":{"result":"Success","start":"2026-09-29T00:00:00Z","end":"2026-09-29T00:00:01Z"},"enqueued_at":"2026-09-29T00:00:00Z"}}},"groups":{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}}' ;;
+  *"group --json"*) printf '%s\n' '{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}' ;;
+  *"log --json"*) printf '%s\n' '{"1":{"task":{"id":1,"created_at":"2026-09-29T00:00:00Z"},"output":"line\n"}}' ;;
+  *) printf '%s 4.0.4\n' pueue ;;
+esac
+SH
+chmod 700 "$work/pueue.fifo"
+mkfifo "$work/data/task_logs/1.log"
+mv "$work/pueue" "$work/pueue.plain"
+cp "$work/pueue.fifo" "$work/pueue"
+run_case v22 logs 1
+mv "$work/pueue.plain" "$work/pueue"
+assert_rc v22 6
+assert_json v22 '.state == "unavailable" and .task_id == 1'
+assert_err_has v22 'is not a regular file'
+rm -f "$work/data/task_logs/1.log"
+clear_runtime
+
 # --- the operation lock directory holding only a metadata temporary ----------
 # `write_lock_metadata` builds its temporary INSIDE the lock directory (so the
 # final rename is same-directory); a process killed in that window leaves

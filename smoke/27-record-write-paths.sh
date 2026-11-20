@@ -562,6 +562,69 @@ if [ -e "$work/data/agentq-requests/$submit_id.json" ]; then
     failures=$((failures + 1))
 fi
 
+# S6b. A --workdir whose RESOLVED path ends in a newline must refuse too.  The
+#      `$( )` in normalize_workdir strips trailing newlines, so without the
+#      sentinel the normalized path silently loses the last component: the
+#      server enqueued in a DIFFERENT directory than the caller named -- and
+#      when the stripped component was the final newline-only one, it persisted
+#      workdir:"" and left a record stuck in `adding` that lookup answers 4 for
+#      forever (measured 2026-11-20).  The path must exist and be a directory
+#      with a trailing newline in its NAME; refusing it is the fail-closed
+#      answer, because no shell can carry that value through `$( )`.
+clear_runtime
+write_stub "$empty_tasks"
+# Built with a sentinel, not `$(printf '...\n')`: command substitution strips
+# trailing newlines, so the obvious spelling creates the TWIN directory and the
+# case silently tests nothing (measured here while writing it -- the first
+# version's `newline` had no newline in its name and the submit legitimately
+# progressed to `adding`).
+nl_work=$(printf '%s/newline\nZ' "$work")
+nl_work=${nl_work%Z}
+mkdir -p "$nl_work"
+cases=$((cases + 1))
+if [ "$(printf '%s' "$nl_work" | od -An -c | tr -d ' ')" = "$(printf '%s' "${nl_work%?}" | od -An -c | tr -d ' ')" ]; then
+    printf 'write-paths s6b: the fixture path does not actually end in a newline; the case would prove nothing\n' >&2
+    failures=$((failures + 1))
+fi
+run_case s6b submit --workdir "$nl_work" --label smoke --request-id "$submit_id" -- true
+assert_rc s6b 2
+assert_err_has s6b 'working directory cannot end with a newline'
+assert_reason s6b
+cases=$((cases + 1))
+if [ -e "$work/data/agentq-requests/$submit_id.json" ]; then
+    printf 'write-paths s6b: a rejected submit persisted a request record: %s\n' "$(cat "$work/data/agentq-requests/$submit_id.json")" >&2
+    failures=$((failures + 1))
+fi
+rmdir "$nl_work" 2>/dev/null || true
+
+# S6c. A non-UTF-8 --label must refuse BEFORE any record exists.  jq's `--arg`
+#      re-encodes its input and rewrites an invalid byte as U+FFFD without a
+#      word, so a persisted label no longer identifies the caller's argument:
+#      measured 2026-11-20, a second submit under the SAME request id with the
+#      DIFFERENT label `q` + U+FFFD answered `reused:true` -- two arguments read
+#      as one.  smoke/02 pins the message; this pins the NO-RECORD half, which is
+#      what makes the request id reusable.
+clear_runtime
+write_stub "$empty_tasks"
+cases=$((cases + 1))
+nonutf8_label=$(printf 'q\377')
+nonutf8_rc=0
+( cd "$work" && TMPDIR="$work" "$work/agentq-server" submit --workdir "$work" \
+    --label "$nonutf8_label" --request-id "$submit_id" -- true ) \
+    >"$work/s6c.out" 2>"$work/s6c.err" || nonutf8_rc=$?
+if [ "$nonutf8_rc" -ne 2 ] || ! grep -qF -- '--label must be valid UTF-8' "$work/s6c.err"; then
+    printf 'write-paths s6c: a non-UTF-8 label was not refused with 2: rc=%s %s\n' \
+        "$nonutf8_rc" "$(head -2 "$work/s6c.err" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if [ -e "$work/data/agentq-requests/$submit_id.json" ]; then
+    printf 'write-paths s6c: a non-UTF-8 label persisted a request record: %s\n' \
+        "$(jq -c '.payload.label' "$work/data/agentq-requests/$submit_id.json" 2>/dev/null)" >&2
+    failures=$((failures + 1))
+fi
+clear_runtime
+
 # C4. The task is gone but the marker says the outcome was never confirmed:
 #     that is the degraded contract (4/cancellation_pending), NOT "unknown
 #     AgentQ task id" -- the id IS known (its record and marker are on disk);
@@ -861,6 +924,61 @@ if [ ! -e "$work/data/agentq-requests/.tombstones/.legacy-orphans/_oldrecord.jso
     failures=$((failures + 1))
 fi
 find "$work/data/agentq-requests/.tombstones/.legacy-orphans" -mindepth 1 -delete
+clear_runtime
+
+# ------------------------------------------------ repair guard-file leak
+# `repair_removed_request_records`' fallback loop is the only place the server
+# captures another reader's stderr into a file, and the reader reports through
+# `fail` -- `exit 2`, which skips the function's own trailing `rm -f`.  The
+# name therefore lives in a GLOBAL that cleanup() and fail() both clear.
+# Measured 2026-11-20: one 0600 `agentq-repair-guard.*` empty file leaked into
+# TMPDIR per failed command, unbounded.
+#
+# The trigger needs BOTH arms: a REMOVED record whose tombstone conflicts with
+# it (so archive_removed_request's `fail` fires from inside the loop) and a
+# record that cannot be read (so the batch fast path falls back to the loop).
+# The removed record's id must sort BEFORE the broken one -- with the opposite
+# order the `fail` fires first and the leak never happens (measured while
+# writing this case: the first version was green for the wrong reason).
+clear_runtime
+repair_tmp="$work/repair-tmp"
+mkdir -p "$repair_tmp"
+repair_removed_id=AQSUB-REPAIRAA-00001
+repair_broken_id=AQSUB-REPAIRZZ-00001
+put_record "$repair_removed_id" removed 1001 '"2026-09-29T00:00:00Z"'
+put_tombstone "$repair_removed_id" 2002
+put_record "$repair_broken_id" accepted 1002 '"2026-09-29T00:00:00Z"'
+chmod 000 "$work/data/agentq-requests/$repair_broken_id.json"
+cases=$((cases + 1))
+repair_status=0
+( cd "$work" && TMPDIR="$repair_tmp" "$work/agentq-server" status --summary ) \
+    >"$work/repair.out" 2>"$work/repair.err" || repair_status=$?
+chmod 600 "$work/data/agentq-requests/$repair_broken_id.json"
+repair_leftovers=$(find "$repair_tmp" -name 'agentq-repair-guard.*' 2>/dev/null | wc -l | tr -d ' ')
+if [ "$repair_leftovers" -ne 0 ]; then
+    printf 'write-paths repair: %s agentq-repair-guard temp file(s) left behind after a failed repair\n' \
+        "$repair_leftovers" >&2
+    failures=$((failures + 1))
+fi
+# The guard's own message must still reach stderr -- in a run where the guard
+# is the FIRST thing the fallback loop hits.  This is the fix's delicate part:
+# the reader reports through `fail`, which now clears the (global) guard file,
+# and that runs inside the read's own `$( )`; the fix blanks the name THERE so
+# the parent can still read it.  Getting that wrong loses the diagnostic while
+# the leak test above stays green (measured 2026-11-20 on the first attempt).
+cases=$((cases + 1))
+clear_runtime
+put_record "$repair_broken_id" accepted 1002 '"2026-09-29T00:00:00Z"'
+chmod 000 "$work/data/agentq-requests/$repair_broken_id.json"
+( cd "$work" && TMPDIR="$repair_tmp" "$work/agentq-server" status --summary ) \
+    >"$work/repair-message.out" 2>"$work/repair-message.err" || repair_status=$?
+chmod 600 "$work/data/agentq-requests/$repair_broken_id.json"
+if ! grep -qF 'invalid AgentQ request record' "$work/repair-message.err"; then
+    printf 'write-paths repair: the malformed record guard message did not reach stderr (exit %s): %s\n' \
+        "$repair_status" "$(head -3 "$work/repair-message.err" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+fi
+rm -rf -- "$repair_tmp"
 clear_runtime
 
 # --------------------------------------------------------------- summary

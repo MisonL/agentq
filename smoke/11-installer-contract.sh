@@ -577,6 +577,16 @@ env HOME="$home" PATH="$stub_full" \
 check_case 'unknown argument' \
     'this installer takes no arguments' "$status"
 assert_home_clean 'unknown argument'
+# `--help` with a TRAILING word is not a help request: the argv is wrong, and
+# answering 0 told a script its (misspelled) invocation succeeded.  Measured
+# 2026-11-20 (independent review): `install-agentq.sh --help extra` exited 0
+# with the usage text, while `install-agentq.sh extra` correctly exited 2.
+status=0
+env HOME="$home" PATH="$stub_full" \
+    /bin/sh "$assets/install-agentq.sh" --help extra >"$work/out" 2>"$work/err" || status=$?
+check_case '--help with a trailing argument' \
+    '--help takes no further arguments' "$status"
+assert_home_clean '--help with a trailing argument'
 status=0
 env HOME="$home" PATH="$stub_full" \
     /bin/sh "$assets/install-agentq.sh" --help >"$work/out" 2>"$work/err" || status=$?

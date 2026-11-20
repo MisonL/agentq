@@ -2818,6 +2818,171 @@ if [ "$status" -ne 0 ] || ! grep -qF 'wait timeout response ok' "$work/out"; the
     failures=$((failures + 1))
 fi
 
+# --- the OPERATION token must be anchored to a line end ----------------------
+# The operation-path reader (Invoke-SshLogged's two copies) takes the last
+# `agentq-exit:<code>` from ssh's stderr.  The POSIX twin deletes CRs and anchors
+# the digits with sed `$`, so `agentq-exit:5<TAB>` is NOT a token there and the
+# SSH exit code stands; `\s*$` accepted it here and the same stubbed stderr gave
+# POSIX exit 2 and Windows exit 5 (measured 2026-11-20).  `\r*$` is the twin's
+# `tr -d '\r'` + `$`.  The PROBE reader is deliberately LENIENT about what
+# follows the digits (it takes a leading digit run), so this case must not be
+# extended to it -- the probe's own case above pins that side.
+for token_suffix_kind in tab nbsp trailing-text; do
+    token_suffix_dir="$work/token-suffix-ssh-$token_suffix_kind"
+    mkdir -p "$token_suffix_dir"
+    case "$token_suffix_kind" in
+        tab) token_suffix=$(printf '\t') ;;
+        nbsp) token_suffix=$(printf '\302\240') ;;
+        trailing-text) token_suffix='x' ;;
+    esac
+    if [ "$client_arg" != "$client" ]; then
+        token_suffix_stub="$token_suffix_dir/ssh.cmd"
+        printf '%s\r\n' \
+            '@echo off' \
+            "echo agentq-exit:5$token_suffix 1>&2" \
+            'exit /b 1' > "$token_suffix_stub"
+        token_suffix_ssh=$(cygpath -w "$token_suffix_stub")
+    else
+        token_suffix_stub="$token_suffix_dir/ssh"
+        # `%%s`: this line is a format for the OUTER printf, so a bare `%s`
+        # would be consumed there and the stub would drop the suffix entirely
+        # -- the case would then assert against a token with no suffix at all
+        # and report a divergence that does not exist (measured 2026-11-20 on
+        # the first version of this case).
+        printf '#!/bin/sh\ncat > /dev/null 2>&1 || true\nprintf "agentq-exit:5%%s\\n" "$AGENTQ_SMOKE_TOKEN_SUFFIX" >&2\nexit 1\n' \
+            > "$token_suffix_stub"
+        chmod 700 "$token_suffix_stub"
+        token_suffix_ssh="$token_suffix_stub"
+    fi
+    token_suffix_probe='
+. "'"$client_arg"'" 2>$null
+$env:AGENTQ_SSH = "'"$token_suffix_ssh"'"
+$script:SshPath = Resolve-SshPath
+$script:RemotePlatform = "windows"
+$script:TargetHost = "smoke-host"
+$script:CredentialSource = ""
+$script:CredentialOptionLines = Get-CredentialSshOptions
+$r = Invoke-SshLogged -RemoteCommand "ignored" -InputPayload $null
+if ($r.ExitCode -ne 1) {
+    [Console]::Error.WriteLine("token suffix: expected the SSH code (1) when the digits are not at a line end, got $($r.ExitCode)")
+    exit 1
+}
+"token suffix ok"
+'
+    cases=$((cases + 1))
+    status=0
+    AGENTQ_SMOKE_TOKEN_SUFFIX=$token_suffix \
+        "$pwsh_binary" -NoProfile -NonInteractive -Command "$token_suffix_probe" \
+        >"$work/out" 2>"$work/err" || status=$?
+    if [ "$status" -ne 0 ] || ! grep -qF 'token suffix ok' "$work/out"; then
+        printf 'ps-client: a token followed by [%s] is still read as the exit code\n' \
+            "$token_suffix_kind" >&2
+        grep -i 'token suffix' "$work/err" >&2 || head -3 "$work/err" >&2 || true
+        failures=$((failures + 1))
+    fi
+done
+
+# --- a CACHED windows platform must still run the launcher-protocol probe ----
+# A cache hit replaces the PLATFORM probe only.  The POSIX twin calls
+# probe_windows_agentq_protocol unconditionally once the platform is known, and
+# the cache entry is written BEFORE that probe -- so an entry is not proof the
+# launcher answered.  This copy returned straight from the auto branch on a
+# windows hit and never confirmed the protocol, so a host whose launcher had
+# broken since the entry was written looked healthy here and failed on POSIX
+# with "deployment is incomplete" (measured 2026-11-20 on the same host and
+# cache file: POSIX 2, Windows 0).  It is dot-sourced and driven through
+# Initialize-RemoteInvocation with the platform probes overridden, so the case
+# sees the CALL ORDER rather than a source shape.
+cache_launcher_probe='
+$ErrorActionPreference = "Stop"
+. "'"$client_arg"'" 2>$null
+$dir = Join-Path ([System.IO.Path]::GetTempPath()) ("aq-cache-launcher-" + $PID)
+$env:AGENTQ_PLATFORM_CACHE_DIR = $dir
+$env:AGENTQ_PLATFORM_PROBE_CACHE = "on"
+$script:RemotePlatform = "auto"
+$script:TargetHost = "smoke-host"
+[void](New-Item -ItemType Directory -Path (Join-Path $dir "platform-cache") -Force)
+$path = Get-PlatformProbeCachePath
+$nowText = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+[System.IO.File]::WriteAllText($path, ("{`"platform`":`"windows`",`"probed_at`":" + $nowText + "}"))
+$script:LauncherProbeRan = $false
+function Confirm-WindowsAgentQProtocol { $script:LauncherProbeRan = $true }
+# Read-PlatformProbeCache ASSIGNS $script:RemotePlatform on a hit, so its
+# return value is not the only evidence of one -- the control reads it BEFORE
+# and asserts it flipped to windows, and then resets it to auto so
+# Initialize-RemoteInvocation is exercised on the cache-hit path rather than
+# on the `default {}` arm.
+$before = $script:RemotePlatform
+try { $script:Hit = Read-PlatformProbeCache } catch { [Console]::Error.WriteLine("cache launcher: the read threw " + $_.Exception.Message); exit 1 }
+if (-not $script:Hit) { [Console]::Error.WriteLine("cache launcher: the seeded entry was not a hit"); exit 1 }
+if ($script:RemotePlatform -ne "windows") { [Console]::Error.WriteLine("cache launcher: the hit did not resolve the platform to windows (was $before)"); exit 1 }
+$script:RemotePlatform = "auto"
+Initialize-RemoteInvocation
+Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+if (-not $script:LauncherProbeRan) {
+    [Console]::Error.WriteLine("cache launcher: a windows cache hit returned without confirming the launcher protocol")
+    exit 1
+}
+if ($script:RemotePlatform -ne "windows") {
+    [Console]::Error.WriteLine("cache launcher: the hit did not resolve the platform to windows")
+    exit 1
+}
+"cache launcher ok"
+'
+cases=$((cases + 1))
+status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command "$cache_launcher_probe" \
+    >"$work/out" 2>"$work/err" || status=$?
+if [ "$status" -ne 0 ] || ! grep -qF 'cache launcher ok' "$work/out"; then
+    printf '%s\n' 'ps-client: a windows platform-cache hit skips the launcher-protocol probe' >&2
+    grep -i 'cache launcher' "$work/err" >&2 || head -3 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+
+# --- the batch-removal response root must be a real ARRAY --------------------
+# `remove --label` answers with a JSON array of per-task results.  The POSIX
+# twin's jq filter requires an array; this copy's validator accepted every
+# shape ConvertFrom-Json collapses ([null], [[]], a bare object), so four
+# different protocol violations answered exit 0 here and exit 2 there (measured
+# 2026-11-20).  Table-driven over the raw bodies, with the expected verdict
+# asserted on THIS client and the empty batch as the positive control.
+batch_root_probe='$ErrorActionPreference = "Stop"
+. "__CLIENT__" 2>$null
+$bad = 0
+$cases = @(
+    @{ n="empty";        b="[]";                                      e=$true },
+    @{ n="empty-spaced"; b="[ ]";                                     e=$true },
+    @{ n="one-object";   b="[{`"task_id`":1,`"removed`":true}]";      e=$true },
+    @{ n="two-objects";  b="[{`"task_id`":1,`"removed`":true},{`"task_id`":2,`"removed`":false}]"; e=$true },
+    @{ n="null-body";    b="null";                                    e=$false },
+    @{ n="one-null";     b="[null]";                                  e=$false },
+    @{ n="nested-empty"; b="[[]]";                                    e=$false },
+    @{ n="two-null";     b="[null,null]";                             e=$false },
+    @{ n="bare-object";  b="{`"task_id`":1,`"removed`":true}";        e=$false },
+    @{ n="missing-field";b="[{`"task_id`":1}]";                       e=$false },
+    @{ n="wrong-field";  b="[{`"task_id`":1,`"removed`":1}]";         e=$false }
+)
+foreach ($c in $cases) {
+    $verdict = Test-AgentQJsonResponse -Operation "remove_batch" -Output $c.b
+    if ($verdict -ne $c.e) {
+        [Console]::Error.WriteLine("batch root $($c.n): expected $($c.e), got $verdict")
+        $bad += 1
+    }
+}
+if ($bad -ne 0) { exit 1 }
+"batch root ok"
+'
+batch_root_probe=${batch_root_probe//__CLIENT__/$client_arg}
+cases=$((cases + 1))
+status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command "$batch_root_probe" \
+    >"$work/out" 2>"$work/err" || status=$?
+if [ "$status" -ne 0 ] || ! grep -qF 'batch root ok' "$work/out"; then
+    printf '%s\n' 'ps-client: the batch-removal response validator disagrees with the POSIX twin' >&2
+    grep -i 'batch root' "$work/err" >&2 || head -3 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+
 # --- the PROBE token reader must take the last token too ---------------------
 # The same divergence existed on the PROBE path, over stdout instead of stderr:
 # the POSIX client's windows_probe_apply_exit_token strips up to the FINAL
@@ -3150,13 +3315,20 @@ cases=$((cases + 1))
 # the pattern too (one is built from Get-FileTextOrEmpty below), and counting
 # those made the "expected 3" pin fail on a correct asset (measured 2026-11-19).
 # `^[[:space:]]*\$` keeps comment lines out for the same reason as before.
+#
+# The PROBE reader is no longer a `[regex]::Matches` at all: it takes the LAST
+# occurrence by `LastIndexOf` and reads a leading digit run, because a
+# first-match/backtracking regex could not express the POSIX twin's rule (last
+# occurrence, leading run, reject 4+ digits, fall back to the SSH code).  It is
+# counted SEPARATELY and bounded by its own predicate (`Length -le 3`), so the
+# per-reader invariant still holds: every reader of the token is enumerated and
+# every enumerated reader is shown to bound its digits.
 exit_readers=$(grep -E '^[[:space:]]*\$.*\[regex\]::Matches.*agentq-exit:' "$client" | grep -c . || true)
 exit_readers_bounded=$(grep -E '^[[:space:]]*\$.*\[regex\]::Matches.*agentq-exit:\(' "$client" | grep -cE 'agentq-exit:\((\\d|\[0-9\])\{1,3\}' || true)
-# 4 since 2026-11-19: Resolve-ProbeExitToken re-scans after dropping a
-# non-protocol token (256-999), so it holds two matches calls; the count is
-# still pinned so a reader cannot disappear unnoticed.
-if [ "$exit_readers" -ne 4 ]; then
-    printf 'ps-client-contract: expected 4 exit-token readers, found %s\n' "$exit_readers" >&2
+# 2 since 2026-11-20: the two operation-path readers (Invoke-SshLogged's file and
+# pipe arms).  The probe reader moved to LastIndexOf and is counted below.
+if [ "$exit_readers" -ne 2 ]; then
+    printf 'ps-client-contract: expected 2 exit-token regex readers, found %s\n' "$exit_readers" >&2
     failures=$((failures + 1))
 fi
 if [ "$exit_readers_bounded" -ne "$exit_readers" ]; then
@@ -3166,6 +3338,17 @@ if [ "$exit_readers_bounded" -ne "$exit_readers" ]; then
 fi
 if grep -qF 'agentq-exit:(\d+)' "$client"; then
     printf '%s\n' 'ps-client-contract: an unbounded \d+ exit-token reader is present; a huge token would crash the [int] cast' >&2
+    failures=$((failures + 1))
+fi
+# The LAST-OCCURRENCE reader: exactly one `LastIndexOf("agentq-exit:"`, and its
+# digit run must still be bounded.  A rewrite that drops the bound would let
+# `agentq-exit:999999999999` reach `[int]` and throw on PS 5.1.
+cases=$((cases + 1))
+last_index_readers=$(grep -c 'LastIndexOf("agentq-exit:"' "$client" || true)
+last_index_bounded=$(grep -c 'tokenText.Length -le 3' "$client" || true)
+if [ "$last_index_readers" -ne 1 ] || [ "$last_index_bounded" -lt 1 ]; then
+    printf 'ps-client-contract: the last-occurrence token reader is missing or unbounded (readers=%s bounds=%s)\n' \
+        "$last_index_readers" "$last_index_bounded" >&2
     failures=$((failures + 1))
 fi
 

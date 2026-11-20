@@ -203,7 +203,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFOR
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.35"
+$script:ClientVersion = "0.1.36"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's Pueue command ceiling, not this machine's platform: a
 # unix target takes up to 100000 base64 characters (the POSIX twin's
@@ -596,6 +596,21 @@ function Test-AsciiWhitespaceOnly {
         return $true
     }
     return ($Value -match '^[ \t\n\r\f\v]*$')
+}
+
+function Remove-TrailingNewlines {
+    # Only `\n` and `\r`: the POSIX twin's probe output passes through `$( )`,
+    # which strips trailing NEWLINE characters and nothing else.  .NET's
+    # TrimEnd() with no argument removes ALL whitespace, so a payload ending in
+    # a TAB or a NBSP kept that character on POSIX (and then failed the exact
+    # comparison) while this side silently dropped it and matched -- measured
+    # 2026-11-20: `agentq-windows<TAB>` was exit 2 on POSIX and 0 here.
+    param([AllowNull()][AllowEmptyString()][string]$Value)
+
+    if ($null -eq $Value) {
+        return $Value
+    }
+    return $Value.TrimEnd([char[]]@("`n", "`r"))
 }
 
 function Get-ConfiguredHost {
@@ -1524,7 +1539,13 @@ function Invoke-SshLogged {
                 # measured fail-open on a 20-digit token, 2026-10-06).
                 # ASCII digits, not `\d` (which matches Unicode digits that the
                 # [int] cast below may throw on) -- measured 2026-11-19.
-                $exitTokenMatches = [regex]::Matches($standardError, '(?m)^agentq-exit:([0-9]{1,3})\s*$')
+                # The line end is `\r*$`, NOT `\s*$`: the POSIX twin deletes CRs
+                # and then anchors with sed `$`, so a TAB or an NBSP after the
+                # digits makes the line NOT a token there.  `\s*$` accepted it
+                # here, so the same stubbed stderr gave POSIX exit 2 and this
+                # client exit 5 (measured 2026-11-20).  `\r*` (not `\r?`)
+                # mirrors `tr -d '\r'`, which removes every CR.
+                $exitTokenMatches = [regex]::Matches($standardError, '(?m)^agentq-exit:([0-9]{1,3})\r*$')
                 if ($exitTokenMatches.Count -gt 0) {
                     $tokenCode = [int]$exitTokenMatches[$exitTokenMatches.Count - 1].Groups[1].Value
                     # 256-999 pass the length filter but are NOT protocol codes;
@@ -1765,7 +1786,8 @@ function Invoke-WaitSshWithTimeout {
                 $standardError = $stderrState.Builder.ToString()
                 if ($script:RemotePlatform -eq "windows") {
                     # ASCII digits only; see the note on the other reader.
-                    $exitTokenMatches = [regex]::Matches($standardError, '(?m)^agentq-exit:([0-9]{1,3})\s*$')
+                    # `\r*$`, not `\s*$`, for the same reason as there.
+                    $exitTokenMatches = [regex]::Matches($standardError, '(?m)^agentq-exit:([0-9]{1,3})\r*$')
                     if ($exitTokenMatches.Count -gt 0) {
                         $tokenCode = [int]$exitTokenMatches[$exitTokenMatches.Count - 1].Groups[1].Value
                         if ($tokenCode -le 255) {
@@ -2277,10 +2299,27 @@ function Test-JsonBatchRemoveResult {
     # validated with @() wrapping.  But @($null) is still a ONE-element array
     # whose only element is $null (measured in pwsh 7.5.4), so an empty array
     # would be rejected unless the null input is handled explicitly here.
-    param([AllowNull()][object]$Response)
+    #
+    # `[null]`, `[[]]` and a BARE OBJECT all deserialize into shapes this
+    # function used to accept, while the POSIX twin's jq filter requires a real
+    # array of objects (measured 2026-11-20: POSIX exit 2, this side exit 0 on
+    # all three).  The raw text is the only place the shapes are still
+    # distinguishable on PS 5.1, so the caller passes it and the ARRAY-ness is
+    # decided here: the response must start with `[` (a bare object and a
+    # `null` body are refused), and the only array that may deserialize to
+    # $null is the EMPTY one.
+    param([AllowNull()][object]$Response, [AllowEmptyString()][string]$RawText)
+
+    if (-not (Remove-TrailingNewlines -Value $RawText).TrimStart(' ', "`t", "`r", "`n").StartsWith("[")) {
+        return $false
+    }
 
     if ($null -eq $Response) {
-        return $true
+        # `[]` and `[null]` both arrive as $null; only the empty array is a
+        # valid batch.  Distinguish by the text between the brackets.
+        $inner = (Remove-TrailingNewlines -Value $RawText).Trim()
+        $inner = $inner.Substring(1, $inner.Length - 2).Trim()
+        return ($inner.Length -eq 0)
     }
 
     foreach ($entry in @($Response)) {
@@ -2291,6 +2330,16 @@ function Test-JsonBatchRemoveResult {
             !($entry.removed -is [bool])) {
             return $false
         }
+    }
+
+    # `[[]]` deserializes to an empty array whose single element vanished; the
+    # text says "there is an element", so require one object per element.  The
+    # count check is the cheap discriminator between `[]` and `[[]]`: for any
+    # non-empty text there must be at least one validated entry.
+    if (@($Response).Count -eq 0) {
+        $inner = $RawText.Trim()
+        $inner = $inner.Substring(1, $inner.Length - 2).Trim()
+        return ($inner.Length -eq 0)
     }
 
     return $true
@@ -2429,12 +2478,9 @@ function Test-AgentQJsonResponse {
             # real array, so a null body was a protocol violation there and a
             # successful removal here.  The raw text is the only place the two
             # shapes are still distinguishable on PS 5.1 (which has no
-            # -NoEnumerate to keep `[]` from collapsing).
-            if ($Output.Trim() -ceq "null") {
-                $valid = $false
-            } else {
-                $valid = Test-JsonBatchRemoveResult -Response $response
-            }
+            # -NoEnumerate to keep `[]` from collapsing), so it is passed down
+            # and the root shape is decided there.
+            $valid = Test-JsonBatchRemoveResult -Response $response -RawText $Output
         }
         "logs" {
             $taskObject = if (Test-JsonObjectProperty -Object $response -Name "task") {
@@ -2965,42 +3011,45 @@ function Resolve-ProbeExitToken {
         [int]$SshExitCode,
         [string]$Output
     )
-
-    # The LAST token wins, matching the POSIX client's
-    # windows_probe_apply_exit_token (which strips up to the final
-    # `agentq-exit:` via ${raw##*agentq-exit:}).  The probe body prints its token
-    # last, so the last one is authoritative; and the output is remote-controlled,
-    # so a first-match reader could be steered by a planted leading token.  Both
-    # callers additionally require an exact Output value, which already rejects
-    # most forgeries -- this keeps the two copies aligned rather than relying on
-    # that as the only defense.
-    # At most three ASCII digits, exactly like the operation-path reader below
-    # (`(?m)^agentq-exit:([0-9]{1,3})\s*$`) AND like the POSIX twin's
-    # windows_probe_apply_exit_token, which additionally rejects 256-999.  Three
-    # separate defects lived in the old `\d{1,3}` form, all measured 2026-11-19:
-    #   1. `\d` matches Unicode digits (Arabic-Indic digits), and the `[int]` cast
-    #      below throws on them -- an uncaught throw, so the client died with a
-    #      PowerShell error where the POSIX twin answered 1.
-    #   2. A token of 256-999 was accepted and then NORMALIZED by the operating
-    #      system (`exit 256` reads 0): the client reported a failed probe as
-    #      success while the POSIX twin, which rejects that range, fell back to
-    #      the ssh exit code.
-    #   3. An unbounded-in-practice token like `agentq-exit:1234` was TRUNCATED
-    #      to 123 instead of ignored -- the twin ignores it.
-    # A rejected token falls back to the SSH exit code, which is the fail-closed
-    # direction and what the twin does.
-    $exitTokenMatches = [regex]::Matches($Output, 'agentq-exit:([0-9]{1,3})')
-    while ($exitTokenMatches.Count -gt 0) {
-        $lastToken = $exitTokenMatches[$exitTokenMatches.Count - 1]
-        $tokenCode = [int]$lastToken.Groups[1].Value
-        $before = $Output.Substring(0, $lastToken.Index)
-        if ($tokenCode -le 255) {
-            return [pscustomobject]@{ ExitCode = $tokenCode; Output = $before.TrimEnd() }
+    # The token is read the way the POSIX twin reads it, not the way a
+    # PowerShell regex naturally would.  Measured 2026-11-20 with the same stub
+    # sequence fed to both clients, three divergences:
+    #   1. `agentq-windows\nagentq-exit:0\nagentq-exit:300`: the twin takes the
+    #      LAST occurrence only, finds 300, rejects it (256-999 is not a
+    #      protocol code) and falls back to the SSH exit code.  This copy
+    #      BACKTRACKED to the earlier 0 and reported success -- so a remote
+    #      could plant `agentq-exit:0` and then a garbage token to steer the
+    #      reader, which is the exact forgery the last-match rule exists to
+    #      stop.
+    #   2. `agentq-exit:1234`: the twin takes the leading digit run, sees four
+    #      digits and ignores the token; the `{1,3}` regex here matched "123"
+    #      and accepted it.
+    #   3. `agentq-exit:0007`: the twin accepts it as 7 (leading zeros are
+    #      digits like any other); this copy rejected it.
+    #   4. `agentq-exit:5` followed by a TAB or an NBSP: the PROBE path in the
+    #      twin reads the leading digit run with no line-end anchor (`${var%%[!0123456789]*}`),
+    #      so a trailing blank is fine THERE -- the strict line-end anchor
+    #      belongs to the OPERATION path's stderr reader, a different parser
+    #      (measured 2026-11-20).  Do not add a terminator requirement here.
+    # So: last occurrence, leading digit run, 1-3 digits, <= 255, else ignore
+    # the token entirely.  The output keeps everything BEFORE that occurrence,
+    # with the trailing newlines the POSIX command substitution would strip.
+    $markerIndex = $Output.LastIndexOf("agentq-exit:", [System.StringComparison]::Ordinal)
+    if ($markerIndex -ge 0) {
+        $afterMarker = $Output.Substring($markerIndex + "agentq-exit:".Length)
+        $digitRun = [regex]::Match($afterMarker, '^[0-9]+')
+        if ($digitRun.Success) {
+            $tokenText = $digitRun.Value
+            if (($tokenText.Length -le 3)) {
+                $tokenCode = [int]$tokenText
+                if (($tokenCode -le 255)) {
+                    return [pscustomobject]@{
+                        ExitCode = $tokenCode
+                        Output = (Remove-TrailingNewlines -Value $Output.Substring(0, $markerIndex))
+                    }
+                }
+            }
         }
-        # Not a protocol code: drop the token and keep looking for an earlier one
-        # inside what precedes it.
-        $Output = $before
-        $exitTokenMatches = [regex]::Matches($Output, 'agentq-exit:([0-9]{1,3})')
     }
     return [pscustomobject]@{ ExitCode = $SshExitCode; Output = $Output }
 }
@@ -3015,7 +3064,7 @@ function Confirm-WindowsAgentQProtocol {
     $protocolProbe = Invoke-PlatformProbeWithRecovery -Probe (Get-WindowsAgentQProtocolProbeCommand)
     Resolve-ProbeExitToken -SshExitCode $protocolProbe.ExitCode -Output $protocolProbe.Output |
         ForEach-Object { $protocolProbe.ExitCode = $_.ExitCode; $protocolProbe.Output = $_.Output }
-    if (($protocolProbe.ExitCode -eq 0) -and ($protocolProbe.Output.Trim() -ceq "agentq-windows-launcher-ready")) {
+    if (($protocolProbe.ExitCode -eq 0) -and ((Remove-TrailingNewlines -Value $protocolProbe.Output) -ceq "agentq-windows-launcher-ready")) {
         return
     }
 
@@ -3023,16 +3072,16 @@ function Confirm-WindowsAgentQProtocol {
     if ($protocolProbe.ExitCode -eq 124) {
         exit 124
     }
-    if (($protocolProbe.ExitCode -eq 42) -and ($protocolProbe.Output.Trim() -ceq "agentq-windows-launcher-missing")) {
+    if (($protocolProbe.ExitCode -eq 42) -and ((Remove-TrailingNewlines -Value $protocolProbe.Output) -ceq "agentq-windows-launcher-missing")) {
         Stop-AgentQ "remote Windows AgentQ deployment is incomplete: C:/ProgramData/AgentQ/agentq-launcher.ps1 is missing; upgrade AgentQ on $($script:TargetHost) before using it"
     }
-    if (($protocolProbe.ExitCode -eq 43) -and ($protocolProbe.Output.Trim() -ceq "agentq-windows-launcher-incompatible")) {
+    if (($protocolProbe.ExitCode -eq 43) -and ((Remove-TrailingNewlines -Value $protocolProbe.Output) -ceq "agentq-windows-launcher-incompatible")) {
         Stop-AgentQ "remote Windows AgentQ deployment is incompatible: C:/ProgramData/AgentQ/agentq-launcher.ps1 does not support the ArgumentsBase64 protocol; upgrade AgentQ on $($script:TargetHost) before using it"
     }
-    if (($protocolProbe.ExitCode -eq 44) -and ($protocolProbe.Output.Trim() -ceq "agentq-windows-launcher-invalid")) {
+    if (($protocolProbe.ExitCode -eq 44) -and ((Remove-TrailingNewlines -Value $protocolProbe.Output) -ceq "agentq-windows-launcher-invalid")) {
         Stop-AgentQ "remote Windows AgentQ deployment is unsafe: C:/ProgramData/AgentQ/agentq-launcher.ps1 or its parent is a reparse path; repair the protected deployment before using it"
     }
-    if (($protocolProbe.ExitCode -eq 45) -and ($protocolProbe.Output.Trim() -ceq "agentq-windows-launcher-too-large")) {
+    if (($protocolProbe.ExitCode -eq 45) -and ((Remove-TrailingNewlines -Value $protocolProbe.Output) -ceq "agentq-windows-launcher-too-large")) {
         Stop-AgentQ "remote Windows AgentQ deployment is incompatible: C:/ProgramData/AgentQ/agentq-launcher.ps1 exceeds the protocol probe size limit; repair the protected deployment before using it"
     }
     # The probe's OWN status, like the POSIX twin, not a flat 2.  The two
@@ -3056,7 +3105,7 @@ function Confirm-NativeWindowsPlatform {
     $windowsProbe = Invoke-PlatformProbeWithRecovery -Probe (Get-WindowsProbeCommand)
     Resolve-ProbeExitToken -SshExitCode $windowsProbe.ExitCode -Output $windowsProbe.Output |
         ForEach-Object { $windowsProbe.ExitCode = $_.ExitCode; $windowsProbe.Output = $_.Output }
-    if (($windowsProbe.ExitCode -eq 0) -and ($windowsProbe.Output.Trim() -ceq "agentq-windows")) {
+    if (($windowsProbe.ExitCode -eq 0) -and ((Remove-TrailingNewlines -Value $windowsProbe.Output) -ceq "agentq-windows")) {
         $script:RemotePlatform = "windows"
         Confirm-WindowsAgentQProtocol
         return $true
@@ -3084,12 +3133,21 @@ function Initialize-RemoteInvocation {
     switch ($script:RemotePlatform) {
         "auto" {
             # Cache first, mirroring the POSIX twin: the cache records the
-            # FINAL verdict (written only after a full resolution including
-            # the launcher-protocol check), so a hit skips both probes.
-            # AGENTQ_PLATFORM_PROBE_CACHE=off, an unparsable/expired entry, or
-            # any filesystem hiccup falls through to probing -- a broken cache
-            # must never break a working command.
+            # PLATFORM verdict, and a hit skips the platform probes -- but NOT
+            # the launcher-protocol check.  initialize_remote_invocation on the
+            # POSIX side calls probe_windows_agentq_protocol unconditionally
+            # once the platform is windows, and platform_cache_write fires
+            # before that probe, so an entry is not proof the launcher
+            # answered.  Returning here on a windows hit made the two clients
+            # disagree on the same host and cache (measured 2026-11-20:
+            # POSIX 2 with the "deployment is incomplete" diagnostic, Windows 0
+            # against a launcher that reported 42).  Fail closed, as the POSIX
+            # comment says: a host whose launcher broke after the entry was
+            # written must be re-checked, not trusted.
             if (Read-PlatformProbeCache) {
+                if ($script:RemotePlatform -eq "windows") {
+                    Confirm-WindowsAgentQProtocol
+                }
                 return
             }
             $unixProbe = Invoke-PlatformProbeWithRecovery -Probe ([pscustomobject]@{
@@ -3097,13 +3155,13 @@ function Initialize-RemoteInvocation {
                 Input = $null
             })
             if ($unixProbe.ExitCode -eq 0) {
-                switch ($unixProbe.Output.Trim()) {
+                switch (Remove-TrailingNewlines -Value $unixProbe.Output) {
                     { $_ -clike "MINGW*" -or $_ -clike "MSYS*" -or $_ -clike "CYGWIN*" } {
                         [void](Confirm-NativeWindowsPlatform)
                         Write-PlatformProbeCache
                         return
                     }
-                    { $_ -like "Linux*" -or $_ -like "Darwin*" } {
+                    { $_ -clike "Linux*" -or $_ -clike "Darwin*" } {
                         $script:RemotePlatform = "unix"
                         Write-PlatformProbeCache
                         return
@@ -3142,7 +3200,7 @@ function Initialize-RemoteInvocation {
             $windowsProbe = Invoke-PlatformProbeWithRecovery -Probe (Get-WindowsProbeCommand)
             Resolve-ProbeExitToken -SshExitCode $windowsProbe.ExitCode -Output $windowsProbe.Output |
                 ForEach-Object { $windowsProbe.ExitCode = $_.ExitCode; $windowsProbe.Output = $_.Output }
-            if (($windowsProbe.ExitCode -eq 0) -and ($windowsProbe.Output.Trim() -ceq "agentq-windows")) {
+            if (($windowsProbe.ExitCode -eq 0) -and ((Remove-TrailingNewlines -Value $windowsProbe.Output) -ceq "agentq-windows")) {
                 $script:RemotePlatform = "windows"
                 Confirm-WindowsAgentQProtocol
                 Write-PlatformProbeCache

@@ -4,7 +4,7 @@ set -eu
 
 program=${0##*/}
 release_version='4.0.4'
-agentq_version='0.1.35'
+agentq_version='0.1.36'
 asset_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 agentq_home=${AGENTQ_HOME:-"$HOME/.agentq"}
 artifact_source_directory=${AGENTQ_PUEUE_SOURCE_DIR:-}
@@ -2629,19 +2629,29 @@ remove_stale_operation_lock() {
             operation_remove_verdict='unverified'
         elif ! installer_regular_file_is_safe "$operation_remove_pid_path"; then
             operation_remove_verdict='unverified'
-        elif ! remove_installer_file "$operation_remove_pid_path"; then
-            operation_remove_status=$?
-            printf '%s: failed to remove AgentQ operation lock metadata: %s\n' "$program" "$operation_remove_pid_path" >&2
-            return "$operation_remove_status"
-        elif [ -e "$operation_remove_pid_path" ] || [ -L "$operation_remove_pid_path" ]; then
-            operation_remove_verdict='unverified'
-        elif ! rmdir -- "$operation_remove_lock_path" 2>/dev/null &&
-            { [ -e "$operation_remove_lock_path" ] || [ -L "$operation_remove_lock_path" ]; }; then
-            # The pid file was this lock's and the holder is dead, but
-            # something else is still inside.  None of it is ours to remove.
-            operation_remove_verdict='unremoval'
         else
-            return 0
+            # The removal is NOT an `elif ! remove_installer_file ...; then
+            # status=$?` arm: inside a negated condition `$?` is the NEGATION's
+            # status (always 0 -- measured under bash and dash, 2026-11-20), so
+            # that shape reported a failed removal as a success and returned 0,
+            # and the caller's `while [ -d "$operation_lock" ]` loop then
+            # retried forever on a lock it could never remove.  The `||` form
+            # captures the real code.
+            remove_installer_file "$operation_remove_pid_path" || {
+                operation_remove_status=$?
+                printf '%s: failed to remove AgentQ operation lock metadata: %s\n' "$program" "$operation_remove_pid_path" >&2
+                return "$operation_remove_status"
+            }
+            if [ -e "$operation_remove_pid_path" ] || [ -L "$operation_remove_pid_path" ]; then
+                operation_remove_verdict='unverified'
+            elif ! rmdir -- "$operation_remove_lock_path" 2>/dev/null &&
+                { [ -e "$operation_remove_lock_path" ] || [ -L "$operation_remove_lock_path" ]; }; then
+                # The pid file was this lock's and the holder is dead, but
+                # something else is still inside.  None of it is ours to remove.
+                operation_remove_verdict='unremoval'
+            else
+                return 0
+            fi
         fi
         if [ "$operation_remove_attempt" -ge 3 ]; then
             printf '%s: AgentQ operation lock could not be verified as gone (the owner cannot be confirmed dead, or the lock holds entries it does not own): %s\n' \
@@ -2949,6 +2959,17 @@ trap 'exit 130' HUP INT TERM
 case "${1:-}" in
     '') ;;
     -h|--help)
+        # `--help extra` is NOT a help request followed by ignored words: the
+        # whole argv is wrong, and answering 0 tells a script its (misspelled)
+        # invocation succeeded.  Same rule the non-help arm already follows.
+        case "$#" in
+            1) ;;
+            *)
+                printf '%s\n' "$program: --help takes no further arguments: $2" >&2
+                printf '%s\n' "try: $program --help" >&2
+                exit 2
+                ;;
+        esac
         printf 'Usage: %s\n\nInstalls AgentQ without arguments; everything is configured through the\nenvironment (see skill/references/install.md). Nothing is read from argv.\n' "$program"
         exit 0
         ;;

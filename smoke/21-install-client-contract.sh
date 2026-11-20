@@ -294,6 +294,37 @@ if grep -qF 'client does not match canonical asset: agentq' "$work/err"; then
     failures=$((failures + 1))
 fi
 
+# --- --check must detect a LOST EXECUTE BIT, not only changed bytes ----------
+# The install stages each client and `chmod 700`s it, so the execute bit is part
+# of the install result; a byte-identical copy with the bit cleared is
+# unrunnable (the shell answers 126) while a bytes-only `--check` said "match".
+# Measured 2026-11-20 (independent review, reproduced here): install, `chmod 600`
+# both clients, `--check` -> exit 0 + "match", `<dest>/agentq --version` -> 126.
+# Drift exits 1, like every other mismatch, and the message names the client.
+mode_destination="$work/mode-drift"
+mkdir -p "$mode_destination"
+cp "$source_directory/agentq" "$mode_destination/agentq"
+cp "$source_directory/sshp" "$mode_destination/sshp"
+chmod 700 "$mode_destination/agentq" "$mode_destination/sshp"
+chmod 600 "$mode_destination/agentq"
+cases=$((cases + 1))
+mode_status=$(run_installer --check --bin-dir "$mode_destination")
+if [ "$mode_status" -ne 1 ]; then
+    printf 'install-client --check (mode drift): expected 1, got %s\n' "$mode_status" >&2
+    head -2 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+if ! grep -qF 'client is not executable in destination: agentq' "$work/err"; then
+    printf 'install-client --check (mode drift): did not name the unrunnable client\n' >&2
+    failures=$((failures + 1))
+fi
+# The executable twin must NOT be blamed -- a check that flagged both would pass
+# the assertion above for the wrong reason.
+if grep -qF 'client is not executable in destination: sshp' "$work/err"; then
+    printf 'install-client --check (mode drift): reported the executable client as well\n' >&2
+    failures=$((failures + 1))
+fi
+
 # --- refusing to overwrite a co-located server wrapper -------------------------
 # This installer's default destination ($HOME/.local/bin/agentq) is EXACTLY
 # where install-agentq.sh puts its exec wrapper.  On a host that runs both, a

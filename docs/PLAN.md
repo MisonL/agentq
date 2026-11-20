@@ -402,6 +402,94 @@ jq 分支**，是本检查从来没有过的**执行证据**（`08` 仍只是间
   **修复后契约形状**：≤约 8.1K 单参数全链路逐字回环；8.1K–32.5K 任务会被
   cmd 截断（stdin/env 层不再失败）；>32.5K 显式 rc=2 + `reason=protocol_error`。
 
+### 2026-11-20 第五轮终审（只读 agent + Orca Codex，审的是 v0.1.35）——修 13 处，外加 1 条本轮自查发现的假阳性
+
+**已修（每条都先在主检出里独立复现，再改，再证明新锁会红）**：
+
+1. **P2：repair 回退循环每次失败泄露一个临时文件。** `repair_removed_request_records`
+   的回退循环把读者的 stderr 捕获进 `mktemp` 文件，而读者经 `fail`（`exit 2`）报告，
+   函数自己的尾部 `rm -f` 因此被跳过。实测（一条 removed 记录与墓碑冲突 + 一条不可读
+   记录，且**前者 id 排序在后**——顺序反过来 `fail` 先触发、泄露不发生）：每条失败命令
+   在 `$TMPDIR` 留一个 0600 空 `agentq-repair-guard.*`，无上界。修法：文件名提升为
+   **全局**，`cleanup()` 与 `fail()` 都清；读取处先把名字在**子 shell 内**置空再用保存
+   的路径重定向，否则 `fail` 在 `$( )` 里把父 shell 随后要 `cat` 的文件删掉（第一版
+   实测丢了诊断、泄露用例仍绿）。锁：`smoke/27` 两例（零残留 + 守卫消息仍在 stderr）。
+2. **安装器陈旧操作锁恢复里的 `$?` 取反陷阱。** `elif ! remove_installer_file …; then
+   status=$?` 捕获的是**取反**状态的 0（bash/dash 实测：非取反 `else` 分支给 7、
+   取反分支给 0），于是失败的删除回答 success、返回 0，调用方的
+   `while [ -d "$operation_lock" ]` 在一把永远删不掉的锁上原地重试。改为
+   `remove_installer_file … || { status=$?; … }`，并把原 `elif` 链改写为 `else` 分支内
+   的 `if`。锁：`smoke/01` 新增**结构性** `negation_captures` 规则（不是行窗口——
+   `smoke/10` 规则 G 已在窗口上栽过两次），带四个分支的自检夹具。
+3. **非 UTF-8 的 `--label` 与 argv 被静默改写。** jq 的 `--arg` 把非法字节换成 U+FFFD：
+   实测 `--label $'q\xff'` 退 0、记录里存的是 `q\xef\xbf\xbd`，随后**同一个 request id**
+   换 `$'q\357\277\275'` 再提交答 `reused:true`——两个不同的参数被读成一个；
+   `remove --label` 同样过匹配，一次删两个。argv 则是 Pueue 自己会拒，但**在 AgentQ
+   落盘 `adding` 记录之后**，那条记录从此不可按原参数重放（实测 `lookup` 永久答 4）。
+   修法：`is_valid_text_argument` / `is_valid_argv`（jq `-Rsj` 往返 vs
+   `LC_ALL=C od -An -v -tx1`，argv 用 NUL 连接保住元素边界），在**写入任何记录之前**
+   拒绝，退 2 `reason=protocol_error`。锁：`smoke/02` 两例 + 无记录断言，`smoke/27` 的
+   S6c 钉「不留记录」那半。
+4. **`--workdir` 解析结果以换行结尾时静默丢最后一个组件。** `normalize_workdir` 的
+   `$( )` 剥掉所有尾随换行，于是任务在**另一个目录**入队；当被剥掉的整段就是那个
+   换行时为 `workdir:""`，记录卡在 `adding`、`lookup` 永久答 4。修法：`pwd -P` 后追加
+   `Z` 哨兵，剥哨兵再剥一个换行，剩余值含 `\n`/`\r` 即拒。锁：`smoke/27` S6b——夹具
+   本身也用哨兵建（`$(printf '…\n')` 会把名字里的换行先剥掉，第一版就这样「测了双胞胎
+   目录」）。
+5. **任务日志路径不是普通文件时 `logs` 挂死。** Pueue 直接 open 该路径，FIFO 上
+   实测 `logs 901` 静默挂 20 秒直到调用方 `timeout` 杀掉（124）。修法：`compact_log`
+   在**调用 Pueue 之前**拒绝该形状，按文档的 `6/unavailable` 回答。锁：`smoke/26` V22，
+   桩**故意应答而不是阻塞**——断言的是「先拒后读」，复现挂死只能证明夹具带超时。
+6. **服务端把 `--tail 00`/`000` 当有效（Codex 报告，已复现）。** 旧
+   `is_bounded_line_count` 先剥前导零再判幅值，于是 `000` 归一为 0 并通过、答「0 行」，
+   而两份客户端都拒、`--tail 0` 也拒——同一个值在三个实现里三种答案，且服务端已经
+   触发了 daemon/status/log 访问。改为直接拒绝零的一切拼写（`0` 与 `0*`）。
+   锁：`smoke/02` 三例（`0`/`00`/`0005`，断言码与 `reason`）。
+7. **Windows 客户端缓存命中后跳过 launcher 协议探测。** 缓存写的是**平台判定**、
+   在 launcher 探测**之前**落盘，所以条目不是「launcher 还答不答」的证明；POSIX 侧命中
+   windows 后仍跑探测，Windows 侧直接 `return`。实测同一主机同一缓存：POSIX 退 2 带
+   「部署不完整」诊断，Windows 退 0 而 launcher 报 42。修法：命中 windows 条目后仍调
+   `Confirm-WindowsAgentQProtocol`，失败即 fail-closed。锁：`smoke/12` 的缓存命中控制例。
+8. **Windows 客户端 `remove --label` 批量结果的根形状校验与 POSIX 不等价。** 空文本、
+   `[null]`、单元素数组解包、`[]` 在两侧给出不同答案。改为**基于原始文本**判定根是数组
+   （`Remove-TrailingNewlines` 后 `TrimStart` 再 `StartsWith("[")`），空数组走「内部为空」
+   判据。实测五个形状 D2 全部 SAME（`/tmp/repro-win-d2d6.sh` 的 17 行差分）。
+9. **探针退出 token 的读取规则两侧不同。** Windows 的读取器用正则 `(?m)^agentq-exit:…$`
+   ——贪婪回溯、接受 4 位数字与前导零、要求行尾锚定；POSIX 取**最后一次出现**的数字串、
+   ≤3 位、≤255、且尾随空白宽松。改为镜像 POSIX：`LastIndexOf` + `^[0-9]+` 数字串 +
+   ≤3 位 + ≤255，否则**整条忽略、`Output` 原样保留**。`smoke/12` 的读取器普查改为
+   「正则读取器 2 个、`LastIndexOf` 读取器 1 个」。
+10. **操作路径的 token 读取在 Windows 侧用 `\s*$`。** POSIX 侧先 `tr -d '\r'` 再以
+    sed `$` 锚定行尾——Windows 的 `\s*` 会吃掉尾随空格/制表符，同一 stderr 两种答案。
+    改 `\r*$`（两处）。锁：`smoke/12` 的 token 后缀循环（tab/nbsp/尾随文本三种）。
+11. **Windows 客户端三处标记比较是 `-eq`/`-like`（不分大小写）。** `-clike`/`-ceq` +
+    `Remove-TrailingNewlines`（只剥 `\n`/`\r`，不剥空格——`.TrimEnd()` 会把尾随空白也剥掉，
+    等于又引入一处与 POSIX 不同的宽松）。
+12. **`install-client.sh --check` 对执行位漂移假绿（Codex 报告，已复现）。** 安装把文件
+    `chmod 700`，而 `--check` 只 `cmp` 字节：实测装好后 `chmod 600` 两个客户端，`--check`
+    退 0 报「match」，直接运行得 126。改为 `--check` 发现目标非可执行即报 drift（退 1）。
+    **Windows 孪生不跟**：那边只比哈希，「可执行」对应的 ACL/扩展名状态没有实测，不声称。
+    锁：`smoke/21` 模式漂移例（一个 600、另一个可执行，断言只有前者被点名）。
+13. **`install-agentq.sh --help extra` 静默成功（Codex 报告，已复现）。** 帮助分支只看
+    `${1:-}` 就退 0。改为 `--help` 带尾随参数时退 2 并点名该参数（与非帮助分支同一规则）。
+    锁：`smoke/11` 一例。
+
+**本轮自己的修复引入的假阳性（已修）**：`smoke/01` 的 local-hazard 规则把
+`| LC_ALL=C od …` 报成未 `local` 的赋值。POSIX 里**纯字面值赋值后跟命令词**是该命令的
+环境前缀、不是 shell 赋值——实测（bash 与 dash）被调用函数里的
+`: | LC_ALL=C od` 不改调用方的 `local LC_ALL`，而语句形式会写穿。判定键在**值**上
+（`[A-Za-z0-9_./:+-]*` 且**从匹配位置**起算——第一版从行首算，行首缩进就满足了
+`[ \t]+`，等于豁免全部缩进行的赋值），并新增一个**阴性**自检夹具：规则必须对
+`acquire_request_lock: LC_ALL` 保持沉默。
+
+**记为边界（不修）**：
+- 两份客户端的 `--stdin-script` 上界在 unix 目标上仍不一致（0.1.31 已记录，本轮未动）。
+- `sshp` 的前台 ssh 中断语义（0.1.35 已记录，本轮未动）。
+- `ps51=NOT-covered`：本机只有 pwsh 7.5.4，第 7/8/9/10/11 条只有静态与 pwsh 7 执行证据。
+- Windows 安装器 `-Check` 不检查「可执行」——没有真 Windows 上的 ACL 证据。
+- 非 UTF-8 的 `--label`/argv 只有**服务端**拒绝；两份客户端不做这个校验（POSIX 侧没有
+  jq，Windows 侧编码路径不同），绕过客户端外的差异已在 `references/contract.md` 写明。
+
 ### 2026-11-19 第四轮终审（7 个只读 agent + Orca Codex，审的是 v0.1.34）——修 12 处，其中 1 条 P1 是客户端的中断语义（编号里有 13 条：第 3 条是本轮我自己的修复引入的回归，不算独立发现）
 
 **已修（每条都先自己复现，再改，再证明锁会红）**：

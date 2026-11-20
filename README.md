@@ -2,7 +2,7 @@
 
 Remote task queue over SSH, backed by [Pueue](https://github.com/Nukesor/pueue) 4.0.4.
 
-**Version:** 0.1.35 — the deployment unit (`skill/assets/`, 23 files) ships as one
+**Version:** 0.1.36 — the deployment unit (`skill/assets/`, 23 files) ships as one
 version; releases are tagged in git, indexed at the top of [`CHANGELOG.md`](CHANGELOG.md),
 and verified by the [`release.yml`](.github/workflows/release.yml) tag/version gate.
 
@@ -64,8 +64,9 @@ sh skill/assets/client/unix/install-client.sh --check          # read-only drift
 ```
 
 Installs `agentq` and `sshp` into `~/.local/bin`. `--check` reports `0` when the
-installed clients match the canonical assets, `1` on drift, `2` on an unsafe
-path — and never writes anything.
+installed clients match the canonical assets **and are executable**, `1` on drift
+(missing, different bytes, or a lost execute bit), `2` on an unsafe path — and
+never writes anything.
 
 **Client** (Windows): `skill/assets/client/windows/install-client.ps1`, with the same
 `-Check` contract.

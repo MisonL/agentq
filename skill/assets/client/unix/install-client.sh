@@ -232,6 +232,19 @@ if [ "$check_only" = true ]; then
         elif ! cmp -s "$source_path" "$destination_path"; then
             printf '%s: client does not match canonical asset: %s\n' "$program" "$client" >&2
             client_drift_found=true
+        elif [ ! -x "$destination_path" ]; then
+            # BYTES ARE NOT THE INSTALL RESULT.  The install path stages the
+            # file and `chmod 700`s it, so the execute bit is part of what an
+            # install produces; a byte-identical copy with the bit cleared is
+            # unrunnable (the shell answers 126) while this check said "match".
+            # Measured 2026-11-20 (independent review, reproduced here):
+            # install, `chmod 600` both clients, `--check` -> exit 0 and
+            # "match", `agentq --version` -> 126.  Drift exits 1, like every
+            # other mismatch.  The Windows twin compares hashes only; which
+            # Windows ACL/extension state is equivalent to "executable" there
+            # has NOT been measured, so it is not claimed.
+            printf '%s: client is not executable in destination: %s\n' "$program" "$client" >&2
+            client_drift_found=true
         fi
     done
     if [ "$client_drift_found" = true ]; then

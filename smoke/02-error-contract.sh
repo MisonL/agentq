@@ -82,6 +82,63 @@ expect_rejected doctor-extra-arg 'doctor accepts --full or no arguments' protoco
 # enforces its own bound instead of trusting the client.
 expect_rejected logs-tail-too-large 'no greater than 2147483647' protocol_error logs 1 --tail 99999999999999999999
 expect_rejected logs-tail-not-number '--tail must be a positive integer or all' protocol_error logs 1 --tail 5x
+# A LEADING ZERO is not a positive integer in any spelling.  Measured
+# 2026-11-20: `--tail 00` was accepted here and answered "0 lines" while both
+# clients refuse it and `--tail 0` is refused -- so the same value meant
+# different things depending on where it was typed.  Both spellings now answer
+# 2.  (`0` fails the positive-integer test and gets that message; a zero-led
+# run passes it and is stopped by the bound, which is where the zero forms are
+# refused -- the two messages differ, the answer does not.)
+expect_rejected logs-tail-zero '--tail must be a positive integer or all' protocol_error logs 1 --tail 0
+expect_rejected logs-tail-leading-zero 'no greater than 2147483647' protocol_error logs 1 --tail 00
+expect_rejected logs-tail-leading-zero-long 'no greater than 2147483647' protocol_error logs 1 --tail 0005
+
+# A non-UTF-8 --label or command argument is refused BEFORE any record exists.
+# Measured 2026-11-20: `--label $'q\xff'` exited 0 and the persisted label held
+# U+FFFD (jq's `--arg` re-encoding is lossy), so a second submit under the same
+# request id with the DIFFERENT label `$'q\357\277\275'` answered `reused:true`
+# -- two distinct arguments read as one.  The argv is refused for a different
+# reason: Pueue rejects invalid UTF-8 itself, but only after an `adding` record
+# is written, and that record is unrecoverable.  Both must answer 2 here.
+cases=$((cases + 1))
+nonutf8_label=$(printf 'q\377')
+q_work=$(mktemp -d "${TMPDIR:-/tmp}/agentq-smoke-nonutf8.XXXXXX")
+q_work=$(unset CDPATH; cd -- "$q_work" && pwd -P)
+nonutf8_status=0
+"$server" submit --workdir "$q_work" --label "$nonutf8_label" \
+    --request-id smoke-nonutf8-label-0001 -- true \
+    >"$work/nonutf8-label.stdout" 2>"$work/nonutf8-label.stderr" || nonutf8_status=$?
+if [ "$nonutf8_status" -ne 2 ] ||
+    ! grep -qF -- '--label must be valid UTF-8' "$work/nonutf8-label.stderr" ||
+    ! grep -qxF -- 'agentq-server: reason=protocol_error' "$work/nonutf8-label.stderr"; then
+    printf 'nonutf8-label: expected exit 2 + a UTF-8 rejection + reason=protocol_error, got %s: %s\n' \
+        "$nonutf8_status" "$(head -2 "$work/nonutf8-label.stderr" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+nonutf8_status=0
+"$server" submit --workdir "$q_work" --label smoke \
+    --request-id smoke-nonutf8-argv-00001 -- "$(printf 'true\377')" \
+    >"$work/nonutf8-argv.stdout" 2>"$work/nonutf8-argv.stderr" || nonutf8_status=$?
+if [ "$nonutf8_status" -ne 2 ] ||
+    ! grep -qF -- 'not valid UTF-8' "$work/nonutf8-argv.stderr" ||
+    ! grep -qxF -- 'agentq-server: reason=protocol_error' "$work/nonutf8-argv.stderr"; then
+    printf 'nonutf8-argv: expected exit 2 + a UTF-8 rejection + reason=protocol_error, got %s: %s\n' \
+        "$nonutf8_status" "$(head -2 "$work/nonutf8-argv.stderr" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+fi
+# Neither refusal may leave a record behind: a persisted `prepared` record for a
+# request the server rejected is state the caller cannot see or clear.
+# Redirected then searched, not piped into `grep -q`: a quiet grep exits at its
+# first match and `find` takes SIGPIPE, which pipefail turns into a FAILED
+# pipeline -- this repo's recorded quiet-grep trap.
+cases=$((cases + 1))
+find "$work/data/agentq-requests" -maxdepth 1 -name 'smoke-nonutf8-*.json' >"$work/nonutf8-records" 2>/dev/null || true
+if [ -s "$work/nonutf8-records" ]; then
+    printf 'nonutf8: a refused submit left a request record behind\n' >&2
+    failures=$((failures + 1))
+fi
+rm -rf -- "$q_work"
 
 # A non-ASCII request id must be rejected here too.  The guard used a bracket
 # RANGE (`A-Za-z`) until 2026-11-06; under bash with a collating locale

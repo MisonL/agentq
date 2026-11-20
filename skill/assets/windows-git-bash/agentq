@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.35'
+agentq_version='0.1.36'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -297,6 +297,13 @@ stat_flavor=''
 compact_log_raw_file=''
 reconcile_raw_status_file=''
 group_raw_file=''
+# repair_removed_request_records' fallback-only stderr capture.  It is a global,
+# not a local, because `archive_removed_request` calls `fail` on a tombstone
+# conflict -- `exit 2` from inside the loop, so the function's own trailing
+# `rm -f` never runs.  Measured 2026-11-20: one 0600 `agentq-repair-guard.*`
+# empty file leaked into $TMPDIR per failed command, unbounded, because the
+# EXIT trap knew nothing about it.
+repair_guard_stderr_file=''
 maintenance_lock_verdict=''
 maintenance_lock_observed_pid=''
 maintenance_lock_observed_identity=''
@@ -334,6 +341,19 @@ fail() {
             printf '%s: failed to clean AgentQ reconciliation raw status temporary file: %s\n' \
                 "$program" "$reconcile_raw_status_file" >&2
         fi
+    fi
+    # The repair guard file is cleared here too, not only by the EXIT trap: the
+    # repair loop runs from several entry points and a `fail` may come from
+    # inside a `$( )`, where only the subshell's copy of the trap body runs.
+    # `rm -f` makes a second removal harmless.  Measured 2026-11-20: an
+    # `archive_removed_request` tombstone conflict exits the server from inside
+    # that loop, and the function's own trailing `rm -f` is skipped -- one 0600
+    # `agentq-repair-guard.*` empty file per failed command, unbounded.  Plain
+    # `rm -f`: the file lives in $TMPDIR, whose parent may be a symlink (/tmp on
+    # macOS), and remove_runtime_temporary_file refuses symlinked parents.
+    if [ -n "$repair_guard_stderr_file" ]; then
+        rm -f -- "$repair_guard_stderr_file" || true
+        repair_guard_stderr_file=''
     fi
     printf '%s: %s\n' "$program" "$1" >&2
     # 机读通道：退出码 2 有三类互不相同的含义（参数错误 / 锁竞争 / 对已结束的
@@ -619,23 +639,20 @@ is_positive_integer() {
 # failure for what is simply an argument a human typed wrong.  With it the server
 # answers 2 / protocol_error, which is what the exit-code table promises for bad
 # arguments, and no log path is touched.
-#
-# Leading zeros stay ACCEPTED: the server canonicalizes them today, so refusing
-# them here would reject input that works.  They are stripped first so the
-# magnitude test sees the real value.  Length is checked before any numeric
-# comparison: a 20-digit operand makes `[ -le ]` overflow or compare as a string
-# depending on the shell.
 is_bounded_line_count() {
-    is_positive_integer "$1" || return 1
-    local bounded_value=$1
-    while :; do
-        case "$bounded_value" in
-            0?*) bounded_value=${bounded_value#0} ;;
-            *) break ;;
-        esac
-    done
-    [ "${#bounded_value}" -le 10 ] || return 1
-    [ "$bounded_value" -le 2147483647 ]
+    # No leading-zero exception, unlike the earlier form: `--tail 00` was
+    # ACCEPTED here and answered "0 lines" while `--tail 0` was refused, and the
+    # two clients refuse both spellings.  The contract says "a positive
+    # integer"; 0 is not positive in any spelling, so refusing the zero forms
+    # outright is the answer both the clients and the message already give.
+    case "$1" in
+        ''|*[!0123456789]*|0) return 1 ;;
+        0*) return 1 ;;
+    esac
+    # Length is checked before any numeric comparison: a 20-digit operand makes
+    # `[ -le ]` overflow or compare as a string depending on the shell.
+    [ "${#1}" -le 10 ] || return 1
+    [ "$1" -le 2147483647 ]
 }
 
 # Spelled out, not `A-Za-z`: bracket ranges are collation-dependent, and under
@@ -662,6 +679,40 @@ is_request_id() {
     esac
 
     [ "${#1}" -ge 16 ] && [ "${#1}" -le 128 ]
+}
+
+# Text AgentQ hands to Pueue (or writes into a record) must survive the round
+# trip byte for byte.  jq is the judge, not a locale: `--arg` re-encodes its
+# input, and a byte that is not valid UTF-8 becomes U+FFFD SILENTLY.  Measured
+# 2026-11-20 with `--label $'q\xff'`: submit exited 0, the record held
+# `q\xef\xbf\xbd`, and a second submit under the SAME request id with the
+# DIFFERENT label `$'q\357\277\275'` answered `reused: true` -- two distinct
+# arguments read as one.  `remove --label` over-matched the same way: one label
+# removed two tasks whose labels differed only in the invalid byte.  Round-trip
+# through jq with both sides hex-compared is the same predicate jq applies, so
+# this refuses exactly the values jq would rewrite.
+is_valid_text_argument() {
+    local candidate=$1
+    local original_bytes round_trip_bytes
+
+    original_bytes=$(printf '%s' "$candidate" | LC_ALL=C od -An -v -tx1) || return 1
+    round_trip_bytes=$(printf '%s' "$candidate" | jq -Rsj . 2>/dev/null | LC_ALL=C od -An -v -tx1) || return 1
+    [ "$original_bytes" = "$round_trip_bytes" ]
+}
+
+# The same check for a whole argv: NUL-joined so the element boundaries are part
+# of the comparison.  Pueue rejects an invalid-UTF-8 argument itself (exit 2,
+# "invalid UTF-8 was detected in one or more arguments"), but only AFTER AgentQ
+# has persisted an `adding` record -- and that record is then unrecoverable from
+# the caller's side (measured 2026-11-20: lookup answers 4 forever).  Refusing
+# here keeps the request id reusable, which is what exit 2 promises.
+is_valid_argv() {
+    local original_bytes round_trip_bytes
+
+    [ "$#" -gt 0 ] || return 0
+    original_bytes=$(printf '%s\0' "$@" | LC_ALL=C od -An -v -tx1) || return 1
+    round_trip_bytes=$(printf '%s\0' "$@" | jq -Rsj . 2>/dev/null | LC_ALL=C od -An -v -tx1) || return 1
+    [ "$original_bytes" = "$round_trip_bytes" ]
 }
 
 # The PRE-0.1.26 id rule: same charset and length, but WITHOUT the
@@ -1907,6 +1958,15 @@ cleanup() {
         remove_runtime_temporary_file "$group_raw_file" 'group raw response file' || cleanup_status=1
         group_raw_file=''
     fi
+    if [ -n "$repair_guard_stderr_file" ]; then
+        # Plain `rm -f`, not remove_runtime_temporary_file: this file lives in
+        # $TMPDIR, and that helper's runtime_temporary_path_is_safe refuses any
+        # symlinked parent -- /tmp is a symlink on macOS -- which would turn a
+        # working cleanup into a refusal.  Same command the repair loop itself
+        # uses; a second removal is harmless.
+        rm -f -- "$repair_guard_stderr_file" || cleanup_status=1
+        repair_guard_stderr_file=''
+    fi
     release_request_metadata_files || cleanup_status=1
     release_operation_lock || cleanup_status=1
     release_request_lock || cleanup_status=1
@@ -2477,6 +2537,7 @@ verify_group() {
 
 normalize_workdir() {
     local input=$1
+    local resolved_workdir
 
     case "$platform_kind" in
         windows)
@@ -2500,7 +2561,32 @@ normalize_workdir() {
             # The cd can still fail if the directory vanished since the check;
             # report it here so the caller's `|| return` never swallows a silent
             # empty path.
-            (CDPATH=; cd -- "$input" && pwd -P) || fail "cannot resolve the working directory: $input"
+            #
+            # The `Z` sentinel keeps trailing newlines through the command
+            # substitution: `$( )` strips every trailing newline, so a
+            # directory whose NAME ends in one arrived here as its twin and
+            # `pwd -P` alone could not tell the two apart.  Measured 2026-11-20:
+            # `--workdir /tmp/x/vfy<newline>` resolved to `/tmp/x/vfy`, the
+            # record persisted that twin, `pueue add` failed on a directory
+            # that does not exist (Pueue strips trailing newlines from
+            # --working-directory, so even a faithful path would run somewhere
+            # else), and the record stayed in `adding` forever -- lookup
+            # answered 4 and no retry could clear it.
+            resolved_workdir=$(CDPATH=; cd -- "$input" && { pwd -P; printf 'Z'; }) ||
+                fail "cannot resolve the working directory: $input"
+            resolved_workdir=${resolved_workdir%Z}
+            # `pwd` terminates its output with one newline; strip exactly that
+            # one, then judge what is left.  Anything trailing after it is part
+            # of the directory's NAME.
+            resolved_workdir=${resolved_workdir%$'\n'}
+            # Fail closed: a path AgentQ cannot hand to Pueue unchanged is a
+            # rejected argument, not a task in the wrong directory.
+            case "$resolved_workdir" in
+                *$'\n'|*$'\r')
+                    fail "working directory cannot end with a newline or carriage return: $input"
+                    ;;
+            esac
+            printf '%s\n' "$resolved_workdir"
             ;;
     esac
 }
@@ -3892,7 +3978,6 @@ repair_removed_request_records() {
     local record_ids=()
     local output
     local read_status=0
-    local repair_guard_stderr=''
 
     shopt -s nullglob
     record_files=("$request_directory"/*.json)
@@ -3936,12 +4021,20 @@ repair_removed_request_records() {
                 # `null` here made the batch answer "not found" for a record
                 # it had refused to look at -- the per-file fallback below
                 # fails loudly for exactly this file.
-                if ! request_record_path_guards_or_fail "$record_path"; then
+                #
+                # `|| { guards_status=$?; ... }`, NOT `if ! guard; then
+                # guards_status=$?`.  The `if !` form captures the status of
+                # the NEGATION (always 0), so the vanished arm was dead code
+                # and every guard failure -- including a concurrent archiver's
+                # race -- ended the batch.  The wait scan next door has always
+                # used the `|| {}` form; measured 2026-11-20 on bash 3.2:
+                # `if ! cmd` left captured=0 for cmd rc=1 AND rc=2.
+                request_record_path_guards_or_fail "$record_path" || {
                     guards_status=$?
                     [ "$guards_status" -eq 1 ] || exit 2
                     printf 'null\n'
                     continue
-                fi
+                }
                 printf '%s\n' "$(<"$record_path")"
             done | jq -rs --args "$request_removed_records_filter" -- "${record_ids[@]}"
         } 2>/dev/null
@@ -3960,7 +4053,13 @@ repair_removed_request_records() {
     # umask 077: the file only ever receives this server's own error text, but
     # that text carries record paths, and every other temporary file this
     # script creates is 0600 for the same reason.
-    repair_guard_stderr=$(umask 077; mktemp "${TMPDIR:-/tmp}/agentq-repair-guard.XXXXXX") || return 1
+    #
+    # The name goes into the GLOBAL, not a local: `archive_removed_request`
+    # below calls `fail` on a tombstone conflict, which exits the whole server
+    # and would leave this file behind (measured 2026-11-20).  cleanup() and
+    # fail() both clear it now; the trailing `rm -f` stays for the ordinary
+    # return path.
+    repair_guard_stderr_file=$(umask 077; mktemp "${TMPDIR:-/tmp}/agentq-repair-guard.XXXXXX") || return 1
     for record_path in "${record_files[@]}"; do
         request_id=${record_path##*/}
         request_id=${request_id%.json}
@@ -3981,15 +4080,27 @@ repair_removed_request_records() {
         # only assigns when the read FAILS, so a status left over from an earlier
         # iteration made every record after it look failed -- a refused record
         # silently skipped its removed successors (measured 2026-11-18).
+        #
+        # The guard file's name is BLANKED in the subshell for the length of the
+        # read, and the redirect uses a saved copy.  The reader reports through
+        # `fail`, which now clears the (global) guard file so a tombstone
+        # conflict cannot leak it -- and that cleanup also runs inside this
+        # `$( )`, where it would delete the very file the parent is about to
+        # `cat`.  Measured 2026-11-20 on the first version of the leak fix:
+        # every malformed record answered "No such file or directory" and lost
+        # the guard's message.  A local variable could not be used instead: the
+        # leak this whole change fixes is precisely a `fail` from inside this
+        # loop, which the EXIT trap cannot clean up unless the name is shared.
         read_status=0
-        output=$(read_request_record_state_and_body "$request_id" 2>"$repair_guard_stderr") ||
+        output=$(repair_guard_read_path=$repair_guard_stderr_file
+            repair_guard_stderr_file=''
+            read_request_record_state_and_body "$request_id" 2>"$repair_guard_read_path") ||
             read_status=$?
         read_status=${read_status:-0}
         if [ "$read_status" -eq 1 ]; then
             continue
         elif [ "$read_status" -ne 0 ]; then
-            cat "$repair_guard_stderr" >&2
-            rm -f -- "$repair_guard_stderr"
+            cat "$repair_guard_stderr_file" >&2
             fail "missing AgentQ request record during recovery: $record_path"
         fi
         record_state=${output%%$'\n'*}
@@ -3997,12 +4108,12 @@ repair_removed_request_records() {
         record=${output#*$'\n'}
         if [ "$record_state" = removed ]; then
             if ! archive_removed_request "$request_id" "$record" >/dev/null; then
-                rm -f -- "$repair_guard_stderr"
                 fail "cannot archive removed AgentQ request during repair: $request_id"
             fi
         fi
     done
-    rm -f -- "$repair_guard_stderr"
+    rm -f -- "$repair_guard_stderr_file"
+    repair_guard_stderr_file=''
 }
 
 migrate_removed_request_records() {
@@ -5811,6 +5922,24 @@ compact_log() {
     local log_window_raw
 
     log_path=$(task_log_path "$task_id")
+    # A log path that is not a regular file makes `pueue log` HANG rather than
+    # fail: Pueue opens the path and blocks on it.  Measured 2026-11-20 -- a
+    # FIFO in place of data/task_logs/<id>.log held `logs` for 20s with no
+    # output until the caller's timeout killed it.
+    #
+    # The predicate is deliberately NARROWER than task_log_file_is_safe: that
+    # one also refuses a symlinked ancestor anywhere in the path, which is right
+    # for the non-UTF-8 fallback's direct reads but wrong as a gate on every
+    # `logs` call -- a deployment rooted under a symlinked directory (macOS
+    # /tmp, a symlinked $HOME) would answer 6 for every task.  `-f` follows
+    # symlinks, so a link to a regular file still passes; a FIFO, directory or
+    # device does not, and those are exactly the shapes that block.
+    if [ -e "$log_path" ] && [ ! -f "$log_path" ]; then
+        jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
+        printf '%s: the task log is unavailable: the log path for task %s is not a regular file\n' \
+            "$program" "$task_id" >&2
+        return 6
+    fi
     if [ "$tail_lines" = all ]; then
         log_args+=(--full)
     else
@@ -6213,6 +6342,16 @@ submit() {
     [ -n "$label" ] || fail '--label must not be empty'
     is_request_id "$request_id" || fail '--request-id must be 16-128 ASCII letters, numbers, dots, underscores, or hyphens and start with a letter or number'
     [ "$#" -gt 0 ] || fail 'submit requires a command after --'
+    # Non-UTF-8 text is refused HERE, before any record is written.  The record
+    # writer runs the value through jq, which rewrites an invalid byte as U+FFFD
+    # without a word, so the persisted label no longer identifies the caller's
+    # argument (see is_valid_text_argument for the measurement).  The argv is
+    # checked for a different reason: Pueue rejects an invalid-UTF-8 argument
+    # itself, but only after a record sits in `adding`, and that record is
+    # unrecoverable -- lookup answers 4 forever.  Both answers are 2, the
+    # documented code for an argument AgentQ will not use.
+    is_valid_text_argument "$label" || fail '--label must be valid UTF-8'
+    is_valid_argv "$@" || fail 'the submit command contains an argument that is not valid UTF-8'
 
     # normalize_workdir reports through `fail`, which inside the command
     # substitution ends only the subshell -- the assignment would otherwise
@@ -6664,15 +6803,19 @@ logs() {
             tail_lines=all
         else
             is_positive_integer "$2" || fail '--tail must be a positive integer or all'
-            # An UPPER BOUND, matching the clients' 2^31-1: `is_positive_integer`
-            # accepts any number of digits, and BSD `tail -n` rejects a value
-            # beyond its offset range with "illegal offset" -- which surfaced as
-            # the generic "Pueue could not read the log" / exit 1, not as a
-            # protocol answer, for a value both clients refuse at parse time.
+            # An UPPER BOUND the two clients do NOT share (see
+            # is_bounded_line_count): `is_positive_integer` accepts any number
+            # of digits, and BSD `tail -n` rejects a value beyond its offset
+            # range with "illegal offset" -- which surfaced as the generic
+            # "Pueue could not read the log" / exit 1, not as a protocol answer.
             # The server is reachable directly over ssh, so it enforces its own
-            # bound instead of trusting the client to have done it.
+            # bound instead of assuming a client did.  (This comment used to say
+            # the clients matched; neither does -- measured 2026-11-20.)
             is_bounded_line_count "$2" || fail '--tail must be a positive integer no greater than 2147483647, or all'
-            tail_lines=$(canonical_task_id "$2")
+            # No canonicalization: 0-prefixed forms are refused by the bound
+            # above, so accepting a value here and then canonicalizing it would
+            # report a different number than the caller typed.
+            tail_lines=$2
         fi
     fi
 
@@ -7254,6 +7397,13 @@ remove_tasks_by_label() {
     case "$match_label" in
         agentq:*) fail 'label cannot start with the reserved prefix agentq:' ;;
     esac
+    # Same predicate as submit's: a non-UTF-8 label cannot equal any stored one
+    # (the store only ever holds valid UTF-8), and jq would rewrite it to U+FFFD
+    # for the comparison -- which turns a label that matches nothing into one
+    # that matches every task whose stored label was rewritten the same way.
+    # Measured 2026-11-20: `remove --label $'ovm-<n>-x\xff' --confirm` removed
+    # TWO tasks, the second belonging to the label `$'ovm-<n>-x\xfe'`.
+    is_valid_text_argument "$match_label" || fail 'label must be valid UTF-8'
 
     ensure_daemon
     # `|| return $?` is load-bearing: inside with_operation_lock's `if "$@"` body
