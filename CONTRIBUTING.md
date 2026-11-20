@@ -62,8 +62,9 @@ every check still passes.
   `install-agentq.sh` is 644 (invoked as `sh ./install-agentq.sh`, no execute
   bit needed), as are the PowerShell/CMD assets, the service units and the
   `.yml` files; the POSIX clients (`agentq`, `sshp`, `install-client.sh`), the
-  two `.bash` bridges, the unix wrapper, and the three server copies
-  (`agentq-server` / two `agentq`) are 755 — `install-client.sh` REFUSES to run
+  two `.bash` bridges, the unix wrapper (`skill/assets/unix/agentq`), and the
+  two server copies (`agentq-server` / `windows-git-bash/agentq`) are 755 —
+  eight files in all — `install-client.sh` REFUSES to run
   when its source assets are not executable.  Clearing an executable bit breaks
   the installer; adding one where there was none changes the deployment unit.
 - **After changing anything under `skill/`, sync the whole directory.** It is
@@ -121,10 +122,11 @@ AgentQ version rather than Pueue's. The two client constants joined on
 unit is all 23 assets, so a version recorded in only some of them is not a
 version at all.
 
-The record set is **derived from the tree**, never hand-listed: the release gate
+The record set is **derived from the tree**, never hand-listed: check `01`
 enumerates every file under `skill/assets/` that declares one of the constant
-shapes, so a new record cannot leave the gate behind — check `01` fails until the
-new file is also read by `release.yml`, on the same line as its own constant name.
+shapes and requires `release.yml` to read each one on the same line as its own
+constant name, so a new record cannot leave the release gate behind — the two
+lists cannot drift without the suite going red.
 
 - The version denotes **the deployment unit**: any change to the bytes under
   `skill/assets/` bumps it; documentation-only changes do not.

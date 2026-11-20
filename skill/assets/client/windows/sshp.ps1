@@ -1070,22 +1070,22 @@ function Get-ProbeOutcome {
 
     $marker = ConvertTo-MarkerText $Result.Output
     if ($Result.ExitCode -eq 0) {
-        if ($marker -match '(?m)^__SSHP_READY__:Windows$') {
+        if ($marker -cmatch '(?m)^__SSHP_READY__:Windows$') {
             return [pscustomobject]@{ Platform = "windows"; Ready = $true }
         }
-        if ($marker -match '(?m)^__SSHP_READY__:[^\r\n]+$') {
+        if ($marker -cmatch '(?m)^__SSHP_READY__:[^\r\n]+$') {
             return [pscustomobject]@{ Platform = "unix"; Ready = $true }
         }
     }
     if ($Result.ExitCode -eq 42) {
-        if ($marker -match '(?m)^__SSHP_INSTALL_REQUIRED__:Windows$') {
+        if ($marker -cmatch '(?m)^__SSHP_INSTALL_REQUIRED__:Windows$') {
             return [pscustomobject]@{ Platform = "windows"; Ready = $false }
         }
-        if ($marker -match '(?m)^__SSHP_INSTALL_REQUIRED__:[^\r\n]+$') {
+        if ($marker -cmatch '(?m)^__SSHP_INSTALL_REQUIRED__:[^\r\n]+$') {
             return [pscustomobject]@{ Platform = "unix"; Ready = $false }
         }
     }
-    if (($Result.ExitCode -eq 127) -and ($marker -match '(?m)^__SSHP_INSTALL_UNAVAILABLE__:[^\r\n]+$')) {
+    if (($Result.ExitCode -eq 127) -and ($marker -cmatch '(?m)^__SSHP_INSTALL_UNAVAILABLE__:[^\r\n]+$')) {
         return [pscustomobject]@{ Platform = "unix"; Ready = $false; InstallUnavailable = $true }
     }
     return $null
@@ -1094,7 +1094,7 @@ function Get-ProbeOutcome {
 function Test-WindowsShellMarker {
     param([pscustomobject]$Result)
 
-    return ((ConvertTo-MarkerText $Result.Output) -match '(?m)^__SSHP_WINDOWS_SHELL__:(MINGW|MSYS|CYGWIN)[^\r\n]*$')
+    return ((ConvertTo-MarkerText $Result.Output) -cmatch '(?m)^__SSHP_WINDOWS_SHELL__:(MINGW|MSYS|CYGWIN)[^\r\n]*$')
 }
 
 function Get-WindowsProbeOutcome {
@@ -1111,20 +1111,20 @@ function Get-WindowsProbeOutcome {
     # the exit code; the code is still recorded and still decides READY (a
     # READY marker with a non-zero status is contradictory and is refused).
     $marker = ConvertTo-MarkerText $Result.Output
-    if ($marker -match '(?m)^__SSHP_READY__:Windows$') {
+    if ($marker -cmatch '(?m)^__SSHP_READY__:Windows$') {
         if ($Result.ExitCode -ne 0) {
             return $null
         }
         $resolved = ""
-        if ($marker -match '(?m)^__SSHP_ZELLIJ__:(.+)$') {
+        if ($marker -cmatch '(?m)^__SSHP_ZELLIJ__:(.+)$') {
             $resolved = $Matches[1].Trim()
         }
         return [pscustomobject]@{ Platform = "windows"; Ready = $true; ZellijPath = $resolved }
     }
-    if ($marker -match '(?m)^__SSHP_INSTALL_REQUIRED__:Windows$') {
+    if ($marker -cmatch '(?m)^__SSHP_INSTALL_REQUIRED__:Windows$') {
         return [pscustomobject]@{ Platform = "windows"; Ready = $false }
     }
-    if ($marker -match '(?m)^__SSHP_INSTALL_UNAVAILABLE__:Windows$') {
+    if ($marker -cmatch '(?m)^__SSHP_INSTALL_UNAVAILABLE__:Windows$') {
         return [pscustomobject]@{ Platform = "windows"; Ready = $false; InstallUnavailable = $true }
     }
     return $null

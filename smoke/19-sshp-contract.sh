@@ -2088,9 +2088,56 @@ else
     fi
 fi
 
+# --- the protocol MARKERS are case-sensitive, like the POSIX twin ------------
+# Every `__SSHP_*` marker comparison in sshp.ps1 used `-match`, PowerShell's
+# case-INSENSITIVE operator, while the POSIX twin greps with `-E`
+# (case-sensitive): the same stderr answered "ready" here and "probe failed"
+# there.  agentq.ps1 was fixed for exactly this class in 0.1.36 and sshp.ps1
+# was not -- the one-file hole this repo keeps hitting.  This drives the real
+# functions through a dot-source (the main body prints usage and is discarded),
+# in both directions: a lowercase marker must be REJECTED, the exact case
+# accepted.  Measured 2026-11-20 against the pre-fix asset: the two "lowercase"
+# assertions are what go red.
+case_marker_state='skipped(pwsh-absent)'
+if [ "$pwsh_usable" = true ]; then
+    cases=$((cases + 1))
+    marker_probe_status=0
+    "$pwsh_binary" -NoProfile -NonInteractive -Command '
+. "'"$sshp_ps_client"'" 2>$null | Out-Null
+$bad = [pscustomobject]@{ ExitCode = 0; Output = "__sshp_ready__:linux" }
+if ($null -ne (Get-ProbeOutcome -Result $bad)) {
+    [Console]::Error.WriteLine("sshp marker: a lowercase READY marker was ACCEPTED (the comparison is case-insensitive)")
+    exit 1
+}
+$good = [pscustomobject]@{ ExitCode = 0; Output = "__SSHP_READY__:Linux" }
+if ($null -eq (Get-ProbeOutcome -Result $good)) {
+    [Console]::Error.WriteLine("sshp marker: the correct-case READY marker was rejected")
+    exit 1
+}
+$shellBad = [pscustomobject]@{ ExitCode = 0; Output = "__sshp_windows_shell__:MINGW64_NT" }
+if (Test-WindowsShellMarker -Result $shellBad) {
+    [Console]::Error.WriteLine("sshp marker: a lowercase WINDOWS_SHELL marker was ACCEPTED")
+    exit 1
+}
+$shellGood = [pscustomobject]@{ ExitCode = 0; Output = "__SSHP_WINDOWS_SHELL__:MINGW64_NT" }
+if (!(Test-WindowsShellMarker -Result $shellGood)) {
+    [Console]::Error.WriteLine("sshp marker: the correct-case WINDOWS_SHELL marker was rejected")
+    exit 1
+}
+[Console]::Out.WriteLine("sshp marker case ok")
+' >"$work/marker-case.out" 2>"$work/marker-case.err" || marker_probe_status=$?
+    if [ "$marker_probe_status" -ne 0 ] || ! grep -qF 'sshp marker case ok' "$work/marker-case.out"; then
+        printf '%s\n' 'sshp-contract: the sshp.ps1 protocol markers are not case-sensitive like the POSIX twin' >&2
+        grep -i 'sshp marker' "$work/marker-case.err" >&2 || head -3 "$work/marker-case.err" >&2 || true
+        failures=$((failures + 1))
+    else
+        case_marker_state='checked'
+    fi
+fi
+
 if [ "$failures" -ne 0 ]; then
     printf 'sshp-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'sshp-contract checks passed: cases=%s stub-ssh=yes reconnect=covered argv=checked residue=none trap-window=pinned charset-cells=%s charset-vulnerable=%s remote-scripts=%s windows-scripts=%s windows-matrix=%s windows-session=%s windows-units=%s\n' \
-    "$cases" "$sshp_charset_cells" "$sshp_range_vulnerable_cells" "$remote_script_state" "$windows_script_state" "$windows_matrix_state" "$win_session_state" "$win_units_state"
+printf 'sshp-contract checks passed: cases=%s stub-ssh=yes reconnect=covered argv=checked residue=none trap-window=pinned charset-cells=%s charset-vulnerable=%s remote-scripts=%s windows-scripts=%s windows-matrix=%s windows-session=%s windows-units=%s marker-case=%s\n' \
+    "$cases" "$sshp_charset_cells" "$sshp_range_vulnerable_cells" "$remote_script_state" "$windows_script_state" "$windows_matrix_state" "$win_session_state" "$win_units_state" "$case_marker_state"

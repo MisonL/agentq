@@ -28,10 +28,14 @@
 # PROGRAM TEXT the server actually hands to jq.  It does not run jq 1.6; it
 # refuses the SHAPE that only 1.7 accepts and 1.6 rejects.
 #
-# What it proves: no jq program the server executes (over the whole command
-# surface, including the request-record and cancellation paths) uses a reserved
-# word in an identifier position -- as an --arg/--argjson name, a $variable, an
-# `as $var` binding, or an object shorthand key.  What it does not prove: that
+# What it proves: no jq program the server executes over the command surface
+# THIS CHECK drives uses a reserved word in an identifier position -- as an
+# --arg/--argjson name, a $variable, an `as $var` binding, or an object
+# shorthand key.  The surface includes the record scan and the cancel-replay
+# branch because the fixture SEEDS a request record and a matching cancellation
+# marker before calling `cancel 1` (see the seed below), not because anything
+# asserts that branch ran: a server change that stopped reading records on the
+# cancel path would still be green here.  What it does not prove: that
 # some OTHER jq version quirk does not bite, or anything about jq filters the
 # driven command surface never reaches (client-side filters, Windows-only
 # branches).  The classifier is calibrated by self-test against measured jq

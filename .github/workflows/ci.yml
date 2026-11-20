@@ -324,7 +324,7 @@ jobs:
             # LOCAL parity rule (smoke/01) can stay a plain "every reason a script
             # can print is allowed" check instead of modelling branch reachability
             # statically.
-            bad_tokens=$(grep -o 'NOT-covered([^)]*)' "$log" | grep -vE '^NOT-covered\((needs-Windows|needs-non-Windows|deliberately-not-exercised|needs-POSIX-pipes|needs-unprivileged-user|needs-symlinked-tmp|no-locale-sensitive-sed|no-tags-in-checkout)\)$' || true)
+            bad_tokens=$(grep -o 'NOT-covered([^)]*)' "$log" | grep -vE '^NOT-covered\((needs-Windows|needs-non-Windows|deliberately-not-exercised|needs-POSIX-pipes|needs-non-utf8-filename|needs-unprivileged-user|needs-symlinked-tmp|no-locale-sensitive-sed|no-tags-in-checkout)\)$' || true)
             if [ -n "$bad_tokens" ]; then
               echo "$check reported NOT-covered without a named platform reason:" >&2
               echo "$bad_tokens" >&2

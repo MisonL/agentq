@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.36'
+agentq_client_version='0.1.37'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072), and the unix bound keeps a
 # safety margin under it.
@@ -1888,7 +1888,7 @@ agentq_remote_exit_token() {
     # to have closed.  Codes above 255 are not ours; ignore them like a
     # missing token (fail-closed, back to the SSH exit code).
     case "$ssh_exit_token_value" in
-        2[56789][0123456789]|[3456789][0123456789][0123456789])
+        25[6789]|2[6789][0123456789]|[3456789][0123456789][0123456789])
             return 1
             ;;
     esac
@@ -2071,6 +2071,18 @@ validate_wait_response() {
     response_file=$1
     response_status=$2
     response_expected_task_id=${3:-}
+
+    # Exit 1 has a documented second source: `pueue wait` returned 0 while the
+    # task snapshot had not reached a terminal state, and the server answers
+    # with an EMPTY body plus `pueue wait exited 0 before task M completed`
+    # (contract.md's exit-code section).  The JSON/semantic filters below
+    # require a Done/Failed task, so this shape was reported as exit 2
+    # ("protocol error, change the arguments") -- the opposite of the
+    # documented 1.  Accept it ONLY for a byte-empty body and ONLY for status
+    # 1: any other malformed body still fails closed.
+    if [ "$response_status" -eq 1 ] && [ -f "$response_file" ] && [ ! -s "$response_file" ]; then
+        return 0
+    fi
 
     if validate_json_response "$response_file" wait '' "$response_expected_task_id"; then
         :
@@ -3231,7 +3243,7 @@ windows_probe_apply_exit_token() {
                 windows_probe_token_code=''
             fi
             case "$windows_probe_token_code" in
-                2[56789][0123456789]|[3456789][0123456789][0123456789])
+                25[6789]|2[6789][0123456789]|[3456789][0123456789][0123456789])
                     windows_probe_token_code=''
                     ;;
             esac

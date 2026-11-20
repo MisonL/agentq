@@ -1047,6 +1047,108 @@ if [ "$wait_budget_elapsed" -ge 15 ]; then
     failures=$((failures + 1))
 fi
 
+# wait exit 1 with an EMPTY body is the CONTRACT, not a protocol error.
+# contract.md's exit-code section names two sources for 1: the task reached
+# Failed, OR `pueue wait` returned 0 while the snapshot was still not terminal
+# -- the second shape arrives with an EMPTY body and a stderr line.  Both
+# clients required a Done/Failed JSON for exit 1 and re-reported this
+# documented shape as exit 2 ("protocol/parameter error"), the opposite of
+# what the caller is told to do with a 1.  Measured 2026-11-20.
+wait_empty_stub="$work/bin/ssh-wait-empty"
+cat > "$wait_empty_stub" <<'STUB'
+#!/bin/sh
+printf 'agentq-server: pueue wait exited 0 before task 7 completed\n' >&2
+exit 1
+STUB
+chmod 700 "$wait_empty_stub"
+cases=$((cases + 1))
+wait_empty_status=0
+AGENTQ_SSH="$wait_empty_stub" AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+    AGENTQ_REMOTE_PLATFORM=unix \
+    "$client" wait 7 >"$work/wait-empty.out" 2>"$work/wait-empty.err" || wait_empty_status=$?
+if [ "$wait_empty_status" -ne 1 ]; then
+    printf 'client wait: an exit-1 response with an EMPTY body must stay 1 (contract), got %s: %s\n' \
+        "$wait_empty_status" "$(head -1 "$work/wait-empty.err")" >&2
+    failures=$((failures + 1))
+fi
+# The fail-closed half: a NON-empty malformed body for exit 1 is still 2.
+# Only the byte-empty shape the server documents is exempted.
+wait_garbage_stub="$work/bin/ssh-wait-garbage"
+cat > "$wait_garbage_stub" <<'STUB'
+#!/bin/sh
+printf 'not json\n'
+exit 1
+STUB
+chmod 700 "$wait_garbage_stub"
+cases=$((cases + 1))
+wait_garbage_status=0
+AGENTQ_SSH="$wait_garbage_stub" AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
+    AGENTQ_REMOTE_PLATFORM=unix \
+    "$client" wait 7 >"$work/wait-garbage.out" 2>"$work/wait-garbage.err" || wait_garbage_status=$?
+if [ "$wait_garbage_status" -ne 2 ]; then
+    printf 'client wait: an exit-1 response with a MALFORMED body must fail closed at 2, got %s\n' \
+        "$wait_garbage_status" >&2
+    failures=$((failures + 1))
+fi
+
+# The `agentq-exit:` token's 3-digit boundary: <= 255 is a real process exit
+# code and is taken as-is; > 255 is not (the shell folds it mod 256, measured
+# 2026-10-13: return 256 read as 0 = SUCCESS).  The case arm covered 250-299,
+# so 250-255 -- legal values the Windows twin accepts -- were refused here and
+# the same stderr gave two answers.  The token only exists on a WINDOWS target
+# (the launcher wrapper is what emits it), so the fixture is a Windows-target
+# stub: it answers the platform and launcher-protocol probes like the flattened
+# stub above, then reports the chosen token with a flattened exit 1.  Both
+# directions are pinned.
+token_boundary_stub="$work/bin/ssh-token-boundary"
+cat > "$token_boundary_stub" <<'STUB'
+#!/bin/sh
+work=${AGENTQ_TOKEN_BOUNDARY_WORK:?}
+last=''
+for argument in "$@"; do last=$argument; done
+case "$last" in
+    *uname*) printf 'MINGW64_NT-10.0-19045\n'; exit 0 ;;
+    *-EncodedCommand*)
+        cat > "$work/token-boundary-stdin.$$" 2>/dev/null || true
+        rm -f "$work/token-boundary-stdin.$$"
+        printf 'agentq-exit:%s\n' "$AGENTQ_TOKEN_BOUNDARY_VALUE" >&2
+        exit 1
+        ;;
+    *powershell.exe*)
+        probe_stdin=$(cat)
+        case "$probe_stdin" in
+            *launcher-ready*) printf 'agentq-windows-launcher-ready' ;;
+            *) printf 'agentq-windows' ;;
+        esac
+        printf 'agentq-exit:0'
+        exit 0
+        ;;
+esac
+exit 1
+STUB
+chmod 700 "$token_boundary_stub"
+for token_boundary in 250 256; do
+    cases=$((cases + 1))
+    boundary_status=0
+    AGENTQ_TOKEN_BOUNDARY_WORK="$work" AGENTQ_TOKEN_BOUNDARY_VALUE="$token_boundary" \
+        AGENTQ_SSH="$token_boundary_stub" AGENTQ_HOST=smoke-win AGENTQ_REMOTE_PLATFORM=auto \
+        AGENTQ_CONFIG="$work/absent-config" TMPDIR="$work" \
+        "$client" status >"$work/token-$token_boundary.out" 2>"$work/token-$token_boundary.err" || boundary_status=$?
+    if [ "$token_boundary" = 250 ]; then
+        if [ "$boundary_status" -ne 250 ]; then
+            printf 'client status: agentq-exit:250 is a legal exit code and must be taken as-is, got %s\n' \
+                "$boundary_status" >&2
+            failures=$((failures + 1))
+        fi
+    else
+        if [ "$boundary_status" -ne 1 ]; then
+            printf 'client status: agentq-exit:256 folds mod 256 to 0 and must be ignored (ssh code 1 stands), got %s\n' \
+                "$boundary_status" >&2
+            failures=$((failures + 1))
+        fi
+    fi
+done
+
 # submit --stdin-script: the script arrives as ONE base64 argument that decodes
 # back to the script itself.  Asserting the decode (not just the exit code) is
 # what proves the payload is the script and not, say, an empty or re-encoded

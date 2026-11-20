@@ -11,7 +11,7 @@
 # token itself (`staging=NOT-covered(needs-Windows)`).  Dropping a name is
 # fine: the gate is a subset test, so a check that stops declaring a gap is a
 # platform covering more, not a failure.
-05-client-contract
+02-error-contract
 12-ps-client-contract
 13-ps-installer-contract
 22-launcher-contract

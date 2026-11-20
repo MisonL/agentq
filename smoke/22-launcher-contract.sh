@@ -1096,7 +1096,7 @@ if [ "$failures" -ne 0 ]; then
     printf 'launcher-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'launcher-contract checks passed: cases=%s pwsh=%s decoder=covered pathguards=covered roundtrip=covered lastexitcode-guards=%s windows-api=NOT-covered(needs-Windows) malformed-payload=exit2\n' \
+printf 'launcher-contract checks passed: cases=%s pwsh=%s decoder=covered pathguards=covered roundtrip=covered lastexitcode-guards=%s windows-api=NOT-covered(deliberately-not-exercised) malformed-payload=exit2\n' \
     "$cases" \
     "$("$pwsh_binary" -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()' 2>/dev/null || printf 'unknown')" \
     "$lastexitcode_guards"

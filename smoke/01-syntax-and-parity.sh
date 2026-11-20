@@ -2326,6 +2326,20 @@ if [ "$release_gate_cal" != ok ]; then
     printf '%s\n' 'release-gate FAILED (its own matcher failed calibration: it must accept a complete line and reject a comment-only mention and an absent file)' >&2
     release_gate_gaps=$((release_gate_gaps + 1))
 fi
+# The ANNOTATED-TAG rule must live where tags are pushed.  smoke/31 rule E
+# checks `git cat-file -t == tag`, but smoke/31 runs in ci.yml -- and a tag
+# push does not trigger ci.yml.  release.yml is the only workflow that runs on
+# the tag itself, so it has to assert the same thing.  Measured 2026-11-20: a
+# lightweight tag passed release.yml green and would have been reported only on
+# the NEXT branch push, if one ever came.  Same matcher as the records, so a
+# comment that merely describes the check does not satisfy it.
+release_gate_annotation=missing
+if release_gate_reads "$release_gate_workflow" 'refs/tags/' 'git cat-file -t'; then
+    release_gate_annotation=asserted
+else
+    printf '%s\n' 'release-gate FAILED (release.yml never asserts that the pushed tag is ANNOTATED: smoke/31 rule E only runs on branch pushes, so a lightweight tag would release green)' >&2
+    release_gate_gaps=$((release_gate_gaps + 1))
+fi
 if [ "$release_gate_gaps" -ne 0 ]; then
     failures=$((failures + 1))
 fi
@@ -2334,7 +2348,7 @@ fi
 # (shellcheck does not flag a self-increment; measured 2026-11-04 in this very
 # round: an unused `release_gate_from_tree` was caught by smoke/05's shellcheck
 # lock, which is why the count now has a consumer).
-release_gate_state="checked($release_gate_records)"
+release_gate_state="checked($release_gate_records)+annotated=$release_gate_annotation"
 
 # --- config-file path patterns must still point at real files ----------------
 # .gitattributes and .editorconfig name paths in order to protect them, and a
@@ -4688,7 +4702,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files negation_captures executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census release_gate workflow_wiring ncov_reasons'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files negation_captures chr_ranges tool_ranges tr_fold executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census release_gate workflow_wiring ncov_reasons'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned

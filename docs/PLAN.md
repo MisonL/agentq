@@ -512,6 +512,88 @@ jq 分支**，是本检查从来没有过的**执行证据**（`08` 仍只是间
    它该有的行为。修法不在代码：`CONTRIBUTING.md` 的 Release 规则补「先推 tag、或与
    索引提交用同一条 `git push origin main vX.Y.Z` 推送」。
 
+### 2026-11-20 第六轮审查（6 个只读 agent + Orca Codex，审的是 v0.1.36）——修 8 处，外加 2 条检查/门禁补强，记录 3 条未修边界与 1 条误报
+
+**已修（每条都先在主检出里独立复现，再改，再证明新锁会红）**：
+
+1. **`--workdir` 的非法 UTF-8 没有被拒（0.1.36 只修了三个 `jq --arg` 输入中的两个：
+   `--label` 与 argv）。**
+   `submit` 里 `normalized_workdir=$(normalize_workdir …)` 之后没有任何文本有效性检查，
+   而 jq 的 `--arg` 会把非法字节重编码成 U+FFFD，Pueue 收到的是**原始字节**——它在
+   record 已写进 `adding` 之后才拒绝，于是 `lookup` 对这个 request id 永远答 4。
+   修法：归一化之后、写记录之前加 `is_valid_text_argument … || fail '--workdir must be
+   valid UTF-8'`。`smoke/02` 新增用例（+1 → `cases=46`）；该用例需要能建出非 UTF-8
+   文件名（ext4 可以、APFS 拒绝 `mkdir`），本机报 `workdir-utf8=NOT-covered(needs-non-utf8-filename)`，
+   名字加入 `smoke/not-covered-known.txt` 与 `ci.yml` 的 Windows 理由白名单。
+2. **Windows 分支的 `normalize_workdir` 会被 `$( )` 吃掉目录名尾部的换行。** unix 分支
+   早已带 `Z` 哨兵（`$( )` 剥掉**所有**尾随换行），windows 分支没有：`cygpath -aw` 的
+   结果若以换行结尾，目录名的最后一个组件就被静默截掉、交给 `pueue add`。改为同一
+   哨兵形态，并显式拒绝结果内部含 `\n`/`\r`。
+3. **准入清单漏了脚本实际调用的工具。** `ensure_runtime_dependencies` 只查
+   jq/base64/date/find/grep/mktemp/stat/tail/tr，而来脚本还调用 cat/head/mkdir/od/rmdir/sed
+   （common）与 ln（unix）——缺其中之一时不是「准入清单点名」，而是运行到一半报
+   `command not found`，失败点离原因很远。补进清单。
+4. **`request_tombstones_states_filter` 把说明文字写在双引号 jq 程序内部。** jq 把 `#`
+   当注释，所以一直「能用」；但双引号字符串不是注释：反引号会被 shell 当命令替换执行
+   （2026-10-23 实测这条注释差点被执行），丢一个 `#` 就把散文当代码交给 jq。说明移出
+   字符串，程序本体不再含注释。
+5. **`remove_cancellation_marker_for_task` 的守卫缩进误导（行为无变化）。** 判据行与
+   `remove_cancellation_marker` 对齐在 `if` 外面，读起来像「无论 marker 是否属于该实例
+   都会删」；实际两条都在 `then` 块内。只改缩进，不改逻辑——如实记录为可读性修复。
+6. **`wait` 的「rc=1 + 空 body」被两份客户端重报成 2。** `contract.md` 写明 exit 1 有
+   两个来源：任务终态 Failed，以及 `pueue wait` **成功返回（0）**而快照仍未终态——
+   后者到达时是**空 body** + 一行 stderr。两份客户端都要求 Done/Failed JSON，于是把这个
+   文档化的 1 报成 2（「协议/参数错误」），恰好与调用方被告知要做的事相反。修法：只在
+   `ExitCode==1` 且 body **字节为空**时放过；任何非空畸形体仍 fail-closed。`smoke/05`
+   （+4 → `cases=120`）与 `smoke/12`（+1 → `cases=226`）的两个方向都钉住。
+7. **POSIX 客户端的 token 分支把 250–255 当越界。** 分支是 `2[56789][0-9]`，覆盖
+   250–299；250–255 是真实进程退出码（≤255），Windows 孪生接受，POSIX 拒成 1——同一
+   `stderr` 两个答案。改为 `25[6789]|2[6789][0123456789]|[3456789][0123456789][0123456789]`
+   （两处读者同步），
+   `smoke/05` 以 Windows-目标桩钉 250→250、256→1（mod 256 会折叠成 0＝成功）。
+8. **`sshp.ps1` 的 `__SSHP_*` 标记比较不分大小写。** 10 处 `-match` 改为 `-cmatch`：
+   PowerShell 的比较运算符默认大小写不敏感，而 POSIX 孪生用 `grep -E`（敏感）——大小写
+   不同的文本会被 Windows 侧当成命中标记。`smoke/19`（+1 → `cases=153`）用 dot-source
+   行为用例钉四个方向，pwsh 缺失时报 `skipped(pwsh-absent)` 而不是静默通过。
+
+**检查/门禁补强（不是资产缺陷，是门禁自身的洞）**：
+
+- **annotated tag 的断言放错了 workflow。** `smoke/31` 的规则 E 检查 `git cat-file -t`
+  == `tag`，但它跑在 `ci.yml`（branch push / PR）里，而 tag push 不触发 ci.yml——一次
+  轻量 tag 会一路发布绿灯，直到下一次 branch push 才可能被报出来。`release.yml` 是唯一
+  在 tag 上运行的 workflow，补一步：同一非注释行必须同时出现 `refs/tags/` 与
+  `git cat-file -t`。`smoke/01` 用同一个 `release_gate_reads` 判据（注释行不算读）钉住
+  `release.yml`，摘要 `release-gate=checked(8)+annotated=asserted`；红证：删掉该步骤
+  `smoke/01` 退 1；实测 `git cat-file -t` 对 annotated 答 `tag`、对轻量 tag 答 `commit`。
+- **`run-tests.sh` 的 SKIP 分支不收集 `NOT-covered`。** `ok`/PART 分支都把声明并入
+  `NOT-covered:` 清单，SKIP 分支不并——一个**整体 SKIP** 的检查若声明了平台缺口，声明
+  随桶一起消失，本地闸门与 CI 的 `^NOT-covered:` 行都看不见。今天没有检查同时满足两个
+  条件（潜伏，不是活的假绿），修法就是同样的二次上报；红证用 `/tmp` 夹具（整体刷
+  `SKIPPED` 且打印 token）实测旧版清单为空、新版点名。
+
+**误报（核实后不改）**：
+
+- 安装器组报的 `com.agentq.pueued.plist` 只被 `require_file`、从不渲染——刻意保留，
+  `smoke/10` 的 scope 注释写明理由（那是一次旧安装路径的遗留资产，安装器只要求它存在、
+  从不渲染它）；把它纳入 token 集会把正确代码报成缺陷。不改。
+
+**未修边界（如实记录，不声称已修）**：
+
+- **Windows 安装器对既有二进制的哈希断言比 POSIX 更严。** Windows 安装器在 root 已存在时
+  用 `Assert-Sha256` 断言 `pueue.exe`/`pueued.exe` 等于**本次发布**的哈希，不等即 throw；
+  POSIX 安装器在同样情形下先比哈希，不等则走 `download_and_verify` 取回期望字节。两侧
+  都 fail-closed，Windows 侧是「拒绝修复」而不是「修复」。要改它的行为必须在一台真
+  Windows 主机上验证升级路径，本会话没有授权也没有证据，故记为未修。
+- **`Get-SshDiagnosticClass` 的 `(?i)` 与 POSIX 的大小写敏感 `grep -E` 不一致**（两份
+  Windows 客户端各一处）。审查者自己判定为低影响的孪生分歧、可能是刻意的
+  健壮性：只影响人类可读的 `class=` 与「装密钥」提示，不改退出码与协议判定；真实 OpenSSH
+  的措辞大小写固定。未改，记录在案。
+- **`DateTimeOffset.ToUnixTimeSeconds` 的平台下界**（.NET Framework 的时间纪元边界）只在
+  5.1 上可达，本机是 pwsh 7.5.4、专用 Windows 测试机没有为本轮开机，未实测。
+
+**覆盖边界**：`smoke/12` 新增用例在 Windows 宿主上的计数未实测（94 是新增之前的数）；
+`smoke/02` 的新用例在本机走 `NOT-covered`，实际执行只在非 macOS 宿主上（CI 的 linux job）。
+
 ### 2026-11-19 第四轮终审（7 个只读 agent + Orca Codex，审的是 v0.1.34）——修 12 处，其中 1 条 P1 是客户端的中断语义（编号里有 13 条：第 3 条是本轮我自己的修复引入的回归，不算独立发现）
 
 **已修（每条都先自己复现，再改，再证明锁会红）**：

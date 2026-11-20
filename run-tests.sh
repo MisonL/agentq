@@ -84,6 +84,18 @@ while IFS= read -r check <&3; do
     elif grep -q 'SKIPPED' "$output"; then
         printf 'SKIP  %-28s %s\n' "$name" "$(grep SKIPPED "$output" | head -1)"
         skipped=$((skipped + 1))
+        # A whole-check skip must still hand its NOT-covered names to the
+        # known-set gate.  The PART arm below does this (that asymmetry was the
+        # point of its own fix); this arm did not, so a SKIPPED check's
+        # platform-gap declaration vanished from BOTH the local gate and
+        # ci.yml's `^NOT-covered:` line.  No check combines the two today --
+        # latent, not a live false green -- but the gate is one grep away from
+        # being blind, and the fix is the same double-report.
+        if grep -q 'NOT-covered\|not-covered' "$output"; then
+            printf 'NCOV  %-28s %s\n' "$name" "$(grep -E 'NOT-covered|not-covered' "$output" | head -1)"
+            notcovered=$((notcovered + 1))
+            notcovered_list="$notcovered_list$name "
+        fi
     elif grep -qi 'skipped' "$output"; then
         # The whole check ran and exited 0, but it reported an inner sub-part it
         # could not verify.  smoke/01 does this: with pwsh absent it still checks

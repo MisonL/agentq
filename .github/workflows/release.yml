@@ -28,6 +28,23 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+      - name: Require an annotated tag
+        # smoke/31 rule E asserts the same thing, but smoke/31 runs in ci.yml,
+        # whose triggers do not include tag pushes -- so without this step the
+        # rule is never evaluated at the moment a tag is published.  Measured
+        # 2026-11-20: `git cat-file -t refs/tags/<name>` answers `tag` for an
+        # annotated tag and `commit` for a lightweight one.  smoke/01 pins that
+        # this workflow carries the assertion (`git cat-file -t` + `refs/tags/`
+        # on one non-comment line), so deleting it turns the suite red.
+        run: |
+          set -eu
+          object_type=$(git cat-file -t "refs/tags/$GITHUB_REF_NAME" 2>/dev/null || true)
+          if [ "$object_type" != tag ]; then
+            echo "tag $GITHUB_REF_NAME is not an annotated tag (git cat-file -t answered '${object_type:-unknown}')." >&2
+            echo "Create it with \`git tag -a\` and push it again: the annotation carries the release notes and the back-link." >&2
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME is an annotated tag"
       - name: Compare the tag with every recorded version
         run: |
           set -eu

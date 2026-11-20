@@ -2,7 +2,7 @@
 
 Remote task queue over SSH, backed by [Pueue](https://github.com/Nukesor/pueue) 4.0.4.
 
-**Version:** 0.1.36 — the deployment unit (`skill/assets/`, 23 files) ships as one
+**Version:** 0.1.37 — the deployment unit (`skill/assets/`, 23 files) ships as one
 version; releases are tagged in git, indexed at the top of [`CHANGELOG.md`](CHANGELOG.md),
 and verified by the [`release.yml`](.github/workflows/release.yml) tag/version gate.
 
@@ -32,9 +32,10 @@ skill/
   assets/              the deployment unit — 23 files
     client/unix/       POSIX agentq, sshp, install-client.sh
     client/windows/    PowerShell / CMD / Git Bash clients and installer
-    unix/              agentq-server, install-agentq.sh, pueue.yml, systemd/launchd units
+    unix/              agentq (the 60-byte exec wrapper), agentq-server,
+                       install-agentq.sh, pueue.yml, systemd/launchd units
     windows-git-bash/  agentq (the server, byte-identical to the unix copy),
-                       durable-move, launcher, start-daemon, installer
+                       durable-move, launcher, start-daemon, installer, pueue.yml
 ```
 
 `skill/` mirrors `~/.agents/skills/agentq/` one for one, so installing is a

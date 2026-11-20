@@ -203,7 +203,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFOR
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.36"
+$script:ClientVersion = "0.1.37"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's Pueue command ceiling, not this machine's platform: a
 # unix target takes up to 100000 base64 characters (the POSIX twin's
@@ -2586,6 +2586,17 @@ function Test-AgentQWaitContract {
         [string]$ExpectedTaskId = ""
     )
 
+    # Exit 1 has a documented second source: `pueue wait` returned 0 while the
+    # task snapshot had not reached a terminal state, and the server answers
+    # with an EMPTY body plus `pueue wait exited 0 before task M completed`
+    # (contract.md's exit-code section).  The Done/Failed checks below would
+    # report that shape as exit 2 ("protocol error"), the opposite of the
+    # documented 1 -- the POSIX twin carries the same exception.  Only a
+    # byte-empty body and only status 1: anything else still fails closed.
+    if (($ExitCode -eq 1) -and [string]::IsNullOrEmpty($Output)) {
+        return $true
+    }
+
     if (!(Test-AgentQJsonResponse -Operation "wait" -Output $Output -ExpectedTaskId $ExpectedTaskId)) {
         return $false
     }
@@ -3024,8 +3035,9 @@ function Resolve-ProbeExitToken {
     #   2. `agentq-exit:1234`: the twin takes the leading digit run, sees four
     #      digits and ignores the token; the `{1,3}` regex here matched "123"
     #      and accepted it.
-    #   3. `agentq-exit:0007`: the twin accepts it as 7 (leading zeros are
-    #      digits like any other); this copy rejected it.
+    #   3. `agentq-exit:007`: both copies read it as 7 (leading zeros are digits
+    #      like any other); `agentq-exit:0007` is FOUR digits, so both copies
+    #      ignore it -- the twin's `{1,3}` and this copy's `Length -le 3` agree.
     #   4. `agentq-exit:5` followed by a TAB or an NBSP: the PROBE path in the
     #      twin reads the leading digit run with no line-end anchor (`${var%%[!0123456789]*}`),
     #      so a trailing blank is fine THERE -- the strict line-end anchor

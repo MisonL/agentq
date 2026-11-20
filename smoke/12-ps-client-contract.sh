@@ -2827,6 +2827,67 @@ if [ "$status" -ne 0 ] || ! grep -qF 'wait timeout response ok' "$work/out"; the
     failures=$((failures + 1))
 fi
 
+# --- wait exit 1 with an EMPTY body is the CONTRACT, not a protocol error ----
+# contract.md names two sources for exit 1: the task reached Failed, OR
+# `pueue wait` returned 0 while the snapshot was not terminal -- the second
+# arrives with an EMPTY body and the stderr line below.  The wait contract
+# required a Done/Failed JSON for exit 1 and reported this documented shape as
+# exit 2, the opposite of what a 1 tells the caller to do.  Both directions
+# are pinned: the empty body passes, a MALFORMED body still fails closed.
+# smoke/05 carries the POSIX twin's half of the same case (measured 2026-11-20).
+wait_empty_dir="$work/wait-empty-ssh"
+mkdir -p "$wait_empty_dir"
+if [ "$client_arg" != "$client" ]; then
+    wait_empty_stub="$wait_empty_dir/ssh.cmd"
+    printf '%s\r\n' \
+        '@echo off' \
+        '1>&2 echo agentq-server: pueue wait exited 0 before task 7 completed' \
+        'exit /b 1' > "$wait_empty_stub"
+    wait_empty_ssh=$(cygpath -w "$wait_empty_stub")
+else
+    wait_empty_stub="$wait_empty_dir/ssh"
+    printf '#!/bin/sh\ncat > /dev/null 2>&1 || true\nprintf "%%s\\n" "agentq-server: pueue wait exited 0 before task 7 completed" >&2\nexit 1\n' \
+        > "$wait_empty_stub"
+    chmod 700 "$wait_empty_stub"
+    wait_empty_ssh="$wait_empty_stub"
+fi
+wait_empty_probe='
+. "'"$client_arg"'" 2>$null
+$env:AGENTQ_SSH = "'"$wait_empty_ssh"'"
+$script:SshPath = Resolve-SshPath
+$script:RemotePlatform = "unix"
+$script:TargetHost = "smoke-host"
+$script:CredentialSource = ""
+$script:CredentialOptionLines = Get-CredentialSshOptions
+$r = Invoke-SshLogged -RemoteCommand "ignored" -InputPayload $null
+if ($r.ExitCode -ne 1) {
+    [Console]::Error.WriteLine("wait empty-body: expected ssh exit 1, got $($r.ExitCode)")
+    exit 1
+}
+if (![string]::IsNullOrEmpty($r.Output)) {
+    [Console]::Error.WriteLine("wait empty-body: the stub wrote to stdout ($($r.Output.Length) chars)")
+    exit 1
+}
+if (!(Test-AgentQWaitContract -Output $r.Output -ExitCode 1 -ExpectedTaskId "7")) {
+    [Console]::Error.WriteLine("wait empty-body: an exit-1 EMPTY body must pass the wait contract")
+    exit 1
+}
+if (Test-AgentQWaitContract -Output "not json" -ExitCode 1 -ExpectedTaskId "7") {
+    [Console]::Error.WriteLine("wait empty-body: a MALFORMED body must still fail closed")
+    exit 1
+}
+"wait empty-body contract ok"
+'
+cases=$((cases + 1))
+status=0
+"$pwsh_binary" -NoProfile -NonInteractive -Command "$wait_empty_probe" \
+    >"$work/out" 2>"$work/err" || status=$?
+if [ "$status" -ne 0 ] || ! grep -qF 'wait empty-body contract ok' "$work/out"; then
+    printf '%s\n' 'ps-client: an exit-1 wait response with an empty body is not accepted (or a malformed one is)' >&2
+    grep -i 'wait empty-body' "$work/err" >&2 || head -3 "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+
 # --- the OPERATION token must be anchored to a line end ----------------------
 # The operation-path reader (Invoke-SshLogged's two copies) takes the last
 # `agentq-exit:<code>` from ssh's stderr.  The POSIX twin deletes CRs and anchors

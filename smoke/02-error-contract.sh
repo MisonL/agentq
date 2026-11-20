@@ -138,6 +138,32 @@ if [ -s "$work/nonutf8-records" ]; then
     printf 'nonutf8: a refused submit left a request record behind\n' >&2
     failures=$((failures + 1))
 fi
+# The third input that reaches jq's --arg: the normalized --workdir.  Same
+# failure as the label (jq rewrites the byte as U+FFFD) with a worse ending --
+# Pueue gets the RAW bytes, rejects them after the record is in `adding`, and
+# lookup answers 4 forever.  Measured 2026-11-20: the guard was missing.
+# Only a filesystem that accepts non-UTF-8 names can build this fixture
+# (ext4 can; APFS refuses the mkdir), so the case declares its gap by name
+# there instead of pretending to have run.
+cases=$((cases + 1))
+nonutf8_workdir=$(printf '%s/w\377' "$q_work")
+workdir_utf8_state='covered'
+if mkdir -- "$nonutf8_workdir" 2>/dev/null; then
+    nonutf8_status=0
+    "$server" submit --workdir "$nonutf8_workdir" --label smoke \
+        --request-id smoke-nonutf8-workdir-0001 -- true \
+        >"$work/nonutf8-workdir.stdout" 2>"$work/nonutf8-workdir.stderr" || nonutf8_status=$?
+    if [ "$nonutf8_status" -ne 2 ] ||
+        ! grep -qF -- '--workdir must be valid UTF-8' "$work/nonutf8-workdir.stderr" ||
+        ! grep -qxF -- 'agentq-server: reason=protocol_error' "$work/nonutf8-workdir.stderr"; then
+        printf 'nonutf8-workdir: expected exit 2 + a UTF-8 rejection + reason=protocol_error, got %s: %s\n' \
+            "$nonutf8_status" "$(head -2 "$work/nonutf8-workdir.stderr" | tr '\n' '|')" >&2
+        failures=$((failures + 1))
+    fi
+else
+    workdir_utf8_state='NOT-covered(needs-non-utf8-filename)'
+fi
+printf 'error-contract: workdir-utf8=%s\n' "$workdir_utf8_state" >&2
 rm -rf -- "$q_work"
 
 # A non-ASCII request id must be rejected here too.  The guard used a bracket
