@@ -498,7 +498,7 @@ printf '#!/bin/sh\nprintf "%%s\\n" "orphan: reason=not_a_failure" >&2\nfor a in 
 chmod 700 "$reason_success_posix"
 if [ "$client_arg" != "$client" ]; then
     reason_success_win="$reason_success_dir/ssh.cmd"
-    printf '%s\r\n' '@echo off' 'echo orphan: reason=not_a_failure 1>&2' 'echo {"group":"agentq","tasks":{}}' 'exit /b 0' > "$reason_success_win"
+    printf '%s\r\n' '@echo off' '1>&2 echo orphan: reason=not_a_failure' 'echo {"group":"agentq","tasks":{}}' 'exit /b 0' > "$reason_success_win"
     reason_success_arg=$(cygpath -w "$reason_success_win")
 else
     reason_success_arg="$reason_success_posix"
@@ -2710,10 +2710,19 @@ exit_token_dir="$work/exit-token-ssh"
 mkdir -p "$exit_token_dir"
 if [ "$client_arg" != "$client" ]; then
     exit_token_stub="$exit_token_dir/ssh.cmd"
+    # REDIRECT FIRST: `echo agentq-exit:0 1>&2` makes cmd echo the space that
+    # separated the text from the redirection too, so the real stderr bytes are
+    # "agentq-exit:0 " -- a trailing space the operation-path reader correctly
+    # refuses (POSIX's `tr -d '\r'` + sed `$` refuses it too).  Measured by the
+    # windows CI job 2026-11-20 (run 44656069440): with the text-first form the
+    # reader fell back to ssh's exit code and this case reported
+    # "expected the LAST token (3), got 1".  The real launcher writes its token
+    # with [Console]::Error.WriteLine, which appends no space; `1>&2 echo x`
+    # emits exactly `x`.  Redirection may precede the command in cmd.
     printf '%s\r\n' \
         '@echo off' \
-        'echo agentq-exit:0 1>&2' \
-        'echo agentq-exit:3 1>&2' \
+        '1>&2 echo agentq-exit:0' \
+        '1>&2 echo agentq-exit:3' \
         'exit /b 1' > "$exit_token_stub"
     exit_token_ssh=$(cygpath -w "$exit_token_stub")
 else
@@ -2837,9 +2846,13 @@ for token_suffix_kind in tab nbsp trailing-text; do
     esac
     if [ "$client_arg" != "$client" ]; then
         token_suffix_stub="$token_suffix_dir/ssh.cmd"
+        # Redirect first for the same reason as the exit-token stub above: the
+        # text-first form adds a trailing space, which would make every suffix
+        # case "not a line end" for the wrong reason and the tab case pass
+        # without ever exercising the tab.
         printf '%s\r\n' \
             '@echo off' \
-            "echo agentq-exit:5$token_suffix 1>&2" \
+            "1>&2 echo agentq-exit:5$token_suffix" \
             'exit /b 1' > "$token_suffix_stub"
         token_suffix_ssh=$(cygpath -w "$token_suffix_stub")
     else

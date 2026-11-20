@@ -137,6 +137,12 @@ new file is also read by `release.yml`, on the same line as its own constant nam
 - **At most three tags per push.** Pushing more than three in one `push` does
   not trigger `release.yml` for the rest; they arrive silently ungated. Push in
   batches of three or fewer and check that the gate ran for each.
+- **Push the tag BEFORE (or with) the commit that adds its index line.** Check
+  `31` runs on every branch push and reads the tags in the checkout: a `main`
+  push that lands first makes CI red with `version index names vX.Y.Z, but no
+  such tag exists in this checkout`. Measured 2026-11-20 on the 0.1.36 release:
+  CI started 21 seconds before the tag push completed. `git push origin
+  main vX.Y.Z` in one command is fine; two commands in the wrong order is not.
 - A release updates **all three layers** together: tag → version-index line at
   the top of `CHANGELOG.md` → log entry. Check `31` fails when an index line
   names a tag that does not exist, when a tag has no index line, or when the

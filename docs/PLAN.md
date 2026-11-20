@@ -490,6 +490,28 @@ jq 分支**，是本检查从来没有过的**执行证据**（`08` 仍只是间
 - 非 UTF-8 的 `--label`/argv 只有**服务端**拒绝；两份客户端不做这个校验（POSIX 侧没有
   jq，Windows 侧编码路径不同），绕过客户端外的差异已在 `references/contract.md` 写明。
 
+### 2026-11-20 发布后（v0.1.36）：CI 首轮两处红——一处是我写的夹具，一处是推送时序
+
+1. **windows job：`smoke/12` 的 `.cmd` 桩发出与真实 launcher 不同的 stderr 字节。**
+   CI run 44656069440 报 `exit token: expected the LAST token (3), got 1`。桩写的是
+   `echo agentq-exit:0 1>&2`：cmd 解析时把重定向摘掉，但**文本与重定向之间的那个空格
+   留在 `echo` 的参数里**，真实 stderr 是 `agentq-exit:0 `（尾随空格）。0.1.36 本轮刚把
+   操作路径读取器从 `\s*$` 收紧为 `\r*$`（第 10 条），它**正确地**拒绝了这个 token、
+   回落到 ssh 的退出码 1——是夹具错，不是资产错，但它把正确行为报成了红。
+   修法：三处桩改为重定向在前的 `1>&2 echo …`（去掉分隔空格后 `echo` 只拿到文本）。
+   **后缀循环（tab/nbsp/尾随文本）此前是假绿**：尾随空格本身就让读取器拒绝，那三个用例
+   在旧桩上**没有真正检验后缀**；修后后缀是数字之后唯一的字节，用例才名副其实。
+   锁就是这些用例本身——桩换回旧形态，exit-token 用例立刻红（CI 已实测）。
+   **覆盖边界（必须记住）**：`.cmd` 分支只在 `cygpath` 存在时生成（Git Bash），
+   macOS 上的 `smoke/12` 绿**不证明**这条分支——本机没有 cmd.exe，修复的证据只能是
+   windows CI job 转绿（转换运行号见 CHANGELOG 验证行）。这是「夹具的一支只在
+   另一台宿主上执行」的形态：开发机全绿与 CI 红可以同时成立，且都是真的。
+2. **linux job：`smoke/31` 报 `version index names v0.1.36, but no such tag exists in
+   this checkout`——推送时序，不是资产或检查缺陷。** 索引行随 `main` 先落地，
+   tag 推送完成晚 21 秒（CI 起跑早于 tag 到达）。检查读的是 checkout 里的 tag，这是
+   它该有的行为。修法不在代码：`CONTRIBUTING.md` 的 Release 规则补「先推 tag、或与
+   索引提交用同一条 `git push origin main vX.Y.Z` 推送」。
+
 ### 2026-11-19 第四轮终审（7 个只读 agent + Orca Codex，审的是 v0.1.34）——修 12 处，其中 1 条 P1 是客户端的中断语义（编号里有 13 条：第 3 条是本轮我自己的修复引入的回归，不算独立发现）
 
 **已修（每条都先自己复现，再改，再证明锁会红）**：
