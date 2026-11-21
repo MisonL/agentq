@@ -2,7 +2,7 @@
 
 Remote task queue over SSH, backed by [Pueue](https://github.com/Nukesor/pueue) 4.0.4.
 
-**Version:** 0.1.39 — the deployment unit (`skill/assets/`, 23 files) ships as one
+**Version:** 0.1.40 — the deployment unit (`skill/assets/`, 23 files) ships as one
 version; releases are tagged in git, indexed at the top of [`CHANGELOG.md`](CHANGELOG.md),
 and verified by the [`release.yml`](.github/workflows/release.yml) tag/version gate.
 
@@ -72,8 +72,17 @@ never writes anything.
 **Client** (Windows): `skill/assets/client/windows/install-client.ps1`, with the same
 `-Check` contract.
 
-**Server**: stage the platform directory to the target host, then run
-`skill/assets/unix/install-agentq.sh` (or `skill/assets/windows-git-bash/install-agentq.ps1`).
+**Server**: stage the platform directory to the target host, then run the platform
+installer: `sh skill/assets/unix/install-agentq.sh` on Linux/macOS, or
+
+```powershell
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File install-agentq.ps1 -StageDirectory <staged-platform-directory>
+```
+
+on Windows Git Bash targets. `-StageDirectory` is **mandatory** and must already hold
+the five server assets (`agentq`, `agentq-launcher.ps1`, `agentq-start-daemon.ps1`,
+`agentq-durable-move.ps1`, `pueue.yml`); adding `pueue-x86_64-pc-windows-msvc.exe` and
+`pueued-x86_64-pc-windows-msvc.exe` selects the same-SHA-256 offline binary path.
 The installer refuses to update while the queue has active or non-terminal tasks.
 
 ## Development

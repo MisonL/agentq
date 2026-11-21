@@ -122,23 +122,8 @@ cleanup_registered_tasks() {
     local id
     local record
     local record_task_id
-    # A recorded id whose task is ALREADY gone cannot be removed at all, so the
-    # record must be dropped directly:
-    # tasks ("unknown AgentQ task id"), so its record must be dropped directly:
-    # otherwise the next run submits onto the same recycled id and finds two
-    # accepted records on it.  Only records of ids this check just tried to
-    # remove are considered, so nothing else in the runtime is touched.
-    if [ -d "$request_record_directory" ]; then
-        for record in "$request_record_directory"/smoke-*.json; do
-            [ -e "$record" ] || continue
-            record_task_id=$(jq -r '.task_id // empty' "$record" 2>/dev/null || true)
-            for id in $cleanup_task_ids; do
-                if [ "$record_task_id" = "$id" ]; then
-                    rm -f -- "$record"
-                fi
-            done
-        done
-    fi
+    # Records are dropped after the server attempts below; see the comment
+    # there for why the order matters.
     # Land anything still alive in a terminal state first: Pueue refuses to
     # remove a Running task instantly, so a remove-only loop would spin for its
     # whole budget (see the cancel-case cleanup comment below).
@@ -153,6 +138,38 @@ cleanup_registered_tasks() {
             sleep 0.5
         done
     done
+
+    # Pueue-DIRECT tasks (the blockers) have no request record, so every
+    # server-mediated cancel/remove above answers 2; clear them with the
+    # pueue binary itself, best effort, or they starve later checks.
+    for id in $cleanup_task_ids ${blocker_ids:-}; do
+        [ -n "$id" ] || continue
+        PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" "$runtime_home/pueue" kill "$id" >/dev/null 2>&1 || true
+    done
+    for id in $cleanup_task_ids ${blocker_ids:-}; do
+        [ -n "$id" ] || continue
+        for _ in $(seq 1 10); do
+            PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" "$runtime_home/pueue" remove "$id" >/dev/null 2>&1 && break
+            sleep 0.5
+        done
+    done
+    # Records are dropped only AFTER the server had its chance: a record
+    # removed first makes the server's own remove answer 2 (it needs the
+    # record to archive the request), the Pueue task then survives, and
+    # the next run finds a recycled id with two owners. A task this run
+    # could not remove keeps its record and is reported by the next run.
+    if [ -d "$request_record_directory" ]; then
+        for record in "$request_record_directory"/smoke-*.json; do
+            [ -e "$record" ] || continue
+            record_task_id=$(jq -r '.task_id // empty' "$record" 2>/dev/null || true)
+            for id in $cleanup_task_ids; do
+                if [ "$record_task_id" = "$id" ]; then
+                    rm -f -- "$record"
+                fi
+            done
+        done
+    fi
+
 }
 # After the id-scoped cleanup above, whatever THIS run created belongs to this
 # run: every record it plants carries `--request-id` starting with
@@ -343,8 +360,9 @@ failure_task_id=$(jq -er '.task_id' <<<"$failure_submit") || {
 cleanup_task_ids="$cleanup_task_ids $failure_task_id"
 failure_status=0
 failure_output=$("$server" wait "$failure_task_id") || failure_status=$?
-if [ "$failure_status" -eq 0 ]; then
-    printf 'wait reported exit 0 for a task that exited non-zero: %s\n' "$failure_output" >&2
+if [ "$failure_status" -ne 1 ]; then
+    printf 'wait for a task that exited non-zero must exit 1, got %s: %s\n' \
+        "$failure_status" "$failure_output" >&2
     exit 1
 fi
 if jq -e '.task.status.Done.result == "Success"' <<<"$failure_output" >/dev/null 2>&1; then

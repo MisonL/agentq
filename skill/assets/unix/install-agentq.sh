@@ -4,7 +4,7 @@ set -eu
 
 program=${0##*/}
 release_version='4.0.4'
-agentq_version='0.1.39'
+agentq_version='0.1.40'
 asset_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 agentq_home=${AGENTQ_HOME:-"$HOME/.agentq"}
 artifact_source_directory=${AGENTQ_PUEUE_SOURCE_DIR:-}
@@ -14,6 +14,12 @@ wrapper_destination="$HOME/.local/bin/agentq"
 # may belong to another installer that is about to write its pid.  The server
 # reads the same value from the environment (maintenance_lock_empty_grace_seconds).
 maintenance_lock_empty_grace_seconds=${maintenance_lock_empty_grace_seconds:-30}
+case "$maintenance_lock_empty_grace_seconds" in
+    ''|*[!0123456789]*)
+        printf '%s: maintenance_lock_empty_grace_seconds must be a non-negative integer: %s\n' "$program" "$maintenance_lock_empty_grace_seconds" >&2
+        exit 2
+    ;;
+esac
 lock_retry_delay_seconds=1
 
 stage_home=''
@@ -2463,13 +2469,25 @@ maintenance_lock_is_stale() {
     process_is_confirmed_dead "$lock_pid" "$lock_identity"
 }
 
-installer_lock_directory_is_empty() {
+installer_lock_directory_is_recoverable_empty() {
     installer_lock_empty_path=$1
+    installer_lock_empty_unexpected=''
     if [ -L "$installer_lock_empty_path" ] || [ ! -d "$installer_lock_empty_path" ]; then
         return 1
     fi
-    installer_lock_empty_child=$(find "$installer_lock_empty_path" -mindepth 1 -maxdepth 1 -print 2>/dev/null) || return 1
-    [ -z "$installer_lock_empty_child" ]
+    if [ -e "$installer_lock_empty_path/pid" ] || [ -L "$installer_lock_empty_path/pid" ]; then
+        return 1
+    fi
+    # A metadata temporary is the installer's OWN writer residue:
+    # write_lock_metadata runs mktemp INSIDE this directory and then mv to
+    # `pid`.  A crash between mkdir and that mv leaves exactly that shape, so
+    # it is this lock's traffic, not a foreign entry -- the same predicate the
+    # server applies to its operation and request locks.  Anything else
+    # (subdirectory, symlink, another file) keeps the lock unowned.
+    installer_lock_empty_unexpected=$(find "$installer_lock_empty_path" -mindepth 1 -maxdepth 1 ! -type f -print -quit 2>/dev/null) || return 1
+    [ -z "$installer_lock_empty_unexpected" ] || return 1
+    installer_lock_empty_unexpected=$(find "$installer_lock_empty_path" -mindepth 1 -maxdepth 1 -type f ! -name '.agentq-lock-metadata.*' -print -quit 2>/dev/null) || return 1
+    [ -z "$installer_lock_empty_unexpected" ] || return 1
 }
 
 installer_lock_directory_mtime() {
@@ -2491,7 +2509,7 @@ maintenance_lock_empty_is_stale() {
     if [ -e "$maintenance_lock/pid" ] || [ -L "$maintenance_lock/pid" ]; then
         return 1
     fi
-    installer_lock_directory_is_empty "$maintenance_lock" || return 1
+    installer_lock_directory_is_recoverable_empty "$maintenance_lock" || return 1
     installer_lock_directory_mtime "$maintenance_lock" || return 1
     maintenance_empty_lock_observed_mtime=$installer_lock_mtime
     maintenance_empty_lock_observed_now=$(date +%s) || return 1
@@ -2527,6 +2545,19 @@ recover_stale_maintenance_lock() {
             # it is gone): judge it afresh rather than act on the first look.
             recover_stale_maintenance_lock
             return $?
+        fi
+        # The directory may hold the writer temporary this installer leaves
+        # when killed between mkdir and the metadata mv (see the predicate
+        # above).  Delete ONLY those; anything else keeps rmdir from
+        # succeeding and the failure below reports it.
+        maintenance_empty_residues=$(find "$maintenance_lock" -mindepth 1 -maxdepth 1 -type f -name '.agentq-lock-metadata.*' -print 2>/dev/null) || maintenance_empty_residues=''
+        if [ -n "$maintenance_empty_residues" ]; then
+            while IFS= read -r maintenance_empty_residue; do
+                [ -n "$maintenance_empty_residue" ] || continue
+                rm -f -- "$maintenance_empty_residue" 2>/dev/null || true
+            done <<EOF
+$maintenance_empty_residues
+EOF
         fi
         # rmdir refuses a non-empty directory, so this cannot take anything
         # with it.  ENOENT means another process removed it in between --

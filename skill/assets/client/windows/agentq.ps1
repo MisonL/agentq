@@ -203,7 +203,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFOR
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.39"
+$script:ClientVersion = "0.1.40"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's Pueue command ceiling, not this machine's platform: a
 # unix target takes up to 100000 base64 characters (the POSIX twin's
@@ -721,7 +721,10 @@ function Resolve-CredentialSource {
         Stop-Credential "AGENTQ_PASSWORD is not supported on Windows; set AGENTQ_ASKPASS to a program that prints the password"
     }
 
-    if (![string]::IsNullOrEmpty($env:AGENTQ_PASSWORD_PROMPT)) {
+    # "0" is the documented spelling for DISABLED (the POSIX twin treats it as
+    # unset), so a shared environment must not fail here; any other non-empty
+    # value is refused below.
+    if (![string]::IsNullOrEmpty($env:AGENTQ_PASSWORD_PROMPT) -and $env:AGENTQ_PASSWORD_PROMPT -cne "0") {
         # Also not supported: Windows ssh reads the password from the console via
         # _getwch(), and with no console it blocks rather than failing -- so an
         # unattended call would hang forever instead of erroring.
@@ -1695,7 +1698,14 @@ function Invoke-WaitSshWithTimeout {
                 $process.StandardInput.Close()
             }
 
-            $maximumStreamCharacters = 65536
+            # stdout is NOT bounded here: this is a remote PROTOCOL response,
+            # and the POSIX twin reads it with no size cap. A 64KiB ceiling
+            # silently truncated a large `wait` body and the failure surfaced
+            # as a JSON protocol error; the platform probe keeps its own
+            # bounded reader. stderr is diagnostics only, so it stays bounded
+            # and the truncation is named in the diagnostics instead.
+            $maximumStreamCharacters = [int]::MaxValue
+            $maximumDiagnosticsCharacters = 65536
             $streamBufferCharacters = 4096
             $stdoutState = [pscustomobject]@{
                 Name = "stdout"
@@ -1730,7 +1740,7 @@ function Invoke-WaitSshWithTimeout {
                     $progressed = $true
                 }
                 if (!$stderrState.Complete -and $stderrState.Task.IsCompleted) {
-                    [void](Read-BoundedProcessStreamChunk -State $stderrState -MaximumCharacters $maximumStreamCharacters)
+                    [void](Read-BoundedProcessStreamChunk -State $stderrState -MaximumCharacters $maximumDiagnosticsCharacters)
                     $progressed = $true
                 }
                 if ($process.HasExited) {
@@ -1768,7 +1778,7 @@ function Invoke-WaitSshWithTimeout {
                         $progressed = $true
                     }
                     if (!$stderrState.Complete -and $stderrState.Task.IsCompleted) {
-                        [void](Read-BoundedProcessStreamChunk -State $stderrState -MaximumCharacters $maximumStreamCharacters)
+                        [void](Read-BoundedProcessStreamChunk -State $stderrState -MaximumCharacters $maximumDiagnosticsCharacters)
                         $progressed = $true
                     }
                     if (!$progressed) {
@@ -1790,6 +1800,21 @@ function Invoke-WaitSshWithTimeout {
                 $exitCode = $process.ExitCode
                 $transportDiagnostics = Get-FileTextOrEmpty -Path $sshLogPath -Bounded
                 $standardError = $stderrState.Builder.ToString()
+                if ($stderrState.Truncated) {
+                    if (!$standardError.EndsWith("`n")) {
+                        $standardError += [Environment]::NewLine
+                    }
+                    $standardError += "[stderr truncated after $maximumDiagnosticsCharacters characters]"
+                }
+                if (![string]::IsNullOrEmpty($stderrState.Failure)) {
+                    if (!$standardError.EndsWith("`n")) {
+                        $standardError += [Environment]::NewLine
+                    }
+                    $standardError += "[stderr read failed: $($stderrState.Failure)]"
+                }
+                if ($stdoutState.Truncated) {
+                    [Console]::Error.WriteLine("$($script:Program): wait response exceeded $maximumStreamCharacters characters; this client cannot validate it")
+                }
                 if ($script:RemotePlatform -eq "windows") {
                     # ASCII digits only; and the CRs are removed before the
                     # anchor -- both rules are the other reader's (see the note
@@ -2465,6 +2490,22 @@ function Test-AgentQJsonResponse {
     if ([string]::IsNullOrWhiteSpace($Output)) {
         [Console]::Error.WriteLine("$($script:Program): remote $Operation response failed the AgentQ JSON protocol validation: response was empty")
         return $false
+    }
+
+    # The POSIX twin slurps the body with `jq -s` and reads `.[0]`, so a
+    # top-level ARRAY is a protocol violation there (a one-element array
+    # becomes `[[...]]`). ConvertFrom-Json unwraps a one-element array
+    # into its element, so a one-element array literal passed THIS validator
+    # (measured 2026-11-22 on pwsh 7.5.4: submit object=True,
+    # array-of-one=True). Pin the root object from the raw text, the same
+    # way Test-JsonBatchRemoveResult pins remove_batch's root array.
+    if ($Operation -ne "remove_batch") {
+        $rootText = $Output.TrimStart([char[]]@(0x20,0x09,0x0A,0x0D))
+        if (($rootText.Length -eq 0) -or ($rootText[0] -cne [char]'{')) {
+            [Console]::Error.WriteLine("$($script:Program): remote $Operation response failed the AgentQ JSON protocol validation: root value is not an object")
+            Write-ResponseMetadata -Output $Output
+            return $false
+        }
     }
 
     try {

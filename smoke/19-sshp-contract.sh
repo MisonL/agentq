@@ -1390,6 +1390,102 @@ unavailable||||127|__SSHP_INSTALL_UNAVAILABLE__:Windows|"
             failures=$((failures + 1))
         fi
     fi
+    # Resolver contract: an UNSAFE candidate is skipped, not fatal.  The
+    # extracted REAL resolver (not the stub) runs against a fixture whose file
+    # is a symlink: the unsafe candidate must not throw, a later safe
+    # candidate must win, and an all-unsafe list must answer $null -- which
+    # the probe body reports as INSTALL_REQUIRED/UNAVAILABLE.  A throw here
+    # (the pre-0.1.40 shape) aborts the probe before any __SSHP_* marker and
+    # the client blames the deployment.  The fixture predicate itself is
+    # asserted first: a host whose safe path reads unsafe would make the case
+    # pass for the wrong reason.
+    resolver_physical=$(cd "$work" && pwd -P)
+    mkdir -p "$resolver_physical/resolver-real"
+    : > "$resolver_physical/resolver-real/app.exe"
+    ln -sfn "$resolver_physical/resolver-real/app.exe" "$resolver_physical/resolver-link.exe"
+    resolver_safe="$resolver_physical/resolver-real/app.exe"
+    resolver_unsafe="$resolver_physical/resolver-link.exe"
+    cat > "$work/resolver-probe.ps1" <<'POWERSHELL'
+$ErrorActionPreference = "Stop"
+# Load ONLY the two resolver functions from the extracted prelude.  The file
+# continues past them into Windows-only top-level code ($remoteUserEnvironment
+# = Resolve-RemoteUserEnvironment), so dot-sourcing the whole file fails on a
+# POSIX host.  The AST is also self-checking: a renamed function is counted,
+# not silently skipped.
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:AGENTQ_RESOLVER_FILE, [ref]$tokens, [ref]$errors)
+$names = @("Resolve-RemoteApplication", "Test-NonReparseWindowsApplicationPath")
+$defs = @($ast.FindAll({ param($node) ($node -is [System.Management.Automation.Language.FunctionDefinitionAst]) -and ($names -contains $node.Name) }, $true))
+foreach ($def in $defs) {
+    . ([scriptblock]::Create($def.Extent.Text))
+}
+$safe = $env:AGENTQ_RESOLVER_SAFE
+$unsafe = $env:AGENTQ_RESOLVER_UNSAFE
+$fixtureSafe = Test-NonReparseWindowsApplicationPath -Path $safe
+$fixtureUnsafe = Test-NonReparseWindowsApplicationPath -Path $unsafe
+$threw = $false
+$got = $null
+try {
+    $got = Resolve-RemoteApplication -CommandNames @() -Candidates @($unsafe, $safe)
+} catch {
+    $threw = $true
+}
+$threwAll = $false
+$all = $null
+try {
+    $all = Resolve-RemoteApplication -CommandNames @() -Candidates @($unsafe)
+} catch {
+    $threwAll = $true
+}
+[Console]::Out.Write("resolver.defs=$($defs.Count)`n")
+[Console]::Out.Write("resolver.fixture.safe=$fixtureSafe`n")
+[Console]::Out.Write("resolver.fixture.unsafe=$fixtureUnsafe`n")
+[Console]::Out.Write("resolver.threw=$threw`n")
+[Console]::Out.Write("resolver.threw.all=$threwAll`n")
+[Console]::Out.Write("resolver.skipped=$([string]::Equals($got, $safe, [StringComparison]::OrdinalIgnoreCase))`n")
+[Console]::Out.Write("resolver.all.null=$($null -eq $all)`n")
+POWERSHELL
+    resolver_status=0
+    AGENTQ_RESOLVER_FILE="$win_resolver_win" AGENTQ_RESOLVER_SAFE="$resolver_safe" AGENTQ_RESOLVER_UNSAFE="$resolver_unsafe" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$work/resolver-probe.ps1" \
+        > "$work/resolver-probe.out" 2> "$work/resolver-probe.err" || resolver_status=$?
+    cases=$((cases + 1))
+    resolver_bad=''
+    [ "$resolver_status" -eq 0 ] || resolver_bad="$resolver_bad;exit=$resolver_status"
+    grep -qF 'resolver.defs=2' "$work/resolver-probe.out" || resolver_bad="$resolver_bad;defs"
+    grep -qF 'resolver.fixture.safe=True' "$work/resolver-probe.out" || resolver_bad="$resolver_bad;fixture-safe"
+    grep -qF 'resolver.fixture.unsafe=False' "$work/resolver-probe.out" || resolver_bad="$resolver_bad;fixture-unsafe"
+    grep -qF 'resolver.threw=False' "$work/resolver-probe.out" || resolver_bad="$resolver_bad;threw"
+    grep -qF 'resolver.threw.all=False' "$work/resolver-probe.out" || resolver_bad="$resolver_bad;threw-all"
+    grep -qF 'resolver.skipped=True' "$work/resolver-probe.out" || resolver_bad="$resolver_bad;skipped"
+    grep -qF 'resolver.all.null=True' "$work/resolver-probe.out" || resolver_bad="$resolver_bad;all-null"
+    if [ -n "$resolver_bad" ]; then
+        printf 'sshp-contract: Windows resolver unsafe-candidate contract failed:%s (stderr: %s)\n' \
+        "$resolver_bad" "$(head -3 "$work/resolver-probe.err" | tr '\n' '|')" >&2
+        failures=$((failures + 1))
+    fi
+    # A READY:Windows marker on the UNIX probe is a claim, not a conclusion:
+    # both clients re-run the Windows probe.  The twin used to accept the
+    # marker as final, so a rewritten unix probe made --check answer READY
+    # while the follow-up probe said UNAVAILABLE (measured 2026-11-22:
+    # pre-fix rc 0, fixed rc 127).  `ssh -V` is the twin's own first call and
+    # consumes one plan line.
+    plan_stub '0	ssh-version
+0	__SSHP_READY__:Windows
+127	__SSHP_INSTALL_UNAVAILABLE__:Windows'
+    ps_route_status=0
+    SSHP_STUB_DIR="$stub_dir" SSHP_SSH="$work/bin/ssh" HOME="$home" TMPDIR="$work/tmp" \
+        PATH="$work/bin:/usr/bin:/bin" \
+        "$pwsh_binary" -NoProfile -NonInteractive -File "$sshp_ps_client" --check smoke-host \
+        >"$work/out" 2>"$work/err" </dev/null || ps_route_status=$?
+    cases=$((cases + 1))
+    if [ "$ps_route_status" -ne 127 ]; then
+        printf 'sshp-contract: the Windows client accepted READY:Windows from the unix probe without the Windows probe answer (exit %s, expected127)\n' \
+            "$ps_route_status" >&2
+        sed 's/^/      /' "$work/err" >&2 || true
+        failures=$((failures + 1))
+    fi
     windows_matrix_state="$((win_probe_rows + win_install_rows))/$((win_probe_matrix_rows + win_install_matrix_rows))"
 fi
 

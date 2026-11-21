@@ -669,8 +669,18 @@ function Resolve-RemoteApplication {
         if ($null -eq $commandItem) {
             continue
         }
+        # An UNSAFE candidate is skipped, not fatal -- the same contract as the
+        # install-client.ps1 Git Bash search.  The resolver walks several
+        # locations (WinGet link/alias, package dir, scoop, cargo, choco) and a
+        # reparse-point candidate must not abort the whole probe: under the
+        # probe setting $ErrorActionPreference = "Stop", a throw exits before
+        # any __SSHP_* marker, and the client then reports "remote dependency
+        # probe failed", blaming the deployment (measured 2026-11-22 on macOS
+        # with an extracted copy: a candidate under a symlinked parent threw).
+        # If EVERY candidate is unsafe the resolver returns $null and the
+        # probe answers INSTALL_REQUIRED/UNAVAILABLE, which is true.
         if (!(Test-NonReparseWindowsApplicationPath -Path $commandPath)) {
-            throw "Remote application path is unsafe: $commandPath"
+            continue
         }
         if (!$commandItem.PSIsContainer) {
             return [System.IO.Path]::GetFullPath($commandPath)
@@ -684,8 +694,9 @@ function Resolve-RemoteApplication {
         if ($null -eq $candidateItem) {
             continue
         }
+        # Skip, do not throw -- see the note above.
         if (!(Test-NonReparseWindowsApplicationPath -Path $candidate)) {
-            throw "Remote application path is unsafe: $candidate"
+            continue
         }
         if (!$candidateItem.PSIsContainer) {
             return [System.IO.Path]::GetFullPath($candidate)
@@ -1164,7 +1175,14 @@ function Prepare-Remote {
         $unixProbe = Invoke-SshLogged -Interactive $false -RemoteCommand (Get-UnixProbeCommand)
         $outcome = Get-ProbeOutcome -Result $unixProbe
         $windowsShellDetected = Test-WindowsShellMarker -Result $unixProbe
-        if (($null -eq $outcome) -or $windowsShellDetected) {
+        # A READY/INSTALL_REQUIRED marker that NAMES Windows is a Windows
+        # conclusion arriving on the unix probe. The POSIX twin re-runs the
+        # Windows probe in that case; this side used to accept the marker as
+        # final, so a rewritten unix probe could make `--check` answer READY
+        # while the session command then failed (twin divergence found
+        #2026-11-22 in review).
+        $windowsMarkerFromUnixProbe = ($null -ne $outcome) -and ($outcome.Platform -eq "windows")
+        if (($null -eq $outcome) -or $windowsShellDetected -or $windowsMarkerFromUnixProbe) {
             if (($unixProbe.ExitCode -eq 255) -and (Test-SshTransportError -Diagnostics $unixProbe.TransportDiagnostics)) {
                 if ($CheckReconnectAttempts -gt 0) {
                     $reconnectAttempt += 1
@@ -1209,7 +1227,7 @@ function Prepare-Remote {
                 # consumer at the outcome stage owns it.)
                 Write-Diagnostics -Diagnostics $unixProbe.Diagnostics
                 Write-Diagnostics -Diagnostics $windowsProbe.Diagnostics
-                $failureDescription = if ($windowsShellDetected) { "the Windows shell" } else { "both Unix and Windows shells" }
+                $failureDescription = if ($windowsShellDetected -or $windowsMarkerFromUnixProbe) { "the Windows shell" } else { "both Unix and Windows shells" }
                 [Console]::Error.WriteLine("$($script:Program): remote dependency probe failed for $failureDescription.")
                 # Propagate the probe's own status, as the POSIX twin does
                 # (`return "$windows_probe_status"`): --check is a diagnostic,

@@ -2249,7 +2249,7 @@ PATH="$uuidfail_dir:$PATH" AGENTQ_SSH_RECORD="$work/ssh-record.txt" \
     AGENTQ_SUBMIT_RETRY_ATTEMPTS=1 AGENTQ_SUBMIT_RETRY_DELAY=1 \
     "$client" submit --workdir /tmp -- true \
     >"$work/uuidgen.out" 2>"$work/uuidgen.err" || cpuuid_status=$?
-if grep -q 'request id' "$work/uuidgen.err"; then
+if grep -q -- '--request-id must' "$work/uuidgen.err"; then
     printf 'uuidgen fallback: a broken uuidgen was reported as a malformed --request-id: %s\n' \
         "$(head -2 "$work/uuidgen.err" | tr '\n' '|')" >&2
     failures=$((failures + 1))

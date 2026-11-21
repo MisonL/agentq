@@ -216,6 +216,22 @@ while IFS= read -r v; do
     prev=$v
 done <"$work.index"
 
+newest_entry_block() {
+    awk '
+        /^[0-9]{4}-[0-9]{2}-[0-9]{2}  / {
+            if (started) { exit }
+            started = 1
+            next
+        }
+        started { print }' "$1"
+}
+# Rule D and its calibration call this SAME predicate: a hand-copied
+# twin silently stopped testing the live rule (measured 2026-11-22:
+# widening the rule to accept a bare `  |` left every row green).
+newest_has_verification() {
+    newest_entry_block "$1" >"$1.block"
+    grep -qE '^[[:space:]]*\|[[:space:]]*[^[:space:]]' "$1.block"
+}
 # --- rule D: the newest log entry carries a verification line --------------
 # An entry begins with 'YYYY-MM-DD' followed by TWO spaces.  Its block runs to
 # the next entry or the end of the section.  A verification line is a line in
@@ -225,20 +241,7 @@ if [ -z "$newest_date" ]; then
     fail 'the descending log section has no entries; a changelog with no entries is not a pass'
 else
     # Block of the newest entry: from its line to the next entry line.
-    newest_block=$(awk '
-        /^[0-9]{4}-[0-9]{2}-[0-9]{2}  / {
-            if (started) { exit }
-            started = 1
-            next
-        }
-        started { print }' "$work.log")
-    printf '%s\n' "$newest_block" >"$work.newest"
-    # A verification line must carry a RECORD after the marker: a bare `  |`
-    # satisfies "a line whose first non-space character is '|'" while saying
-    # nothing.  Measured 2026-11-18: with the plain `^[[:space:]]*\|` form an
-    # entry whose only verification line was `  |` passed this rule and every
-    # calibration fixture, because none of them held a bare bar.
-    if ! grep -qE '^[[:space:]]*\|[[:space:]]*[^[:space:]]' "$work.newest"; then
+    if ! newest_has_verification "$work.log"; then
         fail "the newest log entry ($newest_date) has no '|  <verification>' line; the short format requires one on every new entry"
     fi
     # The newest date must be the newest DATE too: a back-dated entry inserted
@@ -265,17 +268,9 @@ if version_gt v0.1.10 v0.1.9; then :; else cal=bad; printf 'calibration: version
 if version_gt v0.1.9 v0.1.10; then cal=bad; printf 'calibration: version_gt v0.1.9 v0.1.10 returned true\n' >&2; fi
 if version_gt v0.1.30 v0.1.30; then cal=bad; printf 'calibration: version_gt compared equal versions as newer\n' >&2; fi
 
-# Newest-entry verification predicate, over three fixture logs.
-newest_has_verification() {
-    awk '
-        /^[0-9]{4}-[0-9]{2}-[0-9]{2}  / {
-            if (started) { exit }
-            started = 1
-            next
-        }
-        started { print }' "$1" >"$1.block"
-    grep -qE '^[[:space:]]*\|[[:space:]]*[^[:space:]]' "$1.block"
-}
+# newest_has_verification is the same function rule D uses (defined
+# above); nothing is copied here, so a rule mutation cannot leave the
+# calibration testing a stale twin.
 cal_dir=$(mktemp -d "${TMPDIR:-/tmp}/agentq-changelog-cal.XXXXXX")
 printf '2026-11-14  entry\n  |  ./run-tests.sh -> exit 0\n\n2026-11-13  older\n' >"$cal_dir/good.log"
 printf '2026-11-14  entry without verification\n\n2026-11-13  older\n  |  ok\n' >"$cal_dir/no-verify.log"

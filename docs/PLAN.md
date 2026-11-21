@@ -2723,3 +2723,63 @@ A5b 随之修复并经两列双向验证——见 A5b 正文与本节 A5b 行。
 
 
 
+
+## 第九轮全维度终审（2026-11-22，审 v0.1.39；6 个只读 agent + Orca Codex）
+
+六个只读 agent 分域审源码、三平台安装/使用故事与检查自身；Orca Codex 独立审同一棵树。以下每条都在主检出里先复现/读证据再动手。
+
+### 服务端（`skill/assets/unix/agentq-server`，与 windows-git-bash孪生逐字节同步）
+
+- **remove的第二次 record读取可被并发归档击穿。** `mark_request_removed`先读一次 record（rc=0），随后 `validate_task_removal`又读一次。两者之间 `status`/`logs`/`doctor`的锁外 `recover_removing_requests`可以在任务消失后把该 `removing` record收敛为 `removed`并归档，第二次读于是答 rc=1，`fail "missing AgentQ request record while removing task"`退2——一次成功的 remove被报成失败，且重试只会得到 `unknown AgentQ task id`（0.1.29修过同一形状的另一半）。修法：`validate_task_removal`接受调用方已读的 record（第二参数），`mark_request_removed`传自己的那份；并把「第一次读就看到 `removed`」当作同一收敛：校验 record仍指向本任务实例后幂等归档、`removal_recovered_archive=true`退0。`mark_request_removing`仍让函数自己读（此时状态是 `accepted`，归档路径不可达）。
+- **锁恢复的「先验后删」TOCTOU。** `remove_stale_lock`校验 pid/identity后**按路径** `rm` pid再 `rmdir`。并发恢复者 A可以先删掉目录，新持有者随即 mkdir并写入自己的 pid，此时 B（早已完成校验）的 `rm`删的是**活锁的元数据**；B的 `rmdir`还可能删掉新持有者的空目录。实测形态不要求两个恢复者「同时」校验——窗口只要覆盖 A的删除 +新持有者的 mkdir。修法：改用**原子 rename捕获**。pid分支把 `pid`原子改名为 sibling `.stale-capture.$$`，对新路径重新 `read_lock_metadata`并与期望值比对；不匹配则 `mv -n`放回、退2（changed），绝不删除别人的记录。`require_empty`分支把**整个锁目录** rename到 sibling捕获名，再检查它仍只含元数据临时文件；不符同样放回。`rmdir`的退出码成为权威判据（成功后重现的目录属于新持有者，不报错）；失败时若路径上是不同的 pid则退2。
+- **`acquire_operation_lock`把「changed」当致命错误。**读路径早已容忍 `remove_stale_lock`的 rc=2（另一次恢复先动过手），写路径却 `fail`。现两处分支都按读路径处理：rc=2 → `continue`重试，其余非零才 fail。
+- **维护锁同一形状（死持有者 /陈旧空目录两分支）。**安装器与 server的维护锁恢复都是「再确认身份 →删除」。改为同样的 rename捕获：unix死分支捕获 `pid`、windows分支捕获锁文件、empty分支捕获目录；捕获后重新读身份/空性，不符就放回并让上层按 contention/unowned回答。**安装器自己的锁恢复未改**（见边界）。
+-同步：`cmp skill/assets/unix/agentq-server skill/assets/windows-git-bash/agentq` =0。
+
+### Windows客户端（`skill/assets/client/windows/agentq.ps1`）
+
+- **`wait`的 stdout被64KiB静默截断。** `Invoke-WaitSshWithTimeout`与平台探针共用 `$maximumStreamCharacters = 65536`；截断后没有标记、没有错误，protocol校验失败被报成「JSON协议错误」。POSIX孪生对操作响应**不设上限**（写临时文件）。修法：wait的 stdout改为 `[int]::MaxValue`（平台探针保留自己的有界读取）；stderr是诊断流，保留64KiB但在诊断中显式追加 `[stderr truncated after N characters]` / `[stderr read failed: …]`；stdout真被截断时（理论上不可达）打印本地点名的消息。
+- **非批量响应的顶层数组被接受。** POSIX用 `jq -s`把 body读成数组并取 `.[0]`，`[{...}]`于是变成 `[[...]]`，`.[0]`不是对象 →拒绝。`ConvertFrom-Json`把单元素数组**展开成元素本身**，Windows侧的 `submit`校验于是接受 `[{"task_id":1,…}]`。实测（pwsh7.5.4，抽取校验函数）：object=True / array-of-one=True；修后 array-of-one=False。修法：非 `remove_batch`操作先按**原文**裁掉 JSON空白字符，要求首字符是 `{`，与 `remove_batch`已有的根形状原文扫描同一手法。
+- **`AGENTQ_PASSWORD_PROMPT=0`的平台分歧。** POSIX把 `0`当「禁用」，Windows对任何非空值都拒绝（实测 `AGENTQ_PASSWORD_PROMPT=0 agentq --version`：POSIX0 / Windows2）。Windows不需要支持该变量，但共享环境不该因禁用拼写失败：`0`放行，其余非空仍拒绝。冲突检查（与 ASKPASS/PASSWORD同设）保持与 POSIX一致。
+
+### POSIX客户端（`skill/assets/client/unix/agentq`）与安装器
+
+- **wait预算耗尽时清理失败会改写124。** `run_wait_ssh_with_timeout`在超时分支里先清理再 `return 124`，清理返回1/2时直接 `return $?`，调用方的 `-eq 124`不再成立，文档化的 exit 6变成普通失败。修法：清理失败只打印诊断，始终 `return 124`。
+- **两处「声称不泄漏」的清理实际泄漏。** Windows探针脚本临时文件在 identity记录失败时调用 `windows_argument_remove_file`（空 identity必拒）后又把变量清空；ssh stderr捕获同理。修法：这两处按路径 `rm`（路径刚由 `mktemp`在本进程私有临时目录里创建），并订正注释。
+- **非 POSIX的 `local`。** `ascii_whitespace_only`/`workdir_is_blank`使用 `local`（SC3043）；在没有 `local`的 `/bin/sh`（Solaris Bourne、posh、ksh88）上每次调用都会产生 command-not-found诊断，变量还会泄漏成全局。改为函数唯一前缀的全局变量（两处各一个名字），行为不变。
+- **安装器的 `maintenance_lock_empty_grace_seconds`无校验。**非数字值让 `test`打印 `Illegal number`并恒假，陈旧空维护锁永远不被回收，报出的却是「younger than the grace period」。启动时按其它数值环境变量的同一判据校验（仅数字），非数字退2并点名变量。
+
+### 检查自身（smoke/、CI）
+
+- **`smoke/31`的规则 D校准测的是手抄副本。**检查里声称「SAME functions, extracted by sed」，实际校准用了一个复制的 `newest_has_verification`。实测：只把真实判据放宽成 `^[[:space:]]*\|`，校准仍 `ok`、摘要仍 `newest-verified=yes`。修法：抽成 `newest_entry_block` + `newest_has_verification`两个函数，规则与校准都调用它们；红证：把同一判据放宽后运行，校准报 `an empty verification line (" |") passed`并 exit 1。
+- **CI可能静默丢掉 tag/索引门禁（P2）。** `smoke/31`在看不到 tag的检出里打印 `NOT-covered(no-tags-in-checkout)`并退0；`run-tests.sh`归入 NCOV，CI的 PASS正则与 known-set都放行，唯一防线是 `fetch-depth: 0`，没有任何断言验证它真的生效。修法：linux job的断言步增加 `grep -qE '^changelog-and-tags: index=[0-9]+ tags=[1-9][0-9]* ' smoke.log`（成功摘要本来就打印 `index=/tags=`）。
+- **`smoke/03`的三处清理/断言缺口。**①记录在每个 id的 server remove **之前**被删除，服务端 remove于是因缺 record答2，Pueue任务存活，且 re-remove循环的 `record_still_active`立刻 break；改为先让服务端尝试、记录最后删。② EXIT trap对 pueue直连的 blocker只能答2（无 request record），新增自包含的 raw `pueue kill/remove`尽力清理（引用 `${blocker_ids:-}`，早退时为空）。③失败任务的 wait断言只排除 exit 0与 `Done.result == "Success"`，2/5/6也能过；改为必须 `-ne 1`即失败。
+- **`smoke/05`的 uuidgen诊断措辞。**它 grep `'request id'`期望命中的是「被误报成 malformed --request-id」，而客户端的本地校验消息是 `--request-id must be …`（无空格），这个分支永远不会触发；同时正确的 `cannot create a durable AgentQ request id`反而会被误报。改为 grep `-- '--request-id must'`。
+- **`smoke/12`的变异锚点随实现改名。**去掉 `local`后，blank-guard变异锚定 `$stripped`会找不到（自杀式自检）；同步改为 `$agentq_ascii_whitespace_stripped`。cfgpath的「Windows诊断必须点名 config path」用例只 `cases++`，不受 floor保护（整段删掉仍绿）；新增 `twin_cfgpath_diag_rows`计数与 `-ne 1`断言。
+- **`smoke/27`的 text-mode-jq夹具没有阳性对照。** shim若退化成 LF，服务端不会安装 jq换行 shim，s10/s11不经过被测路径也全绿。新增：用合法 JSON喂 shim，`od -An -c`必须看到行内 `\r`（`grep -qF '\r'`），否则失败并点名夹具。
+- **边界（未改）**：`smoke/12`的变异体仍只比较「两侧退出码不同」，没有「变异体确实执行过」的守卫（0.1.39用 `.ps1`改名修掉了实测到的那次，但形态仍在）；`smoke/01`的 `plutil`不在工具清单里（macOS自带，缺失时 `plist=N`不触发断言）。
+
+### 记为边界（未验证/未修，不声称覆盖）
+
+- **安装器 `install-agentq.sh`的维护锁/操作锁恢复仍是「再确认后按路径删除」**（server侧已改为 rename捕获）。修安装器的恢复路径需要同一组捕获/回滚语义，且只能在一次真实升级里验证；本轮不动，记录为已知窗口。
+- **安装器的进程身份探针假设 procps/BSD `ps`**（`ps -o lstart=`、`ps -o command=`）；BusyBox `ps`两者都不支持，依赖门禁只要求 `ps`存在。本机无法验证 BusyBox宿主，记为未覆盖。
+- `smoke/03`的 raw清理是**尽力而为**：kill后最多5s等 remove；失败不改变检查结论（下一次运行仍会清理），且不覆盖「runtime被 SIGKILL」的形态。
+- 锁捕获崩溃残留：`<lock>.stale-capture.<pid>`可能与锁目录并存；server的运行时目录清理表不认该名字（维护锁 sibling也不在清理范围）。正常路径会删掉，只有捕获途中崩溃才留下一个条目，记录为已知残留。
+
+##第十轮终审（2026-11-22，审94af63e / v0.1.39）
+
+范围：源码 + Linux/macOS/Windows安装/使用 +检查自身；6个只读 agent + Orca Codex。
+
+修复（每条均有红证或修复前/后实测）：
+-服务端 UTF-8校验器：`jq -Rsj`输出的是字符串原样字节（不转义换行），文本模式 jq会把值内 LF变成 CRLF，合法多行 label/argv在原生 Windows上被判非法（实测 `610a62` vs `610d0a62`，submit退2）。改为 hex token比较 + CRLF折叠的二次接受；smoke/27 s11b。
+- sshp双端解析器：unsafe（reparse）候选从 `throw`改为 `continue`（与 install-client.ps1同一契约），否则探针在输出任何 `__SSHP_*`前异常退出、客户端误报部署故障；smoke/19用真实函数（AST加载）执行。
+- sshp孪生路由：unix探针上的 `:Windows`标记必须再跑 Windows探针；修前 rc0、修后 rc127（实测，跟随探针报 UNAVAILABLE）；smoke/19新用例。
+- Windows安装器 group查询改走 `Invoke-AgentQInstallerPueueStatus -CommandArguments "group --json"`（UTF-8 ProcessStartInfo），GBK主机上非 ASCII组名不再破坏 JSON。
+-维护锁元数据残留（安装器与服务端两侧）：`mkdir`与 `mv pid`之间被杀会留下 `.agentq-lock-metadata.*`；空锁回收判据放宽为同一前缀的正规文件（删除后再 `rmdir`），其他条目仍然拒绝。smoke/11 +2、smoke/27 m2b/m2c。
+-文档：Windows `-StageDirectory`必填与5个 stage资产、Pueue离线通道、升级前提（既有 daemon可达；Windows既有二进制必须匹配当前 pin，pin变更需人工换二进制）、`--check`的执行位语义、残留拒绝顺序；修正过期行数与用例数。
+
+新增覆盖：smoke/11 cases=51、smoke/19 cases=155、smoke/27 cases=164。
+
+边界（未验证，不声称）：
+-本轮未触碰任何真实 Windows主机（用户未在会话中点名）：WinGet链接/别名是否 reparse、GBK主机实装、本地化 ACL名、.NET4.5.2下 `ToUnixTimeSeconds`、环境块32767溢出、`AGENTQ_PLATFORM_CACHE_DIR`的 cygpath转换，均只有代码级判断。
+- Windows安装器在 pueue pin变更时的升级/回滚仍会被预检拒绝；这是刻意的防篡改行为，已写入 `skill/references/install.md`。

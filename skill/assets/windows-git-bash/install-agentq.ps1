@@ -32,7 +32,7 @@ $expectedClientHash = "28b0756d54ec16ce13d78b251d086aa62e0057089cb27f793cd649f97
 $expectedDaemonHash = "aafa05e2f26cda9aff3eeb9be261e8f9f67752d1e9bb7fbcb47318e35c52ab1d"
 $releaseVersion = "4.0.4"
 $releaseBaseUrl = "https://github.com/Nukesor/pueue/releases/download/v$releaseVersion"
-$agentqVersion = "0.1.39"
+$agentqVersion = "0.1.40"
 $clientAssetName = "pueue-x86_64-pc-windows-msvc.exe"
 $daemonAssetName = "pueued-x86_64-pc-windows-msvc.exe"
 $gitBashPath = $null
@@ -1169,8 +1169,12 @@ function Get-PueueGroupsFromTemporaryFile {
         $previousErrorActionPreference = $ErrorActionPreference
         try {
             $ErrorActionPreference = "Continue"
-            & $ClientPath --config $ConfigPath group --json 1> $temporaryPath 2> $null
-            $exitCode = Get-NativeExitCode
+            # Same capture as `status --json`: `1>` would decode the child as
+            # the console code page (GBK on a zh-CN host), corrupting any
+            # non-ASCII pueue group name and failing JSON parsing (the status
+            # path already went through the UTF-8 reader; this one still used
+            # the redirect; found in the 2026-11-22 review).
+            $exitCode = Invoke-AgentQInstallerPueueStatus -ClientPath $ClientPath -ConfigPath $ConfigPath -DestinationPath $temporaryPath -CommandArguments "group --json"
         } finally {
             $ErrorActionPreference = $previousErrorActionPreference
         }
@@ -1286,7 +1290,8 @@ function Invoke-AgentQInstallerPueueStatus {
     param(
         [string]$ClientPath,
         [string]$ConfigPath,
-        [string]$DestinationPath
+        [string]$DestinationPath,
+        [string]$CommandArguments = "status --json"
     )
 
     # Capture `pueue status --json` WITHOUT going through PowerShell's
@@ -1305,7 +1310,7 @@ function Invoke-AgentQInstallerPueueStatus {
     # cannot deadlock against our stdout read.
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $ClientPath
-    $startInfo.Arguments = "--config `"$ConfigPath`" status --json"
+    $startInfo.Arguments = "--config `"$ConfigPath`" $CommandArguments"
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
     $startInfo.RedirectStandardOutput = $true

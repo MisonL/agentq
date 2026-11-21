@@ -843,6 +843,29 @@ run_case m2 status --task 9999
 assert_rc m2 2
 assert_err_has m2 'unknown AgentQ task id: 9999'
 assert_lock_state m2 absent
+# M2b. The installer's own writer residue: a backdated lock holding ONLY a
+# `.agentq-lock-metadata.*` regular file (no pid) is the crash window
+# between mkdir and `mv pid`.  It must be recovered, not answered as
+# deployment_state forever (found in the 2026-11-22 review).
+reset_maintenance_lock
+mkdir -- "$maintenance_lock"
+: > "$maintenance_lock/.agentq-lock-metadata.M2B000"
+backdate "$maintenance_lock" 90
+run_case m2b status --task 9999
+assert_rc m2b 2
+assert_err_has m2b 'unknown AgentQ task id: 9999'
+assert_lock_state m2b absent
+# M2c. The relaxation names ONE prefix: any other entry keeps the lock
+# unowned -- age alone never removes something this tool did not write.
+reset_maintenance_lock
+mkdir -- "$maintenance_lock"
+: > "$maintenance_lock/extra"
+backdate "$maintenance_lock" 90
+run_case m2c status --task 9999
+assert_rc m2c 2
+assert_err_has m2c 'cannot determine maintenance lock owner; inspect lock manually'
+assert_reason_is m2c deployment_state
+assert_lock_state m2c present
 # M3. A corrupt pid file NEVER authorises an age-based removal, however old.
 reset_maintenance_lock
 mkdir -- "$maintenance_lock"
@@ -1020,18 +1043,37 @@ windows_jq_directory="$work/bin-windows-jq"
 mkdir -p "$windows_jq_directory"
 real_jq=$(command -v jq)
 [ -n "$real_jq" ] || { printf '%s\n' 'write-paths: jq is required for the CRLF case' >&2; exit 1; }
+command -v perl >/dev/null 2>&1 || { printf '%s\n' 'write-paths: perl is required for the NUL-safe text-mode jq stub' >&2; exit 1; }
 cat > "$windows_jq_directory/jq" <<SH
 #!/bin/sh
-# Text-mode jq: omits the final line's CR, which is the shape that reaches the
-# server through \$( ) (smoke/26's W7 records the measurement).
+# Text-mode jq: every LF jq writes reaches the pipe as CRLF (the CRT text-mode
+# translation, not just the shape a \$( ) consumer sees afterwards).
+# perl, not sed: BSD sed aborts ("Assertion failed: (advance > 0)") on a stream
+# that contains BOTH NUL and LF, and the argv validator NUL-joins its input,
+# so a sed-based stub crashes on exactly the newline-in-argv case s11b must
+# exercise (measured 2026-11-22 on macOS).  perl slurps binary and passes NUL.
 output_file=\$(mktemp)
 "$real_jq" "\$@" > "\$output_file"
 status=\$?
-sed '\$!s/\$/\r/' "\$output_file"
+perl -0777 -pe 's/\n/\r\n/g' "\$output_file"
 rm -f "\$output_file"
 exit "\$status"
 SH
 chmod 700 "$windows_jq_directory/jq"
+
+# Positive control: without an inline CR the shim is just jq and the two
+# cases below would pass without exercising the shim at all.
+if ! printf '{"a":1}\n{"b":2}\n' | "$windows_jq_directory/jq" . | od -An -c | grep -F '\r' >/dev/null; then
+    printf '%s\n' 'write-paths: the text-mode jq shim produced no inline CR; the CRLF case would pass without exercising it' >&2
+    exit 1
+fi
+
+# Second control: the shim must pass NUL bytes through AND translate a newline
+# that shares the stream with them; the s11b argv carries both.
+if ! printf 'a\000b\nc\000' | "$windows_jq_directory/jq" -Rsj . | od -An -v -tx1 | grep -F '0d' >/dev/null; then
+    printf '%s\n' 'write-paths: the text-mode jq shim lost the NUL+LF shape; s11b would not exercise it' >&2
+    exit 1
+fi
 
 run_case_with_windows_jq() {
     local label=$1
@@ -1059,6 +1101,20 @@ assert_rc s11 0
 assert_json s11 'type == "array" and length == 1 and .[0].removed == true and .[0].task_id == 4242'
 clear_runtime
 rm -f "$work/.added"
+# S11b. A label and an argv element that contain a NEWLINE are valid UTF-8 and
+# must pass the same text-mode jq. `-Rsj .` prints the slurped string
+# RAW, so a text-mode jq turns the value's internal LFs into CRLFs; the
+# raw byte comparison then rejected them (measured 2026-11-22, red:
+# submit exited 2 `--label must be valid UTF-8`). Both validators accept
+# the CRLF-folded form and still refuse a genuine rewrite.
+clear_runtime
+rm -f "$work/.added"
+write_stateful_stub 4242
+s11b_label=$(printf 'line-one\nline-two')
+s11b_argv=$(printf 'arg-one\narg-two')
+run_case_with_windows_jq s11b submit --workdir "$work" --label "$s11b_label" --request-id "$submit_id" -- printf '%s' "$s11b_argv"
+assert_rc s11b 0
+assert_json s11b '.task_id == 4242 and .reused == false'
 
 # ---------------------------------------- fail-open and convergence cases (r8)
 # S12. `pwd -P` failing must reject the workdir.  The unix branch's command

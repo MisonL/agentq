@@ -1544,6 +1544,7 @@ twin_cfgpath_case() {
         failures=$((failures + 1))
     fi
 }
+twin_cfgpath_diag_rows=0
 case "$twin_platform_state" in
 checked)
     twin_cfgpath_case regular           255 "$twin_cfgpath_dir/real/config"
@@ -1554,6 +1555,7 @@ checked)
     twin_cfgpath_run "$twin_cfgpath_dir/linkdir/config"
     { flatten_err "$work/twin-w.err"; cat "$work/twin-w.out"; } > "$work/twin-w.combined"
     cases=$((cases + 1))
+    twin_cfgpath_diag_rows=$((twin_cfgpath_diag_rows + 1))
     if ! grep -qi 'config path' "$work/twin-w.combined"; then
         printf 'ps-client twin config-path [diagnostic]: refusing a config path must say so; the Windows message named something else\n' >&2
         head -2 "$work/twin-w.combined" >&2 || true
@@ -1579,6 +1581,11 @@ esac
 if [ "$twin_cfgpath_rows" -lt 3 ]; then
     printf 'ps-client twin config-path: only %s case(s) ran (expected at least 3); the enumeration broke\n' \
         "$twin_cfgpath_rows" >&2
+    failures=$((failures + 1))
+fi
+
+if [ "$twin_cfgpath_diag_rows" -ne 1 ]; then
+    printf '%s\n' 'ps-client twin config-path: the Windows diagnostic row did not run; the config-name assertion is unprotected' >&2
     failures=$((failures + 1))
 fi
 # --- which STREAM a diagnostic belongs on -----------------------------------
@@ -1895,7 +1902,7 @@ fi
 # touched; a mutation aimed at the OLD `case` arm now finds nothing, which is
 # why the "not found" branch stays fatal instead of passing on nothing.
 twin_host_mutant_blank="$work/twin-posix-noblank"
-sed 's/^    \[ -z "\$stripped" \]$/    return 1  # mutant: never blank/' \
+sed 's/^    \[ -z "\$agentq_ascii_whitespace_stripped" \]$/    return 1  # mutant: never blank/' \
     "$twin_posix" > "$twin_host_mutant_blank"
 if cmp -s "$twin_posix" "$twin_host_mutant_blank"; then
     printf '%s\n' 'ps-client twin self-test: the POSIX blank-host guard was not found; the host rows cannot be proven able to fail' >&2

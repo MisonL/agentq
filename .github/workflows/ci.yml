@@ -160,6 +160,13 @@ jobs:
           # ship with, since bash -n and zsh -n both accept bashisms dash
           # rejects (measured 2026-10-24).  ubuntu-latest always has dash.
           grep -qE 'shellcheck=checked\([1-9][0-9]*\) scriptcheck=checked\([1-9][0-9]*\) directives=checked\([1-9][0-9]*\) posix=checked\([1-9][0-9]*\)' smoke.log
+          # smoke/31's tag/index rules are the only machine enforcement of the
+          # CHANGELOG version-index contract. When the checkout cannot list tags
+          # it prints NOT-covered(no-tags-in-checkout) and exits 0 (the named-
+          # check gate above accepts a known name), so a regression of the
+          # fetch-depth below would silently stop the rules. The success summary
+          # lists the tag count; require that the enumeration was non-empty.
+          grep -qE '^changelog-and-tags: index=[0-9]+ tags=[1-9][0-9]* ' smoke.log
           # NOT-covered is platform-expected, so it is neither skipped nor
           # partial and must not disturb the line above.  But the word has to
           # be pinned somewhere: every check allowed to admit it must be in the

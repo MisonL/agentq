@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.39'
+agentq_client_version='0.1.40'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072), and the unix bound keeps a
 # safety margin under it.
@@ -192,9 +192,8 @@ agentq_number_of_password_prompts=1
 # Anything outside the ASCII set is a VALUE on both twins, exactly as
 # `workdir_is_blank` decided for `--workdir` in 0.1.27.
 ascii_whitespace_only() {
-    local stripped
-    stripped=$(printf '%s' "$1" | LC_ALL=C tr -d ' \t\n\r\f\v')
-    [ -z "$stripped" ]
+    agentq_ascii_whitespace_stripped=$(printf '%s' "$1" | LC_ALL=C tr -d ' \t\n\r\f\v')
+    [ -z "$agentq_ascii_whitespace_stripped" ]
 }
 
 
@@ -1397,21 +1396,20 @@ run_wait_ssh_with_timeout() {
     agentq_operation_ssh_pid=''
 
     if [ "$wait_ssh_timed_out" -eq 1 ]; then
-        if operation_output_remove_file "$agentq_operation_output_file"; then
-            :
-        else
-            return $?
+        # The BUDGET verdict is the answer this call owes its caller: exit 6
+        # comes from 124 below. A cleanup failure here is reported but must
+        # not replace 124 with 1/2, or the documented 6 would be lost.
+        if ! operation_output_remove_file "$agentq_operation_output_file"; then
+            printf '%s: failed to remove the AgentQ wait output temporary after the wait budget elapsed\n' "$program" >&2
         fi
-        if agentq_ssh_log_remove_file "$agentq_operation_log_file"; then
-            :
-        else
-            return $?
+        if ! agentq_ssh_log_remove_file "$agentq_operation_log_file"; then
+            printf '%s: failed to remove the AgentQ wait SSH log temporary after the wait budget elapsed\n' "$program" >&2
         fi
         if windows_argument_remove_file "$wait_ssh_stderr_capture" "$wait_ssh_stderr_capture_identity"; then
             wait_ssh_stderr_capture=''
             wait_ssh_stderr_capture_identity=''
         else
-            return $?
+            printf '%s: failed to remove the AgentQ wait stderr capture after the wait budget elapsed\n' "$program" >&2
         fi
         return 124
     fi
@@ -2260,7 +2258,6 @@ is_request_id() {
 # The twin uses the same ASCII-only set.  Anything else is a VALUE: the server
 # then rejects a non-absolute path, which is the right answer for `\u00a0`.
 workdir_is_blank() {
-    local remaining
     # Strip every ASCII whitespace character (space, TAB, LF, CR, FF, VT) and
     # ask whether anything is left.  `tr` does the stripping with an explicit
     # BYTE list, so the set cannot drift with the locale, and no `case`
@@ -2269,8 +2266,8 @@ workdir_is_blank() {
     # answers under `LC_ALL=C` (NBSP/U+3000 are values) and a UTF-8 locale
     # (they are blank), and U+0085 was never blank -- while the Windows twin's
     # .NET `\s` accepted all three.  Both twins now use this ASCII set.
-    remaining=$(printf '%s' "$1" | LC_ALL=C tr -d ' \t\n\r\f\v')
-    [ -z "$remaining" ]
+    agentq_workdir_blank_remaining=$(printf '%s' "$1" | LC_ALL=C tr -d ' \t\n\r\f\v')
+    [ -z "$agentq_workdir_blank_remaining" ]
 }
 
 generate_request_id() {
@@ -3199,7 +3196,13 @@ make_windows_probe_script_file() {
     platform_probe_stdin_file=$(mktemp "$agentq_temp_directory/agentq-probe-script.XXXXXX") || return 1
     platform_probe_stdin_identity=$(windows_argument_file_identity "$platform_probe_stdin_file") || {
         printf '%s: cannot record Windows probe script temporary identity\n' "$program" >&2
-        windows_argument_remove_file "$platform_probe_stdin_file" ''
+        # The identity gate cannot help here (there is nothing to compare):
+        # remove the file this function just created by path, or it leaks
+        # untracked. The parent is the client's private temporary directory,
+        # and the path just came from mktemp in it.
+        if agentq_client_temp_path_is_safe "$platform_probe_stdin_file"; then
+            rm -f -- "$platform_probe_stdin_file" || true
+        fi
         platform_probe_stdin_file=''
         return 1
     }
@@ -3844,15 +3847,21 @@ run_ssh_logged() {
     ssh_stderr_redirection='/dev/null'
     if ssh_stderr_capture=$(umask 077; make_client_temporary_file "${agentq_temp_directory:-$ssh_log_file}" 'agentq-ssh-stderr'); then
         ssh_stderr_redirection=$ssh_stderr_capture
-        # Record the identity immediately.  windows_argument_remove_file refuses
+        # Record the identity immediately. windows_argument_remove_file refuses
         # to delete a temporary whose identity was never recorded, so skipping
         # this would make the file unremovable by cleanup_client_runtime -- the
-        # opposite of what registering it there is for.  A capture we cannot
-        # attribute is dropped rather than tracked, which keeps the old
-        # /dev/null behaviour instead of leaking an unattributable file.
+        # opposite of what registering it there is for. A capture we cannot
+        # attribute is removed by path below and not tracked; the redirection
+        # still falls back to /dev/null while the rest of this call runs.
         if ! ssh_stderr_capture_identity=$(windows_argument_file_identity "$ssh_stderr_capture"); then
             ssh_stderr_capture_identity=''
             ssh_stderr_redirection='/dev/null'
+            # The identity gate cannot attribute this file, so the tracked
+            # removal path refuses it; remove what this call created or it
+            # leaks for the life of the temporary directory.
+            if agentq_client_temp_path_is_safe "$ssh_stderr_capture"; then
+                rm -f -- "$ssh_stderr_capture" || true
+            fi
             ssh_stderr_capture=''
         fi
     fi

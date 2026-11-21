@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.39'
+agentq_version='0.1.40'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -702,11 +702,59 @@ is_request_id() {
 # removed two tasks whose labels differed only in the invalid byte.  Round-trip
 # through jq with both sides hex-compared is the same predicate jq applies, so
 # this refuses exactly the values jq would rewrite.
+# 
+# `-Rsj .` prints the slurped string RAW (no quotes, no escaping, no trailing
+# newline), so a text-mode (native Windows) jq translates every LF INSIDE the
+# value to CRLF -- measured 2026-11-22: `printf 'a\nb' | jq -Rsj .` was
+# `61 0a 62` on an LF jq and `61 0d 0a 62` through a text-mode stub, and the
+# raw byte comparison then answered exit 2 `--label must be valid UTF-8` for a
+# legal multi-line value on a native Windows server only (smoke/27's s11b is
+# the lock).  The comment here previously claimed `-Rsj .` escapes newlines
+# inside the value; it does not, and that claim is what hid this.  The fix
+# keeps the exact comparison as the primary test and additionally accepts the
+# output with each CR of a CRLF pair removed -- the only byte a text-mode jq
+# adds -- so a genuine rewrite (invalid UTF-8 -> U+FFFD) still differs and is
+# still refused.
+# `command jq`, not `jq`: install_jq_line_ending_shim appends a newline to ANY
+# non-empty output so multi-line `while read` consumers keep their last line;
+# this predicate compares bytes, so the shim made every non-empty argument read
+# as invalid (measured 2026-11-21, red).  smoke/27's s10/s11 cases are the lock.
+hex_token_stream() {
+    awk '{
+        for (i = 1; i <= NF; i++) {
+            if (count++) printf "%s", " "
+            printf "%s", $i
+        }
+    }
+    END {
+        if (count) printf "\n"
+    }'
+}
+
+# Removes each CR of a CRLF pair from a hex token stream.  These are the only
+# bytes a text-mode jq adds to `-Rsj .` output, and the fold is applied only as
+# a SECOND acceptance test, never in place of the exact one, so an LF jq
+# (where the round trip is already exact) is unaffected and a value that
+# really contains CR LF still compares equal through the fold.
+crlf_folded_hex_token_stream() {
+    awk '{
+        for (i = 1; i <= NF; i++) token[count++] = $i
+    }
+    END {
+        for (i = 0; i < count; i++) {
+            if (token[i] == "0d" && i + 1 < count && token[i + 1] == "0a") continue
+            if (printed++) printf "%s", " "
+            printf "%s", token[i]
+        }
+        if (printed) printf "\n"
+    }'
+}
+
 is_valid_text_argument() {
     local candidate=$1
-    local original_bytes round_trip_bytes
+    local original_bytes round_trip_bytes folded_round_trip_bytes
 
-    original_bytes=$(printf '%s' "$candidate" | LC_ALL=C od -An -v -tx1) || return 1
+    original_bytes=$(printf '%s' "$candidate" | LC_ALL=C od -An -v -tx1 | hex_token_stream) || return 1
     # `command jq`, not `jq`: on a text-mode (native Windows) host
     # install_jq_line_ending_shim appends a newline to ANY non-empty output so
     # multi-line `while read` consumers keep their last line.  This predicate
@@ -714,11 +762,13 @@ is_valid_text_argument() {
     # invalid -- measured 2026-11-21 (red): with the shim installed, `submit`
     # answered exit 2 `--label must be valid UTF-8` for every label and
     # `remove --label` the same, i.e. both write paths were dead on a native
-    # Windows jq.  `-Rsj .` writes no newline itself and jq escapes any newline
-    # inside the value, so the raw bytes are identical on a text-mode and an
-    # LF jq.  smoke/27's s10/s11 cases are the lock.
-    round_trip_bytes=$(printf '%s' "$candidate" | command jq -Rsj . 2>/dev/null | LC_ALL=C od -An -v -tx1) || return 1
-    [ "$original_bytes" = "$round_trip_bytes" ]
+    # Windows jq.  `-Rsj .` writes no newline of its own.
+    round_trip_bytes=$(printf '%s' "$candidate" | command jq -Rsj . 2>/dev/null | LC_ALL=C od -An -v -tx1 | hex_token_stream) || return 1
+    if [ "$original_bytes" = "$round_trip_bytes" ]; then
+        return 0
+    fi
+    folded_round_trip_bytes=$(printf '%s\n' "$round_trip_bytes" | crlf_folded_hex_token_stream) || return 1
+    [ "$original_bytes" = "$folded_round_trip_bytes" ]
 }
 
 # The same check for a whole argv: NUL-joined so the element boundaries are part
@@ -728,14 +778,18 @@ is_valid_text_argument() {
 # the caller's side (measured 2026-11-20: lookup answers 4 forever).  Refusing
 # here keeps the request id reusable, which is what exit 2 promises.
 is_valid_argv() {
-    local original_bytes round_trip_bytes
+    local original_bytes round_trip_bytes folded_round_trip_bytes
 
     [ "$#" -gt 0 ] || return 0
-    original_bytes=$(printf '%s\0' "$@" | LC_ALL=C od -An -v -tx1) || return 1
-    # Same `command jq` rule as is_valid_text_argument above (and the same red
-    # proof: every `submit` was refused on a text-mode jq).
-    round_trip_bytes=$(printf '%s\0' "$@" | command jq -Rsj . 2>/dev/null | LC_ALL=C od -An -v -tx1) || return 1
-    [ "$original_bytes" = "$round_trip_bytes" ]
+    original_bytes=$(printf '%s\0' "$@" | LC_ALL=C od -An -v -tx1 | hex_token_stream) || return 1
+    # Same `command jq` rule and the same CRLF fold as is_valid_text_argument
+    # above (both red proofs are recorded there and in smoke/27 s10/s11b).
+    round_trip_bytes=$(printf '%s\0' "$@" | command jq -Rsj . 2>/dev/null | LC_ALL=C od -An -v -tx1 | hex_token_stream) || return 1
+    if [ "$original_bytes" = "$round_trip_bytes" ]; then
+        return 0
+    fi
+    folded_round_trip_bytes=$(printf '%s\n' "$round_trip_bytes" | crlf_folded_hex_token_stream) || return 1
+    [ "$original_bytes" = "$folded_round_trip_bytes" ]
 }
 
 # The PRE-0.1.26 id rule: same charset and length, but WITHOUT the
@@ -1707,7 +1761,6 @@ maintenance_lock_state_unsafe() {
 
 maintenance_lock_owner() {
     local metadata_status=0
-    local child=''
     local lock_mtime=''
     local current_epoch=''
 
@@ -1773,11 +1826,14 @@ maintenance_lock_owner() {
             metadata_status=$?
         fi
         [ "$metadata_status" -eq 1 ] || return 0
-        [ ! -e "$maintenance_lock_directory/pid" ] && [ ! -L "$maintenance_lock_directory/pid" ] || return 0
-        # `find` failing must not read as "empty": `|| child=?` turns any
-        # failure into a non-empty answer, which keeps the lock unowned.
-        child=$(find "$maintenance_lock_directory" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null) || child=?
-        [ -z "$child" ] || return 0
+        # A metadata temporary is the installer's OWN writer residue: its
+        # write_lock_metadata runs mktemp INSIDE the lock directory and then
+        # mv to `pid`.  A crash between mkdir and that mv leaves exactly that
+        # shape, so it is this lock's traffic, not a foreign entry -- the same
+        # predicate the operation and request locks already use (measured
+        # 2026-11-22: without it the stricter test answered deployment_state
+        # and the lock could never self-heal).
+        lock_directory_has_only_metadata_temporaries "$maintenance_lock_directory" || return 0
         lock_mtime=$(stat_mtime "$maintenance_lock_directory") || return 0
         current_epoch=$(date +%s) || return 0
         case "$lock_mtime$current_epoch" in
@@ -1814,6 +1870,8 @@ maintenance_lock_unowned() {
 recover_stale_maintenance_lock() {
     local lock_pid=''
     local lock_identity=''
+    local maintenance_capture
+    local maintenance_residue='' maintenance_residues=''
 
     case "$maintenance_lock_verdict" in
         dead)
@@ -1826,8 +1884,24 @@ recover_stale_maintenance_lock() {
             process_is_confirmed_dead "$lock_pid" "$lock_identity" || return 0
             case "$platform_kind" in
                 unix)
-                    remove_runtime_temporary_file "$maintenance_lock_directory/pid" \
-                        'stale maintenance lock metadata' ||
+                    # Capture the metadata with an ATOMIC rename before deleting it.
+                    # A separate verify-then-rm lets a concurrent recovery remove
+                    # this lock and a competing installer create its own: the rm
+                    # would then delete the LIVE installer's pid. The rename either
+                    # takes the instance just verified or fails; the captured file
+                    # is re-checked and restored when it is not that instance.
+                    maintenance_capture="$maintenance_lock_directory.stale-capture.$$"
+                    if ! mv -- "$maintenance_lock_directory/pid" "$maintenance_capture" 2>/dev/null; then
+                        return 0
+                    fi
+                    if ! read_lock_metadata "$maintenance_capture" ||
+                        [ "$lock_pid" != "$maintenance_lock_observed_pid" ] ||
+                        [ "$lock_identity" != "$maintenance_lock_observed_identity" ]; then
+                        mv -n -- "$maintenance_capture" "$maintenance_lock_directory/pid" 2>/dev/null || true
+                        return 0
+                    fi
+                    remove_runtime_temporary_file "$maintenance_capture" \
+                        'captured stale maintenance lock metadata' ||
                         fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory" deployment_state
                     # Non-recursive: a file that appeared after the re-read
                     # keeps the lock.  Another reader removing it first is
@@ -1842,9 +1916,17 @@ recover_stale_maintenance_lock() {
                     fi
                     ;;
                 windows)
-                    remove_runtime_temporary_file "$maintenance_lock_directory" 'stale maintenance lock' ||
-                        fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory" deployment_state
-                    [ ! -e "$maintenance_lock_directory" ] && [ ! -L "$maintenance_lock_directory" ] ||
+                    maintenance_capture="$maintenance_lock_directory.stale-capture.$$"
+                    if ! mv -- "$maintenance_lock_directory" "$maintenance_capture" 2>/dev/null; then
+                        return 0
+                    fi
+                    if ! read_lock_metadata "$maintenance_capture" ||
+                        [ "$lock_pid" != "$maintenance_lock_observed_pid" ] ||
+                        [ "$lock_identity" != "$maintenance_lock_observed_identity" ]; then
+                        mv -n -- "$maintenance_capture" "$maintenance_lock_directory" 2>/dev/null || true
+                        return 0
+                    fi
+                    remove_runtime_temporary_file "$maintenance_capture" 'stale maintenance lock' ||
                         fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory" deployment_state
                     ;;
             esac
@@ -1856,15 +1938,32 @@ recover_stale_maintenance_lock() {
             # The directory must still be the SAME one and still empty.
             [ "$(stat_device_inode "$maintenance_lock_directory" 2>/dev/null)" = \
                 "$maintenance_lock_observed_identity" ] || return 0
-            [ ! -e "$maintenance_lock_directory/pid" ] && [ ! -L "$maintenance_lock_directory/pid" ] || return 0
-            [ -z "$(find "$maintenance_lock_directory" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] || return 0
-            rmdir -- "$maintenance_lock_directory" 2>/dev/null
-            if [ -e "$maintenance_lock_directory" ] || [ -L "$maintenance_lock_directory" ]; then
-                if [ -e "$maintenance_lock_directory/pid" ] ||
-                    [ -n "$(find "$maintenance_lock_directory" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
-                    maintenance_lock_unowned
-                fi
-                maintenance_lock_unowned
+ lock_directory_has_only_metadata_temporaries "$maintenance_lock_directory" || return 0
+            # Capture the empty directory first: after the rename it can no
+            # longer be a starting installer's lock, and a directory created
+            # at the original path afterwards belongs to a NEW installer.
+            maintenance_capture="$maintenance_lock_directory.stale-capture.$$"
+            if ! mv -- "$maintenance_lock_directory" "$maintenance_capture" 2>/dev/null; then
+                return 0
+            fi
+            if ! lock_directory_has_only_metadata_temporaries "$maintenance_capture"; then
+                mv -n -- "$maintenance_capture" "$maintenance_lock_directory" 2>/dev/null || true
+                return 0
+            fi
+            # Delete ONLY the writer temporaries; an unexpected entry keeps the
+            # directory non-empty and the rmdir below reports it.
+            maintenance_residues=$(find "$maintenance_capture" -mindepth 1 -maxdepth 1 -type f -name '.agentq-lock-metadata.*' -print 2>/dev/null) || maintenance_residues=''
+            if [ -n "$maintenance_residues" ]; then
+                while IFS= read -r maintenance_residue; do
+                    [ -n "$maintenance_residue" ] || continue
+                    rm -f -- "$maintenance_residue" 2>/dev/null || true
+                done <<EOF
+$maintenance_residues
+EOF
+            fi
+            rmdir -- "$maintenance_capture" 2>/dev/null
+            if [ -e "$maintenance_capture" ] || [ -L "$maintenance_capture" ]; then
+                fail "cannot recover stale AgentQ maintenance lock: $maintenance_lock_directory" deployment_state
             fi
             ;;
         *)
@@ -2079,6 +2178,7 @@ acquire_operation_lock() {
     local lock_holder_age
     local operation_lock_holder
     local operation_lock_message
+    local recover_status
 
     case "$candidate" in
         */*)
@@ -2124,14 +2224,25 @@ acquire_operation_lock() {
         [ ! -L "$candidate" ] || fail "invalid AgentQ operation lock path: $candidate"
         if read_lock_metadata "$candidate/pid"; then
             if process_is_confirmed_dead "$lock_pid" "$lock_identity"; then
-                if ! remove_stale_lock "$candidate" operation "$lock_pid" "$lock_identity"; then
-                    fail "cannot recover stale AgentQ operation lock: $candidate"
+                if remove_stale_lock "$candidate" operation "$lock_pid" "$lock_identity"; then
+                    :
+                else
+                    recover_status=$?
+                    # 2 means another recovery changed the lock first (it was
+                    # captured or replaced). That is not this call's failure:
+                    # retry, exactly as the read path does.
+                    [ "$recover_status" -eq 2 ] ||
+                        fail "cannot recover stale AgentQ operation lock: $candidate"
                 fi
                 continue
             fi
         elif lock_directory_is_stale_unowned "$candidate"; then
-            if ! remove_stale_lock "$candidate" operation '' '' true; then
-                fail "cannot recover unowned AgentQ operation lock: $candidate"
+            if remove_stale_lock "$candidate" operation '' '' true; then
+                :
+            else
+                recover_status=$?
+                [ "$recover_status" -eq 2 ] ||
+                    fail "cannot recover unowned AgentQ operation lock: $candidate"
             fi
             continue
         fi
@@ -2228,6 +2339,7 @@ remove_stale_lock() {
     local require_empty=${5:-false}
     local pid_path
     local remove_status
+    local capture_path
 
     [ -n "$lock_path" ] || return 1
     if ! path_chain_is_safe "$lock_path"; then
@@ -2239,29 +2351,81 @@ remove_stale_lock() {
         return 2
     fi
     pid_path="$lock_path/pid"
+    # The capture name is unique per process, and renaming is ATOMIC: two
+    # concurrent recoveries cannot both proceed, and a lock created at the
+    # original path after the capture is never touched by this function
+    # again. Deleting by path after a separate verification has neither
+    # property -- reaper A can remove the stale directory and a new owner
+    # can create its own pid between reaper B's check and B's rm, so B
+    # deletes a LIVE owner's metadata.
+    capture_path="$lock_path.stale-capture.$$"
     if [ "$require_empty" = true ]; then
         # Re-verify under the lock: the verdict was reached OUTSIDE, and the
         # only thing that may be inside is the metadata writer's own temporary
-        # (see lock_directory_has_only_metadata_temporaries).  A `pid` that
+        # (see lock_directory_has_only_metadata_temporaries). A `pid` that
         # appeared meanwhile, or any foreign entry, means the lock is live or
         # not ours -- refuse and let the caller retry.
         if ! lock_directory_has_only_metadata_temporaries "$lock_path"; then
             printf '%s: AgentQ %s lock changed while recovering its unowned directory: %s\n' "$program" "$lock_kind" "$lock_path" >&2
             return 2
         fi
-        if ! find "$lock_path" -mindepth 1 -maxdepth 1 -type f -delete; then
-            printf '%s: failed to remove AgentQ %s stale lock metadata: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+        if ! mv -- "$lock_path" "$capture_path" 2>/dev/null; then
+            printf '%s: AgentQ %s lock changed while recovering its unowned directory: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+            return 2
+        fi
+        if ! lock_directory_has_only_metadata_temporaries "$capture_path"; then
+            # A writer put a pid or a foreign entry inside between the
+            # verification and the rename: put the directory back, delete nothing.
+            if mv -n -- "$capture_path" "$lock_path" 2>/dev/null &&
+                [ ! -e "$capture_path" ] && [ ! -L "$capture_path" ]; then
+                printf '%s: AgentQ %s lock changed while recovering its unowned directory: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+                return 2
+            fi
+            printf '%s: captured AgentQ %s lock directory no longer matches and could not be restored: %s\n' "$program" "$lock_kind" "$capture_path" >&2
             return 1
         fi
-    elif [ -n "$expected_pid" ]; then
+        if ! find "$capture_path" -mindepth 1 -maxdepth 1 -type f -delete; then
+            printf '%s: failed to remove AgentQ %s stale lock metadata: %s\n' "$program" "$lock_kind" "$capture_path" >&2
+            return 1
+        fi
+        if ! rmdir -- "$capture_path"; then
+            printf '%s: failed to remove captured AgentQ %s lock directory: %s\n' "$program" "$lock_kind" "$capture_path" >&2
+            return 1
+        fi
+        return 0
+    fi
+    if [ -n "$expected_pid" ]; then
         if ! read_lock_metadata "$pid_path" ||
             [ "$lock_pid" != "$expected_pid" ] ||
             [ "$lock_identity" != "$expected_identity" ]; then
             printf '%s: AgentQ %s stale lock identity changed during recovery: %s\n' "$program" "$lock_kind" "$lock_path" >&2
             return 2
         fi
-    fi
-    if [ -e "$pid_path" ] || [ -L "$pid_path" ]; then
+        if ! mv -- "$pid_path" "$capture_path" 2>/dev/null; then
+            printf '%s: AgentQ %s stale lock identity changed during recovery: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+            return 2
+        fi
+        if ! read_lock_metadata "$capture_path" ||
+            [ "$lock_pid" != "$expected_pid" ] ||
+            [ "$lock_identity" != "$expected_identity" ]; then
+            # The captured file is not the one inspected. That is only possible
+            # when another reaper removed the directory and a new owner wrote
+            # its own pid in the gap: restore it, never delete a live record.
+            if mv -n -- "$capture_path" "$pid_path" 2>/dev/null &&
+                [ ! -e "$capture_path" ] && [ ! -L "$capture_path" ]; then
+                printf '%s: AgentQ %s stale lock identity changed during recovery: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+                return 2
+            fi
+            printf '%s: captured AgentQ %s lock metadata no longer matches and could not be restored: %s\n' "$program" "$lock_kind" "$capture_path" >&2
+            return 1
+        fi
+        if remove_runtime_temporary_file "$capture_path" 'captured stale lock metadata'; then
+            :
+        else
+            remove_status=$?
+            return "$remove_status"
+        fi
+    elif [ -e "$pid_path" ] || [ -L "$pid_path" ]; then
         if remove_runtime_temporary_file "$pid_path" 'stale lock metadata'; then
             :
         else
@@ -2269,12 +2433,21 @@ remove_stale_lock() {
             return "$remove_status"
         fi
     fi
-    if ! rmdir -- "$lock_path"; then
+    # rmdir's exit status is authoritative: a directory that reappears
+    # after a successful removal belongs to a NEW owner and is not ours to
+    # report. A failed removal is 'changed' only when the path now carries
+    # a different owner's metadata; anything else is a real failure.
+    if ! rmdir -- "$lock_path" 2>/dev/null; then
+        if [ ! -e "$lock_path" ] && [ ! -L "$lock_path" ]; then
+            return 0
+        fi
+        if [ -n "$expected_pid" ] && read_lock_metadata "$pid_path" &&
+            { [ "$lock_pid" != "$expected_pid" ] ||
+                [ "$lock_identity" != "$expected_identity" ]; }; then
+            printf '%s: AgentQ %s lock was replaced during recovery: %s\n' "$program" "$lock_kind" "$lock_path" >&2
+            return 2
+        fi
         printf '%s: failed to remove AgentQ %s stale lock directory: %s\n' "$program" "$lock_kind" "$lock_path" >&2
-        return 1
-    fi
-    if [ -e "$lock_path" ] || [ -L "$lock_path" ]; then
-        printf '%s: AgentQ %s stale lock directory remained after cleanup: %s\n' "$program" "$lock_kind" "$lock_path" >&2
         return 1
     fi
     return 0
@@ -4967,6 +5140,13 @@ request_id_from_task() {
 
 validate_task_removal() {
     local task=$1
+    # An optional record the caller already read. Re-reading it here opens
+    # a window the lock-free reconciler can close: it archives a `removing`
+    # record as soon as the task disappears, so after `pueue remove`
+    # succeeded a second read answers "missing AgentQ request record"
+    # (exit 2) for a removal that in fact completed. mark_request_removed
+    # passes its own read; the pre-removal caller still lets this read.
+    local preloaded_record=${2:-}
     local request_id
     local record
     local task_id
@@ -4984,7 +5164,11 @@ validate_task_removal() {
     [ -n "$request_id" ] || return 0
     is_request_id "$request_id" || fail "invalid request id attached to task removal: $request_id"
 
-    record=$(read_request_record "$request_id") || fail "missing AgentQ request record while removing task: $request_id"
+    if [ -n "$preloaded_record" ]; then
+        record=$preloaded_record
+    else
+        record=$(read_request_record "$request_id") || fail "missing AgentQ request record while removing task: $request_id"
+    fi
     task_id=$(jq -r '.id' <<<"$task") ||
         fail "cannot read the AgentQ task id: $task_id"
     task_created_at=$(jq -r '.created_at' <<<"$task") ||
@@ -5053,6 +5237,9 @@ mark_request_removed() {
     local record_read_status
     local tombstone
     local tombstone_read_status
+    local removal_read_state
+    local removal_read_task_id
+    local removal_read_task_created_at
 
     if request_id=$(request_id_from_task "$task"); then
         :
@@ -5096,7 +5283,28 @@ mark_request_removed() {
         *) fail "cannot read the AgentQ request record while removing task: $request_id" ;;
     esac
 
-    if validate_task_removal "$task"; then
+    # A lock-free reader can also converge the record to `removed` (and
+    # archive it) between the read above and the validation below. That is
+    # the same outcome this function writes, and the record still names
+    # THIS task instance, so archive idempotently and report success.
+    removal_read_state=$(jq -r '.state' <<<"$record") ||
+        fail "cannot read the AgentQ request record state: $request_id"
+    if [ "$removal_read_state" = removed ]; then
+        removal_read_task_id=$(jq -r '.task_id' <<<"$record") ||
+            fail "cannot read the AgentQ request task id: $request_id"
+        removal_read_task_created_at=$(jq -r '.task_created_at' <<<"$record") ||
+            fail "cannot read the AgentQ request task creation time: $request_id"
+        [ "$removal_read_task_id" = "$task_id" ] ||
+            fail "AgentQ request record does not match the task being removed: $request_id"
+        [ "$removal_read_task_created_at" = "$task_created_at" ] ||
+            fail "AgentQ request record does not match the task creation time being removed: $request_id"
+        if ! archive_removed_request "$request_id" "$record" >/dev/null; then
+            fail "cannot archive removed AgentQ request while removing task: $request_id"
+        fi
+        removal_recovered_archive=true
+        return 0
+    fi
+    if validate_task_removal "$task" "$record"; then
         :
     else
         return $?

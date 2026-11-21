@@ -3,7 +3,7 @@
 # case here must be rejected before the installer writes anything, so the whole
 # check runs against a sandbox HOME and a stub PATH.
 #
-# Why this check exists: assets/unix/install-agentq.sh is 2,876 lines -- the
+# Why this check exists: assets/unix/install-agentq.sh is 3,297 lines -- the
 # largest asset in the repo with no behavioural coverage at all.  Before this
 # file, the only thing that had ever looked at it was 01's `bash -n`.  It is the
 # single biggest hole in the suite, and this session's seven defects were six
@@ -21,7 +21,7 @@
 #     a real install, which is out of scope without explicit authorization.
 #   - anything past `prepare_service_stage` (launchctl/systemctl behaviour).
 #     Reaching it requires a successful binary stage and a service to register.
-#   - Windows.  install-agentq.ps1 is a different 2,922-line asset with a
+#   - Windows.  install-agentq.ps1 is a different 3,283-line asset with a
 #     different failure surface; it is not touched here.
 #   - the hash-mismatch case below proves the installer REJECTS a bad binary; it
 #     does not prove it accepts a good one.
@@ -925,6 +925,55 @@ if [ -e "$dead_holder_lock" ] || [ -L "$dead_holder_lock" ]; then
 fi
 rm -rf "$home/.agentq" "$home/.local" "$dead_holder_lock"
 assert_home_clean 'dead-holder maintenance lock is recovered'
+
+# --- a maintenance lock holding ONLY the installer's writer temporary -------
+# write_lock_metadata runs mktemp INSIDE the lock and then mv to `pid`; a
+# kill in that window leaves `.agentq-lock-metadata.*` and NO pid.  The
+# recovery used to demand a strictly empty directory, so this shape was
+# refused as "maintenance is already in progress" forever (found in the
+# 2026-11-22 review).  grace=0 is the documented knob; it keeps the fixture
+# instant.
+residue_lock="$home/.agentq.maintenance.lock"
+mkdir -p "$residue_lock"
+: >"$residue_lock/.agentq-lock-metadata.SMOKE0"
+status=0
+env HOME="$home" PATH="$stub_full" AGENTQ_PUEUE_SOURCE_DIR="$source_dir" \
+    maintenance_lock_empty_grace_seconds=0 \
+    /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+cases=$((cases + 1))
+if grep -qF 'maintenance is already in progress' "$work/err"; then
+    printf '%s\n' 'installer metadata-residue lock case: refused an aged lock holding only its own writer temporary' >&2
+    sed 's/^/      /' "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if ! grep -qF 'sha256 mismatch for staged asset' "$work/err"; then
+    printf '%s\n' 'installer metadata-residue lock case: the run did not reach the binary stage, so the lock was not recovered' >&2
+    sed 's/^/      /' "$work/err" >&2 || true
+    failures=$((failures + 1))
+fi
+cases=$((cases + 1))
+if [ -e "$residue_lock" ] || [ -L "$residue_lock" ]; then
+    printf '%s\n' 'installer metadata-residue lock case: the installer did not release the lock it created' >&2
+    failures=$((failures + 1))
+fi
+rm -rf "$home/.agentq" "$home/.local" "$residue_lock"
+assert_home_clean 'metadata-residue maintenance lock is recovered'
+
+# --- the relaxation is prefix-scoped ----------------------------------------
+mkdir -p "$home/.agentq.maintenance.lock"
+: >"$home/.agentq.maintenance.lock/extra"
+status=0
+env HOME="$home" PATH="$stub_full" maintenance_lock_empty_grace_seconds=0 \
+    /bin/sh "$assets/install-agentq.sh" >"$work/out" 2>"$work/err" || status=$?
+check_case 'unknown-entry maintenance lock is kept' \
+    'maintenance is already in progress' "$status"
+if [ ! -d "$home/.agentq.maintenance.lock" ]; then
+    printf '%s\n' 'installer unknown-entry lock case: cleared a lock this tool did not write' >&2
+    failures=$((failures + 1))
+fi
+rm -rf "$home/.agentq" "$home/.local" "$home/.agentq.maintenance.lock"
+assert_home_clean 'unknown-entry maintenance lock is kept'
 
 # --- a stale maintenance lock that cannot be recovered -----------------------
 # A lock whose holder is confirmed dead, but whose directory cannot be removed
