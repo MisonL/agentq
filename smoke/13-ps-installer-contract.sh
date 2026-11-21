@@ -604,15 +604,19 @@ function Get-DeadProcessId {
     # (measured 2026-11-21, .NET 9 / pwsh 7.5: argv became
     # ["'-c", "exit", "0'"], /bin/sh answered
     # "'-c: No such file or directory", and this case reported it as "the
-    # stale recovery failed"). ArgumentList passes argv verbatim, and the
-    # interpreter this check always uses is pwsh7, which has it.
+    # stale recovery failed"). ArgumentList passes argv verbatim, but it does
+    # NOT exist on .NET Framework: on this check's Windows PS5.1 run the
+    # property was missing and the stale-recovery case failed with
+    # "The property 'ArgumentList' cannot be found" (measured 2026-11-21 in
+    # CI). .Arguments with DOUBLE quotes is portable: .NET's Unix parser
+    # strips double quotes (measured 2026-11-21: '-c "exit 0"' became argv
+    # ['-c', 'exit 0'] and sh exited 0), and Windows passes the raw string
+    # to cmd, whose /c rule needs no quoting for this payload.
     $processInfo = [System.Diagnostics.ProcessStartInfo]::new($shell)
     if ($shell -like "*cmd.exe") {
-     $processInfo.ArgumentList.Add("/c")
-     $processInfo.ArgumentList.Add("exit 0")
+        $processInfo.Arguments = '/c exit 0'
     } else {
-     $processInfo.ArgumentList.Add("-c")
-     $processInfo.ArgumentList.Add("exit 0")
+        $processInfo.Arguments = '-c "exit 0"'
     }
     $process = [System.Diagnostics.Process]::Start($processInfo)
     $process.WaitForExit()

@@ -1135,7 +1135,7 @@ run_case s14 status --summary
 assert_rc s14 0
 cases=$((cases + 1))
 for s14_dir in "$work/data" "$work/data/task_logs"; do
-    s14_mode=$(stat -f '%Lp' "$s14_dir" 2>/dev/null || stat -c '%a' "$s14_dir")
+    s14_mode=$(stat -c '%a' "$s14_dir" 2>/dev/null || stat -f '%Lp' "$s14_dir")
     if [ "$s14_mode" != 700 ]; then
         printf 'write-paths s14: %s is mode %s after a command, expected 700\n' "$s14_dir" "$s14_mode" >&2
         failures=$((failures + 1))
