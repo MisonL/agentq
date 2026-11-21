@@ -2778,6 +2778,7 @@ A5b 随之修复并经两列双向验证——见 A5b 正文与本节 A5b 行。
 -维护锁元数据残留（安装器与服务端两侧）：`mkdir`与 `mv pid`之间被杀会留下 `.agentq-lock-metadata.*`；空锁回收判据放宽为同一前缀的正规文件（删除后再 `rmdir`），其他条目仍然拒绝。smoke/11 +2、smoke/27 m2b/m2c。
 -文档：Windows `-StageDirectory`必填与5个 stage资产、Pueue离线通道、升级前提（既有 daemon可达；Windows既有二进制必须匹配当前 pin，pin变更需人工换二进制）、`--check`的执行位语义、残留拒绝顺序；修正过期行数与用例数。
 
+- CI的 `smoke/31`门禁断言锚点写错：smoke.log的摘要行带 `ok    31-changelog-and-tags`前缀，`^changelog-and-tags:`从未匹配；v0.1.40首推（f5e3402）的 linux job在「Assert the full suite really ran」步无消息退 1，而套件本身 PASS 31/0/0/0。改为锚定 `^ok +31-changelog-and-tags +…`，注释写明；修复提交2b0937f。
 新增覆盖：smoke/11 cases=51、smoke/19 cases=155、smoke/27 cases=164。
 
 边界（未验证，不声称）：
