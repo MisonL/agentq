@@ -86,6 +86,27 @@ else
     : >"$work.log"
 fi
 
+
+
+# rule_b_applies_to <tag> <snapshot-tag-or-empty> -- rule B holds a snapshot
+# responsible only for index lines it COULD have written. At a branch checkout
+# that is every tag; at a checkout sitting exactly on a release tag it is that
+# tag and older ones, because the snapshot's CHANGELOG predates every later
+# tag by definition. Measured 2026-11-21 by the independent review: re-running
+# an old tag's release workflow once a newer tag exists demanded index lines
+# for the newer tag and went red for a reason unrelated to that release.
+# Reachability (git tag --merged HEAD) is NOT usable instead -- this
+# repository's development checkouts are shallow/grafted, where it answers
+# only the newest tag (measured 2026-11-21).
+rule_b_applies_to() { # $1=tag, $2=snapshot tag or empty
+    if [ -z "$2" ]; then return 0; fi
+    case $1 in
+    v[0-9]*.[0-9]*.[0-9]*) ;;
+        *) return 0 ;;
+        esac
+    ! version_gt "$1" "$2"
+}
+
 # --- tags visible in this checkout ----------------------------------------
 # A shallow or tag-less checkout is a HOST limitation, not a repository
 # defect: report it as NOT-covered and skip rules A and B rather than
@@ -111,7 +132,15 @@ tag_count=$(grep -c . "$work.tags" || true)
 if [ "$tag_count" -eq 0 ] && [ "$index_count" -gt 0 ]; then
     printf 'NOT-covered(no-tags-in-checkout) index=%s: git could not list tags here, so tag/index agreement was not checked\n' "$index_count"
 else
-    # --- rule A: every index line names a tag that exists ------------------
+    # The release tag this checkout sits on, if it sits on one at all (the shape
+        # a re-run of a tag-push workflow has). Empty everywhere else.
+        snapshot_head_tag=$(git -C "$root" describe --exact-match --tags HEAD 2>/dev/null || true)
+        case "$snapshot_head_tag" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+        *) snapshot_head_tag='' ;;
+esac
+
+# --- rule A: every index line names a tag that exists ------------------
     while IFS= read -r v; do
         [ -n "$v" ] || continue
         grep -qxF -- "$v" "$work.tags" || fail "version index names $v, but no such tag exists in this checkout"
@@ -156,6 +185,9 @@ else
     # --- rule B: every tag has exactly one index line ----------------------
     while IFS= read -r v; do
         [ -n "$v" ] || continue
+            if ! rule_b_applies_to "$v" "$snapshot_head_tag"; then
+            continue
+        fi
         n=$(grep -cxF -- "$v" "$work.index" || true)
         case $n in
             1) ;;
@@ -255,6 +287,13 @@ if newest_has_verification "$cal_dir/no-verify.log"; then cal=bad; printf 'calib
 if newest_has_verification "$cal_dir/only.log"; then :; else cal=bad; printf 'calibration: single-entry fixture was flagged\n' >&2; fi
 if newest_has_verification "$cal_dir/bare-bar.log"; then cal=bad; printf 'calibration: an empty verification line ("  |") passed\n' >&2; fi
 rm -rf "$cal_dir"
+# rule_b_applies_to, both directions: the snapshot's own tag and older ones are
+# its responsibility; a NEWER tag is not (that is the re-run fix), and a
+# branch checkout is responsible for every tag.
+rule_b_applies_to v0.1.38 v0.1.38 || { cal=bad; printf 'calibration: the snapshot tag itself was excluded from rule B\n' >&2; }
+rule_b_applies_to v0.1.30 v0.1.38 || { cal=bad; printf 'calibration: an OLDER tag was excluded from rule B\n' >&2; }
+if rule_b_applies_to v0.1.39 v0.1.38; then cal=bad; printf 'calibration: a NEWER tag was admitted to rule B\n' >&2; fi
+rule_b_applies_to v0.1.39 '' || { cal=bad; printf 'calibration: a branch checkout excluded a tag from rule B\n' >&2; }
 check_cal "$cal" ok 'rule predicates'
 # The calibration must be load-bearing.  It used to only print: mutating the
 # verification-line predicate to accept a bare `  |` made the four lines above

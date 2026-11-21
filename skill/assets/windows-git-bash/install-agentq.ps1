@@ -10,6 +10,20 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 $script:Program = "agentq-installer"
 
+# An unhandled `throw` left the process with exit 1 and a multi-line renderer
+# block on stderr -- source path, line number, coloured tokens (measured
+# 2026-11-21 on macOS with pwsh 7.5, 681 bytes for one gate message).  The
+# POSIX installer reports every deployment failure as exit 2 and one
+# program-prefixed line, and the Windows launcher already maps 42-45 into that
+# shape; a script-scope trap makes this installer answer the same way instead
+# of leaking a PowerShell rendering the operator has to decode.
+trap {
+    $message = [string]$_.Exception.Message
+    $message = ($message -replace "`r`n|`r|`n", " ").Trim()
+    [Console]::Error.WriteLine("$($script:Program): $message")
+    exit 2
+}
+
 $taskName = "AgentQ Pueued"
 $rootDirectory = "C:\ProgramData\AgentQ"
 $parentDirectory = Split-Path -Parent $rootDirectory
@@ -18,7 +32,7 @@ $expectedClientHash = "28b0756d54ec16ce13d78b251d086aa62e0057089cb27f793cd649f97
 $expectedDaemonHash = "aafa05e2f26cda9aff3eeb9be261e8f9f67752d1e9bb7fbcb47318e35c52ab1d"
 $releaseVersion = "4.0.4"
 $releaseBaseUrl = "https://github.com/Nukesor/pueue/releases/download/v$releaseVersion"
-$agentqVersion = "0.1.38"
+$agentqVersion = "0.1.39"
 $clientAssetName = "pueue-x86_64-pc-windows-msvc.exe"
 $daemonAssetName = "pueued-x86_64-pc-windows-msvc.exe"
 $gitBashPath = $null
@@ -474,7 +488,7 @@ function Install-AgentQLauncher {
 function Set-PrivatePathAcl {
     param([string]$Path)
 
-    Assert-NonReparseFilePath -Path $Path -Description "private tree ACL path"
+    Assert-NonReparseFilePath -Path $Path -Description "private tree ACL path" -AllowDirectory
     $item = Get-Item -LiteralPath $Path -Force
     if ($item.PSIsContainer) {
         $acl = New-Object System.Security.AccessControl.DirectorySecurity
@@ -859,7 +873,8 @@ function Assert-NonReparseDirectory {
 function Test-NonReparseFilePath {
     param(
         [string]$Path,
-        [switch]$AllowMissing
+        [switch]$AllowMissing,
+        [switch]$AllowDirectory
     )
 
     if ([string]::IsNullOrWhiteSpace($Path)) {
@@ -896,6 +911,16 @@ function Test-NonReparseFilePath {
     if ($null -ne $item -and (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
         return $false
     }
+    if (($null -ne $item) -and $item.PSIsContainer -and !$AllowDirectory) {
+        # This predicate is named for FILES, and every caller but one hashes
+        # the path, hands it to bash, or executes it.  A directory used to
+        # pass here because only the reparse bit was checked, so the defect
+        # surfaced later as "SHA-256 mismatch" or an opaque CreateProcess
+        # failure instead of naming the wrong kind of entry (measured
+        # 2026-11-21 in review).  Set-PrivatePathAcl is the one caller that
+        # walks directories and files alike; it passes -AllowDirectory.
+        return $false
+    }
 
     $parent = [System.IO.Directory]::GetParent($fullPath)
     if ($null -eq $parent) {
@@ -916,10 +941,11 @@ function Assert-NonReparseFilePath {
     param(
         [string]$Path,
         [string]$Description,
-        [switch]$AllowMissing
+        [switch]$AllowMissing,
+        [switch]$AllowDirectory
     )
 
-    if (!(Test-NonReparseFilePath -Path $Path -AllowMissing:$AllowMissing)) {
+    if (!(Test-NonReparseFilePath -Path $Path -AllowMissing:$AllowMissing -AllowDirectory:$AllowDirectory)) {
         throw "AgentQ $Description must be a regular non-reparse path: $Path"
     }
 }
@@ -2499,7 +2525,7 @@ function Test-NonReparseLockPath {
         return $false
     }
 
-    if (!(Test-NonReparseFilePath -Path $Path -AllowMissing:$AllowMissing)) {
+    if (!(Test-NonReparseFilePath -Path $Path -AllowMissing:$AllowMissing -AllowDirectory:$RequireContainer)) {
         return $false
     }
 

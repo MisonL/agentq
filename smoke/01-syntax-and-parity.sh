@@ -1803,11 +1803,21 @@ def reasons(files):
     found = {}
     for path in files:
         try:
-            body = open(path, encoding="utf-8", errors="replace").read()
+            lines = open(path, encoding="utf-8",
+                         errors="replace").read().splitlines()
         except OSError:
             continue
-        for token in re.findall(r"NOT-covered\(([A-Za-z0-9_-]+)\)", body):
-            found.setdefault(token, os.path.basename(path))
+        for line in lines:
+            # A FULL-LINE comment cannot print anything, and counting it made
+            # the allowlist grow entries no run can ever emit (review round
+            # eight).  Only this shape is stripped: a '#' anywhere else may
+            # sit inside a quoted string or a heredoc body, where the text
+            # really can reach stdout, and stripping those would hide a live
+            # printer -- the failure direction this rule exists to prevent.
+            if line.lstrip().startswith("#"):
+                continue
+            for token in re.findall(r"NOT-covered\(([A-Za-z0-9_-]+)\)", line):
+                found.setdefault(token, os.path.basename(path))
     return found
 
 
@@ -2462,15 +2472,14 @@ glob_to_regex() {
 }
 
 pattern_matches_under() {
-    local re f rel start=$root
+    local re f rel sub=${2:-.}
     re="^$(glob_to_regex "$1")\$"
-    [ -n "${2:-}" ] && start="$root/$2"
     while IFS= read -r f; do
-        rel=${f#"$root"/}
+        rel=${f#./}
         if [[ $rel =~ $re ]]; then
             return 0
         fi
-    done < <(find "$start" -path "$root/.git" -prune -o -type f -print)
+    done < <(cd "$root" && find "$sub" -name .git -prune -o -type f -print)
     return 1
 }
 

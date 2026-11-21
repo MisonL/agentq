@@ -289,8 +289,32 @@ else
     if [ "$gate_status" -eq 0 ]; then
         printf '%s\n' 'ps-installer: a non-Windows run exited 0 instead of failing' >&2
         failures=$((failures + 1))
+    elif [ "$gate_status" -ne 2 ]; then
+        # The installer's script-scope trap answers an unhandled throw the way
+        # the POSIX twin does: exit 2.  Before it existed this run exited 1 with
+        # a multi-line renderer block (measured 2026-11-21, 85 bytes for this
+        # gate's message only because pwsh 7 clipped it -- a bare `throw` is
+        # a rendering the operator has to decode, not a diagnostic).
+        printf 'ps-installer: a non-Windows run exited %s, expected 2 (the failure contract is one program-prefixed line and exit 2)\n' \
+            "$gate_status" >&2
+        failures=$((failures + 1))
     elif ! grep -qF 'Windows Principal functionality is not supported on this platform' "$work/gate.err"; then
         printf 'ps-installer: the platform gate reported something unexpected: %s\n' \
+            "$(head -1 "$work/gate.err")" >&2
+        failures=$((failures + 1))
+    fi
+
+    # ...and the SHAPE of that answer: exactly one line, carrying the program
+    # prefix.  The trap emits it through [Console]::Error.WriteLine, so it reads
+    # the same on PS 5.1 and pwsh 7.
+    cases=$((cases + 1))
+    gate_stderr_lines=$(wc -l <"$work/gate.err" | tr -d ' ')
+    if [ "$gate_stderr_lines" -ne 1 ]; then
+        printf 'ps-installer: the platform gate wrote %s stderr lines; the failure contract is one program-prefixed line\n' \
+            "$gate_stderr_lines" >&2
+        failures=$((failures + 1))
+    elif ! grep -qE '^agentq-installer: ' "$work/gate.err"; then
+        printf 'ps-installer: the platform gate line does not carry the program prefix: %s\n' \
             "$(head -1 "$work/gate.err")" >&2
         failures=$((failures + 1))
     fi
@@ -575,8 +599,22 @@ function Get-DeadProcessId {
     # and the failure came back as "the stale recovery failed" -- reading like a
     # defect in the asset under test (measured 2026-11-10).
     $shell = if ($env:COMSPEC -and (Test-Path -LiteralPath $env:COMSPEC)) { $env:COMSPEC } else { "/bin/sh" }
-    $arguments = if ($shell -like "*cmd.exe") { "'/c exit 0'" } else { "'-c exit 0'" }
-    $process = [System.Diagnostics.Process]::Start([System.Diagnostics.ProcessStartInfo]::new($shell, $arguments))
+    # The two-string constructor hands .NET ONE string and lets ITS parser
+    # split it -- and that parser does NOT strip single quotes on Unix
+    # (measured 2026-11-21, .NET 9 / pwsh 7.5: argv became
+    # ["'-c", "exit", "0'"], /bin/sh answered
+    # "'-c: No such file or directory", and this case reported it as "the
+    # stale recovery failed"). ArgumentList passes argv verbatim, and the
+    # interpreter this check always uses is pwsh7, which has it.
+    $processInfo = [System.Diagnostics.ProcessStartInfo]::new($shell)
+    if ($shell -like "*cmd.exe") {
+     $processInfo.ArgumentList.Add("/c")
+     $processInfo.ArgumentList.Add("exit 0")
+    } else {
+     $processInfo.ArgumentList.Add("-c")
+     $processInfo.ArgumentList.Add("exit 0")
+    }
+    $process = [System.Diagnostics.Process]::Start($processInfo)
     $process.WaitForExit()
     return [string]$process.Id
 }

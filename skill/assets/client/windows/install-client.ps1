@@ -9,6 +9,21 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $script:Program = "agentq-client-installer"
 
+# An unhandled `throw` left the process with exit 1 and a multi-line renderer
+# block on stderr -- source path, line number, coloured tokens (measured
+# 2026-11-21 on macOS with pwsh 7.5, 681 bytes for one gate message).  Exit 1
+# is the documented answer for "-Check found drift", so that shape also made
+# an environment failure indistinguishable from a clean verdict.  A
+# script-scope trap answers the POSIX installer contract instead: exit 2 and
+# one program-prefixed line, and `-Check`'s own 0/1/2 returns are untouched
+# (a trap runs on terminating errors, never on `exit`).
+trap {
+    $message = [string]$_.Exception.Message
+    $message = ($message -replace "`r`n|`r|`n", " ").Trim()
+    [Console]::Error.WriteLine("$($script:Program): $message")
+    exit 2
+}
+
 $scriptDirectory = Split-Path -Parent $PSCommandPath
 if (([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT)) {
     throw "This installer must run on Windows. Use assets/client/unix/install-client.sh on macOS, Linux, or WSL."

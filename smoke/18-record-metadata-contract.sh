@@ -13,13 +13,21 @@
 # What is asserted here, all on a synthetic runtime so a failure is
 # attributable to the scan rather than to a missing daemon:
 #
-#   1. Every malformed record is refused with exit 2 AND reason=protocol_error,
-#      byte-identical stderr against a recorded baseline.
+# 1. Every malformed record is refused with exit 2, reason=protocol_error,
+# an EXPECTED stderr fragment, and one jq diagnostic line. The file also
+# diffs every case against a "baseline" tree -- but that tree is a copy
+# of the SAME asset, so in a default run the diff can only show the two
+# sides agree, not that either is right. It carries information only in
+# mutation mode (AGENTQ_SMOKE_SERVER points the variant at an edited
+# copy); the expected fragments and rc assertions are what hold the
+# contract in CI. Said plainly because "byte-identical against a
+# recorded baseline" overstated it (review round eight).
 #   2. The legal crash-window state self-heals: a `removed` record plus its
 #      tombstone collapses to the tombstone, and the record is gone.
 #   3. `prepared`/`adding` records keep `task_id: null` legal, and `removed`
 #      records are still accepted by the loader while rejected by the aggregate.
-#   4. A good run's stdout is byte-identical to the baseline.
+# 4. The accepted paths exit 0 (the null_* cases). What the stdout diff
+# against the baseline copy proves, and does not, is stated in item 1.
 #
 # What this check does NOT cover, recorded so the green is not over-read:
 # the aggregate filter in `load_request_records` re-checks the filename/id

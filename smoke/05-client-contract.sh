@@ -212,10 +212,14 @@ expect_env_rejected() {
     shift 2
     local status=0
     env_rejections=$((env_rejections + 1))
+    # `< /dev/null` is load-bearing: the client refuses a prompt credential
+    # source when stdin is not a terminal, so run from an interactive terminal
+    # (the documented `./run-tests.sh` flow) this correct client would answer 0
+    # and the case would report it as broken (measured 2026-11-21 under a pty).
     env -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD -u AGENTQ_PASSWORD_PROMPT \
         AGENTQ_SSH="$work/bin/ssh" AGENTQ_HOST=smoke-host \
         AGENTQ_CONFIG="$work/absent-config" \
-        "$@" "$client" status >"$work/out" 2>"$work/err" || status=$?
+        "$@" "$client" status < /dev/null >"$work/out" 2>"$work/err" || status=$?
     if [ "$status" -ne 2 ]; then
         printf 'client %s: expected exit 2, got %s\n' "$label" "$status" >&2
         head -3 "$work/err" >&2 || true
@@ -2212,6 +2216,96 @@ if [ "$junk_status" -ne 1 ]; then
     failures=$((failures + 1))
 fi
 case "$junk_out" in *pwned*) printf '%s\n' 'the agentq-exit token was executed as shell' >&2; failures=$((failures + 1)) ;; esac
+
+# --- a PRESENT but broken uuidgen must not become `aq-` ---------------------
+# generate_request_id used to print whatever uuidgen produced, including
+# nothing. The caller then ran is_request_id on `aq-` and reported a
+# MALFORMED --request-id -- blaming an argument the operator never passed
+# (review round eight). The generator now falls through to openssl. The
+# positive control is the same case: the id that reaches the remote command
+# must be `aq-` plus openssl's 32 hex characters.
+cat > "$work/bin/ssh-record" <<'STUB'
+#!/bin/sh
+: > "${AGENTQ_SSH_RECORD:?}"
+for argument in "$@"; do
+    printf '%s\n' "$argument" >> "$AGENTQ_SSH_RECORD"
+    case "$argument" in
+        *uname*) printf 'Linux\n'; exit 0 ;;
+    esac
+done
+exit 1
+STUB
+chmod 700 "$work/bin/ssh-record"
+uuidfail_dir="$work/bin-uuidfail"
+mkdir -p "$uuidfail_dir"
+printf '%s\n' '#!/bin/sh' 'exit 1' > "$uuidfail_dir/uuidgen"
+chmod 700 "$uuidfail_dir/uuidgen"
+cases=$((cases + 1))
+cpuuid_status=0
+PATH="$uuidfail_dir:$PATH" AGENTQ_SSH_RECORD="$work/ssh-record.txt" \
+    AGENTQ_SSH="$work/bin/ssh-record" AGENTQ_HOST=smoke-host \
+    AGENTQ_CONFIG="$work/absent-config" AGENTQ_REMOTE_PLATFORM=unix \
+    AGENTQ_OPERATION_RETRY_ATTEMPTS=1 AGENTQ_OPERATION_RETRY_DELAY=1 \
+    AGENTQ_SUBMIT_RETRY_ATTEMPTS=1 AGENTQ_SUBMIT_RETRY_DELAY=1 \
+    "$client" submit --workdir /tmp -- true \
+    >"$work/uuidgen.out" 2>"$work/uuidgen.err" || cpuuid_status=$?
+if grep -q 'request id' "$work/uuidgen.err"; then
+    printf 'uuidgen fallback: a broken uuidgen was reported as a malformed --request-id: %s\n' \
+        "$(head -2 "$work/uuidgen.err" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+elif ! grep -Eq -- '--request-id aq-[0123456789abcdef]{32}' "$work/ssh-record.txt" 2>/dev/null && \
+    ! grep -Eq -- 'aq-[0123456789abcdef]{32}' "$work/ssh-record.txt" 2>/dev/null; then
+    printf 'uuidgen fallback: the openssl-generated id did not reach the remote command (record: %s)\n' \
+        "$(head -2 "$work/ssh-record.txt" 2>/dev/null | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+    if [ "$cpuuid_status" -eq 0 ]; then
+        printf '%s\n' 'uuidgen fallback: a submit against a failing ssh stub exited 0; the case asserted nothing' >&2
+        failures=$((failures + 1))
+    fi
+fi
+
+# --- launcher refusals 44/45 are the same contract as the Windows twin -------
+# The client used to propagate 44/45 verbatim with the generic "probe failed"
+# text, while the Windows twin answered exit 2 with a deployment message -- two
+# answers for one remote outcome (measured 2026-11-21 in review).
+for launcher_refusal in 44:agentq-windows-launcher-invalid:reparse \
+                          45:agentq-windows-launcher-too-large:exceeds; do
+    refusal_code=${launcher_refusal%%:*}
+    refusal_rest=${launcher_refusal#*:}
+    refusal_marker=${refusal_rest%%:*}
+    refusal_word=${refusal_rest#*:}
+    refusal_stub="$work/bin/ssh-launcher-refusal-$refusal_code"
+    cat > "$refusal_stub" <<STUB
+#!/bin/sh
+# Marker and token are written BACK TO BACK, with no newline between them,
+# exactly as the real remote emits them: windows_probe_script_with_exit_token
+# rewrites each \`exit N\` into two consecutive [Console]::Out.Write calls, so
+# the wire bytes are "agentq-windows-launcher-invalidagentq-exit:44". The
+# first version of this stub printed the marker with a trailing newline;
+# measured 2026-11-21 against the fixed client, \${raw%agentq-exit:*} keeps
+# that newline, the marker comparison fails, and a correct asset reads as
+# broken.
+printf '%s' '$refusal_marker'
+printf 'agentq-exit:$refusal_code'
+exit $refusal_code
+STUB
+    chmod 700 "$refusal_stub"
+    refusal_status=0
+    AGENTQ_SSH="$refusal_stub" AGENTQ_HOST=smoke-win AGENTQ_REMOTE_PLATFORM=windows \
+        AGENTQ_PLATFORM_PROBE_CACHE=off TMPDIR="$work" \
+        "$client" lookup smokeclient00000011 >"$work/refusal-$refusal_code.out" 2>"$work/refusal-$refusal_code.err" \
+        || refusal_status=$?
+    if [ "$refusal_status" -ne 2 ]; then
+        printf 'launcher refusal %s: the client exited %s, expected 2 (the Windows twin answers 2 with a deployment message)\n' \
+            "$refusal_code" "$refusal_status" >&2
+        failures=$((failures + 1))
+    fi
+    if ! grep -qF -- "$refusal_word" "$work/refusal-$refusal_code.err"; then
+        printf 'launcher refusal %s: stderr does not name the deployment defect (%s): %s\n' \
+            "$refusal_code" "$refusal_word" "$(head -2 "$work/refusal-$refusal_code.err" | tr '\n' '|')" >&2
+        failures=$((failures + 1))
+    fi
+done
 
 # --- an EARLY valid token must not override the real one --------------------
 # The junk case above proves a non-numeric token is ignored.  This one is the

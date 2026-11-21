@@ -71,7 +71,11 @@ while IFS= read -r check <&3; do
     # 3<&- : fd 3 is this loop's own list of checks.  Leaving it open meant a
     # check that read fd 3 drained the list, and the only symptom was a later
     # "only N of M smoke checks ran" with no idea which one did it.
-    if "$check" 3<&- >"$output" 2>&1; then
+    # < /dev/null: the checks must see a non-terminal stdin.  They inherit the
+    # caller's otherwise, so running this suite from an interactive terminal
+    # turned smoke/05's prompt-without-a-tty case into a FALSE failure of a
+    # correct client (measured 2026-11-21 under a pty: exit 0, expected 2).
+    if "$check" 3<&- < /dev/null >"$output" 2>&1; then
         status=0
     else
         status=$?

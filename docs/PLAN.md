@@ -726,6 +726,76 @@ smoke/31」），还原后绿。
 Windows 目标身份复核只做静态/桩验证，未在真 Windows + 真 SSH 上端到端运行；本轮所有
 并发与诊断测试都在本机合成运行时上，生产 Pueue/远端/凭证未验证。
 
+### 2026-11-21 第八轮审查（全维度：6个只读 agent + Orca Codex，审的是 v0.1.38）——修服务端 Windows jq CRLF与队列语义、客户端形状校验、检查自身假绿，版本0.1.38 →0.1.39
+
+**范围与边界**：6个只读 agent（服务端协议/并发、POSIX客户端、Windows客户端与安装器、
+smoke检查自身、文档一致性、防御性安全）与 Orca Codex worker各自出报告；所有发现都在
+主检出独立复现后才改，未能复现的写进边界。安全 agent只做防御性静态分析，未构造或运行
+利用载荷。生产主机一台未碰；测试机真远端的既有证据不因本轮扩展。
+
+**服务端**：
+1. **原生 Windows jq的 CRLF让文本/argv校验永远判非法**（P0）。`is_valid_text_argument`
+与 `is_valid_argv`经仓库自装的 `jq()`过滤（wrapper会补行尾换行），而原生 Windows jq
+写 CRLF——字节级往返校验恒不等，`submit`/`remove --label`在原生 Windows上100%退2。
+改为 `command jq`直读后，CRLF桩实测 rc=2 → rc=0。
+2. **`normalize_workdir`的 `{ pwd -P; printf Z; }`状态取自 `printf`**：`pwd`失败被吞，
+空 workdir通过文本校验并入队；改为显式取 `pwd -P`的状态。
+3. **`mark_request_removed`把并发的 record消失报成失败**：另一个归档者先删了 record时
+ rename失败被当错误；现在识别 record已消失并按收敛处理（`recovered:true`）。
+4. `ensure_*_directory`补 `chmod 700`；`ensure_group`失败从 `protocol_error`归到
+ `deployment_state`。
+
+**客户端与 Twin**：
+- **Windows批量删除接受嵌套数组**：`ConvertFrom-Json`逐层解包单元素数组，`[[{...}]]`解成
+ array[1]，与扁平数组不可区分（实测 verdict=True），POSIX客户端则拒绝。解密后的原文是
+唯一保留形状的地方：新增 `Test-JsonBatchElementsAreObjects`原始文本扫描（字符串感知、
+深度跟踪），`[[…]]`现在两客户端同拒（smoke/12两方向用例）。
+- **POSIX的 launcher44/45与 Windows孪生分叉**：同一探针输出，Windows答2 +专属
+消息，POSIX透传44/45（这两个码对调用方含义相反）；对齐为2。
+- **`generate_request_id`在 uuidgen坏时打出 `aq-`**（空后缀），下游误报成「request-id
+格式错」；现在校验 uuidgen输出的字符集与长度，不合格落 `openssl rand -hex 16`，两者
+都坏才明确报 `cannot create a durable AgentQ request id`。
+- **Windows安装器的未处理 throw**从 exit 1 +多行渲染块改为一前缀行 + exit 2（脚本级
+ trap，两个安装器各一份）；`Test-NonReparseFilePath`现在拒绝目录，锁目录校验按
+ `-RequireContainer`转发 `-AllowDirectory`（先打坏锁校验、被 smoke/13抓到后修好）。
+- **token读取器**先剥 `\r`再匹配 `(?m)^agentq-exit:([0-9]{1,3})$`。边界：interior-CR
+形状在 Windows不可达——PowerShell原生 stderr重定向按 CR拆行（字节级实测），
+ POSIX读原始字节才能看到；记录为架构差异，`smoke/12`不再为该形状保留用例。
+
+**检查/门禁自身的假绿（每个都先做红证）**：
+- `smoke/03`：新增 `end_task_and_require_absent`（原清理把失败吞成0）；直接用 pueue建的
+ blocker不再走服务端 remove（服务端对它永答 `does not identify its request`，实测 rc=2），
+改 pueue直连 `end_raw_task`；残留守卫补基础 request id形状（`…Z`与 `…Z-*`）。
+- `smoke/05`：44/45夹具改为背靠背无换行 token（原 fixture在 marker后多打换行，正确资产
+被报成44——fixture凭想象写的一类实测复现）；新增 uuidgen坏桩用例（断言兜底 request id
+以 `aq-[0-9a-f]{32}`到达远端命令且无 'request id'误报）。
+- `smoke/12`：空变异体的假绿——budget-disabled mutant若不产出远端命令，字节比较「证明」
+不了比较器能红，现单独报红；**新守卫第一次跑就抓到了它防的那个形状，而且就在 harness
+自己身上**：两个 Windows变异副本（`twin-windows-nobudget`、`twin-windows-plus`）都没有
+`.ps1`扩展名，实测 `pwsh -File`对无扩展名副本在 line 4之前失败（`$script:Program`在
+StrictMode下未设，顶层 trap再读它时二次报错），exit 1、副本整个没执行——此前
+「posix与 windows响应不同」的断言因此一直为真，但真因是副本没跑。两份副本改名为
+`.ps1`后 mutant正常产出远端命令。interior-CR用例删除（fixture描述传输层不存在的形状）。
+- `smoke/13`：`Get-DeadProcessId`的 `'-c exit 0'`单串被 .NET Unix解析成三参（引号不剥），
+改用 `ArgumentList`；平台门槛断言必须 exit 2 +恰一行 + `^agentq-installer: `前缀。
+- `smoke/16`：`-path "$root/…"`受检出路径含 glob字符影响（`./`前缀也打坏了 R4豁免），
+改为在 root内 `find .`后剥前缀的自枚举函数。
+- `smoke/01`：`pattern_matches_under`同因；NOT-covered扫描不再把整行注释算作「可能打印」。
+- `smoke/31`：规则 B在重跑历史 tag时要求后续 tag的索引行，与「最新日志条目」规则冲突；
+ `git tag --list --merged HEAD`在本仓 shallow/grafted检出上只答1/39个 tag，改为快照
+视界谓词（只检查不晚于 HEAD版本的部分），四方向自校准。
+- `smoke/18`：头部说明订正——占位基线是同一资产的副本，不是独立 oracle，承重的是期望
+片段与 rc。
+-文档：`release.yml`自2026-11-20起有 `Require an annotated tag`步骤（轻量 tag退1），
+ `CLAUDE.md`/`CONTRIBUTING.md`仍写「轻量 tag也能过」——已改。
+
+**未修边界（不声称覆盖）**：`AGENTQ_REMOTE_PLATFORM`大小写与平台缓存归一化在孪生间的
+分叉；平台缓存 `probed_at`残渣；POSIX平台探针临时文件在命令替换里的泄漏路径；
+`smoke/10`的 D2/规则 B已知窗口；`smoke/11`的零断言形态；`smoke/02`站点扫描的覆盖
+边界；`smoke/16` R4的路径字面豁免；部分跨文档计数；安全 agent的 P3-1/P3-3/P3-4
+（只读协议即可构造的低价值信息面，未改动）；pwsh7.0–7.4无 `-DateKind`；生产环境
+仍未验证。
+
 ### 2026-11-19 第四轮终审（7 个只读 agent + Orca Codex，审的是 v0.1.34）——修 12 处，其中 1 条 P1 是客户端的中断语义（编号里有 13 条：第 3 条是本轮我自己的修复引入的回归，不算独立发现）
 
 **已修（每条都先自己复现，再改，再证明锁会红）**：

@@ -131,11 +131,13 @@ lists cannot drift without the suite going red.
 - The version denotes **the deployment unit**: any change to the bytes under
   `skill/assets/` bumps it; documentation-only changes do not.
 - **Releases are annotated tags.** `git tag -a vX.Y.Z -m "..."`, then push. A
-  lightweight tag still passes the `release.yml` gate (it compares the name, not
-  the object type), but the annotation carries the release note that links back
-  to the `CHANGELOG.md` entry, and this repository has been inconsistent about
-  that: seven of the first thirty-one tags were lightweight. New tags are
-  annotated.
+  lightweight tag FAILS the `release.yml` gate: its `Require an annotated tag`
+  step re-fetches `refs/tags/<name>` and exits 1 unless `git cat-file -t`
+  answers `tag` (the name comparison alone did not enforce this until
+  2026-11-20). The annotation is also what carries the release note that links
+  back to the `CHANGELOG.md` entry, and this repository has been inconsistent
+  about that: seven of the first thirty-one tags were lightweight. New tags
+  are annotated.
 - **At most three tags per push.** Pushing more than three in one `push` does
   not trigger `release.yml` for the rest; they arrive silently ungated. Push in
   batches of three or fewer and check that the gate ran for each.

@@ -203,7 +203,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFOR
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.38"
+$script:ClientVersion = "0.1.39"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's Pueue command ceiling, not this machine's platform: a
 # unix target takes up to 100000 base64 characters (the POSIX twin's
@@ -622,7 +622,7 @@ function Get-ConfiguredHost {
     $configuredHost = ""
     $configText = Read-AgentQConfigFile -Path $script:ConfigPath
     foreach ($line in @($configText -split "`r?`n")) {
-        # `[^\s]*`, not `[^\s]+`: an EMPTY value is an assignment too.  Both
+        # `*`, not `+`: an EMPTY value is an assignment too.  Both
         # clients take the LAST matching line, so the quantifier decides what a
         # trailing `AGENTQ_HOST=` means.  With `+` this line did not match, the
         # earlier value survived, and the two clients resolved the SAME config
@@ -1539,13 +1539,19 @@ function Invoke-SshLogged {
                 # measured fail-open on a 20-digit token, 2026-10-06).
                 # ASCII digits, not `\d` (which matches Unicode digits that the
                 # [int] cast below may throw on) -- measured 2026-11-19.
-                # The line end is `\r*$`, NOT `\s*$`: the POSIX twin deletes CRs
-                # and then anchors with sed `$`, so a TAB or an NBSP after the
-                # digits makes the line NOT a token there.  `\s*$` accepted it
-                # here, so the same stubbed stderr gave POSIX exit 2 and this
-                # client exit 5 (measured 2026-11-20).  `\r*` (not `\r?`)
-                # mirrors `tr -d '\r'`, which removes every CR.
-                $exitTokenMatches = [regex]::Matches($standardError, '(?m)^agentq-exit:([0-9]{1,3})\r*$')
+                # The POSIX twin DELETES every CR (`tr -d '\r'`) and then anchors
+                # with sed `$`; a TAB or an NBSP after the digits makes the line NOT a
+                # token there. `\s*$` accepted those here, so the same stubbed stderr
+                # gave POSIX exit 2 and this client exit 5 (measured 2026-11-20). CRs are
+                # therefore removed first, then the anchor is applied -- the same two
+                # steps the twin performs. TRAILING CRs are what this reader can actually
+                # see: PowerShell's native stderr redirection (`2> file`) splits on CR
+                # before the reader runs, so a CR BETWEEN the colon and the digits arrives
+                # as two lines that nothing here can join (measured 2026-11-21 on the
+                # literal bytes). The POSIX twin reads raw bytes and does see that shape
+                # -- a recorded divergence, not one fixable in this architecture.
+                $exitTokenSource = $standardError -replace "`r", ""
+                $exitTokenMatches = [regex]::Matches($exitTokenSource, '(?m)^agentq-exit:([0-9]{1,3})$')
                 if ($exitTokenMatches.Count -gt 0) {
                     $tokenCode = [int]$exitTokenMatches[$exitTokenMatches.Count - 1].Groups[1].Value
                     # 256-999 pass the length filter but are NOT protocol codes;
@@ -1785,9 +1791,11 @@ function Invoke-WaitSshWithTimeout {
                 $transportDiagnostics = Get-FileTextOrEmpty -Path $sshLogPath -Bounded
                 $standardError = $stderrState.Builder.ToString()
                 if ($script:RemotePlatform -eq "windows") {
-                    # ASCII digits only; see the note on the other reader.
-                    # `\r*$`, not `\s*$`, for the same reason as there.
-                    $exitTokenMatches = [regex]::Matches($standardError, '(?m)^agentq-exit:([0-9]{1,3})\r*$')
+                    # ASCII digits only; and the CRs are removed before the
+                    # anchor -- both rules are the other reader's (see the note
+                    # there: the POSIX twin deletes every CR first).
+                    $exitTokenSource = $standardError -replace "`r", ""
+                    $exitTokenMatches = [regex]::Matches($exitTokenSource, '(?m)^agentq-exit:([0-9]{1,3})$')
                     if ($exitTokenMatches.Count -gt 0) {
                         $tokenCode = [int]$exitTokenMatches[$exitTokenMatches.Count - 1].Groups[1].Value
                         if ($tokenCode -le 255) {
@@ -2303,6 +2311,57 @@ function Test-JsonSummaryMap {
     return $true
 }
 
+function Test-JsonBatchElementsAreObjects {
+    # ConvertFrom-Json cannot answer "is this element an array?" -- it
+    # UNWRAPS single-element arrays at every level (measured 2026-11-21,
+    # pwsh 7.5.4: `[[{"task_id":1,"removed":true}]]` arrives as a one-element
+    # array holding the OBJECT, and `[[o1,o2]]` as a two-element array), so
+    # after parsing a nested array is indistinguishable from a flat one.
+    # Test-JsonBatchRemoveResult accepted both while the POSIX twin's jq
+    # filter (`all(.[]; type == "object")`) refused them -- one remote
+    # payload, two answers (measured 2026-11-21 by the independent review).
+    # The raw text still carries the shape, so this walks it OUTSIDE string
+    # literals and rejects a `[` at the top level of the outer array.
+    # Brackets inside strings, and inside an OBJECT (an unknown extra field's
+    # array value), are left alone: the POSIX predicate ignores extra fields,
+    # and rejecting those here would be the same divergence in the other
+    # direction.
+    param([AllowEmptyString()][string]$RawText)
+
+    $text = Remove-TrailingNewlines -Value $RawText
+    $start = $text.IndexOf('[')
+    $end = $text.LastIndexOf(']')
+    if ($start -lt 0 -or $end -le $start) {
+        return $false
+    }
+    $inString = $false
+    $escaped = $false
+    $objectDepth = 0
+    for ($index = $start + 1; $index -lt $end; $index += 1) {
+        $character = $text[$index]
+        if ($inString) {
+            if ($escaped) {
+                $escaped = $false
+            } elseif ($character -eq [char]'\') {
+                $escaped = $true
+            } elseif ($character -eq [char]'"') {
+                $inString = $false
+            }
+            continue
+        }
+        if ($character -eq [char]'"') {
+            $inString = $true
+        } elseif ($character -eq [char]'{') {
+            $objectDepth += 1
+        } elseif ($character -eq [char]'}') {
+            $objectDepth -= 1
+        } elseif ($character -eq [char]'[' -and $objectDepth -le 0) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Test-JsonBatchRemoveResult {
     # The batch-removal response is a JSON ARRAY of per-task results.  PS 5.1
     # and 7 both turn a JSON array into an object stream: `[]` arrives as $null
@@ -2324,6 +2383,13 @@ function Test-JsonBatchRemoveResult {
     param([AllowNull()][object]$Response, [AllowEmptyString()][string]$RawText)
 
     if (-not (Remove-TrailingNewlines -Value $RawText).TrimStart(' ', "`t", "`r", "`n").StartsWith("[")) {
+        return $false
+    }
+
+    # A nested array inside the top-level array is invisible after
+    # ConvertFrom-Json unwraps it; the raw text still shows it, and the
+    # POSIX twin refuses that shape (see Test-JsonBatchElementsAreObjects).
+    if (-not (Test-JsonBatchElementsAreObjects -RawText $RawText)) {
         return $false
     }
 

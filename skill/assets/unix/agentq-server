@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.38'
+agentq_version='0.1.39'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -304,6 +304,10 @@ group_raw_file=''
 # empty file leaked into $TMPDIR per failed command, unbounded, because the
 # EXIT trap knew nothing about it.
 repair_guard_stderr_file=''
+# Set by mark_request_removed when a lock-free reader archived the `removing`
+# record before the writer's own archive ran (see the comment there); read by
+# remove_task to add `recovered: true` to the response.
+removal_recovered_archive=false
 maintenance_lock_verdict=''
 maintenance_lock_observed_pid=''
 maintenance_lock_observed_identity=''
@@ -703,7 +707,17 @@ is_valid_text_argument() {
     local original_bytes round_trip_bytes
 
     original_bytes=$(printf '%s' "$candidate" | LC_ALL=C od -An -v -tx1) || return 1
-    round_trip_bytes=$(printf '%s' "$candidate" | jq -Rsj . 2>/dev/null | LC_ALL=C od -An -v -tx1) || return 1
+    # `command jq`, not `jq`: on a text-mode (native Windows) host
+    # install_jq_line_ending_shim appends a newline to ANY non-empty output so
+    # multi-line `while read` consumers keep their last line.  This predicate
+    # compares BYTES, so that newline made every non-empty argument read as
+    # invalid -- measured 2026-11-21 (red): with the shim installed, `submit`
+    # answered exit 2 `--label must be valid UTF-8` for every label and
+    # `remove --label` the same, i.e. both write paths were dead on a native
+    # Windows jq.  `-Rsj .` writes no newline itself and jq escapes any newline
+    # inside the value, so the raw bytes are identical on a text-mode and an
+    # LF jq.  smoke/27's s10/s11 cases are the lock.
+    round_trip_bytes=$(printf '%s' "$candidate" | command jq -Rsj . 2>/dev/null | LC_ALL=C od -An -v -tx1) || return 1
     [ "$original_bytes" = "$round_trip_bytes" ]
 }
 
@@ -718,7 +732,9 @@ is_valid_argv() {
 
     [ "$#" -gt 0 ] || return 0
     original_bytes=$(printf '%s\0' "$@" | LC_ALL=C od -An -v -tx1) || return 1
-    round_trip_bytes=$(printf '%s\0' "$@" | jq -Rsj . 2>/dev/null | LC_ALL=C od -An -v -tx1) || return 1
+    # Same `command jq` rule as is_valid_text_argument above (and the same red
+    # proof: every `submit` was refused on a text-mode jq).
+    round_trip_bytes=$(printf '%s\0' "$@" | command jq -Rsj . 2>/dev/null | LC_ALL=C od -An -v -tx1) || return 1
     [ "$original_bytes" = "$round_trip_bytes" ]
 }
 
@@ -1626,12 +1642,24 @@ ensure_data_directory() {
     path_chain_is_safe "$data_directory" || fail "invalid AgentQ data directory path: $data_directory"
     [ ! -L "$data_directory" ] || fail "invalid AgentQ data directory path: $data_directory"
     [ -d "$data_directory" ] || fail "missing AgentQ data directory: $data_directory"
+
+    # Same self-heal as the cancellation/request/runtime directories: this
+    # directory holds task metadata and task-log paths whose raw output may
+    # echo a caller's tokens, and a deployment restored from a 0755 archive
+    # would otherwise stay world-readable forever while its siblings converge.
+    if [ "$platform_kind" = unix ]; then
+        chmod 700 "$data_directory" || fail "cannot secure AgentQ data directory: $data_directory"
+    fi
 }
 
 ensure_task_log_directory() {
     path_chain_is_safe "$task_log_directory" || fail "invalid AgentQ task log directory path: $task_log_directory"
     [ ! -L "$task_log_directory" ] || fail "invalid AgentQ task log directory path: $task_log_directory"
     [ -d "$task_log_directory" ] || fail "missing AgentQ task log directory: $task_log_directory"
+
+    if [ "$platform_kind" = unix ]; then
+        chmod 700 "$task_log_directory" || fail "cannot secure AgentQ task log directory: $task_log_directory"
+    fi
 }
 
 ensure_request_directory() {
@@ -1696,10 +1724,11 @@ maintenance_lock_owner() {
     fi
     case "$platform_kind" in
         unix)
-            # A dangling symlink is ABSENT (nothing to judge); a link to a
-            # directory is the unsafe shape an installer would follow.  A
-            # dangling link is also what the server's own unlink leaves after a
-            # read link's target was removed; it must never brick every command.
+            # Any symlink at this path is refused EARLIER, by
+            # path_chain_is_safe above (it checks -L on every component,
+            # including the last), so a dangling link never reaches this
+            # branch: it answers deployment_state and the operator must remove
+            # the link.  This arm is the plain "nothing there" case.
             if [ ! -e "$maintenance_lock_directory" ] &&
                 [ ! -d "$maintenance_lock_directory" ]; then
                 return 0
@@ -2592,7 +2621,14 @@ normalize_workdir() {
             # --working-directory, so even a faithful path would run somewhere
             # else), and the record stayed in `adding` forever -- lookup
             # answered 4 and no retry could clear it.
-            resolved_workdir=$(CDPATH=; cd -- "$input" && { pwd -P; printf 'Z'; }) ||
+            # `&&`, not `;`: the status of `{ pwd -P; printf 'Z'; }` is printf's
+            # 0, so a failing `pwd -P` (cd succeeded, the directory vanished or
+            # getcwd fails) left an EMPTY resolved_workdir -- the empty string
+            # round-trips the UTF-8 check and would be persisted and handed to
+            # `pueue add --working-directory`.  Measured 2026-11-21: with a
+            # `pwd` that returns 1, the old form produced `value=[]` and status
+            # 0.  The Windows branch below already uses `&&`.
+            resolved_workdir=$(CDPATH=; cd -- "$input" && { pwd -P && printf 'Z'; }) ||
                 fail "cannot resolve the working directory: $input"
             resolved_workdir=${resolved_workdir%Z}
             # `pwd` terminates its output with one newline; strip exactly that
@@ -5014,20 +5050,57 @@ mark_request_removed() {
     local task_id
     local task_created_at
     local prepared_state
+    local record_read_status
+    local tombstone
+    local tombstone_read_status
 
-    if validate_task_removal "$task"; then
-        :
-    else
-        return $?
-    fi
     if request_id=$(request_id_from_task "$task"); then
         :
     else
         return $?
     fi
     [ -n "$request_id" ] || return 0
+    task_id=$(jq -r '.id' <<<"$task") ||
+        fail "cannot read the AgentQ task id: $task_id"
+    task_created_at=$(jq -r '.created_at' <<<"$task") ||
+        fail "cannot read the AgentQ task creation time: $task_id"
 
-    record=$(read_request_record "$request_id") || fail "missing AgentQ request record while removing task: $request_id"
+    # A lock-free reader (`status`/`logs`/`doctor` -> ensure_daemon ->
+    # recover_removing_requests) may archive this `removing` request between
+    # `pueue remove` and this write: it sees the task gone and converges the
+    # record to removed.  That is the SAME outcome this function writes, so a
+    # matching tombstone means "already done" -- reporting it as exit 2 made a
+    # successful remove look failed, and a retry then answered
+    # `unknown AgentQ task id`, so the caller could never learn it succeeded.
+    # The tombstone must name THIS task instance; anything else is a hard
+    # failure, exactly as before.
+    record_read_status=0
+    record=$(read_request_record "$request_id" 2>/dev/null) || record_read_status=$?
+    case "$record_read_status" in
+        0) ;;
+        1)
+            tombstone_read_status=0
+            tombstone=$(read_request_tombstone "$request_id" 2>/dev/null) || tombstone_read_status=$?
+            case "$tombstone_read_status" in
+                0) ;;
+                1) fail "missing AgentQ request record while removing task: $request_id" ;;
+                *) fail "cannot read the AgentQ request tombstone while removing task: $request_id" ;;
+            esac
+            jq -e --argjson task_id "$task_id" --arg created "$task_created_at" '
+                .state == "removed" and .task_id == $task_id and .task_created_at == $created
+            ' <<<"$tombstone" >/dev/null 2>&1 ||
+                fail "AgentQ request record vanished while removing task and its tombstone does not match it: $request_id"
+            removal_recovered_archive=true
+            return 0
+            ;;
+        *) fail "cannot read the AgentQ request record while removing task: $request_id" ;;
+    esac
+
+    if validate_task_removal "$task"; then
+        :
+    else
+        return $?
+    fi
     prepared_state=$(jq -r '.state' <<<"$record") ||
         fail "cannot read the AgentQ request record state: $request_id"
     [ "$prepared_state" = removing ] || fail "AgentQ request removal was not prepared: $request_id"
@@ -6533,7 +6606,7 @@ submit() {
         if [ "$record_state" = accepted ]; then
             ensure_daemon
             if ! ensure_group; then
-                fail "cannot ensure AgentQ group while submitting: $request_id"
+                fail "cannot ensure AgentQ group while submitting: $request_id" deployment_state
             fi
             reconcile_accepted_rc=0
             record=$(reconcile_accepted_request "$request_id" "$record") || reconcile_accepted_rc=$?
@@ -6603,7 +6676,7 @@ submit() {
 
     ensure_daemon
     if ! ensure_group; then
-        fail "cannot ensure AgentQ group while submitting: $request_id"
+        fail "cannot ensure AgentQ group while submitting: $request_id" deployment_state
     fi
 
         find_request_task_rc=0
@@ -7593,6 +7666,7 @@ remove_task() {
     local removable_status=0
 
     ensure_daemon
+    removal_recovered_archive=false
     removable_task=$(compact_task "$task_id") || removable_status=$?
     report_compact_task_failure "$removable_status" "$task_id"
     if mark_request_removing "$removable_task"; then
@@ -7606,7 +7680,11 @@ remove_task() {
         else
             return $?
         fi
-        jq -cn --argjson task_id "$task_id" '{task_id: $task_id, removed: true}'
+        if [ "$removal_recovered_archive" = true ]; then
+            jq -cn --argjson task_id "$task_id" '{task_id: $task_id, removed: true, recovered: true}'
+        else
+            jq -cn --argjson task_id "$task_id" '{task_id: $task_id, removed: true}'
+        fi
         return 0
     fi
 

@@ -1947,7 +1947,12 @@ fi
 # class in 0.1.35: the value's set is now the ASCII byte list ` \t\n\r\f\v`
 # instead of `\s`, so the old `[^\s]` anchor found nothing and the self-test
 # correctly went red -- it was aimed at a line the fix had replaced.)
-twin_config_mutant="$work/twin-windows-plus"
+# The copy MUST keep a .ps1 name. Measured 2026-11-21: `pwsh -File` on an
+# extensionless copy fails before line 4 (`$script:Program` is unset under
+# Set-StrictMode), the top-level trap then dies reading it, and the script exits
+# 1 without running at all -- so both self-tests below compared against a copy
+# that never executed and read the difference as "the comparator works".
+twin_config_mutant="$work/twin-windows-plus.ps1"
 sed 's/\\f\\v\]\*)/\\f\\v]+)/' "$client" > "$twin_config_mutant"
 if cmp -s "$client" "$twin_config_mutant"; then
     printf '%s\n' 'ps-client twin self-test: the Windows config-value quantifier was not found; the config rows cannot be proven able to fail' >&2
@@ -2100,7 +2105,7 @@ fi
 # in a copy of the Windows client (the exact fix this round landed) and require
 # the wait --timeout row to disagree; if the anchor cannot be found the
 # mutation never happened, and saying so beats passing on nothing.
-remotecmd_mutant="$work/twin-windows-nobudget"
+remotecmd_mutant="$work/twin-windows-nobudget.ps1"
 remotecmd_mutant_ok=1
 python3 - "$client" "$remotecmd_mutant" <<'PY' || remotecmd_mutant_ok=0
 import io, sys
@@ -2118,7 +2123,15 @@ else
     remotecmd_run "$twin_posix" "$remotecmd_mutant" "$work/remotecmd" wait 1 --timeout 5
     mutant_p=$(remotecmd_decode "$work/remotecmd-p.cmd")
     mutant_w=$(remotecmd_decode "$work/remotecmd-w.cmd")
-    if [ "$mutant_p" = "$mutant_w" ]; then
+
+        # A mutant that produced NO command would differ from the real side for
+        # that reason alone and "prove" the comparator -- the wrong-way-green
+        # shape this self-test exists to prevent (review round eight). The
+        # mutation is meant to change the decoded COMMAND, not to silence it.
+        if [ -z "$mutant_w" ]; then
+        printf '%s\n' 'ps-client remote-command self-test: the budget-disabled mutant produced no remote command; the comparison proved nothing' >&2
+        failures=$((failures + 1))
+        elif [ "$mutant_p" = "$mutant_w" ]; then
         printf 'ps-client remote-command self-test: a Windows client with the budget arm disabled still built the same command as the POSIX side; the comparator cannot see the defect it was written for\n' >&2
         failures=$((failures + 1))
     fi
@@ -2956,6 +2969,7 @@ if ($r.ExitCode -ne 1) {
     fi
 done
 
+
 # --- a CACHED windows platform must still run the launcher-protocol probe ----
 # A cache hit replaces the PLATFORM probe only.  The POSIX twin calls
 # probe_windows_agentq_protocol unconditionally once the platform is known, and
@@ -3031,6 +3045,9 @@ $cases = @(
     @{ n="null-body";    b="null";                                    e=$false },
     @{ n="one-null";     b="[null]";                                  e=$false },
     @{ n="nested-empty"; b="[[]]";                                    e=$false },
+    @{ n="nested-object"; b="[[{`"task_id`":1,`"removed`":true}]]"; e=$false },
+    @{ n="nested-two"; b="[[{`"task_id`":1,`"removed`":true},{`"task_id`":2,`"removed`":true}]]"; e=$false },
+    @{ n="extra-field-array"; b="[{`"task_id`":1,`"removed`":true,`"x`":[1]}]"; e=$true },
     @{ n="two-null";     b="[null,null]";                             e=$false },
     @{ n="bare-object";  b="{`"task_id`":1,`"removed`":true}";        e=$false },
     @{ n="missing-field";b="[{`"task_id`":1}]";                       e=$false },

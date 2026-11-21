@@ -1007,6 +1007,160 @@ fi
 rm -rf -- "$repair_tmp"
 clear_runtime
 
+# -------------------------------------------- native-Windows jq (CRLF) cases
+# A text-mode jq (the native Windows build; see smoke/26's W7) makes the server
+# install its jq line-ending shim, which appends a newline to ANY non-empty jq
+# output so multi-line `while read` consumers keep their last line.  The UTF-8
+# validators compare BYTES, so that newline made every non-empty argument look
+# invalid: measured 2026-11-21 (red proof below) -- with the shim installed,
+# `submit` answered exit 2 `--label must be valid UTF-8` for any label and
+# `remove --label` the same, i.e. the two write paths were dead on a native
+# Windows jq.  Both validators must read jq's RAW bytes (`command jq`).
+windows_jq_directory="$work/bin-windows-jq"
+mkdir -p "$windows_jq_directory"
+real_jq=$(command -v jq)
+[ -n "$real_jq" ] || { printf '%s\n' 'write-paths: jq is required for the CRLF case' >&2; exit 1; }
+cat > "$windows_jq_directory/jq" <<SH
+#!/bin/sh
+# Text-mode jq: omits the final line's CR, which is the shape that reaches the
+# server through \$( ) (smoke/26's W7 records the measurement).
+output_file=\$(mktemp)
+"$real_jq" "\$@" > "\$output_file"
+status=\$?
+sed '\$!s/\$/\r/' "\$output_file"
+rm -f "\$output_file"
+exit "\$status"
+SH
+chmod 700 "$windows_jq_directory/jq"
+
+run_case_with_windows_jq() {
+    local label=$1
+    shift
+    local rc=0
+    ( cd "$work" && TMPDIR="$work" PATH="$windows_jq_directory:$PATH" "$work/agentq-server" "$@" ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+
+# S10. A submit on a text-mode jq must succeed exactly like the baseline; the
+#      UTF-8 validators must judge the ARGUMENT, not the shim's convenience
+#      newline.
+clear_runtime
+rm -f "$work/.added"
+write_stateful_stub 4242
+run_case_with_windows_jq s10 submit --workdir "$work" --label smoke --request-id "$submit_id" -- true
+assert_rc s10 0
+assert_json s10 '.task_id == 4242 and .reused == false'
+
+# S11. `remove --label` goes through the same byte comparison for its label;
+#      it must remove the batch the S10 submit created.
+run_case_with_windows_jq s11 remove --label smoke --confirm
+assert_rc s11 0
+assert_json s11 'type == "array" and length == 1 and .[0].removed == true and .[0].task_id == 4242'
+clear_runtime
+rm -f "$work/.added"
+
+# ---------------------------------------- fail-open and convergence cases (r8)
+# S12. `pwd -P` failing must reject the workdir.  The unix branch's command
+#      group used to be `{ pwd -P; printf 'Z'; }`, whose status is printf's 0,
+#      so a failing pwd produced an EMPTY resolved workdir: the empty string
+#      round-trips the UTF-8 check and would reach `pueue add`.  The fixture
+#      exports a bash function named `pwd` (BASH_FUNC environment import) that
+#      fails ONLY in the sentinel directory -- the server itself resolves its
+#      own root with `pwd -P` at startup, so a blanket failure would not start.
+clear_runtime
+mkdir -p "$work/wd-fail"
+write_stub "$empty_tasks"
+s12_sentinel=$(printf '%s' "$work/wd-fail" | sed 's/[\\"`$]/\\&/g')
+s12_status=0
+( cd "$work" && TMPDIR="$work" env "BASH_FUNC_pwd%%=() { if [ \"\$PWD\" = \"$s12_sentinel\" ]; then return 1; fi; builtin pwd -P; }" \
+    "$work/agentq-server" submit --workdir "$work/wd-fail" --label smoke \
+        --request-id "$submit_id" -- true ) >"$work/s12.out" 2>"$work/s12.err" || s12_status=$?
+printf '%s' "$s12_status" > "$work/s12.rc"
+assert_rc s12 2
+assert_err_has s12 'cannot resolve the working directory'
+assert_reason s12
+clear_runtime
+
+# S13. A lock-free reader wins the race between `pueue remove` and the writer's
+#      archive: it converges the `removing` record to removed.  The remove must
+#      report that outcome (removed + recovered) instead of failing with
+#      "missing AgentQ request record".  The stub simulates the reader by
+#      deleting the record and writing a matching tombstone inside `pueue
+#      remove` -- exactly what recover_removing_requests leaves behind.
+write_removal_race_stub() {
+    local add_id=$1
+    cat > "$work/pueue" <<SH
+#!/bin/sh
+case "\$*" in
+  *"remove "*)
+    rm -f -- "$work/data/agentq-requests/$submit_id.json"
+    printf '{"version":1,"request_id":"%s","task_id":%s,"task_created_at":"2026-09-29T00:00:00Z","state":"removed","removed_at":"2026-09-29T00:00:00Z"}\n' \
+        "$submit_id" "$add_id" > "$work/data/agentq-requests/.tombstones/$submit_id.json"
+    exit 0
+    ;;
+  *"kill "*) exit 0 ;;
+  *"add "*) printf '%s\n' $add_id; : > "$work/.added" ;;
+  *"status --json"*)
+    if [ -e "$work/.added" ]; then
+      printf '%s\n' '{"tasks":{"$add_id":{"id":$add_id,"created_at":"2026-09-29T00:00:00Z","command":"true","label":"agentq:$submit_id","status":{"Queued":{}},"group":"agentq"}},"groups":{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}}'
+    else
+      printf '%s\n' '{"tasks":{},"groups":{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}}'
+    fi
+    ;;
+  *"group --json"*) printf '%s\n' '{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}' ;;
+  *) printf '%s 4.0.4\n' pueue ;;
+esac
+SH
+    chmod 700 "$work/pueue"
+}
+clear_runtime
+rm -f "$work/.added"
+write_removal_race_stub 4242
+run_case s13 submit --workdir "$work" --label smoke --request-id "$submit_id" -- true
+assert_rc s13 0
+run_case s13rm remove 4242
+assert_rc s13rm 0
+assert_json s13rm '.removed == true and .recovered == true'
+clear_runtime
+rm -f "$work/.added"
+
+# S14. `data/` and `data/task_logs/` were the only two AgentQ directories the
+#      server did NOT converge to 0700 (cancellation/request/runtime already
+#      are), so a deployment restored from a 0755 archive stayed readable.
+clear_runtime
+write_stub "$empty_tasks"
+chmod 755 "$work/data" "$work/data/task_logs"
+run_case s14 status --summary
+assert_rc s14 0
+cases=$((cases + 1))
+for s14_dir in "$work/data" "$work/data/task_logs"; do
+    s14_mode=$(stat -f '%Lp' "$s14_dir" 2>/dev/null || stat -c '%a' "$s14_dir")
+    if [ "$s14_mode" != 700 ]; then
+        printf 'write-paths s14: %s is mode %s after a command, expected 700\n' "$s14_dir" "$s14_mode" >&2
+        failures=$((failures + 1))
+    fi
+done
+
+# S15. A failing `pueue parallel` during submit is a DEPLOYMENT problem, not a
+#      protocol/argument error: the reason class must say deployment_state, as
+#      verify_group does for the same group.
+cat > "$work/pueue" <<'SH'
+#!/bin/sh
+case "$*" in
+  *"parallel "*) exit 1 ;;
+  *"status --json"*) printf '%s\n' '{"tasks":{},"groups":{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}}' ;;
+  *"group --json"*) printf '%s\n' '{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}' ;;
+  *) printf '%s 4.0.4\n' pueue ;;
+esac
+SH
+chmod 700 "$work/pueue"
+clear_runtime
+run_case s15 submit --workdir "$work" --label smoke --request-id "$submit_id" -- true
+assert_rc s15 2
+assert_err_has s15 'cannot ensure AgentQ group'
+assert_reason_is s15 deployment_state
+
 # --------------------------------------------------------------- summary
 if [ "$failures" -ne 0 ]; then
     printf 'write-paths checks FAILED: cases=%s failures=%s\n' "$cases" "$failures" >&2

@@ -114,8 +114,10 @@ workflow，超出部分静默不触发**）、在版本索引加一行并在日�
   的 linux job 用 `fetch-depth: 0` 检出让规则每次都真的跑（实测：浅克隆 `tags=0`、全量 `tags=35`，2026-11-19）。
 - 六向变异红证（幽灵 tag / 缺索引 / 重复索引 / 顺序颠倒 / 最新条目缺验证行 / 顶部倒填日期）都
   跑过并还原。
-- **tag 用 annotated**：`git tag -a vX.Y.Z -m "..."`。`release.yml` 只比名字、轻量 tag 也能过，
-  但注释是承载发布说明与回链的地方；此前 32 个 tag 里有 7 个是轻量的，属历史，新 tag 一律带注释。
+- **tag 用 annotated**：`git tag -a vX.Y.Z -m "..."`。`release.yml` 的
+  `Require an annotated tag` 步骤会 re-fetch `refs/tags/<name>` 并对轻量 tag 退 1
+  （2026-11-20 前它只比名字，是 smoke/31 规则 E 与这条注释发现的分叉）；
+  注释是承载发布说明与回链的地方。此前 32 个 tag 里有 7 个是轻量的，属历史，新 tag 一律带注释。
 
 ## 协议契约
 

@@ -508,6 +508,38 @@ expect_junk scanned CHANGELOG.md               'an ordinary repository file'
 # testing itself.  Each directory is built here, scanned, then removed.  The
 # catch cases are asserted by the violation COUNT delta, because the report
 # masks the address (by design) and cannot be grepped for it.
+# Enumerate the repository tree for scanning. It runs INSIDE the root and
+# uses a literal `.` plus NAME-based pruning, because every earlier shape put
+# `$root` into a find PATTERN (`-path "$root/.git/*"`): a checkout whose path
+# contains glob metacharacters -- `[`, `]`, `*`, `?` -- makes find match
+# those as pattern syntax, the exclusions stop excluding, and .git/.claude
+# contents enter the scan (measured 2026-11-21 by the independent review
+# with a root named `a[b]`). Names cannot carry the root in.
+enumerate_repo_files() { # $1=root
+    (cd "$1" && find . \( -name .git -o -name .claude \) -prune -o -type f -not -name '*.syntax.*' -print | sed 's|^\./||' | sort)
+}
+# The tree enumeration must not let the CHECKOUT PATH change what it scans.
+# It used to hand "$root/.git/*" to find -path, so a root containing glob
+# metacharacters made those exclusions pattern-match OTHER names and .git /
+# .claude contents entered the scan (measured 2026-11-21 by the independent
+# review with a root named a[b]). Both directions are asserted: the excluded
+# trees must stay out AND the real file must still be enumerated, so an
+# enumeration that fails outright cannot pass as "excluded everything".
+enum_base=$(mktemp -d "${TMPDIR:-/tmp}/agentq-enum-glob.XXXXXX")
+enum_root="$enum_base/a[b]"
+mkdir -p "$enum_root/.git/x" "$enum_root/.claude/x" "$enum_root/real"
+: > "$enum_root/.git/x/secret"
+: > "$enum_root/.claude/x/scratch"
+: > "$enum_root/real/file"
+enum_got=$(enumerate_repo_files "$enum_root")
+enum_want='real/file'
+if [ "$enum_got" != "$enum_want" ]; then
+    printf 'self-test: the tree enumeration under a glob-containing root scanned [%s], expected [%s]\n' \
+    "$enum_got" "$enum_want" >&2
+    selftest_failures=$((selftest_failures + 1))
+fi
+rm -rf -- "$enum_root" "$enum_base" 2>/dev/null || true
+
 mj_root=$(mktemp -d "${TMPDIR:-/tmp}/agentq-memory-states.XXXXXX")
 mj_dq=$(printf '%s.%s.%s.%s' 10 1 2 3)   # assembled: this file is scanned too
 mj_expect() { # mj_expect <want-state> <want-violations> <dir> <what>
@@ -713,7 +745,7 @@ while IFS= read -r file; do
     tree_scanned=$((tree_scanned + 1))
     scan_file "$file"
 done <<EOF
-$(find "$root" -type f -not -path "$root/.git/*" -not -path "$root/.claude/*" -not -name '*.syntax.*' | sort)
+$(enumerate_repo_files "$root")
 EOF
 # Zero files means the enumeration broke, not that the tree is clean.  Without
 # this guard a bad root reported "files=17 violations=0" (all from the memory

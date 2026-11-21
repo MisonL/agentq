@@ -384,8 +384,32 @@ else
     if [ "$gate_status" -eq 0 ]; then
         printf '%s\n' 'ps-client-installer: a non-Windows run exited 0 instead of failing' >&2
         failures=$((failures + 1))
+    elif [ "$gate_status" -ne 2 ]; then
+        # The installer's script-scope trap answers an unhandled throw the way
+        # the POSIX twin does: exit 2.  Before it existed this run exited 1 with
+        # a multi-line renderer block, and 1 is also the documented -Check
+        # verdict for drift -- measured 2026-11-21.
+        printf 'ps-client-installer: a non-Windows run exited %s, expected 2 (the failure contract is one program-prefixed line and exit 2)\n' \
+            "$gate_status" >&2
+        failures=$((failures + 1))
     elif ! grep -qF 'This installer must run on Windows' <<< "$(strip_ansi "$work/err")"; then
         printf 'ps-client-installer: the platform gate reported something unexpected: %s\n' \
+            "$(strip_ansi "$work/err" | head -1)" >&2
+        failures=$((failures + 1))
+    fi
+
+    # ...and the SHAPE of that answer, not just its text: exactly one line,
+    # carrying the program prefix.  The trap builds that line itself through
+    # [Console]::Error.WriteLine, so it reads the same on PS 5.1 and pwsh 7; a
+    # regression to a bare `throw` would surface here as the renderer block.
+    cases=$((cases + 1))
+    gate_stderr_lines=$(strip_ansi "$work/err" | wc -l | tr -d ' ')
+    if [ "$gate_stderr_lines" -ne 1 ]; then
+        printf 'ps-client-installer: the platform gate wrote %s stderr lines; the failure contract is one program-prefixed line\n' \
+            "$gate_stderr_lines" >&2
+        failures=$((failures + 1))
+    elif ! grep -qE '^agentq-client-installer: ' "$work/err"; then
+        printf 'ps-client-installer: the platform gate line does not carry the program prefix: %s\n' \
             "$(strip_ansi "$work/err" | head -1)" >&2
         failures=$((failures + 1))
     fi

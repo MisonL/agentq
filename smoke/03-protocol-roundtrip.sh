@@ -256,7 +256,12 @@ if [ -d "$runtime_home/data/agentq-requests" ]; then
             # builds (this file's own id comment: `smoke-` + pid + UTC stamp),
             # never a bare `smoke-*`: a user label that merely starts with
             # "smoke" is not this check's.
-            agentq:smoke-[0-9]*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-*)
+            # TWO arms, because `$request_id` itself is bare: the FIRST submit
+            # carries `agentq:smoke-<pid>-<stamp>` with no case suffix, and a
+            # pattern requiring `Z-` missed exactly that record -- the same
+            # permanent self-brick through the one shape the first fix left out
+            # (measured 2026-11-21 in review).
+            agentq:smoke-[0-9]*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z|agentq:smoke-[0-9]*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z-*)
                 printf 'dropping a record left by an earlier run of this check: %s (label %s)\n' \
                     "${candidate##*/}" "$leftover_label" >&2
                 rm -f -- "$candidate"
@@ -776,17 +781,16 @@ fi
 # Queued means "no slot free": the victim has to be behind a task that is
 # Running when it is submitted.
 #
-# The case does not predict Pueue -- it looks.  The first try puts ZERO blockers
-# and submits alone.  If the victim is Queued anyway, it is queued in the sense
-# the contract cares about, and the case proceeds (that is the normal state of a
-# freshly created group, and the one CI starts from).  If it starts, the case
-# adds ONE blocker, waits until the server reports it Running, lowers the group
-# to 0 (`submit` re-asserts `parallel 1`, but the submit happens while the group
-# is at 0), submits again, and looks again; a victim that started on that try is
-# removed (never `cancel`: a cancellation marker would poison the replay case
-# below) and the loop stops -- it never adds a second blocker, because a
-# previously started group can dispatch every queued task in one step (measured
-# 2026-11-17: 8 blockers queued and the victim submitted next still ran first).
+# The case does not predict Pueue -- it looks.  TWO 300-second blockers are
+# queued FIRST, at parallelism 1, so at most one runs and the victim submitted
+# behind them has nowhere to go; the group is normalised to 1 and the value is
+# asserted before the case relies on it (see below).  A try that finds the
+# victim started removes it (never `cancel`: a cancellation marker would poison
+# the replay case below) and retries under a new request id; a third retry adds
+# one more blocker.  The older shape -- zero blockers, then "lower the group to
+# 0" -- is gone because `pueue parallel 0` means UNLIMITED, not paused
+# (pueue 4.0.4 `parallel --help`, measured 2026-11-21), and the first try on a
+# fresh group could dispatch the victim before any blocker existed.
 #
 # Every observation comes from the server.  `pueue status` is not evidence: it
 # reported tasks as Running that never started, and a `sleep 60` as done after a
@@ -837,6 +841,72 @@ agentq_task_harness() {
         printf 'task %s %s exited %s\n' "$id" "$subcommand" "$status" >&2
     return 0
 }
+
+# End a task this run created and REQUIRE it to be gone. The primitive above
+# tolerates a non-zero cancel/remove because "already gone" answers 2 for both
+# -- but a cleanup that only PRINTS the failure and returns 0 lets the check
+# exit 0 while leaving a task or a request record behind (review round eight:
+# measured once with `remove` answering 2 and the run still green). Every
+# caller that ends a task from an EARLIER run, or a victim whose slot the next
+# step needs, goes through this one instead.
+end_task_and_require_absent() {
+    local id=$1
+    local waited=0
+    agentq_task_harness cancel "$id"
+    agentq_task_harness remove "$id"
+    remove_raw_task "$id"
+    while [ "$(task_status_name "$id")" != Absent ]; do
+        if [ "$waited" -ge 60 ]; then
+            printf 'task %s survived cleanup (%s); later cases would run against its residue\n' \
+            "$id" "$(task_status_name "$id")" >&2
+            exit 1
+        fi
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+}
+
+# Tasks added through `pueue add` DIRECTLY (the blockers) have no AgentQ
+# request record, so every server-mediated cancel/remove answers2
+# "AgentQ task metadata does not identify its request" -- measured 2026-11-21
+# while this round's teardown left two Done blockers behind and then failed
+# its own Absent assertion. The server was always the wrong tool for them;
+# these helpers drive pueue itself.
+remove_raw_task() { # $1=id
+    PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" "$runtime_home/pueue" remove "$1" >/dev/null 2>&1 || true
+}
+end_raw_task() { # $1=id; kill, wait out of Running/Queued, remove, require Absent
+    local id=$1 waited=0 state
+    PUEUE_CONFIG_PATH="$runtime_home/config/pueue.yml" "$runtime_home/pueue" kill "$id" >/dev/null 2>&1 || true
+    while :; do
+        state=$(pueue_task_state "$id")
+        case "$state" in
+            Running|Queued) ;;
+            *) break ;;
+        esac
+        if [ "$waited" -ge 60 ]; then
+            printf 'task %s stayed %s after a kill; later cases would starve behind it\n' "$id" "$state" >&2
+            exit 1
+        fi
+        sleep 0.5
+        waited=$((waited + 1))
+    done
+    remove_raw_task "$id"
+    waited=0
+        while :; do
+        state=$(pueue_task_state "$id")
+            case "$state" in
+        Absent|Removed) return 0 ;;
+        esac
+            if [ "$waited" -ge 60 ]; then
+            printf 'task %s survived cleanup (%s)\n' "$id" "$state" >&2
+        exit 1
+        fi
+        sleep 0.5
+    waited=$((waited + 1))
+    done
+}
+blocker_ids=''
 add_blocker() {
     local output
     local blocker_id
@@ -854,6 +924,7 @@ add_blocker() {
     # Registered before anything else can fail: an unregistered blocker would
     # hold a slot for 300 seconds, and the trap could only wait it out.
     cleanup_task_ids="$cleanup_task_ids $blocker_id"
+    blocker_ids="$blocker_ids $blocker_id"
     # No stdout at all -- the caller gets the id through this variable.  This
     # check captures the output of every command between itself and some later
     # ones, and a stray line would corrupt them (measured here once: a printed id
@@ -874,8 +945,13 @@ victim_request_id="${request_id}-queued"
 # carrying this request id's own label; the record below is dropped only once
 # the victim task is really gone, because a record deleted under a live task is
 # how a later submit on the id answers `ambiguous`.
-stale_victim_absent=1
+# FAIL-CLOSED: a snapshot that cannot be read proves nothing, so the records
+# below are only dropped when the read SUCCEEDED and every stale victim is
+# confirmed gone (the old initial value of 1 answered "absent" for a failed
+# read and deleted the records anyway).
+stale_victim_absent=0
 if stale_snapshot=$("$server" status 2>/dev/null); then
+    stale_victim_absent=1
     # Both of this case's request ids, since the second try uses its own.
     stale_victim_ids=$(jq -r --arg v1 "$victim_request_id" --arg v2 "${request_id}-queued2" \
         '.tasks | to_entries[]
@@ -889,8 +965,7 @@ if stale_snapshot=$("$server" status 2>/dev/null); then
                       or (.value.label // "") == ("agentq:" + $v2))
              | .key' <<<"$stale_snapshot" 2>/dev/null || true); do
         printf 'ending a task left by an earlier run of this check: %s\n' "$stale_id" >&2
-        agentq_task_harness cancel "$stale_id"
-        agentq_task_harness remove "$stale_id"
+        end_task_and_require_absent "$stale_id"
     done
     if [ -n "$stale_victim_ids" ]; then
         for stale_id in $stale_victim_ids; do
@@ -1018,12 +1093,7 @@ start_victim() {
     # End it with `remove` (never `cancel`, which would leave a cancellation
     # marker for the replay case below) and wait until the server no longer
     # lists it, so the slot it held is really free for the next try.
-    agentq_task_harness cancel "$victim_task_id"
-    agentq_task_harness remove "$victim_task_id"
-    for _ in $(seq 1 60); do
-        [ "$(task_status_name "$victim_task_id")" = Absent ] && break
-        sleep 0.5
-    done
+     end_task_and_require_absent "$victim_task_id"
     return 0
 }
 start_victim
@@ -1135,25 +1205,34 @@ pueue_task_state() { # $1=id; the Pueue status key, Absent when the id is gone
             '.tasks[$id].status // "Absent" | if type == "object" then keys[0] else "Absent" end' \
                 2>/dev/null || printf 'Unreadable'
 }
-for blocker in $first_blocker_id $second_blocker_id; do
-    agentq_task_harness cancel "$blocker"
+for blocker in $blocker_ids; do
+    end_raw_task "$blocker"
 done
-for blocker in $first_blocker_id $second_blocker_id; do
+for blocker in $blocker_ids; do
     for _ in $(seq 1 60); do
         case "$(pueue_task_state "$blocker")" in
             Running|Queued) sleep 0.5 ;;
             *) break ;;
         esac
     done
-    agentq_task_harness remove "$blocker"
+    remove_raw_task "$blocker"
 done
-for blocker in $first_blocker_id $second_blocker_id; do
+# Every blocker -- including any a third retry added -- must be GONE before the
+# cases below submit and wait: one left Running would hold the group's only
+# slot for its whole 300 seconds.
+for blocker in $blocker_ids; do
+    blocker_gone=0
     for _ in $(seq 1 60); do
         case "$(pueue_task_state "$blocker")" in
-            Absent|Removed) break ;;
+            Absent|Removed) blocker_gone=1; break ;;
             *) sleep 0.5 ;;
         esac
     done
+    if [ "$blocker_gone" -ne 1 ]; then
+        printf 'a queued-case blocker is still in the queue after the window: %s (%s); later cases would starve behind it\n' \
+            "$blocker" "$(pueue_task_state "$blocker")" >&2
+        exit 1
+    fi
 done
 
 # The replay must be pinned to the same task INSTANCE.  Pueue reuses numeric

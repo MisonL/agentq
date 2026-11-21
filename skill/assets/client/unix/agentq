@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.38'
+agentq_client_version='0.1.39'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072), and the unix bound keeps a
 # safety margin under it.
@@ -2275,18 +2275,35 @@ workdir_is_blank() {
 
 generate_request_id() {
     if command -v uuidgen >/dev/null 2>&1; then
-        generated=$(uuidgen | LC_ALL=C tr '[:upper:]' '[:lower:]')
-        printf 'aq-%s\n' "$generated"
-        return
+    generated=$(uuidgen 2>/dev/null | LC_ALL=C tr '[:upper:]' '[:lower:]')
+    # A uuidgen that is PRESENT but answers nothing usable must not be
+    # printed as `aq-`: the caller's next check is is_request_id, and it
+    # would report the generated id as a malformed --request-id -- naming
+    # the wrong thing, and pointing the operator at an argument they never
+    # passed (review round eight). Fall through to the next tool instead.
+    case "$generated" in
+        ''|*[!0123456789abcdef-]*) ;;
+        *)
+            if [ "${#generated}" -ge 32 ]; then
+                printf 'aq-%s\n' "$generated"
+                return 0
+            fi
+        ;;
+    esac
     fi
 
     if command -v openssl >/dev/null 2>&1; then
-        generated=$(openssl rand -hex 16)
-        printf 'aq-%s\n' "$generated"
-        return
+    generated=$(openssl rand -hex 16 2>/dev/null)
+    case "$generated" in
+        ''|*[!0123456789abcdef]*) ;;
+        *)
+            printf 'aq-%s\n' "$generated"
+            return 0
+        ;;
+    esac
     fi
 
-    fail 'uuidgen or openssl is required to create a durable AgentQ request id'
+    fail 'cannot create a durable AgentQ request id: uuidgen and openssl are both unavailable or failed'
 }
 
 ssh_transport_error() {
@@ -3342,12 +3359,30 @@ probe_windows_agentq_protocol() {
             "$program" "$host" >&2
         return 2
     fi
+    # 44/45 are launcher refusals of the same class as 42/43 (a deployment
+    # defect: an unsafe reparse path, or a launcher over the probe size limit),
+    # and the Windows twin turns them into exit 2 with these messages.  They
+    # used to propagate here as 44/45 with the generic text, so the same remote
+    # outcome gave the two clients different exit codes AND different
+    # diagnostics (measured 2026-11-21 in review).  A 44/45 whose payload does
+    # not carry its marker still falls through to the propagation below.
+    if [ "$windows_protocol_status" -eq 44 ] && [ "$windows_protocol_output" = agentq-windows-launcher-invalid ]; then
+        printf '%s: remote Windows AgentQ deployment is unsafe: C:/ProgramData/AgentQ/agentq-launcher.ps1 or its parent is a reparse path; repair the protected deployment before using it\n' \
+            "$program" >&2
+        return 2
+    fi
+    if [ "$windows_protocol_status" -eq 45 ] && [ "$windows_protocol_output" = agentq-windows-launcher-too-large ]; then
+        printf '%s: remote Windows AgentQ deployment is incompatible: C:/ProgramData/AgentQ/agentq-launcher.ps1 exceeds the protocol probe size limit; repair the protected deployment before using it\n' \
+            "$program" >&2
+        return 2
+    fi
 
     # A mismatched response with SSH status 0 is still a protocol failure.
     # Returning the 0 verbatim made the probe advisory: the message printed and
     # the command ran anyway (measured 2026-10-06).  The platform probe next
-    # door already fails closed here; this aligns the two.  Nonzero statuses
-    # (44/45/124) still propagate for their callers' diagnostics.
+    # door already fails closed here; this aligns the two.  Unmatched failures
+    # still propagate for their callers' diagnostics (124, and a 44/45 whose
+    # payload did not carry its marker).
     if [ "$windows_protocol_status" -eq 0 ]; then
         windows_protocol_status=2
     fi
