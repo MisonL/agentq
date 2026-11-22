@@ -736,7 +736,7 @@ smoke 检查自身、文档一致性、防御性安全）与 Orca Codex worker �
 **服务端**：
 1. **原生 Windows jq 的 CRLF 让文本/argv 校验永远判非法**（P0）。`is_valid_text_argument`
 与 `is_valid_argv`经仓库自装的 `jq()`过滤（wrapper 会补行尾换行），而原生 Windows jq
-写 CRLF——字节级往返校验恒不等，`submit`/`remove --label`在原生 Windows 上 100%退 2。
+写 CRLF——字节级往返校验恒不等，`submit`/`remove --label`在原生 Windows 上 100% 退 2。
 改为 `command jq`直读后，CRLF 桩实测 rc=2 → rc=0。
 2. **`normalize_workdir`的 `{ pwd -P; printf Z; }`状态取自 `printf`**：`pwd`失败被吞，
 空 workdir 通过文本校验并入队；改为显式取 `pwd -P`的状态。
