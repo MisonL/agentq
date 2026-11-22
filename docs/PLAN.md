@@ -45,8 +45,8 @@ CHANGELOG 里的过程记录）都是历史，不是任务。
    Windows 客户端内嵌 wrapper、POSIX 客户端内嵌 wrapper 各自必须能独立发出同一份
    payload 协议，无法合并。漂移由 `smoke/10` 规则 E 检测（比较 token 序列而非字节），
    四类分叉实测全部被抓。**所以这一项是「已加护栏」，不是「已消除重复」。**
-2. **一半代码凭什么被相信** —— 现役口径为 **417 行 / 34,514 = 1.21%**
-   （2026-11-12 复核，见第六节；`docs/verification-status.md` 的覆盖表是它的逐项账本）。
+2. **一半代码凭什么被相信** —— 现役口径为 **417 行 / 37,121 = 1.12%**
+   （2026-11-22 按当前字节重算分母，见第六节；`docs/verification-status.md` 的覆盖表是它的逐项账本）。
    14.2%（9 个资产 / 3,498 行）是 2026-09-24 的历史口径，**只作对照、不要再引用**；另有更大
    一片是「只有源码断言、没有行为执行」。**这一项本质未变**，只靠逐项补契约检查
    推进（A1/B4 已做 3 个）。
@@ -726,74 +726,74 @@ smoke/31」），还原后绿。
 Windows 目标身份复核只做静态/桩验证，未在真 Windows + 真 SSH 上端到端运行；本轮所有
 并发与诊断测试都在本机合成运行时上，生产 Pueue/远端/凭证未验证。
 
-### 2026-11-21 第八轮审查（全维度：6个只读 agent + Orca Codex，审的是 v0.1.38）——修服务端 Windows jq CRLF与队列语义、客户端形状校验、检查自身假绿，版本0.1.38 →0.1.39
+### 2026-11-21 第八轮审查（全维度：6 个只读 agent + Orca Codex，审的是 v0.1.38）——修服务端 Windows jq CRLF 与队列语义、客户端形状校验、检查自身假绿，版本 0.1.38 →0.1.39
 
-**范围与边界**：6个只读 agent（服务端协议/并发、POSIX客户端、Windows客户端与安装器、
-smoke检查自身、文档一致性、防御性安全）与 Orca Codex worker各自出报告；所有发现都在
-主检出独立复现后才改，未能复现的写进边界。安全 agent只做防御性静态分析，未构造或运行
+**范围与边界**：6 个只读 agent（服务端协议/并发、POSIX 客户端、Windows 客户端与安装器、
+smoke 检查自身、文档一致性、防御性安全）与 Orca Codex worker 各自出报告；所有发现都在
+主检出独立复现后才改，未能复现的写进边界。安全 agent 只做防御性静态分析，未构造或运行
 利用载荷。生产主机一台未碰；测试机真远端的既有证据不因本轮扩展。
 
 **服务端**：
-1. **原生 Windows jq的 CRLF让文本/argv校验永远判非法**（P0）。`is_valid_text_argument`
-与 `is_valid_argv`经仓库自装的 `jq()`过滤（wrapper会补行尾换行），而原生 Windows jq
-写 CRLF——字节级往返校验恒不等，`submit`/`remove --label`在原生 Windows上100%退2。
-改为 `command jq`直读后，CRLF桩实测 rc=2 → rc=0。
+1. **原生 Windows jq 的 CRLF 让文本/argv 校验永远判非法**（P0）。`is_valid_text_argument`
+与 `is_valid_argv`经仓库自装的 `jq()`过滤（wrapper 会补行尾换行），而原生 Windows jq
+写 CRLF——字节级往返校验恒不等，`submit`/`remove --label`在原生 Windows 上 100%退 2。
+改为 `command jq`直读后，CRLF 桩实测 rc=2 → rc=0。
 2. **`normalize_workdir`的 `{ pwd -P; printf Z; }`状态取自 `printf`**：`pwd`失败被吞，
-空 workdir通过文本校验并入队；改为显式取 `pwd -P`的状态。
-3. **`mark_request_removed`把并发的 record消失报成失败**：另一个归档者先删了 record时
- rename失败被当错误；现在识别 record已消失并按收敛处理（`recovered:true`）。
+空 workdir 通过文本校验并入队；改为显式取 `pwd -P`的状态。
+3. **`mark_request_removed`把并发的 record 消失报成失败**：另一个归档者先删了 record 时
+ rename 失败被当错误；现在识别 record 已消失并按收敛处理（`recovered:true`）。
 4. `ensure_*_directory`补 `chmod 700`；`ensure_group`失败从 `protocol_error`归到
  `deployment_state`。
 
 **客户端与 Twin**：
-- **Windows批量删除接受嵌套数组**：`ConvertFrom-Json`逐层解包单元素数组，`[[{...}]]`解成
- array[1]，与扁平数组不可区分（实测 verdict=True），POSIX客户端则拒绝。解密后的原文是
+- **Windows 批量删除接受嵌套数组**：`ConvertFrom-Json`逐层解包单元素数组，`[[{...}]]`解成
+ array[1]，与扁平数组不可区分（实测 verdict=True），POSIX 客户端则拒绝。解密后的原文是
 唯一保留形状的地方：新增 `Test-JsonBatchElementsAreObjects`原始文本扫描（字符串感知、
-深度跟踪），`[[…]]`现在两客户端同拒（smoke/12两方向用例）。
-- **POSIX的 launcher44/45与 Windows孪生分叉**：同一探针输出，Windows答2 +专属
-消息，POSIX透传44/45（这两个码对调用方含义相反）；对齐为2。
-- **`generate_request_id`在 uuidgen坏时打出 `aq-`**（空后缀），下游误报成「request-id
-格式错」；现在校验 uuidgen输出的字符集与长度，不合格落 `openssl rand -hex 16`，两者
+深度跟踪），`[[…]]`现在两客户端同拒（smoke/12 两方向用例）。
+- **POSIX 的 launcher44/45 与 Windows 孪生分叉**：同一探针输出，Windows 答 2 +专属
+消息，POSIX 透传 44/45（这两个码对调用方含义相反）；对齐为 2。
+- **`generate_request_id`在 uuidgen 坏时打出 `aq-`**（空后缀），下游误报成「request-id
+格式错」；现在校验 uuidgen 输出的字符集与长度，不合格落 `openssl rand -hex 16`，两者
 都坏才明确报 `cannot create a durable AgentQ request id`。
-- **Windows安装器的未处理 throw**从 exit 1 +多行渲染块改为一前缀行 + exit 2（脚本级
+- **Windows 安装器的未处理 throw**从 exit 1 +多行渲染块改为一前缀行 + exit 2（脚本级
  trap，两个安装器各一份）；`Test-NonReparseFilePath`现在拒绝目录，锁目录校验按
- `-RequireContainer`转发 `-AllowDirectory`（先打坏锁校验、被 smoke/13抓到后修好）。
-- **token读取器**先剥 `\r`再匹配 `(?m)^agentq-exit:([0-9]{1,3})$`。边界：interior-CR
-形状在 Windows不可达——PowerShell原生 stderr重定向按 CR拆行（字节级实测），
- POSIX读原始字节才能看到；记录为架构差异，`smoke/12`不再为该形状保留用例。
+ `-RequireContainer`转发 `-AllowDirectory`（先打坏锁校验、被 smoke/13 抓到后修好）。
+- **token 读取器**先剥 `\r`再匹配 `(?m)^agentq-exit:([0-9]{1,3})$`。边界：interior-CR
+形状在 Windows 不可达——PowerShell 原生 stderr 重定向按 CR 拆行（字节级实测），
+ POSIX 读原始字节才能看到；记录为架构差异，`smoke/12`不再为该形状保留用例。
 
 **检查/门禁自身的假绿（每个都先做红证）**：
-- `smoke/03`：新增 `end_task_and_require_absent`（原清理把失败吞成0）；直接用 pueue建的
- blocker不再走服务端 remove（服务端对它永答 `does not identify its request`，实测 rc=2），
-改 pueue直连 `end_raw_task`；残留守卫补基础 request id形状（`…Z`与 `…Z-*`）。
-- `smoke/05`：44/45夹具改为背靠背无换行 token（原 fixture在 marker后多打换行，正确资产
-被报成44——fixture凭想象写的一类实测复现）；新增 uuidgen坏桩用例（断言兜底 request id
+- `smoke/03`：新增 `end_task_and_require_absent`（原清理把失败吞成 0）；直接用 pueue 建的
+ blocker 不再走服务端 remove（服务端对它永答 `does not identify its request`，实测 rc=2），
+改 pueue 直连 `end_raw_task`；残留守卫补基础 request id 形状（`…Z`与 `…Z-*`）。
+- `smoke/05`：44/45 夹具改为背靠背无换行 token（原 fixture 在 marker 后多打换行，正确资产
+被报成 44——fixture 凭想象写的一类实测复现）；新增 uuidgen 坏桩用例（断言兜底 request id
 以 `aq-[0-9a-f]{32}`到达远端命令且无 'request id'误报）。
-- `smoke/12`：空变异体的假绿——budget-disabled mutant若不产出远端命令，字节比较「证明」
+- `smoke/12`：空变异体的假绿——budget-disabled mutant 若不产出远端命令，字节比较「证明」
 不了比较器能红，现单独报红；**新守卫第一次跑就抓到了它防的那个形状，而且就在 harness
-自己身上**：两个 Windows变异副本（`twin-windows-nobudget`、`twin-windows-plus`）都没有
-`.ps1`扩展名，实测 `pwsh -File`对无扩展名副本在 line 4之前失败（`$script:Program`在
-StrictMode下未设，顶层 trap再读它时二次报错），exit 1、副本整个没执行——此前
-「posix与 windows响应不同」的断言因此一直为真，但真因是副本没跑。两份副本改名为
-`.ps1`后 mutant正常产出远端命令。interior-CR用例删除（fixture描述传输层不存在的形状）。
-- `smoke/13`：`Get-DeadProcessId`的 `'-c exit 0'`单串被 .NET Unix解析成三参（引号不剥），
+自己身上**：两个 Windows 变异副本（`twin-windows-nobudget`、`twin-windows-plus`）都没有
+`.ps1`扩展名，实测 `pwsh -File`对无扩展名副本在 line 4 之前失败（`$script:Program`在
+StrictMode 下未设，顶层 trap 再读它时二次报错），exit 1、副本整个没执行——此前
+「posix 与 windows 响应不同」的断言因此一直为真，但真因是副本没跑。两份副本改名为
+`.ps1`后 mutant 正常产出远端命令。interior-CR 用例删除（fixture 描述传输层不存在的形状）。
+- `smoke/13`：`Get-DeadProcessId`的 `'-c exit 0'`单串被 .NET Unix 解析成三参（引号不剥），
 改用 `ArgumentList`；平台门槛断言必须 exit 2 +恰一行 + `^agentq-installer: `前缀。
-- `smoke/16`：`-path "$root/…"`受检出路径含 glob字符影响（`./`前缀也打坏了 R4豁免），
-改为在 root内 `find .`后剥前缀的自枚举函数。
-- `smoke/01`：`pattern_matches_under`同因；NOT-covered扫描不再把整行注释算作「可能打印」。
-- `smoke/31`：规则 B在重跑历史 tag时要求后续 tag的索引行，与「最新日志条目」规则冲突；
- `git tag --list --merged HEAD`在本仓 shallow/grafted检出上只答1/39个 tag，改为快照
-视界谓词（只检查不晚于 HEAD版本的部分），四方向自校准。
+- `smoke/16`：`-path "$root/…"`受检出路径含 glob 字符影响（`./`前缀也打坏了 R4 豁免），
+改为在 root 内 `find .`后剥前缀的自枚举函数。
+- `smoke/01`：`pattern_matches_under`同因；NOT-covered 扫描不再把整行注释算作「可能打印」。
+- `smoke/31`：规则 B 在重跑历史 tag 时要求后续 tag 的索引行，与「最新日志条目」规则冲突；
+ `git tag --list --merged HEAD`在本仓 shallow/grafted 检出上只答 1/39 个 tag，改为快照
+视界谓词（只检查不晚于 HEAD 版本的部分），四方向自校准。
 - `smoke/18`：头部说明订正——占位基线是同一资产的副本，不是独立 oracle，承重的是期望
 片段与 rc。
--文档：`release.yml`自2026-11-20起有 `Require an annotated tag`步骤（轻量 tag退1），
- `CLAUDE.md`/`CONTRIBUTING.md`仍写「轻量 tag也能过」——已改。
+-文档：`release.yml`自 2026-11-20 起有 `Require an annotated tag`步骤（轻量 tag 退 1），
+ `CLAUDE.md`/`CONTRIBUTING.md`仍写「轻量 tag 也能过」——已改。
 
 **未修边界（不声称覆盖）**：`AGENTQ_REMOTE_PLATFORM`大小写与平台缓存归一化在孪生间的
-分叉；平台缓存 `probed_at`残渣；POSIX平台探针临时文件在命令替换里的泄漏路径；
-`smoke/10`的 D2/规则 B已知窗口；`smoke/11`的零断言形态；`smoke/02`站点扫描的覆盖
-边界；`smoke/16` R4的路径字面豁免；部分跨文档计数；安全 agent的 P3-1/P3-3/P3-4
-（只读协议即可构造的低价值信息面，未改动）；pwsh7.0–7.4无 `-DateKind`；生产环境
+分叉；平台缓存 `probed_at`残渣；POSIX 平台探针临时文件在命令替换里的泄漏路径；
+`smoke/10`的 D2/规则 B 已知窗口；`smoke/11`的零断言形态；`smoke/02`站点扫描的覆盖
+边界；`smoke/16` R4 的路径字面豁免；部分跨文档计数；安全 agent 的 P3-1/P3-3/P3-4
+（只读协议即可构造的低价值信息面，未改动）；pwsh7.0–7.4 无 `-DateKind`；生产环境
 仍未验证。
 
 ### 2026-11-19 第四轮终审（7 个只读 agent + Orca Codex，审的是 v0.1.34）——修 12 处，其中 1 条 P1 是客户端的中断语义（编号里有 13 条：第 3 条是本轮我自己的修复引入的回归，不算独立发现）
@@ -1242,7 +1242,7 @@ wait 的 record 批量扫描（`request_record_path_guards_or_fail "$path" || { 
 
 ## 六、执行状态
 
-**第五轮全维度审查（2026-10-16，用户「使用agents进行全维度全场景审查」）——
+**第五轮全维度审查（2026-10-16，用户「使用 agents 进行全维度全场景审查」）——
 7 个并行只读 agent 覆盖服务端 / POSIX 客户端 / Windows 客户端 / smoke 质量 /
 协议一致性 / 安全面 / 安装器与 launcher；1 个 agent 中途 API 超时，其半成品
 线索本人复核后确认为真 P0。每条发现均先复现或证伪再动手。**
@@ -1687,8 +1687,8 @@ A5b 随之修复并经两列双向验证——见 A5b 正文与本节 A5b 行。
 `agentq`/`sshp`），此前只有 `01` 的 `bash -n`。剩下的 417 行里，**没有一个资产超过 294 行**，
 且其中 294 行的那个（`agentq-start-daemon.ps1`）已实测确认在 macOS 上不可**整体**执行（`smoke/22` 覆盖的守卫等除外，见上）；余下的是
 2 个 `.cmd`（8 行，`01` 已有结构断言）与声明式配置（`.plist`/`.yml`/`.service`，110 行）。
-分母已于 **2026-11-12 重算为 34,514**（`skill/assets/` 全部 23 个资产 `wc -l` 之和，实测；此前为 27,821，2026-10-14 记的值）。**分子 417 的构成**（逐项按当前字节）：`agentq-start-daemon.ps1` 294（整个资产仍不可执行，`smoke/22` 只覆盖它的两个路径守卫、`Set-AgentQUserEnvironment` 与三处拒绝站点）、2 个 `.cmd` 8（`01` 有结构断言）、2 个 `.plist` + 2 个 `pueue.yml` + 1 个 `.service` 共 110（声明式配置：`01` 做 XML/YAML/结构解析、`10` 做渲染占位符守卫）、`unix/agentq` 5（转发 shim）。
-别再引用旧的 25.9%、13.8%、4.8%、1.6%、1.5%、1.4%、391、27,821、25,536 或 26,264。
+分母已于 **2026-11-22 重算为 37,121**（`skill/assets/` 全部 23 个资产 `wc -l` 之和，实测；此前 2026-11-12 记 34,514、更早 27,821）。**分子 417 的构成**（逐项按当前字节）：`agentq-start-daemon.ps1` 294（整个资产仍不可执行，`smoke/22` 只覆盖它的两个路径守卫、`Set-AgentQUserEnvironment` 与三处拒绝站点）、2 个 `.cmd` 8（`01` 有结构断言）、2 个 `.plist` + 2 个 `pueue.yml` + 1 个 `.service` 共 110（声明式配置：`01` 做 XML/YAML/结构解析、`10` 做渲染占位符守卫）、`unix/agentq` 5（转发 shim）。**分子未变，但它的账要从两处并成一处**：2026-11-12 那 391→417 的增量全部来自 `agentq-start-daemon.ps1`，而自 0.1.38 以来的改动只发生在两份客户端、服务端与安装器里（`git diff v0.1.38..HEAD -- <分子的四项>` 实测为空），所以本轮只改分母。
+别再引用旧的 25.9%、13.8%、4.8%、1.6%、1.5%、1.4%、391、27,821、25,536、26,264、34,514 或 1.21%。
 
 **0.1.13 修复之后的平行实现清查（2026-10-16，用户「继续」）**：0.1.13 修了 POSIX 安装器的
 不可粘贴占位符；两份安装器是平行实现，Windows 侧按同一类缺陷清查，**查实同类缺陷仍在**
@@ -2135,7 +2135,7 @@ A5b 随之修复并经两列双向验证——见 A5b 正文与本节 A5b 行。
     - **未采信的三条（服务端 Agent 的 ①②③，我逐条复现后推翻）**：它用 `touch`/伪造 body 的 `DyNqB1legacy-aaaa` 记录断言「合法旧 id 漏网并卡死所有命令」——该 id 按新旧规则都合法，失败来自我自己的伪记录体（`request_records_filter` 要求 `payload`/`task_label`/`state` 齐全）；用 `mktemp` 的构造断言「`make_temporary_file` 生成非隐藏名」——该函数是内部拼模板 `"$dir/${prefix}.${owner}.XXXXXX"`，非裸 `mktemp`；把 `.legacy-orphans` 的 `find` 递归写成缺陷——本轮已按 `-maxdepth 1` 修好。**教训**：Agent 的 probe 若自建 fixture，必须先用同一判据证明「好输入通过」，否则它测的是自己的 fixture。同一轮它报的另外两条（`run_pueue` 屏蔽 stderr、`logs` 退 1 无输出）是刻意的既有设计/已被 0.1.26 的 `Pueue could not read the log` 诊断覆盖，未改。
     - **锁**：`smoke/18` 新增「legacy quarantine」组（三份旧名 record 必须进 `.legacy-orphans/`、真临时名**不得**被隔离，另加一条二次运行不搬不覆盖；共 2 例，其中**隔离目录必须 0700** 的断言在主例内——两棵树都在显式 `umask 022` 下跑，`stat -c '%a' || stat -f '%Lp'`，读不到模式计失败而非跳过）+ 6 条空白 `--workdir` 必退 2（`41 09 0a0d0c0b c2a0 e38080 c285`）；`smoke/12` 新增 3 条 request-id 差分（尾随 LF、U+212A 开头、U+0130 开头——两侧都退 2 且都报 `start with a letter or number`；值用 `$'\n'` 与八进制 `printf` 构造，macOS 的 bash 3.2 没有 `\u`）。**第七十七类的「隔离未做成自动断言」边界就此关闭**（不再需要一份旧规则的服务端：旧名文件直接播下去即可）。
     - **红证（逐条、单次变异、跑完即 `cmp` 还原）**：① 去掉 `umask 077` 包装 → `smoke/18` 报 `base-quarantine-mode:755 variant-quarantine-mode:755`，rc=1；② 把精确豁免换回 `case "$name" in .agentqtmp.*) continue ;; esac` → `base-missing/base-left:.agentqtmp.aaaaaaaaaaaaaaaa.json`（双侧），rc=1；③ Windows 副本换回 `-match '^…$'` → `smoke/12` 恰 3 条 `[request-id trailing-lf|kelvin-sign|dotless-capital-i]: windows-exit=255`，rc=1；④ POSIX 副本把 `workdir_is_blank` 换回 `case … [[:space:]]` → `smoke/12` 非 ASCII 空白差分变红，rc=1。
-  - **第七十七类（2026-11-09，用户「本项目还有其他问题吗，使用Agents进行全维度全场景审查，也让codex审查一下」——5 个隔离 worktree 的审查 Agent + Codex 全量复审，我逐条复现后才采纳；三对 Agent/Codex 的结论被实测推翻、未采信）**（资产变更：`unix/agentq-server` 与 canonical 孪生、两份客户端；`CHANGELOG.md`、`CLAUDE.md`、`SKILL.md` 未改语义。）
+  - **第七十七类（2026-11-09，用户「本项目还有其他问题吗，使用 Agents 进行全维度全场景审查，也让 codex 审查一下」——5 个隔离 worktree 的审查 Agent + Codex 全量复审，我逐条复现后才采纳；三对 Agent/Codex 的结论被实测推翻、未采信）**（资产变更：`unix/agentq-server` 与 canonical 孪生、两份客户端；`CHANGELOG.md`、`CLAUDE.md`、`SKILL.md` 未改语义。）
     - **① `is_request_id` 的首字符规则只在消息里（P0）**：服务端（`agentq-server` 的 `is_request_id`）与 POSIX 客户端是同一份代码：`''|*[!集合]*|[!集合])` —— 第三支没有 `*`，是**单字符串**匹配，于是 `.aaaaaaaaaaaaaaa` / `_aaaaaaaaaaaaaaa` / `-aaaaaaaaaaaaaaa` 全部通过；三处报错都写着 `start with a letter or number`。Windows 孪生用 `^[A-Za-z0-9][A-Za-z0-9._-]{15,127}$`，一直是对的。**点开头的 id 不是美容问题**：`request_record_path` 写 `$request_directory/.<id>.json`，而服务端每个枚举都走 `shopt -s nullglob; "$dir"/*.json`（不开 `dotglob`），实测同目录下 `.abc.json` 不在 glob 结果里——该请求能提交、能建任务、`lookup` 走直读路径也能查到，但**永远不会被归档或修复**，是一条不可发现的死记录。修法：两支都写成 `[!集合]*`（照抄 Windows 的语义），`is_request_id` 加注释说明为什么第二个括号必须带 `*`。
     - **② 修复本身的升级陷阱（本轮新发现，比 ① 更险）**：规则收紧后，旧部署已经写下的 record（隐藏的 `.id.json`，以及可见的 `_id.json`/`-id.json`）会让**新**服务端的每一条命令退 2——`prune_request_temporary_files_in_directory` 把所有 `.*.json` 当临时文件、名字解析不出 `<id>.<pid>` 就 `fail`；`load_request_records` 与 wait 的扫描对文件名 id 跑 `is_request_id`，旧 id 不再合法同样 `fail`。**沙箱实测复现**：红证用旧服务端建出一条隐藏 record，换回修复版后 `lookup` 直接 `invalid AgentQ request temporary process id`、`status` 报 `invalid AgentQ request record filename`。修法：`quarantine_legacy_request_records`（挂进 `ensure_request_record_layout` **与** `migrate_removed_request_records`——后者是三条免锁读路径的共用前置点，`lookup` 恰好在锁路径之外先读），把「旧规则合法、新规则非法」的 record 连同字节移进同目录下的 `.legacy-orphans/`；没有任何扫描会进入该子目录（每个枚举都只 glob 一层且要求 `.json` 后缀），数据留给人，活路径不必学会跳过不再可寻址的 id。`.agentqtmp.*` 显式豁免（那是本服务端自己的临时记录，归 pruner 管）。`is_legacy_request_id` 只用于**识别存量**，绝不用来放行新输入。
     - **③ 纯空白 argv 的两端分歧（P1）**：`--request-id ' '` 在 POSIX 上退 `2`（`[ -z ]` 判空后再走字符集守卫）、在 Windows 上**静默生成 GUID 并提交**（`IsNullOrWhiteSpace` 当未提供）；`--workdir ' '` 在 POSIX 上白跑一次 SSH（服务端的 `working directory must be absolute` 不转发给调用方）、在 Windows 上本地退 `2`。修法对齐**结果**而不是谓词：Windows 的 `requestId` 判定改 `IsNullOrEmpty`（纯空白落进 `Test-RequestId` 退 2，与 POSIX 同一句消息）；`workdir` 两侧都显式拒绝纯空白（POSIX 用 `case` 的 `*[![:space:]]*` 免 fork，Windows 用 `IsNullOrEmpty` + `^\s*$`，`'/a b'` 这种含空格的合法值两侧都仍放行到 SSH）。
@@ -2490,7 +2490,7 @@ A5b 随之修复并经两列双向验证——见 A5b 正文与本节 A5b 行。
     - **本节的边界（新增）**：① 上界只在**长度**上对齐，`smoke/14` 站点 9 的 3646 字符是按 **1024 的容量**算的；**会话名没有长度上界**（两侧都只有字符集守卫），实测 4000 字符的会话名会让命令行长到 10986 字符、远超 powershell.exe 的 8125 截断上限——**两侧同形**，所以不是孪生分歧，是一条共享的边界，本轮**未修**（记在这里，不是待办清单——`docs/PLAN.md` 才是）。**（2026-11-05 已修：第七十一类给它补了 1024 上界，两侧同一常量；此句保留为当时的判断，不再是现状。）**② 单位矩阵只在**本机**跑；某个远端 shell 单位不同这件事不在覆盖内。
     - **同轮自查出的第四个（用户先报的）：`smoke/19` 的 `cannot-start` fixture 每跑一次，macOS 就弹一个 GUI 窗口。**用户报告「跑测试会乱打开文件」，并附截图显示 Dock 里出现 **Parallels Desktop**。第一版按「文件关联」去查，实测把这个方向钉死了：本机 `open` 的关联是——**无扩展名 → TextEdit、`.exe` → Parallels Desktop、`.dat` → IINA**。扩展名只是**选哪个 app 去打开**，不是「会不会被打开」；第一版把 fixture 从无扩展名改成 `.exe`，用只数 TextEdit 窗口的检测器量出 `0→0` 就以为修好了，**而它只是把 TextEdit 换成了 Parallels**——用户的截图正是这一步的产物（检测器只问一个 app，就是「比了个寂寞」）。
     - **机制**：测试主机上 `& '<path>'` 对**存在的、非可执行**的文件不失败——它走 macOS LaunchServices，用关联的 app **打开**这个文件。这是**测试主机**的属性，不是被测代码的：真 Windows 目标在 CreateProcess 里失败，从不问 LaunchServices。这一行要的是「失败且 `$LASTEXITCODE` 未被设置」，而 LaunchServices 路径反而**装作成功**。
-    - **实测（前台 app 追踪，不是进程计数）**：正常跑一次 `smoke/19`，前台 app 在 TextEdit 与 `prl_client_app` 之间来回 **13 次**，而检查依旧 `cases=130` 退 0——**绿着开窗**。逐形态测（真安装 body，fixed vs 轮46 前缀 body）：0644 常规文件（任意扩展）→ **开窗**；`0755` + 坏解释器 / 目录 / 不存在路径 → **终止性**错误，守卫根本没跑（前缀 body 也退 1，行失去判别力）；`000` → 仍调 LaunchServices（失败）；**悬空符号链接 → 完全不碰 LaunchServices**（`The file … does not exist`，非终止错误、`$LASTEXITCODE` 未设置，fixed=1 / 前缀=0，判别力保留）。
+    - **实测（前台 app 追踪，不是进程计数）**：正常跑一次 `smoke/19`，前台 app 在 TextEdit 与 `prl_client_app` 之间来回 **13 次**，而检查依旧 `cases=130` 退 0——**绿着开窗**。逐形态测（真安装 body，fixed vs 轮 46 前缀 body）：0644 常规文件（任意扩展）→ **开窗**；`0755` + 坏解释器 / 目录 / 不存在路径 → **终止性**错误，守卫根本没跑（前缀 body 也退 1，行失去判别力）；`000` → 仍调 LaunchServices（失败）；**悬空符号链接 → 完全不碰 LaunchServices**（`The file … does not exist`，非终止错误、`$LASTEXITCODE` 未设置，fixed=1 / 前缀=0，判别力保留）。
     - **修法：fixture 改成悬空符号链接**（指向一个不存在的 target）。理由不是「这个扩展名安全」，而是**没有 target 可打开**——任何机器的任何关联都够不到它。守卫改成双向：真判据 `[ -L "$1" ] && [ ! -e "$1" ]`，一条断言 fixture 必须满足它，**另一条拿一个常规文件喂同一个判据要求它拒绝**（判据恒真的话这一半先红——变异 C 实测正是 `launch-safety guard accepted a regular file`）。
     - **红证**：把 fixture 换回 0644 常规文件 → 守卫点名 `is not a dangling symlink` 退 1（变异 B；该 run 同时禁用了矩阵行，避免为了取证再开窗）；判据改成 `return 0` → 自检那条先红（变异 C）。绿证：一次完整 `smoke/19` 前后**全进程窗口普查逐字相同**（`TextEdit=5;prl_client_app=2;…` 不变），对照修复前同一检测器在运行中看到 13 次前台切换。
     - **边界**：悬空符号链接在 Git Bash/Windows 上不可移植（`ln -s` 会失败或需要开发者模式），但这个 fixture 只在 `pwsh` 可用时构造，而 `smoke/19` 在 windows CI job 里**不跑**（该 job 只跑 12/13/20/22/23/25）；Linux CI 的 `ln -s` 行为与 macOS 相同（实测 Linux pwsh 7 上同一 fixture 仍是「No such file or directory」、无窗口、stderr 不含 `Write-Error:`/`Exception:`）。「已有文件被 macOS 打开」这个类**只在这一处**修了；`smoke/12` 的 `unlaunchable`（0644、无扩展名、交给 PS 客户端）**实测不开窗，而且原因是代码级的、不是量出来的巧合**：Windows 客户端的启动守卫走 `[System.Diagnostics.ProcessStartInfo]` 且 `UseShellExecute = $false`，实测对同一个 0644 常规文件**抛 `Permission denied`**（本机 pwsh 7.5，`agentq.ps1:679-693`），而 LaunchServices 只在**调用运算符 `&`** 的路径上被问到——`smoke/19` 的 Windows 目标 body 正是 `& $installer.Path …`，`smoke/12` 不是。窗口计数也做了两遍：0.4s 轮询贯穿整次运行，**没有任何 app 的窗口数超过基线**（`IINA=1` 自始至终），运行前后全进程普查逐字相同。**但同一台机上粗糙的前后两次快照普查曾对 `smoke/12` 报过一次 `WINDOW-OPENED`——那是两次取样的间隙里无关桌面活动造成的假阳**，由更细的轮询判掉；记下来是因为「粗检测器报红」和「真的开窗」在这一轮都出现过，先例与本轮 `smoke/19` 的 `.exe` 误修同型（检测器问得越窄越容易撒谎）。`smoke/05` 的 `askpass-noexec`（0600）从未被执行——同样没有开窗行为。
@@ -2728,59 +2728,59 @@ A5b 随之修复并经两列双向验证——见 A5b 正文与本节 A5b 行。
 
 六个只读 agent 分域审源码、三平台安装/使用故事与检查自身；Orca Codex 独立审同一棵树。以下每条都在主检出里先复现/读证据再动手。
 
-### 服务端（`skill/assets/unix/agentq-server`，与 windows-git-bash孪生逐字节同步）
+### 服务端（`skill/assets/unix/agentq-server`，与 windows-git-bash 孪生逐字节同步）
 
-- **remove的第二次 record读取可被并发归档击穿。** `mark_request_removed`先读一次 record（rc=0），随后 `validate_task_removal`又读一次。两者之间 `status`/`logs`/`doctor`的锁外 `recover_removing_requests`可以在任务消失后把该 `removing` record收敛为 `removed`并归档，第二次读于是答 rc=1，`fail "missing AgentQ request record while removing task"`退2——一次成功的 remove被报成失败，且重试只会得到 `unknown AgentQ task id`（0.1.29修过同一形状的另一半）。修法：`validate_task_removal`接受调用方已读的 record（第二参数），`mark_request_removed`传自己的那份；并把「第一次读就看到 `removed`」当作同一收敛：校验 record仍指向本任务实例后幂等归档、`removal_recovered_archive=true`退0。`mark_request_removing`仍让函数自己读（此时状态是 `accepted`，归档路径不可达）。
-- **锁恢复的「先验后删」TOCTOU。** `remove_stale_lock`校验 pid/identity后**按路径** `rm` pid再 `rmdir`。并发恢复者 A可以先删掉目录，新持有者随即 mkdir并写入自己的 pid，此时 B（早已完成校验）的 `rm`删的是**活锁的元数据**；B的 `rmdir`还可能删掉新持有者的空目录。实测形态不要求两个恢复者「同时」校验——窗口只要覆盖 A的删除 +新持有者的 mkdir。修法：改用**原子 rename捕获**。pid分支把 `pid`原子改名为 sibling `.stale-capture.$$`，对新路径重新 `read_lock_metadata`并与期望值比对；不匹配则 `mv -n`放回、退2（changed），绝不删除别人的记录。`require_empty`分支把**整个锁目录** rename到 sibling捕获名，再检查它仍只含元数据临时文件；不符同样放回。`rmdir`的退出码成为权威判据（成功后重现的目录属于新持有者，不报错）；失败时若路径上是不同的 pid则退2。
+- **remove 的第二次 record 读取可被并发归档击穿。** `mark_request_removed`先读一次 record（rc=0），随后 `validate_task_removal`又读一次。两者之间 `status`/`logs`/`doctor`的锁外 `recover_removing_requests`可以在任务消失后把该 `removing` record 收敛为 `removed`并归档，第二次读于是答 rc=1，`fail "missing AgentQ request record while removing task"`退 2——一次成功的 remove 被报成失败，且重试只会得到 `unknown AgentQ task id`（0.1.29 修过同一形状的另一半）。修法：`validate_task_removal`接受调用方已读的 record（第二参数），`mark_request_removed`传自己的那份；并把「第一次读就看到 `removed`」当作同一收敛：校验 record 仍指向本任务实例后幂等归档、`removal_recovered_archive=true`退 0。`mark_request_removing`仍让函数自己读（此时状态是 `accepted`，归档路径不可达）。
+- **锁恢复的「先验后删」TOCTOU。** `remove_stale_lock`校验 pid/identity 后**按路径** `rm` pid 再 `rmdir`。并发恢复者 A 可以先删掉目录，新持有者随即 mkdir 并写入自己的 pid，此时 B（早已完成校验）的 `rm`删的是**活锁的元数据**；B 的 `rmdir`还可能删掉新持有者的空目录。实测形态不要求两个恢复者「同时」校验——窗口只要覆盖 A 的删除 +新持有者的 mkdir。修法：改用**原子 rename 捕获**。pid 分支把 `pid`原子改名为 sibling `.stale-capture.$$`，对新路径重新 `read_lock_metadata`并与期望值比对；不匹配则 `mv -n`放回、退 2（changed），绝不删除别人的记录。`require_empty`分支把**整个锁目录** rename 到 sibling 捕获名，再检查它仍只含元数据临时文件；不符同样放回。`rmdir`的退出码成为权威判据（成功后重现的目录属于新持有者，不报错）；失败时若路径上是不同的 pid 则退 2。
 - **`acquire_operation_lock`把「changed」当致命错误。**读路径早已容忍 `remove_stale_lock`的 rc=2（另一次恢复先动过手），写路径却 `fail`。现两处分支都按读路径处理：rc=2 → `continue`重试，其余非零才 fail。
-- **维护锁同一形状（死持有者 /陈旧空目录两分支）。**安装器与 server的维护锁恢复都是「再确认身份 →删除」。改为同样的 rename捕获：unix死分支捕获 `pid`、windows分支捕获锁文件、empty分支捕获目录；捕获后重新读身份/空性，不符就放回并让上层按 contention/unowned回答。**安装器自己的锁恢复未改**（见边界）。
+- **维护锁同一形状（死持有者 /陈旧空目录两分支）。**安装器与 server 的维护锁恢复都是「再确认身份 →删除」。改为同样的 rename 捕获：unix 死分支捕获 `pid`、windows 分支捕获锁文件、empty 分支捕获目录；捕获后重新读身份/空性，不符就放回并让上层按 contention/unowned 回答。**安装器自己的锁恢复未改**（见边界）。
 -同步：`cmp skill/assets/unix/agentq-server skill/assets/windows-git-bash/agentq` =0。
 
-### Windows客户端（`skill/assets/client/windows/agentq.ps1`）
+### Windows 客户端（`skill/assets/client/windows/agentq.ps1`）
 
-- **`wait`的 stdout被64KiB静默截断。** `Invoke-WaitSshWithTimeout`与平台探针共用 `$maximumStreamCharacters = 65536`；截断后没有标记、没有错误，protocol校验失败被报成「JSON协议错误」。POSIX孪生对操作响应**不设上限**（写临时文件）。修法：wait的 stdout改为 `[int]::MaxValue`（平台探针保留自己的有界读取）；stderr是诊断流，保留64KiB但在诊断中显式追加 `[stderr truncated after N characters]` / `[stderr read failed: …]`；stdout真被截断时（理论上不可达）打印本地点名的消息。
-- **非批量响应的顶层数组被接受。** POSIX用 `jq -s`把 body读成数组并取 `.[0]`，`[{...}]`于是变成 `[[...]]`，`.[0]`不是对象 →拒绝。`ConvertFrom-Json`把单元素数组**展开成元素本身**，Windows侧的 `submit`校验于是接受 `[{"task_id":1,…}]`。实测（pwsh7.5.4，抽取校验函数）：object=True / array-of-one=True；修后 array-of-one=False。修法：非 `remove_batch`操作先按**原文**裁掉 JSON空白字符，要求首字符是 `{`，与 `remove_batch`已有的根形状原文扫描同一手法。
-- **`AGENTQ_PASSWORD_PROMPT=0`的平台分歧。** POSIX把 `0`当「禁用」，Windows对任何非空值都拒绝（实测 `AGENTQ_PASSWORD_PROMPT=0 agentq --version`：POSIX0 / Windows2）。Windows不需要支持该变量，但共享环境不该因禁用拼写失败：`0`放行，其余非空仍拒绝。冲突检查（与 ASKPASS/PASSWORD同设）保持与 POSIX一致。
+- **`wait`的 stdout 被 64KiB 静默截断。** `Invoke-WaitSshWithTimeout`与平台探针共用 `$maximumStreamCharacters = 65536`；截断后没有标记、没有错误，protocol 校验失败被报成「JSON 协议错误」。POSIX 孪生对操作响应**不设上限**（写临时文件）。修法：wait 的 stdout 改为 `[int]::MaxValue`（平台探针保留自己的有界读取）；stderr 是诊断流，保留 64KiB 但在诊断中显式追加 `[stderr truncated after N characters]` / `[stderr read failed: …]`；stdout 真被截断时（理论上不可达）打印本地点名的消息。
+- **非批量响应的顶层数组被接受。** POSIX 用 `jq -s`把 body 读成数组并取 `.[0]`，`[{...}]`于是变成 `[[...]]`，`.[0]`不是对象 →拒绝。`ConvertFrom-Json`把单元素数组**展开成元素本身**，Windows 侧的 `submit`校验于是接受 `[{"task_id":1,…}]`。实测（pwsh7.5.4，抽取校验函数）：object=True / array-of-one=True；修后 array-of-one=False。修法：非 `remove_batch`操作先按**原文**裁掉 JSON 空白字符，要求首字符是 `{`，与 `remove_batch`已有的根形状原文扫描同一手法。
+- **`AGENTQ_PASSWORD_PROMPT=0`的平台分歧。** POSIX 把 `0`当「禁用」，Windows 对任何非空值都拒绝（实测 `AGENTQ_PASSWORD_PROMPT=0 agentq --version`：POSIX0 / Windows2）。Windows 不需要支持该变量，但共享环境不该因禁用拼写失败：`0`放行，其余非空仍拒绝。冲突检查（与 ASKPASS/PASSWORD 同设）保持与 POSIX 一致。
 
-### POSIX客户端（`skill/assets/client/unix/agentq`）与安装器
+### POSIX 客户端（`skill/assets/client/unix/agentq`）与安装器
 
-- **wait预算耗尽时清理失败会改写124。** `run_wait_ssh_with_timeout`在超时分支里先清理再 `return 124`，清理返回1/2时直接 `return $?`，调用方的 `-eq 124`不再成立，文档化的 exit 6变成普通失败。修法：清理失败只打印诊断，始终 `return 124`。
-- **两处「声称不泄漏」的清理实际泄漏。** Windows探针脚本临时文件在 identity记录失败时调用 `windows_argument_remove_file`（空 identity必拒）后又把变量清空；ssh stderr捕获同理。修法：这两处按路径 `rm`（路径刚由 `mktemp`在本进程私有临时目录里创建），并订正注释。
-- **非 POSIX的 `local`。** `ascii_whitespace_only`/`workdir_is_blank`使用 `local`（SC3043）；在没有 `local`的 `/bin/sh`（Solaris Bourne、posh、ksh88）上每次调用都会产生 command-not-found诊断，变量还会泄漏成全局。改为函数唯一前缀的全局变量（两处各一个名字），行为不变。
-- **安装器的 `maintenance_lock_empty_grace_seconds`无校验。**非数字值让 `test`打印 `Illegal number`并恒假，陈旧空维护锁永远不被回收，报出的却是「younger than the grace period」。启动时按其它数值环境变量的同一判据校验（仅数字），非数字退2并点名变量。
+- **wait 预算耗尽时清理失败会改写 124。** `run_wait_ssh_with_timeout`在超时分支里先清理再 `return 124`，清理返回 1/2 时直接 `return $?`，调用方的 `-eq 124`不再成立，文档化的 exit 6 变成普通失败。修法：清理失败只打印诊断，始终 `return 124`。
+- **两处「声称不泄漏」的清理实际泄漏。** Windows 探针脚本临时文件在 identity 记录失败时调用 `windows_argument_remove_file`（空 identity 必拒）后又把变量清空；ssh stderr 捕获同理。修法：这两处按路径 `rm`（路径刚由 `mktemp`在本进程私有临时目录里创建），并订正注释。
+- **非 POSIX 的 `local`。** `ascii_whitespace_only`/`workdir_is_blank`使用 `local`（SC3043）；在没有 `local`的 `/bin/sh`（Solaris Bourne、posh、ksh88）上每次调用都会产生 command-not-found 诊断，变量还会泄漏成全局。改为函数唯一前缀的全局变量（两处各一个名字），行为不变。
+- **安装器的 `maintenance_lock_empty_grace_seconds`无校验。**非数字值让 `test`打印 `Illegal number`并恒假，陈旧空维护锁永远不被回收，报出的却是「younger than the grace period」。启动时按其它数值环境变量的同一判据校验（仅数字），非数字退 2 并点名变量。
 
 ### 检查自身（smoke/、CI）
 
-- **`smoke/31`的规则 D校准测的是手抄副本。**检查里声称「SAME functions, extracted by sed」，实际校准用了一个复制的 `newest_has_verification`。实测：只把真实判据放宽成 `^[[:space:]]*\|`，校准仍 `ok`、摘要仍 `newest-verified=yes`。修法：抽成 `newest_entry_block` + `newest_has_verification`两个函数，规则与校准都调用它们；红证：把同一判据放宽后运行，校准报 `an empty verification line (" |") passed`并 exit 1。
-- **CI可能静默丢掉 tag/索引门禁（P2）。** `smoke/31`在看不到 tag的检出里打印 `NOT-covered(no-tags-in-checkout)`并退0；`run-tests.sh`归入 NCOV，CI的 PASS正则与 known-set都放行，唯一防线是 `fetch-depth: 0`，没有任何断言验证它真的生效。修法：linux job的断言步增加 `grep -qE '^changelog-and-tags: index=[0-9]+ tags=[1-9][0-9]* ' smoke.log`（成功摘要本来就打印 `index=/tags=`）。
-- **`smoke/03`的三处清理/断言缺口。**①记录在每个 id的 server remove **之前**被删除，服务端 remove于是因缺 record答2，Pueue任务存活，且 re-remove循环的 `record_still_active`立刻 break；改为先让服务端尝试、记录最后删。② EXIT trap对 pueue直连的 blocker只能答2（无 request record），新增自包含的 raw `pueue kill/remove`尽力清理（引用 `${blocker_ids:-}`，早退时为空）。③失败任务的 wait断言只排除 exit 0与 `Done.result == "Success"`，2/5/6也能过；改为必须 `-ne 1`即失败。
-- **`smoke/05`的 uuidgen诊断措辞。**它 grep `'request id'`期望命中的是「被误报成 malformed --request-id」，而客户端的本地校验消息是 `--request-id must be …`（无空格），这个分支永远不会触发；同时正确的 `cannot create a durable AgentQ request id`反而会被误报。改为 grep `-- '--request-id must'`。
-- **`smoke/12`的变异锚点随实现改名。**去掉 `local`后，blank-guard变异锚定 `$stripped`会找不到（自杀式自检）；同步改为 `$agentq_ascii_whitespace_stripped`。cfgpath的「Windows诊断必须点名 config path」用例只 `cases++`，不受 floor保护（整段删掉仍绿）；新增 `twin_cfgpath_diag_rows`计数与 `-ne 1`断言。
-- **`smoke/27`的 text-mode-jq夹具没有阳性对照。** shim若退化成 LF，服务端不会安装 jq换行 shim，s10/s11不经过被测路径也全绿。新增：用合法 JSON喂 shim，`od -An -c`必须看到行内 `\r`（`grep -qF '\r'`），否则失败并点名夹具。
-- **边界（未改）**：`smoke/12`的变异体仍只比较「两侧退出码不同」，没有「变异体确实执行过」的守卫（0.1.39用 `.ps1`改名修掉了实测到的那次，但形态仍在）；`smoke/01`的 `plutil`不在工具清单里（macOS自带，缺失时 `plist=N`不触发断言）。
+- **`smoke/31`的规则 D 校准测的是手抄副本。**检查里声称「SAME functions, extracted by sed」，实际校准用了一个复制的 `newest_has_verification`。实测：只把真实判据放宽成 `^[[:space:]]*\|`，校准仍 `ok`、摘要仍 `newest-verified=yes`。修法：抽成 `newest_entry_block` + `newest_has_verification`两个函数，规则与校准都调用它们；红证：把同一判据放宽后运行，校准报 `an empty verification line (" |") passed`并 exit 1。
+- **CI 可能静默丢掉 tag/索引门禁（P2）。** `smoke/31`在看不到 tag 的检出里打印 `NOT-covered(no-tags-in-checkout)`并退 0；`run-tests.sh`归入 NCOV，CI 的 PASS 正则与 known-set 都放行，唯一防线是 `fetch-depth: 0`，没有任何断言验证它真的生效。修法：linux job 的断言步增加 `grep -qE '^changelog-and-tags: index=[0-9]+ tags=[1-9][0-9]* ' smoke.log`（成功摘要本来就打印 `index=/tags=`）。
+- **`smoke/03`的三处清理/断言缺口。**①记录在每个 id 的 server remove **之前**被删除，服务端 remove 于是因缺 record 答 2，Pueue 任务存活，且 re-remove 循环的 `record_still_active`立刻 break；改为先让服务端尝试、记录最后删。② EXIT trap 对 pueue 直连的 blocker 只能答 2（无 request record），新增自包含的 raw `pueue kill/remove`尽力清理（引用 `${blocker_ids:-}`，早退时为空）。③失败任务的 wait 断言只排除 exit 0 与 `Done.result == "Success"`，2/5/6 也能过；改为必须 `-ne 1`即失败。
+- **`smoke/05`的 uuidgen 诊断措辞。**它 grep `'request id'`期望命中的是「被误报成 malformed --request-id」，而客户端的本地校验消息是 `--request-id must be …`（无空格），这个分支永远不会触发；同时正确的 `cannot create a durable AgentQ request id`反而会被误报。改为 grep `-- '--request-id must'`。
+- **`smoke/12`的变异锚点随实现改名。**去掉 `local`后，blank-guard 变异锚定 `$stripped`会找不到（自杀式自检）；同步改为 `$agentq_ascii_whitespace_stripped`。cfgpath 的「Windows 诊断必须点名 config path」用例只 `cases++`，不受 floor 保护（整段删掉仍绿）；新增 `twin_cfgpath_diag_rows`计数与 `-ne 1`断言。
+- **`smoke/27`的 text-mode-jq 夹具没有阳性对照。** shim 若退化成 LF，服务端不会安装 jq 换行 shim，s10/s11 不经过被测路径也全绿。新增：用合法 JSON 喂 shim，`od -An -c`必须看到行内 `\r`（`grep -qF '\r'`），否则失败并点名夹具。
+- **边界（未改）**：`smoke/12`的变异体仍只比较「两侧退出码不同」，没有「变异体确实执行过」的守卫（0.1.39 用 `.ps1`改名修掉了实测到的那次，但形态仍在）；`smoke/01`的 `plutil`不在工具清单里（macOS 自带，缺失时 `plist=N`不触发断言）。
 
 ### 记为边界（未验证/未修，不声称覆盖）
 
-- **安装器 `install-agentq.sh`的维护锁/操作锁恢复仍是「再确认后按路径删除」**（server侧已改为 rename捕获）。修安装器的恢复路径需要同一组捕获/回滚语义，且只能在一次真实升级里验证；本轮不动，记录为已知窗口。
-- **安装器的进程身份探针假设 procps/BSD `ps`**（`ps -o lstart=`、`ps -o command=`）；BusyBox `ps`两者都不支持，依赖门禁只要求 `ps`存在。本机无法验证 BusyBox宿主，记为未覆盖。
-- `smoke/03`的 raw清理是**尽力而为**：kill后最多5s等 remove；失败不改变检查结论（下一次运行仍会清理），且不覆盖「runtime被 SIGKILL」的形态。
-- 锁捕获崩溃残留：`<lock>.stale-capture.<pid>`可能与锁目录并存；server的运行时目录清理表不认该名字（维护锁 sibling也不在清理范围）。正常路径会删掉，只有捕获途中崩溃才留下一个条目，记录为已知残留。
+- **安装器 `install-agentq.sh`的维护锁/操作锁恢复仍是「再确认后按路径删除」**（server 侧已改为 rename 捕获）。修安装器的恢复路径需要同一组捕获/回滚语义，且只能在一次真实升级里验证；本轮不动，记录为已知窗口。
+- **安装器的进程身份探针假设 procps/BSD `ps`**（`ps -o lstart=`、`ps -o command=`）；BusyBox `ps`两者都不支持，依赖门禁只要求 `ps`存在。本机无法验证 BusyBox 宿主，记为未覆盖。
+- `smoke/03`的 raw 清理是**尽力而为**：kill 后最多 5s 等 remove；失败不改变检查结论（下一次运行仍会清理），且不覆盖「runtime 被 SIGKILL」的形态。
+- 锁捕获崩溃残留：`<lock>.stale-capture.<pid>`可能与锁目录并存；server 的运行时目录清理表不认该名字（维护锁 sibling 也不在清理范围）。正常路径会删掉，只有捕获途中崩溃才留下一个条目，记录为已知残留。
 
-##第十轮终审（2026-11-22，审94af63e / v0.1.39）
+##第十轮终审（2026-11-22，审 94af63e / v0.1.39）
 
-范围：源码 + Linux/macOS/Windows安装/使用 +检查自身；6个只读 agent + Orca Codex。
+范围：源码 + Linux/macOS/Windows 安装/使用 +检查自身；6 个只读 agent + Orca Codex。
 
 修复（每条均有红证或修复前/后实测）：
--服务端 UTF-8校验器：`jq -Rsj`输出的是字符串原样字节（不转义换行），文本模式 jq会把值内 LF变成 CRLF，合法多行 label/argv在原生 Windows上被判非法（实测 `610a62` vs `610d0a62`，submit退2）。改为 hex token比较 + CRLF折叠的二次接受；smoke/27 s11b。
-- sshp双端解析器：unsafe（reparse）候选从 `throw`改为 `continue`（与 install-client.ps1同一契约），否则探针在输出任何 `__SSHP_*`前异常退出、客户端误报部署故障；smoke/19用真实函数（AST加载）执行。
-- sshp孪生路由：unix探针上的 `:Windows`标记必须再跑 Windows探针；修前 rc0、修后 rc127（实测，跟随探针报 UNAVAILABLE）；smoke/19新用例。
-- Windows安装器 group查询改走 `Invoke-AgentQInstallerPueueStatus -CommandArguments "group --json"`（UTF-8 ProcessStartInfo），GBK主机上非 ASCII组名不再破坏 JSON。
+-服务端 UTF-8 校验器：`jq -Rsj`输出的是字符串原样字节（不转义换行），文本模式 jq 会把值内 LF 变成 CRLF，合法多行 label/argv 在原生 Windows 上被判非法（实测 `610a62` vs `610d0a62`，submit 退 2）。改为 hex token 比较 + CRLF 折叠的二次接受；smoke/27 s11b。
+- sshp 双端解析器：unsafe（reparse）候选从 `throw`改为 `continue`（与 install-client.ps1 同一契约），否则探针在输出任何 `__SSHP_*`前异常退出、客户端误报部署故障；smoke/19 用真实函数（AST 加载）执行。
+- sshp 孪生路由：unix 探针上的 `:Windows`标记必须再跑 Windows 探针；修前 rc0、修后 rc127（实测，跟随探针报 UNAVAILABLE）；smoke/19 新用例。
+- Windows 安装器 group 查询改走 `Invoke-AgentQInstallerPueueStatus -CommandArguments "group --json"`（UTF-8 ProcessStartInfo），GBK 主机上非 ASCII 组名不再破坏 JSON。
 -维护锁元数据残留（安装器与服务端两侧）：`mkdir`与 `mv pid`之间被杀会留下 `.agentq-lock-metadata.*`；空锁回收判据放宽为同一前缀的正规文件（删除后再 `rmdir`），其他条目仍然拒绝。smoke/11 +2、smoke/27 m2b/m2c。
--文档：Windows `-StageDirectory`必填与5个 stage资产、Pueue离线通道、升级前提（既有 daemon可达；Windows既有二进制必须匹配当前 pin，pin变更需人工换二进制）、`--check`的执行位语义、残留拒绝顺序；修正过期行数与用例数。
+-文档：Windows `-StageDirectory`必填与 5 个 stage 资产、Pueue 离线通道、升级前提（既有 daemon 可达；Windows 既有二进制必须匹配当前 pin，pin 变更需人工换二进制）、`--check`的执行位语义、残留拒绝顺序；修正过期行数与用例数。
 
-- CI的 `smoke/31`门禁断言锚点写错：smoke.log的摘要行带 `ok    31-changelog-and-tags`前缀，`^changelog-and-tags:`从未匹配；v0.1.40首推（f5e3402）的 linux job在「Assert the full suite really ran」步无消息退 1，而套件本身 PASS 31/0/0/0。改为锚定 `^ok +31-changelog-and-tags +…`，注释写明；修复提交2b0937f。
+- CI 的 `smoke/31`门禁断言锚点写错：smoke.log 的摘要行带 `ok    31-changelog-and-tags`前缀，`^changelog-and-tags:`从未匹配；v0.1.40 首推（f5e3402）的 linux job 在「Assert the full suite really ran」步无消息退 1，而套件本身 PASS 31/0/0/0。改为锚定 `^ok +31-changelog-and-tags +…`，注释写明；修复提交 2b0937f。
 新增覆盖：smoke/11 cases=51、smoke/19 cases=155、smoke/27 cases=164。
 
 边界（未验证，不声称）：
--本轮未触碰任何真实 Windows主机（用户未在会话中点名）：WinGet链接/别名是否 reparse、GBK主机实装、本地化 ACL名、.NET4.5.2下 `ToUnixTimeSeconds`、环境块32767溢出、`AGENTQ_PLATFORM_CACHE_DIR`的 cygpath转换，均只有代码级判断。
-- Windows安装器在 pueue pin变更时的升级/回滚仍会被预检拒绝；这是刻意的防篡改行为，已写入 `skill/references/install.md`。
+-本轮未触碰任何真实 Windows 主机（用户未在会话中点名）：WinGet 链接/别名是否 reparse、GBK 主机实装、本地化 ACL 名、.NET4.5.2 下 `ToUnixTimeSeconds`、环境块 32767 溢出、`AGENTQ_PLATFORM_CACHE_DIR`的 cygpath 转换，均只有代码级判断。
+- Windows 安装器在 pueue pin 变更时的升级/回滚仍会被预检拒绝；这是刻意的防篡改行为，已写入 `skill/references/install.md`。

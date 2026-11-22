@@ -170,6 +170,12 @@ sha256_of() {
 
 # Fetch one binary into the cache, verifying against the installer's hash.
 # A cached copy that already matches is reused, so repeat runs need no network.
+# TRANSIENT release-hosting failures are real: GitHub answered a 403 on a URL
+# that had succeeded ten minutes earlier (CI run 44944386352 attempt 1,
+# 2026-11-22).  The retry loop wraps the WHOLE fetch because curl's own
+# --retry deliberately does not re-request a 403 (it reads as permanent).
+# LOCKED BY smoke/30 (success-on-attempt-3, total-failure, sleep-called);
+# do not revert to a single `curl || die`.
 fetch_verified() {
     local asset=$1 expected=$2 destination=$3
     local url="https://github.com/Nukesor/pueue/releases/download/v4.0.4/$asset"
@@ -180,7 +186,16 @@ fetch_verified() {
     else
         rm -f "$cached"
         printf '  %s (downloading)\n' "$asset"
-        curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 -o "$cached" "$url" || die "download failed: $url"
+        local attempt=1
+        until curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 -o "$cached" "$url"; do
+            if [ "$attempt" -ge 3 ]; then
+                rm -f "$cached"
+                die "download failed after $attempt attempts: $url"
+            fi
+            attempt=$((attempt + 1))
+            printf '  %s (download failed, retry %s/3)\n' "$asset" "$attempt"
+            sleep 5
+        done
         local actual
         actual=$(sha256_of "$cached")
         if [ "$actual" != "$expected" ]; then

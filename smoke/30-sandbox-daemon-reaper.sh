@@ -622,6 +622,199 @@ if [ "$keep_ok" = false ]; then
     failures=$((failures + 1))
 fi
 
+
+# --- download retry: a transient release-hosting failure must not kill `up` --
+# Measured 2026-11-22, CI run 44944386352 attempt 1: GitHub Releases answered
+# a 403 for the pueue download on a URL that had SUCCEEDED ten minutes earlier
+# (attempt 2 of the same run passed untouched).  The single-shot `curl || die`
+# turned that transient into a whole red linux job that only a manual rerun
+# could clear.  fetch_verified now retries the whole fetch three times.
+# `curl --retry` alone would NOT have caught it: curl deliberately does not
+# re-request a 403, which reads as permanent (curl docs, --retry).
+#
+# The three cases drive the REAL fetch_verified: the runner cuts sandbox.sh at
+# its trailing dispatcher (so `up`/`down`/`status` never run), repoints $root
+# into a fixture tree holding a fixture installer with the same block shape the
+# real installer ships, sources the result, and calls fetch_verified with a
+# counting curl stub.  sleep is stubbed to a recorder, so the retries cost no
+# wall-clock and the calls between attempts are ASSERTED, not assumed.
+fv_sha256() { # $1 = file -> sha256 hex, same precedence as sandbox.sh
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        sha256sum "$1" | awk '{print $1}'
+    fi
+}
+cat >"$work/fv-curl-stub" <<'FVCURL'
+#!/bin/sh
+# Counts invocations in $STUB_DIR/attempts; behaviour from $STUB_MODE:
+#   always    -> every attempt fails (22 = curl's HTTP-error exit)
+# transient -> the first two fail, the third serves the payload
+#   ok        -> every attempt serves the payload
+n=$(cat "$STUB_DIR/attempts" 2>/dev/null || echo 0)
+n=$((n + 1))
+printf '%s\n' "$n" >"$STUB_DIR/attempts"
+out=''
+prev=''
+for a in "$@"; do
+    if [ "$prev" = "-o" ]; then out=$a; break; fi
+    prev=$a
+done
+if [ -z "$out" ]; then
+    printf 'fv curl stub: no -o target in argv\n' >&2
+    exit 2
+fi
+case "${STUB_MODE:-always}" in
+always)
+    printf 'fv curl stub: permanent failure (attempt %s)\n' "$n" >&2
+    exit 22
+    ;;
+transient)
+    if [ "$n" -le 2 ]; then
+        printf 'fv curl stub: transient 403 (attempt %s)\n' "$n" >&2
+        exit 22
+    fi
+    ;;
+esac
+cat "$PAYLOAD_FILE" >"$out"
+FVCURL
+cat >"$work/fv-sleep-stub" <<'FVSLEEP'
+#!/bin/sh
+printf 'x\n' >>"$STUB_DIR/sleeps"
+exit 0
+FVSLEEP
+cat >"$work/fv-runner" <<'FVRUN'
+#!/usr/bin/env bash
+# usage: fv-runner STUB_DIR FIXTURE_ROOT SANDBOX_SCRIPT WANT_SHA
+set -eu
+stub_dir=$1
+fv_root=$2
+sandbox_script=$3
+want_sha=$4
+dispatch_line=$(grep -n '^case "${1:-}" in' "$sandbox_script" | head -1 | cut -d: -f1)
+if [ -z "$dispatch_line" ]; then
+    printf 'fv-runner: the dispatcher line is gone from %s; refusing to source an uncut copy\n' "$sandbox_script" >&2
+    exit 9
+fi
+gen=$(mktemp "$fv_root/sourced.XXXXXX")
+sed -n "1,$((dispatch_line - 1))p" "$sandbox_script" |
+    sed "s#^root=\$(unset CDPATH.*#root=$fv_root#" >"$gen"
+if grep -q 'up) cmd_up' "$gen"; then
+    printf 'fv-runner: the cut copy still contains the dispatcher\n' >&2
+    rm -f "$gen"
+    exit 9
+fi
+# shellcheck disable=SC1090
+. "$gen"
+if [ "$installer" != "$fv_root/skill/assets/unix/install-agentq.sh" ]; then
+    printf 'fv-runner: $installer resolved outside the fixture: %s\n' "$installer" >&2
+    exit 9
+fi
+mkdir -p "$cache"
+PATH="$stub_dir:$PATH" fetch_verified fake-pueue "$want_sha" "$fv_root/destination"
+printf 'fv-runner: fetch_verified returned 0\n'
+FVRUN
+chmod 700 "$work/fv-curl-stub" "$work/fv-sleep-stub" "$work/fv-runner"
+printf 'pueue-payload-under-test' >"$work/fv-payload"
+fv_want_sha=$(fv_sha256 "$work/fv-payload")
+
+fv_prep() { # $1 = mode -> fresh stub dir + fixture tree; echoes "<stub> <fv_root>"
+    mode=$1
+    fs="$work/fv-$mode"
+    rm -rf "$fs" "$fs-cache"
+    stub="$fs/stub"
+    mkdir -p "$stub" "$fs/skill/assets/unix"
+    cp "$work/fv-curl-stub" "$stub/curl"
+    cp "$work/fv-sleep-stub" "$stub/sleep"
+    key="$(uname -s):$(uname -m)"
+    cat >"$fs/skill/assets/unix/install-agentq.sh" <<FIXINST
+case x in
+    $key)
+        pueue_asset='fake-pueue'
+        pueue_sha256='$fv_want_sha'
+        pueued_asset='fake-pueued'
+        pueued_sha256='$fv_want_sha'
+        ;;
+esac
+FIXINST
+    printf '%s %s\n' "$stub" "$fs"
+}
+
+# Case 1: two failures then success -> fetch_verified returns 0, the payload
+# landed, THREE curl attempts and exactly TWO sleeps happened between them.
+cases=$((cases + 1))
+read -r fv_stub fv_root <<EOF
+$(fv_prep transient)
+EOF
+fv_rc=0
+AGENTQ_SANDBOX_ROOT="$fv_root" STUB_DIR="$fv_stub" STUB_MODE=transient \
+    PAYLOAD_FILE="$work/fv-payload" "$work/fv-runner" "$fv_stub" "$fv_root" "$sandbox" "$fv_want_sha" \
+    >"$work/fv-transient.out" 2>&1 || fv_rc=$?
+if [ "$fv_rc" -ne 0 ]; then
+    printf 'sandbox-daemon-reaper: fetch_verified gave up although a later attempt could have succeeded (exit %s)\n' "$fv_rc" >&2
+    failures=$((failures + 1))
+fi
+if [ "$(cat "$fv_stub/attempts" 2>/dev/null || echo 0)" != "3" ]; then
+    printf 'sandbox-daemon-reaper: the transient-failure case made %s curl attempts, expected 3 (two failures + one success)\n' "$(cat "$fv_stub/attempts" 2>/dev/null || echo 0)" >&2
+    failures=$((failures + 1))
+fi
+if [ "$(wc -l <"$fv_stub/sleeps" 2>/dev/null | tr -d ' ')" != "2" ]; then
+    printf 'sandbox-daemon-reaper: the retries slept %s times, expected 2 -- without a pause between them the retry is a hammer, not a backoff\n' "$(wc -l <"$fv_stub/sleeps" 2>/dev/null | tr -d ' ')" >&2
+    failures=$((failures + 1))
+fi
+if ! cmp -s "$work/fv-payload" "$fv_root/destination"; then
+    printf '%s\n' 'sandbox-daemon-reaper: fetch_verified returned 0 but the destination does not match the payload' >&2
+    failures=$((failures + 1))
+fi
+
+# Case 2: every attempt fails -> a loud death, named attempt count, no
+# half-written cache file left behind.
+cases=$((cases + 1))
+read -r fv_stub fv_root <<EOF
+$(fv_prep always)
+EOF
+fv_rc=0
+AGENTQ_SANDBOX_ROOT="$fv_root" STUB_DIR="$fv_stub" STUB_MODE=always \
+    PAYLOAD_FILE="$work/fv-payload" "$work/fv-runner" "$fv_stub" "$fv_root" "$sandbox" "$fv_want_sha" \
+    >"$work/fv-always.out" 2>&1 || fv_rc=$?
+if [ "$fv_rc" -eq 0 ]; then
+    printf '%s\n' 'sandbox-daemon-reaper: fetch_verified returned 0 although EVERY curl attempt failed' >&2
+    failures=$((failures + 1))
+fi
+if ! grep -q 'download failed after 3 attempts' "$work/fv-always.out"; then
+    printf '%s\n' 'sandbox-daemon-reaper: the total-failure path does not name the attempt count, so an operator cannot tell a retry-exhausted download from a single-shot one' >&2
+    failures=$((failures + 1))
+fi
+if [ "$(cat "$fv_stub/attempts" 2>/dev/null || echo 0)" != "3" ]; then
+    printf 'sandbox-daemon-reaper: the total-failure case made %s curl attempts, expected 3\n' "$(cat "$fv_stub/attempts" 2>/dev/null || echo 0)" >&2
+    failures=$((failures + 1))
+fi
+if [ -e "$fv_root-cache/fake-pueue" ]; then
+    printf '%s\n' 'sandbox-daemon-reaper: a failed download left its (partial or garbage) cache file in place for the next run to re-verify -- the cache must only ever hold verified bytes' >&2
+    failures=$((failures + 1))
+fi
+
+# Case 3: the first attempt succeeds -> exactly ONE curl call, ZERO sleeps.
+# Without this case, a "retry" implemented as three unconditional curls would
+# pass both failure-mode cases above while hammering every healthy run.
+cases=$((cases + 1))
+read -r fv_stub fv_root <<EOF
+$(fv_prep ok)
+EOF
+fv_rc=0
+AGENTQ_SANDBOX_ROOT="$fv_root" STUB_DIR="$fv_stub" STUB_MODE=ok \
+    PAYLOAD_FILE="$work/fv-payload" "$work/fv-runner" "$fv_stub" "$fv_root" "$sandbox" "$fv_want_sha" \
+    >"$work/fv-ok.out" 2>&1 || fv_rc=$?
+if [ "$fv_rc" -ne 0 ] || [ "$(cat "$fv_stub/attempts" 2>/dev/null || echo 0)" != "1" ]; then
+    printf 'sandbox-daemon-reaper: a healthy download took %s attempts (expected exactly 1) or failed (exit %s)\n' "$(cat "$fv_stub/attempts" 2>/dev/null || echo 0)" "$fv_rc" >&2
+    failures=$((failures + 1))
+fi
+if [ -f "$fv_stub/sleeps" ]; then
+    printf '%s\n' 'sandbox-daemon-reaper: the success path slept -- retry delays must only follow a FAILURE' >&2
+    failures=$((failures + 1))
+fi
+
+
 if [ "$failures" -ne 0 ]; then
     printf 'sandbox-daemon-reaper: %s failure(s)\n' "$failures" >&2
     exit 1
