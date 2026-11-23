@@ -2784,3 +2784,53 @@ A5b 随之修复并经两列双向验证——见 A5b 正文与本节 A5b 行。
 边界（未验证，不声称）：
 -本轮未触碰任何真实 Windows 主机（用户未在会话中点名）：WinGet 链接/别名是否 reparse、GBK 主机实装、本地化 ACL 名、.NET4.5.2 下 `ToUnixTimeSeconds`、环境块 32767 溢出、`AGENTQ_PLATFORM_CACHE_DIR`的 cygpath 转换，均只有代码级判断。
 - Windows 安装器在 pueue pin 变更时的升级/回滚仍会被预检拒绝；这是刻意的防篡改行为，已写入 `skill/references/install.md`。
+
+## 第十一轮全维度终审（2026-11-23，审 c901165 / v0.1.40；4 个只读 agent + Orca Codex）
+
+范围：源码全量 + 三平台安装/使用故事 + 检查自身；每条发现在主检出里先复现/读证据再动手。版本 0.1.40 → 0.1.41。
+
+### 服务端（`skill/assets/unix/agentq-server`，孪生逐字节同步）
+
+- **P1：fail 消息展开未赋值变量 → 子 shell 崩 → 调用方读成「不存在」→ 重复入队。** 复现（`jq -r length` 在 `find_request_task` 内注入一次失败，macOS bash 3.2.57 与 nginx:1.30.7 的 bash 5.2.37 都实测）：`$( )` 里 `set -u` 的 unbound expansion 以 rc=1 终止子 shell，submit 的判据 `[ rc -ne 0 ] && [ rc -ne 1 ]` 把 1 当「无可见任务」，于是对**已可见同标签任务**的 request 调 `pueue add`、退 0、`reused:false`。修前 CONTROL=复用/0 add，INJECTED=add×1。
+  - **探针推翻的旧认知（必须先量再修）**：本轮先前记录「同函数裸 `local x` 在两版 bash 下都安全」只对 **bash 3.2**——bash ≥4.4 下同函数未赋值 `local` 的裸展开同样 unbound（实测 `same-52 rc=127`）。所以危险面不是 14 处跨函数站点，而是**全部 90 条 `fail` 里展开 `$task_id` 的行**（多数是自引用 `X=$(…) || fail "…$X"` 形态——失败命令恰恰没来得及给 X赋值）。
+  - 修法：90 处统一改 `${task_id-}`（实测 3.2/5.2 与命令替换内均安全、零退出）；复现点改报其真实查询键 `$task_label`（该函数的参数，恒有值）。不改写扫描顺序、不发明新变量——`fail()` 上方加契约注释，smoke/01 加静态规则（见检查自身节），smoke/27 加行为锁 S16。
+  - **S16 的教训（断言在正确树上失败 = 它在教你契约）**：第一版 S16 对「armed 失败不改 record」的快照取自 control **之前**，而 control 合法地把 prepared 恢复成 accepted——红的是我的测试假设，不是生产代码。快照改在 control 之后、armed 之前。双向红证：退回裸 `$task_id` → S16 报 4 条（含 `unbound variable` 原文）；还原 → 182 例全绿。
+- **静态锁 `fail_msg_vars`（新分类器 `smoke/01-fail-msg-vars.py`）**：同函数视角判「fail 消息展开已 `local` 声明但在该行之前无赋值」；`${x-}`/`${x:-}` 豁免；`x=$(…) || fail "…$x"` 的自引用形态按「同一行且赋值在 `||` 之前」判违规。跨函数动态作用域读是**声明盲区**（无 `local` 声明即不在判定域），由消息形态改造 + S16 行为锁兜底，盲区写进分类器 docstring。
+  - **两轮假阳性校准**：第一版把 `if request_id=$(…)`（if 是赋值位！）与 `while IFS= read -r x; do`（read 变量以 `;` 收尾）读成未赋值，真树报 50 行。教训与农场分类器同型：**新静态规则的第一次真树运行就是它自己的假阳性证明**，必须先双向夹具（12 条）+ 真树清零再谈红证。
+  - 端到端红证必须是**双侧同步变异**：单侧变异先被 parity 规则拦下，红的是错的规则（本轮真踩过一次，靠 grep 红证输出词才发现）。
+
+### dev 工具 `sandbox.sh`（Codex P0/P1）
+
+- **标记所有权改内容 token**：`down`/`up` 此前只认**文件名** `.agentq-sandbox`，预置空文件 + `AGENTQ_SANDBOX_ROOT=<目标>` 即可让 `rm -rf` 删任意树（Codex P0）。现 token=`agentq-sandbox v1` 由 `up` 写入、`owns_sandbox_root`（常规文件 + 首行精确匹配）在 `down`/`up`/`cleanup_partial` 三个读点统一判定。**兼容性是本机可见的**：旧沙箱留空标记 → 新代码拒收 → 手工 `printf 'agentq-sandbox v1\n' > marker && down` 恢复（本轮实测走过）。smoke/30 的 9 处 fixture 改从被测文件读 token（夹具与实现不双写），新增 planted-marker 双案例（up/down 各一，红证：校验退回 `-f` 只看名字 → 3 条红、哨兵被删）。
+- **signal 前复核进程身份（P1）**：`ps` 快照与 `kill` 之间 PID 可被复用。`daemon_is_still_ours` 用**同一 argv 判据**逐 pid 复核，不可读=不 signal。锁是双向的：control（复核仍见 daemon→必须 reap）+ reuse（复核改报无辜→必须放过）。第一版只断言 reuse 方向，对「去掉首道复核」的变异**全绿**（daemon 还活着，两形态都给同一答案）——双向性缺失正是被自己抓到、被 control 方向补上的。
+- **curl 夹具的传输模型必须先量**：给 fetch_verified 的清理断言加「失败留部分文件」时，我先在注释里**断言** curl `-f -o` 失败会留文件——本机实测（本地 403 服务器 + curl 8.7.1）恰恰**不留**。注释改为记录实测，fixture 保留种部分文件（更难的状态），并对清理行做删除变异 → case 红，证明断言承重。**「凭想象写 fixture」在本仓是第三次撞钟**（ssh stderr 那次之后）。
+- 过程性自纠：本轮用 python 字符串手术删 `rm -f "$cached"` 时把 `until` 循环削断（语法红才暴露）——变异编辑要用**整块替换 + `bash -n` 立即验证**，不用 index 拼接。
+
+### 安装器
+
+- **无 HOME 时先答 `--help`（Codex P2，实测）**：两份 POSIX 安装器第一条 `$HOME` 展开在 argv 处理之前，`env -u HOME sh install-agentq.sh --help` 报 `HOME: unbound variable` 退 1。修法：help/argv 判定整体提到 `$HOME` 依赖之前，安装路径自己答 `HOME is not set…` 退 2。install-client.sh 的 `AGENTQ_CLIENT_BIN_DIR` 默认值**延后到 argv 解析之后**展开，并加 `destination_explicit` 旗标——`--bin-dir ''` 的既有拒绝契约（smoke/21）必须走**显式设置**分支而不是 env 存在性分支；第一版用 `${VAR+set}` 判显式，被 smoke/21 当场抓红（`AGENTQ_CLIENT_BIN_DIR=` 也算已设置）。
+- **stage 身份即时记录**：`prepare_service_stage` 在 `create` 成功后**立刻**记录 identity（原来在全部内容渲染之后），失败中断路径因此可清理；结尾改为**比对**重取的 identity 与创建时的记录（中途被换内容即拒，防「重新记录」把替换洗白）。动机：agent B 实测两次中断各留一个 `.agentq-plist.stage.*` 孤儿 + 清理拒绝无身份文件。
+- **注释失实修正**：`maintenance_lock_empty_grace_seconds` 的注释声称服务端读同名环境变量——实测服务端 agentq-server:285 **硬编码 30**，只有安装器可 env 覆盖。注释改述实测。
+- **未改、记为边界（本轮验证过现状后刻意不动）**：
+  - 安装器 `wait_for_operation_lock` 无「仅元数据陈旧」恢复臂（服务端有）。安装器的 `remove_stale_operation_lock` 拒绝无主锁、空锁宽限逻辑只存在于维护锁侧；补这一臂需要给操作锁新建 capture/回滚语义且只能在真实中断下验证——维持「宁可退 2 不可误删」。
+  - Windows 目标临时文件的两处「identity 失败→保留不删」泄漏（Codex P2）：这是**策略**（不可归属宁漏勿错删），与 wait-stderr 分支同族，沙箱不可利用（mktemp 名 + 0700 目录），保留现状。
+  - `AGENTQ_PLATFORM_CACHE_DIR` 空白/相对值：`skill/references/clients.md:71` 把「空≠未设置、进入正常校验」钉成**三实现一致的实测契约**，收紧校验=破坏文档化契约，需跨两语言协调一轮，本轮不动。
+
+### PowerShell 侧
+
+- **sshp.ps1 补 `[Console]::OutputEncoding` UTF-8 守卫**：agentq.ps1 早已有、姊妹没有——同族「守卫只落一个孪生」缺陷（此前 macOS LaunchServices 探针在同对文件上漏过、活了九天）。锁做成**遍历两个 PS 客户端**（存在性 + 位置双断言），位置判据锚 dispatch 行（`switch ($operation)` / `Prepare-Remote`）——第一版锚 `script:SshPath` 首现，被 agentq.ps1 的 `$script:SshPath = $null` 声明行误伤，锚错对象是检测器自己的缺陷。GBK 真机效果仍不可本机验证，记边界。
+- **平台缓存 TTL 计算挪进 try**：`Read-PlatformProbeCache` 的 `ToUnixTimeSeconds` 在 try 外，.NET 4.5.2 宿主（PS 5.1 下界）上**每条 auto 命令**在 dispatch 前 MethodException。第一版修复（epoch 算术改写）被两个自测推翻：`[int]` 强转把 Int64 秒数截进 2038（smoke/12 4054 行的 `probed_at` 契约正是 2026 年的 10 位数），而 4.6+ 上「修一个未证实风险引入一个新风险」不成立；且「移进 try」在 4.5.2 上同样只是把崩退 2 变成走探测路径。最终取**最小形态**：ttl/age 两行移入既有 try，catch 的 `return $false` 语义=「缓存未命中」，pwsh 功能探针四路（fresh hit/未来时间戳拒/过期拒/写读 round-trip 形状）实测不变。4.5.2 真机不存在——**该崩溃路径保持未证实**，PLAN 与代码注释都写明。
+- **规则 L：强制杀必须「最后一次查询之后有身份复核」**：`Stop-ManagedPueueProcessTree` 的 descendant 循环在 CIM 枚举+验证之后又按旧 PID `Get-Process` 再 `Stop-Process -Force`，两次 lookups 之间没有身份检查（Codex P1）。锁的判据不是窗口也不是「函数里有检查」（旧代码的验证在**紧邻的上一循环**，任何窗口/函数级判据都放行它）——按文件线性扫：最近 LOOKUP 行 vs 最近 IDENTITY 信号行，`Stop-Process -Id * -Force` 落在 identity<=lookup 即违规。三形态各自验证：修复后的 descendant（同语句 gate）绿、root（Get-Process→StartTime 比对→Stop）绿、**退回旧形态红**。作用域从 `grep -rl Stop-Process` 派生（不是手写清单——规则根从树上派生是既定教训）。rule_sites 计数 10→11；L 的「sites」是**普查到的强制杀语句数**（违例必须为 0 才可绿，sites>0 证其未瞎），这处语义偏差在 smoke/10 注释里写明而不是藏进算术。
+
+### 检查自身
+
+- **7 个 smoke 的信号 trap 改 `cleanup; exit 130` 双行形态**（Codex P2）：handler 返回后脚本**继续跑**（本机实测输出 `after-signal`），已删工作目录被继续访问。EXIT 行保持 `trap cleanup EXIT`（`$?` 不被改写），HUP/INT/TERM 显式 130。smoke/28 全绿复跑（它本身就是测 trap 的）。
+- **smoke/01 校准夹具移出仓库**（Codex P2）：`smoke/_ncov_calibration_fixture.txt` 固定路径 + finally 删除 → SIGKILL 即残留污染工作树；改 `tempfile.mkdtemp`，断言键名随夹具 basename。
+- **ci_pin 扩一条：windows 作业子集=声明遵守 `AGENTQ_SMOKE_PWSH` 的检查集合**（agent D P1 的结构化替代）。判据不是猜的：`for check in` 循环解析自 ci.yml，与「扩展了该变量的检查」求差，唯一豁免 `19-sshp-contract` 写死在注释里（它自身会打印 `skipped(pwsh-absent)`，撞上该作业自己的 `grep SKIPPED` 拒绝——这是**读过的行为**，不是推测）。双向红证各一（删豁免条目→报 19；从循环删 22→报 22）。检测器扫全体 smoke/*.sh 含 smoke/01 自己——**规则文档里写出变量形态会被自己扫到**，注释措辞避开扩展形态。
+- **三处文档漂移修正（活文档，按日期注记）**：HANDOFF 的 SKIP 清单 4 项→6 项（`15`/`17` 的判据与前四**逐字相同**，逐一 grep 验证后补名）；verification-status 的 `rule_sites_checked 必须为 8`→11 与站点数不再钉死（该数由运行时打印）；CLAUDE.md 权威口径是**五次**损坏，smoke/01 注释里的「twice/两种消息」同步修正。`##第十轮终审` 补空格（blame：2727/2769 两节同批 c4d7455 落地、内容不同，**不是重复段**——本轮先怀疑重复、后以 blame 证伪，只修渲染）。
+
+### 记为边界（未验证/未修，不声称覆盖）
+
+- 本轮未触碰任何真实主机（用户未点名）；Windows 生产、.NET 4.5.2、GBK 真机、PID 复用的内核级竞态全部是脚本模型。
+- Codex 的 sandbox P0/P1 修复针对**本机可达面**（文件层、argv 层）；OS 层 PID 复用窗口只能收窄不能消除（复核与 signal 之间仍有理论窗口）。
+- `fail_msg_vars` 静态规则看不到跨函数动态作用域读；该家族由 S16 行为锁 + 全量消息改造覆盖现状，新代码若再引入需行为锁跟进。
