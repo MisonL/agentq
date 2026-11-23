@@ -53,7 +53,11 @@ export AGENTQ_PLATFORM_CACHE_DIR="$work/platform-cache"
 # its own fresh directory.
 export AGENTQ_PLATFORM_PROBE_CACHE=off
 cleanup() { rm -rf -- "$work"; }
-trap cleanup EXIT HUP INT TERM
+# A signal handler that RETURNS lets the interrupted script resume; measured
+# 2026-11-22 (Codex review P2) with a trap that printed cleanup and then
+# continued into the rest of the fixture.  Use an explicit exit on signals.
+trap 'cleanup; exit 130' HUP INT TERM
+trap cleanup EXIT
 
 failures=0
 cases=0

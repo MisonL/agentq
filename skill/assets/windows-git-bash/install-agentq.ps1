@@ -32,7 +32,7 @@ $expectedClientHash = "28b0756d54ec16ce13d78b251d086aa62e0057089cb27f793cd649f97
 $expectedDaemonHash = "aafa05e2f26cda9aff3eeb9be261e8f9f67752d1e9bb7fbcb47318e35c52ab1d"
 $releaseVersion = "4.0.4"
 $releaseBaseUrl = "https://github.com/Nukesor/pueue/releases/download/v$releaseVersion"
-$agentqVersion = "0.1.40"
+$agentqVersion = "0.1.41"
 $clientAssetName = "pueue-x86_64-pc-windows-msvc.exe"
 $daemonAssetName = "pueued-x86_64-pc-windows-msvc.exe"
 $gitBashPath = $null
@@ -793,9 +793,16 @@ function Stop-ManagedPueueProcessTree {
         throw "AgentQ daemon process identity changed before forced termination: $rootId"
     }
     foreach ($descendant in $validatedDescendants) {
-        $process = Get-Process -Id ([int]$descendant.ProcessId) -ErrorAction SilentlyContinue
-        if ($null -ne $process) {
-            Stop-Process -Id $process.Id -Force -ErrorAction Stop
+        # Re-verify IMMEDIATELY before the kill: validation ran against the
+        # Get-ProcessDescendants snapshot, and a validated descendant that has
+        # since exited lets Windows recycle its PID -- the number may now
+        # belong to an unrelated process.  Test-ProcessSnapshotIdentity answers
+        # false for "gone", throws for "a different process sits there";
+        # either way nothing unrelated is stopped.  Measured 2026-11-22 (final
+        # review, Codex P1): the old loop called Stop-Process on the stale
+        # number with no re-check.  LOCKED BY smoke/10 rule L.
+        if (Test-ProcessSnapshotIdentity -Snapshot $descendant) {
+            Stop-Process -Id ([int]$descendant.ProcessId) -Force -ErrorAction Stop
         }
     }
 

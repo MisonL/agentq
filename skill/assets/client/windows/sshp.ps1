@@ -1454,6 +1454,19 @@ if ($script:SessionName.Length -gt $script:SessionNameLimit) {
 }
 
 $script:SshPath = Resolve-SshPath
+# PS 5.1 decodes a native child's redirected stdout with Console.OutputEncoding,
+# and on a zh-CN Windows that is GBK: the probe and install legs of
+# Invoke-SshLogged capture ssh with `1> file`, and a CJK word in that capture
+# came back mangled on the real test host (the same class PLAN.md measured for
+# agentq.ps1 on 2026-10-08; the guard existed there and not in this sibling --
+# the "guard landed in one twin, not the other" class this repo has now paid
+# for twice).  `[Console]::Out` uses the same property, so one setter pins
+# decode AND encode.  Guarded exactly like the twin: with no usable console
+# handle the setter throws, and the platform default is then the old behaviour.
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+} catch {
+}
 $script:PreparationResult = $null
 if ($checkOnly) {
     Prepare-Remote -AllowInstall:$false -CheckReconnectAttempts 3

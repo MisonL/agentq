@@ -69,7 +69,11 @@ cleanup() {
     [ -n "$pueued_pid" ] && kill "$pueued_pid" >/dev/null 2>&1 || true
     rm -rf -- "$work"
 }
-trap cleanup EXIT HUP INT TERM
+# A signal handler that RETURNS lets the interrupted script resume; measured
+# 2026-11-22 (Codex review P2) with a trap that printed cleanup and then
+# continued into the rest of the fixture.  Use an explicit exit on signals.
+trap 'cleanup; exit 130' HUP INT TERM
+trap cleanup EXIT
 
 failures=0
 

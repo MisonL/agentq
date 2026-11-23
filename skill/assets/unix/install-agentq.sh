@@ -4,15 +4,59 @@ set -eu
 
 program=${0##*/}
 release_version='4.0.4'
-agentq_version='0.1.40'
+agentq_version='0.1.41'
 asset_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+# HOME is required for a real install, but NOT for `--help`: answering a
+# help request must not depend on it.  Measured 2026-11-22 (Codex review P2):
+# with HOME unset BOTH installers died at their first `$HOME` expansion
+# (`HOME: unbound variable`, exit 1) before their own argv checks could run.
+# The help/argument dispatch therefore sits ABOVE this guard, and the guard
+# answers the install path with a controlled exit 2 like every other refusal.
+# This installer takes NO arguments, and says so instead of ignoring them.  It
+# used to read none of "$@" at all, so `sh install-agentq.sh --check` -- a flag
+# that DOES exist on the sibling install-client.sh, whose usage sits a few lines
+# from this one in README -- performed a full install: took the maintenance
+# lock, stopped pueued, swapped the tree and restarted the service.  An
+# operator asking for a read-only preflight got an irreversible write.
+# (Found by the 2026-11-19 independent review, reproduced with a stub PATH.)
+case "${1:-}" in
+    '') ;;
+    -h|--help)
+        # `--help extra` is NOT a help request followed by ignored words: the
+        # whole argv is wrong, and answering 0 tells a script its (misspelled)
+        # invocation succeeded.  Same rule the non-help arm already follows.
+        case "$#" in
+            1) ;;
+            *)
+                printf '%s\n' "$program: --help takes no further arguments: $2" >&2
+                printf '%s\n' "try: $program --help" >&2
+                exit 2
+                ;;
+        esac
+        printf 'Usage: %s\n\nInstalls AgentQ without arguments; everything is configured through the\nenvironment (see skill/references/install.md). Nothing is read from argv.\n' "$program"
+        exit 0
+        ;;
+    *)
+        printf '%s\n' "$program: this installer takes no arguments; ignoring them would perform a full install: $1" >&2
+        printf '%s\n' "try: $program --help" >&2
+        exit 2
+        ;;
+esac
+
+if [ -z "${HOME:-}" ]; then
+    printf '%s\n' "$program: HOME is not set; export HOME before installing AgentQ (or run --help)" >&2
+    exit 2
+fi
 agentq_home=${AGENTQ_HOME:-"$HOME/.agentq"}
 artifact_source_directory=${AGENTQ_PUEUE_SOURCE_DIR:-}
 wrapper_destination="$HOME/.local/bin/agentq"
 # An empty maintenance lock directory (a run killed between `mkdir` and the pid
 # write) may be reclaimed only after this long: a directory that just appeared
-# may belong to another installer that is about to write its pid.  The server
-# reads the same value from the environment (maintenance_lock_empty_grace_seconds).
+# may belong to another installer that is about to write its pid.  The SERVER
+# uses the same number but does NOT read it from the environment -- it
+# hard-codes 30 (agentq-server: `maintenance_lock_empty_grace_seconds=30`), so
+# this value is only overridable HERE; a claim that both sides honour an export
+# would be wrong (measured 2026-11-22).
 maintenance_lock_empty_grace_seconds=${maintenance_lock_empty_grace_seconds:-30}
 case "$maintenance_lock_empty_grace_seconds" in
     ''|*[!0123456789]*)
@@ -30,6 +74,7 @@ failed_home=''
 failed_home_identity=''
 service_stage=''
 service_stage_identity=''
+service_stage_identity_recheck=''
 service_temporary=''
 service_temporary_identity=''
 service_restore_temporary=''
@@ -1876,6 +1921,17 @@ prepare_service_stage() {
             service_destination="$HOME/.config/systemd/user/agentq-pueued.service"
             service_stage=$(create_installer_temporary_file "$agentq_parent" '.agentq-service.stage') ||
                 fail "failed to create the AgentQ service staging path in: $agentq_parent"
+# Record the identity IMMEDIATELY after creation: every step below
+# (`cp`, `chmod`, the `sed` redirect, the guards) can fail, and cleanup
+# refuses an unattributed stage file -- measured 2026-11-22 (review
+# agent B): two interrupted runs left two `.agentq-plist.stage.*` files
+# that nothing would ever remove. The identity of a file this installer
+# just created through O_EXCL can only change if something replaced it,
+# which the post-content check below catches.
+            service_stage=$(create_installer_temporary_file "$agentq_parent" '.agentq-service.stage') ||
+                fail "failed to create the AgentQ service staging path in: $agentq_parent"
+            service_stage_identity=$(installer_file_identity "$service_stage") ||
+                fail "failed to inspect the AgentQ service staging path: $service_stage"
             cp "$asset_directory/agentq-pueued.service" "$service_stage"
             chmod 600 "$service_stage"
             require_installer_stage_file "$service_stage" 'service staging path'
@@ -1884,6 +1940,17 @@ prepare_service_stage() {
             service_destination="$macos_system_service_directory/com.agentq.pueued.plist"
             service_stage=$(create_installer_temporary_file "$agentq_parent" '.agentq-plist.stage') ||
                 fail "failed to create the AgentQ service staging path in: $agentq_parent"
+# Record the identity IMMEDIATELY after creation: every step below
+# (`cp`, `chmod`, the `sed` redirect, the guards) can fail, and cleanup
+# refuses an unattributed stage file -- measured 2026-11-22 (review
+# agent B): two interrupted runs left two `.agentq-plist.stage.*` files
+# that nothing would ever remove. The identity of a file this installer
+# just created through O_EXCL can only change if something replaced it,
+# which the post-content check below catches.
+            service_stage=$(create_installer_temporary_file "$agentq_parent" '.agentq-plist.stage') ||
+                fail "failed to create the AgentQ service staging path in: $agentq_parent"
+            service_stage_identity=$(installer_file_identity "$service_stage") ||
+                fail "failed to inspect the AgentQ service staging path: $service_stage"
             escaped_home=$(printf '%s' "$agentq_home" | sed 's/[\\&|]/\\&/g')
             escaped_user=$(printf '%s' "$(id -un)" | sed 's/[\\&|]/\\&/g')
             escaped_home_parent=$(printf '%s' "$HOME" | sed 's/[\\&|]/\\&/g')
@@ -1923,8 +1990,12 @@ prepare_service_stage() {
 
     installer_path_is_safe "$service_destination" ||
         fail "service destination path is unsafe: $service_destination"
-    service_stage_identity=$(installer_file_identity "$service_stage") ||
+    # Re-reading and RE-RECORDING the identity here would whitewash a stage
+    # file replaced between creation and this point; compare instead.
+    service_stage_identity_recheck=$(installer_file_identity "$service_stage") ||
         fail "failed to inspect AgentQ service staging path: $service_stage"
+    [ "$service_stage_identity_recheck" = "$service_stage_identity" ] ||
+        fail "AgentQ service staging path identity changed: $service_stage"
 
     if [ -e "$service_destination" ] || [ -L "$service_destination" ]; then
         service_existed_before=true
@@ -2979,37 +3050,6 @@ cleanup_on_exit() {
 
 trap cleanup_on_exit EXIT
 trap 'exit 130' HUP INT TERM
-
-# This installer takes NO arguments, and says so instead of ignoring them.  It
-# used to read none of "$@" at all, so `sh install-agentq.sh --check` -- a flag
-# that DOES exist on the sibling install-client.sh, whose usage sits a few lines
-# from this one in README -- performed a full install: took the maintenance
-# lock, stopped pueued, swapped the tree and restarted the service.  An
-# operator asking for a read-only preflight got an irreversible write.
-# (Found by the 2026-11-19 independent review, reproduced with a stub PATH.)
-case "${1:-}" in
-    '') ;;
-    -h|--help)
-        # `--help extra` is NOT a help request followed by ignored words: the
-        # whole argv is wrong, and answering 0 tells a script its (misspelled)
-        # invocation succeeded.  Same rule the non-help arm already follows.
-        case "$#" in
-            1) ;;
-            *)
-                printf '%s\n' "$program: --help takes no further arguments: $2" >&2
-                printf '%s\n' "try: $program --help" >&2
-                exit 2
-                ;;
-        esac
-        printf 'Usage: %s\n\nInstalls AgentQ without arguments; everything is configured through the\nenvironment (see skill/references/install.md). Nothing is read from argv.\n' "$program"
-        exit 0
-        ;;
-    *)
-        printf '%s\n' "$program: this installer takes no arguments; ignoring them would perform a full install: $1" >&2
-        printf '%s\n' "try: $program --help" >&2
-        exit 2
-        ;;
-esac
 
 [ "$agentq_home" = "$HOME/.agentq" ] || fail 'AGENTQ_HOME overrides are unsupported because the bundled Pueue config is rooted at ~/.agentq'
 [ ! -L "$agentq_home" ] || fail "AgentQ home must not be a symbolic link: $agentq_home"

@@ -4,7 +4,8 @@ set -eu
 
 program=${0##*/}
 script_directory=$(unset CDPATH; cd "$(dirname "$0")" && pwd -P)
-destination_directory=${AGENTQ_CLIENT_BIN_DIR:-"$HOME/.local/bin"}
+destination_directory=${AGENTQ_CLIENT_BIN_DIR:-}
+destination_explicit=${AGENTQ_CLIENT_BIN_DIR:+yes}
 staged_agentq_path=''
 staged_sshp_path=''
 check_only=false
@@ -186,6 +187,7 @@ while [ "$#" -gt 0 ]; do
         --bin-dir)
             [ "$#" -ge 2 ] || fail '--bin-dir requires a directory'
             destination_directory=$2
+            destination_explicit=yes
             shift 2
             ;;
         -h|--help)
@@ -198,9 +200,17 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-case "$destination_directory" in
-    '') fail 'destination directory cannot be empty' ;;
-esac
+# The $HOME default is resolved only AFTER argv parsing, so `--help` answers
+# without a HOME at all (measured 2026-11-22, Codex review P2: with HOME unset
+# the expansion died with `HOME: unbound variable`, exit 1).  An explicitly
+# empty AGENTQ_CLIENT_BIN_DIR keeps its old shape -- the empty-string refusal.
+if [ -z "$destination_directory" ]; then
+    if [ -n "$destination_explicit" ]; then
+        fail 'destination directory cannot be empty'
+    fi
+    [ -n "${HOME:-}" ] || fail 'HOME is not set; export HOME or pass --bin-dir <directory>'
+    destination_directory="$HOME/.local/bin"
+fi
 require_safe_path "$destination_directory"
 assert_no_symlink_path_chain "$destination_directory" 'destination directory'
 

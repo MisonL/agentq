@@ -62,6 +62,15 @@ set -euo pipefail
 
 root=$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 sandbox="$root/sandbox.sh"
+# Read the required marker CONTENT from the script under test: a fixture that
+# hard-codes its own idea of the marker would keep passing after the ownership
+# check regressed to "any file with the right name".  The token is a plain
+# single-quoted assignment in sandbox.sh.
+marker_token=$(sed -n "s/^marker_token='\(.*\)'$/\1/p" "$sandbox" | head -1)
+if [ -z "$marker_token" ]; then
+    printf '%s\n' 'sandbox-daemon-reaper: FAIL (marker token not found in sandbox.sh)' >&2
+    exit 1
+fi
 if [ ! -x "$sandbox" ]; then
     printf '%s\n' 'sandbox-daemon-reaper: FAIL (sandbox.sh is missing or not executable)' >&2
     exit 1
@@ -81,13 +90,21 @@ cleanup() {
 # A forged process is a child of an exited subshell (see forge below), so it is
 # reparented and this shell never prints a "Terminated" job notice after the
 # summary line -- run-tests.sh reports a check by its LAST line.
-trap cleanup EXIT HUP INT TERM
+# A signal handler that RETURNS lets the interrupted script resume; measured
+# 2026-11-22 (Codex review P2) with a trap that printed cleanup and then
+# continued into the rest of the fixture.  Use an explicit exit on signals.
+trap 'cleanup; exit 130' HUP INT TERM
+trap cleanup EXIT
 
 failures=0
 cases=0
 
 # The config path sandbox.sh computes for a given root.  Kept in one place so
 # the forged argv cannot drift from what the locator reads.
+mark_owned() { # $1 = sandbox root : write the same marker content `up` writes
+    printf '%s\n' "$marker_token" > "$1/.agentq-sandbox"
+}
+
 config_for() { # $1 = sandbox root -> the pueue.yml path sandbox.sh would use
     printf '%s' "$1/home/.agentq/config/pueue.yml"
 }
@@ -173,7 +190,7 @@ if [ "$premise_ok" = true ]; then
     pid_gone=$(forge "./pueued --config $(config_for "$sb_gone")")
     decoys="$decoys $pid_gone"
     mkdir -p "$sb_gone/home/.agentq/runtime"
-    : >"$sb_gone/.agentq-sandbox"
+    mark_owned "$sb_gone"
     sleep 0.3
     down_gone_status=0
     AGENTQ_SANDBOX_ROOT="$sb_gone" "$sandbox" down >"$work/down-gone.out" 2>&1 || down_gone_status=$?
@@ -196,7 +213,7 @@ if [ "$premise_ok" = true ]; then
     innocent=$(forge 'sleep 300 --not-a-daemon')
     decoys="$decoys $pid_stale $innocent"
     mkdir -p "$sb_stale/home/.agentq/runtime"
-    : >"$sb_stale/.agentq-sandbox"
+    mark_owned "$sb_stale"
     printf '%s\n' "$innocent" >"$sb_stale/home/.agentq/runtime/pueued.pid"
     sleep 0.3
     AGENTQ_SANDBOX_ROOT="$sb_stale" "$sandbox" down >"$work/down-stale.out" 2>&1 || true
@@ -219,7 +236,7 @@ if [ "$premise_ok" = true ]; then
     pid_stranger=$(forge "./pueued --config $(config_for "$work/not-our-sandbox")")
     decoys="$decoys $pid_other $pid_stranger"
     mkdir -p "$sb_other/home/.agentq/runtime"
-    : >"$sb_other/.agentq-sandbox"
+    mark_owned "$sb_other"
     sleep 0.3
     AGENTQ_SANDBOX_ROOT="$sb_other" "$sandbox" down >"$work/down-other.out" 2>&1 || true
     if alive "$pid_stranger"; then
@@ -344,7 +361,7 @@ STUB
     sb_doomed="$work/doomed-rebuild"
     fake_root="$work/doomed-repo"
     mkdir -p "$fake_root/skill/assets/unix" "$sb_doomed/home/.agentq/config" "$sb_doomed/home/.agentq/runtime"
-    : >"$sb_doomed/.agentq-sandbox"
+    mark_owned "$sb_doomed"
     printf 'shared:\n  pueue_directory: x\n' >"$sb_doomed/home/.agentq/config/pueue.yml"
     # A copy of the script whose $root resolves to the installer-less tree, so the
     # case is hermetic: it never touches this repo.
@@ -424,13 +441,109 @@ STUB
         chmod 700 "$1/ps"
     }
 
+    # --- planted marker: a NAME is not ownership (Codex P0, 2026-11-22) ------
+    # A foreign directory with a bare empty `.agentq-sandbox` used to be
+    # accepted as ours by both `up` and `down`, after which `rm -rf` erased it.
+    # The positive control below first proves a tree with OUR marker content is
+    # treated as ours (it is reaped: the reuse cases above already cover that);
+    # here the planted file carries the same name but not the content.
+    cases=$((cases + 1))
+    sb_planted="$work/planted-marker"
+    mkdir -p "$sb_planted/precious"
+    printf 'user data\n' >"$sb_planted/precious/keep.txt"
+    : >"$sb_planted/.agentq-sandbox"
+    plant_rc=0
+    AGENTQ_SANDBOX_ROOT="$sb_planted" "$sandbox" down >"$work/down-planted.out" 2>&1 || plant_rc=$?
+    if [ "$plant_rc" -eq 0 ]; then
+        printf '%s\n' 'sandbox-daemon-reaper: down accepted a planted empty marker as ownership' >&2
+        failures=$((failures + 1))
+    fi
+    if [ ! -f "$sb_planted/precious/keep.txt" ]; then
+        printf '%s\n' 'sandbox-daemon-reaper: down DELETED a tree that had only a planted marker' >&2
+        failures=$((failures + 1))
+    fi
+    if [ ! -s "$work/down-planted.out" ]; then
+        printf '%s\n' 'sandbox-daemon-reaper: the planted-marker refusal was silent' >&2
+        failures=$((failures + 1))
+    fi
+    cases=$((cases + 1))
+    plant_up_rc=0
+    PATH="$work/stub-bin:$PATH" AGENTQ_SANDBOX_ROOT="$sb_planted" "$sandbox" up \
+        >"$work/up-planted.out" 2>&1 || plant_up_rc=$?
+    if [ "$plant_up_rc" -eq 0 ]; then
+        printf '%s\n' 'sandbox-daemon-reaper: up accepted a planted empty marker as ownership' >&2
+        failures=$((failures + 1))
+    fi
+    if [ ! -f "$sb_planted/precious/keep.txt" ]; then
+        printf '%s\n' 'sandbox-daemon-reaper: up DELETED a tree that had only a planted marker' >&2
+        failures=$((failures + 1))
+    fi
+
+    # --- snapshot-to-signal PID reuse (Codex P1, 2026-11-22) -----------------
+    # `down` reads a ps SNAPSHOT and then signals each pid -- and between those
+    # two moments a pid can be exited and REUSED by an unrelated process.  A
+    # controllable `ps` models exactly that: on the snapshot call it reports the
+    # victim pid as our daemon; on every later call (what the pre-signal
+    # re-check reads) it reports that same pid as an unrelated `sleep`, or as
+    # gone.  The positive control first: when the re-check STILL reports the
+    # daemon and then reports it gone, `down` must reap the victim -- so a
+    # fixture whose re-check always fails could pass without re-checking at
+    # all. The mutant (signal on the stale snapshot, no re-check) kills the
+    # victim in the reuse arm and goes red there; the control arm stays green
+    # in both worlds and is what makes this case mean "identity-gated kill".
+    reuse_bin="$work/ps-reuse-bin"
+    mkdir -p "$reuse_bin"
+    cat >"$reuse_bin/ps" <<STUB
+#!/usr/bin/env bash
+# \$REUSE_MODE: control = daemon on calls 1-2, absent from call 3 on.
+#              reuse = daemon on call 1, unrelated process from call 2 on.
+state="${work}/ps-reuse-state"
+n=0
+[ -f "\$state" ] && n=\$("\$REUSE_CAT" "\$state" 2>/dev/null || :)
+n=\$((n + 1)); printf '%s\n' "\$n" > "\$state"
+if [ "\$n" -eq 1 ]; then
+    printf '%s ./pueued --config %s\n' "\$REUSE_VICTIM" "\${REUSE_CONFIG}"
+elif [ "\$REUSE_MODE" = control ]; then
+    [ "\$n" -eq 2 ] && printf '%s ./pueued --config %s\n' "\$REUSE_VICTIM" "\${REUSE_CONFIG}"
+else
+    printf '%s sleep 300 --innocent\n' "\$REUSE_VICTIM"
+fi
+STUB
+    chmod 700 "$reuse_bin/ps"
+    for reuse_mode in control reuse; do
+        cases=$((cases + 1))
+        sb_reuse="$work/pid-reuse-$reuse_mode"
+        mkdir -p "$sb_reuse/home/.agentq/config"
+        mark_owned "$sb_reuse"
+        rm -f "$work/ps-reuse-state"
+        # The victim is a real process; SIGTERM must be able to kill it (the
+        # forge runs a loop, and bash honours the default TERM disposition).
+        reuse_victim=$(forge 'sleep 300 --victim')
+        decoys="$decoys $reuse_victim"
+        sleep 0.3
+        PATH="$reuse_bin:$PATH" REUSE_MODE="$reuse_mode" REUSE_VICTIM="$reuse_victim" \
+            REUSE_CAT="$(command -v cat)" REUSE_CONFIG="$(config_for "$sb_reuse")" \
+            AGENTQ_SANDBOX_ROOT="$sb_reuse" "$sandbox" down \
+            >"$work/down-reuse-$reuse_mode.out" 2>&1 || true
+        sleep 0.3
+        if [ "$reuse_mode" = control ]; then
+            if alive "$reuse_victim"; then
+                printf '%s\n' 'sandbox-daemon-reaper: down did NOT reap the daemon although the re-check kept reporting it (the reuse arm below would pass for the wrong reason)' >&2
+                failures=$((failures + 1))
+            fi
+        elif ! alive "$reuse_victim"; then
+            printf '%s\n' 'sandbox-daemon-reaper: down killed a recycled pid the pre-signal re-check had reported as an unrelated process' >&2
+            failures=$((failures + 1))
+        fi
+    done
+
     # --- A: a BusyBox-shaped ps is handled, not merely survived ---------------
     cases=$((cases + 1))
     bb_bin="$work/ps-busybox-bin"
     mk_ps "$bb_bin" busybox
     bb_cal="$work/ps-busybox-cal"
     mkdir -p "$bb_cal/home/.agentq/config"
-    : >"$bb_cal/.agentq-sandbox"
+    mark_owned "$bb_cal"
     bb_cal_pid=$(forge "./pueued --config $(config_for "$bb_cal")")
     decoys="$decoys $bb_cal_pid"
     sleep 0.3
@@ -444,7 +557,7 @@ STUB
         cases=$((cases + 1))
         sb_bb="$work/ps-busybox-down"
         mkdir -p "$sb_bb/home/.agentq/config"
-        : >"$sb_bb/.agentq-sandbox"
+        mark_owned "$sb_bb"
         bb_pid=$(forge "./pueued --config $(config_for "$sb_bb")")
         decoys="$decoys $bb_pid"
         sleep 0.3
@@ -479,7 +592,7 @@ STUB
         cases=$((cases + 1))
         sb_blind="$work/ps-unusable-down"
         mkdir -p "$sb_blind/home/.agentq/config"
-        : >"$sb_blind/.agentq-sandbox"
+        mark_owned "$sb_blind"
         blind_pid=$(forge "./pueued --config $(config_for "$sb_blind")")
         decoys="$decoys $blind_pid"
         sleep 0.3
@@ -507,7 +620,7 @@ STUB
         cases=$((cases + 1))
         sb_blind_up="$work/ps-unusable-up"
         mkdir -p "$sb_blind_up/home/.agentq/config"
-        : >"$sb_blind_up/.agentq-sandbox"
+        mark_owned "$sb_blind_up"
         up_blind_pid=$(forge "./pueued --config $(config_for "$sb_blind_up")")
         decoys="$decoys $up_blind_pid"
         sleep 0.3
@@ -534,7 +647,7 @@ STUB
         cases=$((cases + 1))
         sb_st="$work/ps-unusable-status"
         mkdir -p "$sb_st/home/.agentq/config"
-        : >"$sb_st/.agentq-sandbox"
+        mark_owned "$sb_st"
         st_pid=$(forge "./pueued --config $(config_for "$sb_st")")
         decoys="$decoys $st_pid"
         sleep 0.3
@@ -666,12 +779,22 @@ if [ -z "$out" ]; then
 fi
 case "${STUB_MODE:-always}" in
 always)
+    # Measured on this machine's curl before writing this stub: a `-f -o
+    # FILE` run against a real 403 exits 22 and leaves NO file behind (curl
+    # unlinks its own output on HTTP error under -f).  The stub therefore
+    # creates a planted partial file instead -- the WORST case cleanup must
+    # survive -- and the case below mutates this very line to prove the
+    # cache-file assertion has teeth.  If curl ever regresses to leaving a
+    # file (the documented --remove-output default flip), the real code is
+    # already covered because the fixture plants the harder state.
+    printf 'partial-garbage-under-test\n' >"$out"
     printf 'fv curl stub: permanent failure (attempt %s)\n' "$n" >&2
     exit 22
     ;;
 transient)
     if [ "$n" -le 2 ]; then
-        printf 'fv curl stub: transient 403 (attempt %s)\n' "$n" >&2
+        printf 'partial-garbage-under-test\n' >"$out"
+        printf 'fv curl stub: transient403 (attempt %s)\n' "$n" >&2
         exit 22
     fi
     ;;
@@ -819,4 +942,4 @@ if [ "$failures" -ne 0 ]; then
     printf 'sandbox-daemon-reaper: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'sandbox-daemon-reaper checks passed: cases=%s locator=config-path pidfile=not-authoritative innocent=spared sibling=spared orphan=reaped tree-less=reaped foreign-tree=rejected refusal=read-only doomed-up=non-destructive ps-blind=reported reap-sites=checked\n' "$cases"
+printf 'sandbox-daemon-reaper checks passed: cases=%s locator=config-path pidfile=not-authoritative innocent=spared sibling=spared orphan=reaped tree-less=reaped foreign-tree=rejected refusal=read-only doomed-up=non-destructive ps-blind=reported reap-sites=checked planted-marker=rejected pid-reuse=spared\n' "$cases"

@@ -40,7 +40,11 @@ installer_source="${AGENTQ_SMOKE_INSTALLER:-$source_directory/install-client.sh}
 work=$(mktemp -d /tmp/agentq-smoke-installclient.XXXXXX)
 work=$(unset CDPATH; cd -- "$work" && pwd -P)
 cleanup_sandbox() { rm -rf -- "$work"; }
-trap cleanup_sandbox EXIT HUP INT TERM
+# A signal handler that RETURNS lets the interrupted script resume; measured
+# 2026-11-22 (Codex review P2) with a trap that printed cleanup and then
+# continued into the rest of the fixture.  Use an explicit exit on signals.
+trap 'cleanup_sandbox; exit 130' HUP INT TERM
+trap cleanup_sandbox EXIT
 
 installer_directory="$work/installer"
 mkdir -p "$installer_directory"

@@ -30,6 +30,13 @@ home="$sandbox_root/home"
 agentq_home="$home/.agentq"
 cache="$sandbox_root-cache"
 marker="$sandbox_root/.agentq-sandbox"
+# The marker's CONTENT is its proof, not just its name.  A bare file named
+# `.agentq-sandbox` is trivially plantable in any directory, and `down`/`up`
+# take that as the ownership evidence before `rm -rf` -- measured 2026-11-22
+# (Codex review P0): a planted marker plus AGENTQ_SANDBOX_ROOT=<target> deleted
+# a foreign tree whole.  The token below is written only by this script's `up`,
+# and every read path checks it.
+marker_token='agentq-sandbox v1'
 config="$agentq_home/config/pueue.yml"
 
 die() {
@@ -37,12 +44,20 @@ die() {
     exit 1
 }
 
+# Whether $sandbox_root carries OUR marker: a regular file (no symlink -- a
+# symlinked marker could aim at any existing file), whose first line is exactly
+# the token.  Absent tree is NOT ownership: callers pair this with -e.
+owns_sandbox_root() {
+    [ -f "$marker" ] || return 1
+    [ "$(head -n 1 -- "$marker" 2>/dev/null)" = "$marker_token" ]
+}
+
 # A failure part-way through `up` must not leave a half-built tree behind: the
 # next `up` would find it and report "removing a stale sandbox", and a user
 # reading the directory would see something that looks runnable but is not.
 # Only a tree this script marked is removed.
 cleanup_partial() {
-    if [ -f "$marker" ]; then
+    if owns_sandbox_root; then
         rm -rf -- "$sandbox_root" 2>/dev/null || true
     fi
 }
@@ -113,6 +128,15 @@ sandbox_daemon_pids() {
     done
     printf "sandbox: cannot read the process table: this host's ps accepted neither 'ps -ww -axo pid=,command=' nor 'ps -o pid=,args='\n" >&2
     return 1
+}
+
+# Whether the CURRENT process table still attributes $1 to a pueued running
+# THIS sandbox's config.  Same predicate as sandbox_daemon_pids, applied to one
+# pid: it closes the snapshot-to-signal window above, and errs closed -- ps
+# unreadable or the pid absent means "do not signal".
+daemon_is_still_ours() {
+    printf '%s\n' "$(sandbox_daemon_pids 2>/dev/null)" |
+        awk -v want="$1" '$1 == want { found = 1 } END { exit !found }'
 }
 
 # The one daemon this sandbox owns, for the status and ready displays.
@@ -189,6 +213,11 @@ fetch_verified() {
         local attempt=1
         until curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 -o "$cached" "$url"; do
             if [ "$attempt" -ge 3 ]; then
+                # LOCKED BY smoke/30 case 2 (its reverse direction: deleting
+                # this line turns the case red -- the fixture plants a
+                # partial cache file on every failed attempt, the harder
+                # state; curl's own -f unlink measured on this machine 2026-
+                # 11-23: real 403 exits 22 leaving NO file).
                 rm -f "$cached"
                 die "download failed after $attempt attempts: $url"
             fi
@@ -241,8 +270,8 @@ cmd_up() {
     # Refuse BEFORE the daemon reap, so nothing at all is touched: an unmarked
     # tree is not ours, and a `down` that declines to delete it does not license
     # `up` to adopt it.
-    if [ -e "$sandbox_root" ] && [ ! -f "$marker" ]; then
-        die "$sandbox_root exists but carries no $(basename "$marker") marker; refusing to touch a tree this script did not create -- move it aside, or pick another AGENTQ_SANDBOX_ROOT"
+    if [ -e "$sandbox_root" ] && ! owns_sandbox_root; then
+        die "$sandbox_root exists but does not carry our $(basename "$marker") marker; refusing to touch a tree this script did not create -- move it aside, or pick another AGENTQ_SANDBOX_ROOT"
     fi
     if [ -e "$sandbox_root" ]; then
         printf 'sandbox: removing a stale sandbox at %s\n' "$sandbox_root" >&2
@@ -269,7 +298,7 @@ cmd_up() {
     fi
 
     mkdir -p "$home" "$agentq_home/config" "$agentq_home/data/task_logs" "$agentq_home/runtime"
-    : >"$marker"
+    printf '%s\n' "$marker_token" >"$marker"
     # From here the tree exists; clear it if anything below fails.
     up_complete=false
     # Set when the tree must survive a failure: the one case is a daemon that
@@ -388,8 +417,8 @@ cmd_down() {
     #
     # A tree that does not exist is NOT a refusal case: the daemon can outlive its
     # tree, and that orphan is ours to reap (there is nothing else to protect).
-    if [ -e "$sandbox_root" ] && [ ! -f "$marker" ]; then
-        printf 'sandbox: %s has no marker file; refusing to delete it\n' "$sandbox_root" >&2
+    if [ -e "$sandbox_root" ] && ! owns_sandbox_root; then
+        printf 'sandbox: %s does not carry our marker file; refusing to delete it\n' "$sandbox_root" >&2
         return 1
     fi
     # Reap EVERY matching daemon, not just one: a second sandbox started after
@@ -403,13 +432,19 @@ cmd_down() {
     # a voice, so the failure is caught and reported, and NOTHING below runs.
     pids=$(sandbox_daemon_pids) || return 1
     for pid in $pids; do
+        # The snapshot above is a MOMENT old by the time the signal lands, and
+        # PIDs get reused: measured 2026-11-22 (Codex review P1), killing on
+        # the stale snapshot could signal an unrelated process that had taken
+        # the number in between.  Re-resolve by argv immediately before every
+        # signal; a pid no longer matching our config is skipped, never killed.
+        daemon_is_still_ours "$pid" || continue
         kill "$pid" 2>/dev/null || true
         local waited=0
-        while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 10 ]; do
+        while daemon_is_still_ours "$pid" && [ "$waited" -lt 10 ]; do
             sleep 1
             waited=$((waited + 1))
         done
-        kill -9 "$pid" 2>/dev/null || true
+        daemon_is_still_ours "$pid" && kill -9 "$pid" 2>/dev/null
     done
     [ -n "$pids" ] && printf 'stopped pueued (%s)\n' "$(printf '%s' "$pids" | tr '\n' ' ' | sed 's/ $//')"
     # The pid file is written by pueued; drop it too so a later `up` does not

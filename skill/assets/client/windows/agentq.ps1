@@ -203,7 +203,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFOR
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.40"
+$script:ClientVersion = "0.1.41"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's Pueue command ceiling, not this machine's platform: a
 # unix target takes up to 100000 base64 characters (the POSIX twin's
@@ -1991,13 +1991,23 @@ function Read-PlatformProbeCache {
         if (!([int64]::TryParse("$($probedAtProperty.Value)", [ref]$probedAt))) {
             return $false
         }
+        # Already validated at startup (positive 32-bit integer); no reparsing
+        # here, so there is no way for a bad value to fall back to a default
+        # silently.  INSIDE the try on purpose: DateTimeOffset.ToUnixTimeSeconds
+        # only binds on .NET Framework from 4.6, and PS 5.1's documented floor
+        # is 4.5.2 (flagged 2026-11-22, the final review round, unconfirmed --
+        # no real 4.5.2 host is available; docs/PLAN.md records it as a
+        # boundary in that round's section).  A MethodException there now
+        # lands on the catch below,
+        # i.e. "cache miss": the command falls through to the normal platform
+        # probe instead of dying before dispatch.  The write site is already
+        # inside Write-PlatformProbeCache's never-fatal try, so a 4.5.2 host
+        # loses the cache WITHOUT losing the operation on both paths.
+        $ttl = $script:PlatformProbeCacheTtl
+        $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $probedAt
     } catch {
         return $false
     }
-    # Already validated at startup (positive 32-bit integer); no reparsing here,
-    # so there is no way for a bad value to fall back to a default silently.
-    $ttl = $script:PlatformProbeCacheTtl
-    $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $probedAt
     # A timestamp from the future (clock skew, or an entry written while the
     # clock was ahead) must not make the entry immortal: with only the `-gt`
     # test a negative age always passes.

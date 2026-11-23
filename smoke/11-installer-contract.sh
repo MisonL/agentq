@@ -75,7 +75,11 @@ cleanup_sandbox() {
 }
 # EXIT alone is not enough: a check killed by the harness (or by Ctrl-C) would
 # never run an EXIT-only trap and would leak the sleeper into the next run.
-trap cleanup_sandbox EXIT HUP INT TERM
+# A signal handler that RETURNS lets the interrupted script resume; measured
+# 2026-11-22 (Codex review P2) with a trap that printed cleanup and then
+# continued into the rest of the fixture.  Use an explicit exit on signals.
+trap 'cleanup_sandbox; exit 130' HUP INT TERM
+trap cleanup_sandbox EXIT
 
 home="$work/home"
 stub_bare="$work/bin-bare"

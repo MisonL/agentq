@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.40'
+agentq_version='0.1.41'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -328,6 +328,15 @@ Usage:
 EOF
 }
 
+# CONTRACT for every `fail` message: expand only identifiers that are assigned
+# on every path that reaches it.  Under `set -u` a message that expands an
+# unset variable aborts the shell BEFORE fail runs: at top level that skips
+# the cleanup and the reason= line, and inside `$( )` the subshell exits 1 --
+# which callers READ AS "no matching task / record absent".  Measured
+# 2026-11-22: one injected `jq -r length` failure inside find_request_task
+# made submit enqueue a DUPLICATE task and exit 0.  task_id is often the very
+# value being read when the message fires, so these messages spell it
+# ${task_id-} (prints the value when assigned, never trips set -u).
 fail() {
     local failure_reason=${2:-$agentq_default_failure_reason}
     if [ -n "$group_raw_file" ]; then
@@ -501,9 +510,9 @@ jq_preserves_integer_digits() {
 validate_task_id_precision() {
     local task_id=$1
 
-    is_task_id "$task_id" || fail "invalid AgentQ task id: $task_id"
+    is_task_id "$task_id" || fail "invalid AgentQ task id: ${task_id-}"
     if ! jq_preserves_integer_digits && task_id_exceeds_jq_safe_integer "$task_id"; then
-        fail "task id exceeds the exact-integer range of the configured jq: $task_id"
+        fail "task id exceeds the exact-integer range of the configured jq: ${task_id-}"
     fi
 }
 
@@ -530,7 +539,7 @@ validate_task_id_precision_in_file() {
     while IFS= read -r task_id; do
         [ -n "$task_id" ] || continue
         if task_id_exceeds_jq_safe_integer "$task_id"; then
-            fail "task id exceeds the exact-integer range of the configured jq: $task_id"
+            fail "task id exceeds the exact-integer range of the configured jq: ${task_id-}"
         fi
     done < <(
         printf '%s\n' "$json_text" |
@@ -553,7 +562,7 @@ validate_pueue_task_id_precision_in_file() {
     while IFS= read -r task_id; do
         [ -n "$task_id" ] || continue
         if task_id_exceeds_jq_safe_integer "$task_id"; then
-            fail "Pueue task id exceeds the exact-integer range of the configured jq: $task_id"
+            fail "Pueue task id exceeds the exact-integer range of the configured jq: ${task_id-}"
         fi
     done < <(
         printf '%s\n' "$json_text" |
@@ -4185,11 +4194,11 @@ request_tombstone_matches_record() {
     local task_created_at
 
     request_id=$(jq -r '.request_id' <<<"$record") ||
-        fail "cannot read the AgentQ request id: $task_id"
+        fail "cannot read the AgentQ request id: ${task_id-}"
     task_id=$(jq -r '.task_id' <<<"$record") ||
-        fail "cannot read the AgentQ task id: $task_id"
+        fail "cannot read the AgentQ task id: ${task_id-}"
     task_created_at=$(jq -r '.task_created_at' <<<"$record") ||
-        fail "cannot read the AgentQ task creation time: $task_id"
+        fail "cannot read the AgentQ task creation time: ${task_id-}"
     jq -e \
         --arg request_id "$request_id" \
         --arg task_id "$task_id" \
@@ -4829,6 +4838,10 @@ find_request_task() {
     # concludes the task is gone, and archives a LIVE request as `removed`.
     # Return a distinct status instead; each caller raises the hard failure in its
     # own shell (see the guard at the top of the matching `else`).
+    # Note the SECOND channel to the same false "gone": a fail MESSAGE that
+    # expands a variable unset at that point (task_id, on the match_count
+    # read) aborts this subshell with rc=1 before fail() prints anything.
+    # That is how a transient jq failure became a duplicate enqueue.
     run_pueue status --json > "$raw_status_file" || {
         remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file' || true
         reconcile_raw_status_file=''
@@ -4856,7 +4869,7 @@ find_request_task() {
     match_count=$(jq -r 'length' <<<"$matches") || {
         remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file' || true
         reconcile_raw_status_file=''
-        fail "cannot count the visible Pueue tasks for AgentQ task: $task_id"
+        fail "cannot count the visible Pueue tasks for AgentQ task label: $task_label"
     }
 
     case "$match_count" in
@@ -4929,9 +4942,9 @@ reconcile_accepted_request() {
     task_label=$(jq -r '.task_label' <<<"$record") ||
         fail "cannot read the AgentQ request record task label: $request_id"
     expected_task_id=$(jq -r '.task_id' <<<"$record") ||
-        fail "cannot read the AgentQ expected task id: $task_id"
+        fail "cannot read the AgentQ expected task id: ${task_id-}"
     expected_task_created_at=$(jq -r '.task_created_at' <<<"$record") ||
-        fail "cannot read the AgentQ expected task creation time: $task_id"
+        fail "cannot read the AgentQ expected task creation time: ${task_id-}"
     is_task_id "$expected_task_id" || fail "invalid task id in AgentQ request record: $request_id"
     validate_task_id_precision "$expected_task_id"
 
@@ -4959,9 +4972,9 @@ reconcile_accepted_request() {
             fail "invalid visible Pueue task metadata while reconciling AgentQ request: $request_id"
         fi
         observed_task_id=$(jq -r '.id' <<<"$task") ||
-            fail "cannot read the AgentQ observed task id: $task_id"
+            fail "cannot read the AgentQ observed task id: ${task_id-}"
         observed_task_created_at=$(jq -r '.created_at' <<<"$task") ||
-            fail "cannot read the AgentQ observed task creation time: $task_id"
+            fail "cannot read the AgentQ observed task creation time: ${task_id-}"
         validate_task_id_precision "$observed_task_id"
         if [ "$observed_task_id" != "$expected_task_id" ] || [ "$observed_task_created_at" != "$expected_task_created_at" ]; then
             fail "AgentQ request record does not match the visible Pueue task: $request_id"
@@ -5003,9 +5016,9 @@ reconcile_removing_request() {
     task_label=$(jq -r '.task_label' <<<"$record") ||
         fail "cannot read the AgentQ removing request task label: $request_id"
     expected_task_id=$(jq -r '.task_id' <<<"$record") ||
-        fail "cannot read the AgentQ expected task id: $task_id"
+        fail "cannot read the AgentQ expected task id: ${task_id-}"
     expected_task_created_at=$(jq -r '.task_created_at' <<<"$record") ||
-        fail "cannot read the AgentQ expected task creation time: $task_id"
+        fail "cannot read the AgentQ expected task creation time: ${task_id-}"
     is_task_id "$expected_task_id" || fail "invalid task id in AgentQ removing request: $request_id"
     validate_task_id_precision "$expected_task_id"
 
@@ -5033,9 +5046,9 @@ reconcile_removing_request() {
             fail "invalid visible Pueue task metadata while reconciling AgentQ removing request: $request_id"
         fi
         observed_task_id=$(jq -r '.id' <<<"$task") ||
-            fail "cannot read the AgentQ observed task id: $task_id"
+            fail "cannot read the AgentQ observed task id: ${task_id-}"
         observed_task_created_at=$(jq -r '.created_at' <<<"$task") ||
-            fail "cannot read the AgentQ observed task creation time: $task_id"
+            fail "cannot read the AgentQ observed task creation time: ${task_id-}"
         validate_task_id_precision "$observed_task_id"
         if [ "$observed_task_id" != "$expected_task_id" ] || [ "$observed_task_created_at" != "$expected_task_created_at" ]; then
             fail "AgentQ removing request does not match the visible Pueue task: $request_id"
@@ -5107,9 +5120,9 @@ request_id_from_task() {
     local task_label
 
     metadata_request_id=$(jq -r '.agentq.request_id // empty' <<<"$task") ||
-        fail "cannot read the Pueue request metadata for AgentQ task: $task_id"
+        fail "cannot read the Pueue request metadata for AgentQ task: ${task_id-}"
     task_label=$(jq -r '.label // empty' <<<"$task") ||
-        fail "cannot read the Pueue task label for AgentQ task: $task_id"
+        fail "cannot read the Pueue task label for AgentQ task: ${task_id-}"
     case "$task_label" in
         agentq:*)
             request_id=${task_label#agentq:}
@@ -5170,9 +5183,9 @@ validate_task_removal() {
         record=$(read_request_record "$request_id") || fail "missing AgentQ request record while removing task: $request_id"
     fi
     task_id=$(jq -r '.id' <<<"$task") ||
-        fail "cannot read the AgentQ task id: $task_id"
+        fail "cannot read the AgentQ task id: ${task_id-}"
     task_created_at=$(jq -r '.created_at' <<<"$task") ||
-        fail "cannot read the AgentQ task creation time: $task_id"
+        fail "cannot read the AgentQ task creation time: ${task_id-}"
     removal_state=$(jq -r '.state' <<<"$record") ||
         fail "cannot read the AgentQ request record state: $request_id"
     case "$removal_state" in
@@ -5210,12 +5223,12 @@ mark_request_removing() {
 
     record=$(read_request_record "$request_id") || fail "missing AgentQ request record while preparing task removal: $request_id"
     report_state=$(jq -r '.state' <<<"$record") ||
-        fail "cannot read the AgentQ request record state: $task_id"
+        fail "cannot read the AgentQ request record state: ${task_id-}"
     if [ "$report_state" = accepted ]; then
         task_id=$(jq -r '.id' <<<"$task") ||
-            fail "cannot read the AgentQ task id: $task_id"
+            fail "cannot read the AgentQ task id: ${task_id-}"
         task_created_at=$(jq -r '.created_at' <<<"$task") ||
-            fail "cannot read the AgentQ task creation time: $task_id"
+            fail "cannot read the AgentQ task creation time: ${task_id-}"
         # Errexit is OFF (this function runs as an `if` condition); a bare `$( )`
         # failure would write an empty record over the valid `accepted` one.
         record=$(set_request_state "$record" removing "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')") || {
@@ -5248,9 +5261,9 @@ mark_request_removed() {
     fi
     [ -n "$request_id" ] || return 0
     task_id=$(jq -r '.id' <<<"$task") ||
-        fail "cannot read the AgentQ task id: $task_id"
+        fail "cannot read the AgentQ task id: ${task_id-}"
     task_created_at=$(jq -r '.created_at' <<<"$task") ||
-        fail "cannot read the AgentQ task creation time: $task_id"
+        fail "cannot read the AgentQ task creation time: ${task_id-}"
 
     # A lock-free reader (`status`/`logs`/`doctor` -> ensure_daemon ->
     # recover_removing_requests) may archive this `removing` request between
@@ -5313,9 +5326,9 @@ mark_request_removed() {
         fail "cannot read the AgentQ request record state: $request_id"
     [ "$prepared_state" = removing ] || fail "AgentQ request removal was not prepared: $request_id"
     task_id=$(jq -r '.id' <<<"$task") ||
-        fail "cannot read the AgentQ task id: $task_id"
+        fail "cannot read the AgentQ task id: ${task_id-}"
     task_created_at=$(jq -r '.created_at' <<<"$task") ||
-        fail "cannot read the AgentQ task creation time: $task_id"
+        fail "cannot read the AgentQ task creation time: ${task_id-}"
     # Same errexit-off guard as mark_request_removing: an empty record must not
     # reach archive_removed_request.
     record=$(set_request_state "$record" removed "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')") || {
@@ -5820,7 +5833,7 @@ wait_reconcile_missing_task() {
                     if [ "$(canonical_task_id "$wait_tombstone_task_id")" = "$(canonical_task_id "$task_id")" ]; then
                         matched_tombstone_request_id=$request_id
                         matched_tombstone_created_at=$(jq -r '.task_created_at' <<<"$tombstone") ||
-                            fail "cannot read the AgentQ tombstone creation time: $task_id"
+                            fail "cannot read the AgentQ tombstone creation time: ${task_id-}"
                         break
                     fi
                 done
@@ -5901,7 +5914,7 @@ wait_reconcile_missing_task() {
 
     if [ -n "$matched_record" ]; then
         task_created_at=$(jq -r '.task_created_at' <<<"$matched_record") ||
-            fail "cannot read the AgentQ task creation time: $task_id"
+            fail "cannot read the AgentQ task creation time: ${task_id-}"
         # Errexit is OFF (this function runs as an `if` condition); a bare `$( )`
         # failure would archive an empty record and the wait would then report
         # `removed` for a task whose record was destroyed.
@@ -5952,7 +5965,7 @@ task_log_path() {
 
     validate_task_id_precision "$task_id"
     [ "$(canonical_task_id "$task_id")" = "$task_id" ] ||
-        fail "non-canonical AgentQ task id: $task_id"
+        fail "non-canonical AgentQ task id: ${task_id-}"
     printf '%s/%s.log\n' "$task_log_directory" "$task_id"
 }
 
@@ -5980,7 +5993,7 @@ cancellation_marker_path() {
 
     validate_task_id_precision "$task_id"
     [ "$(canonical_task_id "$task_id")" = "$task_id" ] ||
-        fail "non-canonical AgentQ task id: $task_id"
+        fail "non-canonical AgentQ task id: ${task_id-}"
     printf '%s/%s.json\n' "$cancellation_directory" "$task_id"
 }
 
@@ -6089,9 +6102,9 @@ report_compact_task_failure() {
 
     [ "$compact_status" -ne 0 ] || return 0
     if [ "$compact_status" -eq 4 ]; then
-        fail "unknown AgentQ task id: $task_id"
+        fail "unknown AgentQ task id: ${task_id-}"
     fi
-    fail "cannot inspect Pueue while reading AgentQ task: $task_id"
+    fail "cannot inspect Pueue while reading AgentQ task: ${task_id-}"
 }
 
 write_cancellation_marker() {
@@ -6111,7 +6124,7 @@ write_cancellation_marker() {
 
     marker=$(cancellation_marker_path "$task_id")
     temporary=$(umask 077; make_temporary_file "$cancellation_directory" ".agentqcancel.${task_id}" '.json') ||
-        fail "cannot create temporary AgentQ cancellation marker: $task_id"
+        fail "cannot create temporary AgentQ cancellation marker: ${task_id-}"
     marker_contents=$(jq -cn \
         --argjson task_id "$task_id" \
         --arg created_at "$created_at" \
@@ -6120,16 +6133,16 @@ write_cancellation_marker() {
         --arg state "$state" \
         '{task_id: $task_id, created_at: $created_at, requested_at: $requested_at, reason: $reason, state: $state}') || {
         if ! remove_runtime_temporary_file "$temporary" 'cancellation marker temporary file'; then
-            fail "cannot encode AgentQ cancellation marker; temporary cleanup failed: $task_id"
+            fail "cannot encode AgentQ cancellation marker; temporary cleanup failed: ${task_id-}"
         fi
-        fail "cannot encode AgentQ cancellation marker: $task_id"
+        fail "cannot encode AgentQ cancellation marker: ${task_id-}"
     }
     if ! write_temporary_contents "$temporary" "$marker_contents" ||
         ! install_temporary_file "$temporary" "$marker"; then
         if ! remove_runtime_temporary_file "$temporary" 'cancellation marker temporary file'; then
-            fail "cannot write AgentQ cancellation marker; temporary cleanup failed: $task_id"
+            fail "cannot write AgentQ cancellation marker; temporary cleanup failed: ${task_id-}"
         fi
-        fail "cannot write AgentQ cancellation marker: $task_id"
+        fail "cannot write AgentQ cancellation marker: ${task_id-}"
     fi
 }
 
@@ -6205,7 +6218,7 @@ wait_for_task() {
     validate_task_id_precision "$task_id"
     ensure_daemon
     if task=$(compact_task "$task_id"); then
-        task_created_at=$(jq -er '.created_at | strings' <<<"$task") || fail "invalid creation time for AgentQ task: $task_id"
+        task_created_at=$(jq -er '.created_at | strings' <<<"$task") || fail "invalid creation time for AgentQ task: ${task_id-}"
         if ! task_identity_is_unambiguous "$task"; then
             jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
             printf '%s: task %s has an ambiguous AgentQ identity; the final state is unavailable\n' "$program" "$task_id" >&2
@@ -6222,7 +6235,7 @@ wait_for_task() {
                 return "$reconcile_status"
                 ;;
             1)
-                fail "unknown AgentQ task id: $task_id"
+                fail "unknown AgentQ task id: ${task_id-}"
                 ;;
             *)
                 return "$reconcile_status"
@@ -6230,7 +6243,7 @@ wait_for_task() {
         esac
     fi
     if ! release_operation_lock; then
-        fail "cannot release AgentQ operation lock before waiting for task: $task_id"
+        fail "cannot release AgentQ operation lock before waiting for task: ${task_id-}"
     fi
     if run_pueue wait --quiet "$task_id"; then
         :
@@ -6432,7 +6445,7 @@ compact_log() {
         ' < "$compact_log_raw_file"; } 2>/dev/null
     ) || {
         cleanup_compact_log_raw_file || true
-        fail "cannot read the Pueue log diagnostic for AgentQ task: $task_id"
+        fail "cannot read the Pueue log diagnostic for AgentQ task: ${task_id-}"
     }
     if [ "$log_pueue_error" = 1 ]; then
         # A readable file on disk means the diagnostic is not about a missing
@@ -6458,7 +6471,7 @@ compact_log() {
                 ' < "$compact_log_raw_file"; } 2>/dev/null
             ) || {
                 cleanup_compact_log_raw_file || true
-                fail "cannot read the Pueue task status while reading AgentQ task logs: $task_id"
+                fail "cannot read the Pueue task status while reading AgentQ task logs: ${task_id-}"
             }
             if [ "$log_status_has_done" = 1 ]; then
                 jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
@@ -6470,7 +6483,7 @@ compact_log() {
             fi
             if [ -z "$task" ]; then
                 task=$(compact_task "$task_id") ||
-                    fail "cannot inspect Pueue while reading AgentQ task logs: $task_id"
+                    fail "cannot inspect Pueue while reading AgentQ task logs: ${task_id-}"
             fi
             if jq -cn --argjson task "$task" '{task: $task, output: ""}'; then
                 command_status=0
@@ -6522,7 +6535,7 @@ compact_log() {
         ' < "$compact_log_raw_file"; } 2>/dev/null
     ) || {
         cleanup_compact_log_raw_file || true
-        fail "cannot read the Pueue log marker for AgentQ task: $task_id"
+        fail "cannot read the Pueue log marker for AgentQ task: ${task_id-}"
     }
     case "$log_pueue_marker" in
         full|line)
@@ -6546,7 +6559,7 @@ compact_log() {
                         < "$compact_log_raw_file"; } 2>/dev/null
                 ) || {
                     cleanup_compact_log_raw_file || true
-                    fail "cannot read the rendered Pueue log window for AgentQ task: $task_id"
+                    fail "cannot read the rendered Pueue log window for AgentQ task: ${task_id-}"
                 }
                 if [ "$tail_lines" = all ]; then
                     log_window_raw=$(cat -- "$log_path" 2>/dev/null) || log_window_raw=''
@@ -6571,7 +6584,7 @@ compact_log() {
             # escape as this function's return under `set -e`, with no reason
             # line -- the value 5 the contract reserves for a removed task.
             task=$(compact_task "$task_id") ||
-                fail "cannot inspect Pueue while reading AgentQ task logs: $task_id"
+                fail "cannot inspect Pueue while reading AgentQ task logs: ${task_id-}"
         fi
         require_task_log_file "$log_path"
 
@@ -6605,9 +6618,9 @@ compact_log() {
             # log content cannot be delivered.  A distinct code here would make
             # two neighbouring branches describe one state in two vocabularies.
             if tracked_path_vanished "$log_path"; then
-                fail "the task log disappeared while it was being read: $task_id"
+                fail "the task log disappeared while it was being read: ${task_id-}"
             fi
-            fail "cannot encode non-UTF-8 task log for AgentQ task: $task_id"
+            fail "cannot encode non-UTF-8 task log for AgentQ task: ${task_id-}"
         fi
         if printf '%s' "$log_encoded" | tr -d '\r\n' | jq -Rsc --argjson task "$task" '
                 {
@@ -6625,7 +6638,7 @@ compact_log() {
         # See the note at this function's tail: a non-zero jq status must not
         # escape as the contract's 5 (removed) with no reason line.
         if [ "$command_status" -ne 0 ]; then
-            fail "cannot encode non-UTF-8 task log for AgentQ task: $task_id"
+            fail "cannot encode non-UTF-8 task log for AgentQ task: ${task_id-}"
         fi
         return 0
     fi
@@ -6804,7 +6817,7 @@ submit() {
         request_payload_matches "$record" "$payload" || fail "request id was already used with different submit arguments: $request_id"
 
         record_state=$(jq -r '.state' <<<"$record") ||
-            fail "cannot read the AgentQ request record state: $task_id"
+            fail "cannot read the AgentQ request record state: ${task_id-}"
         if [ "$record_state" = removed ]; then
             if ! archive_removed_request "$request_id" "$record" >/dev/null; then
                 fail "cannot archive removed AgentQ request while submitting: $request_id"
@@ -6828,7 +6841,7 @@ submit() {
             fi
             if [ "$reconcile_accepted_rc" -eq 0 ]; then
                 task_id=$(jq -r '.task_id' <<<"$record") ||
-                    fail "cannot read the AgentQ task id: $task_id"
+                    fail "cannot read the AgentQ task id: ${task_id-}"
                 request_response "$request_id" "$task_id" true
                 return 0
             fi
@@ -6847,7 +6860,7 @@ submit() {
                 # this same state with 4 and a JSON body; a bare exit 2 here
                 # told callers to fix their arguments instead.
                 task_id=$(jq -r '.task_id' <<<"$record") ||
-                    fail "cannot read the AgentQ task id: $task_id"
+                    fail "cannot read the AgentQ task id: ${task_id-}"
                 validate_task_id_precision "$task_id"
                 jq -cn --arg request_id "$request_id" --argjson task_id "$task_id" '{request_id: $request_id, task_id: $task_id, state: "removing"}'
                 printf '%s: request id has a pending removal; retry remove to finish it: %s\n' "$program" "$request_id" >&2
@@ -6900,14 +6913,14 @@ submit() {
         if [ "$find_request_task_rc" -eq 0 ]; then
             validate_visible_task_metadata "$task"
             task_id=$(jq -r '.id' <<<"$task") ||
-                fail "cannot read the AgentQ task id: $task_id"
+                fail "cannot read the AgentQ task id: ${task_id-}"
             task_created_at=$(jq -r '.created_at' <<<"$task") ||
-                fail "cannot read the AgentQ task creation time: $task_id"
+                fail "cannot read the AgentQ task creation time: ${task_id-}"
             validate_task_id_precision "$task_id"
             recovered=true
     else
         record_state=$(jq -r '.state' <<<"$record") ||
-            fail "cannot read the AgentQ request record state: $task_id"
+            fail "cannot read the AgentQ request record state: ${task_id-}"
         if [ "$record_state" = adding ]; then
             jq -cn --arg request_id "$request_id" '{request_id: $request_id, task_id: null, state: "ambiguous"}'
             printf '%s: request may have reached Pueue but no matching task is visible; refusing to enqueue it again: %s\n' "$program" "$request_id" >&2
@@ -6934,15 +6947,15 @@ submit() {
             --escape \
             -- \
             "$@"); then
-            is_task_id "$task_id" || fail "Pueue returned an invalid task id: $task_id"
+            is_task_id "$task_id" || fail "Pueue returned an invalid task id: ${task_id-}"
             validate_task_id_precision "$task_id"
 
             if task=$(raw_compact_task "$task_id"); then
                 validate_visible_task_metadata "$task"
-                observed_task_id=$(jq -er '.id' <<<"$task") || fail "Pueue returned a task without a valid id: $task_id"
+                observed_task_id=$(jq -er '.id' <<<"$task") || fail "Pueue returned a task without a valid id: ${task_id-}"
                 validate_task_id_precision "$observed_task_id"
                 [ "$(canonical_task_id "$observed_task_id")" = "$(canonical_task_id "$task_id")" ] ||
-                    fail "Pueue returned a task with a mismatched id: $task_id"
+                    fail "Pueue returned a task with a mismatched id: ${task_id-}"
                 task_created_at=$(jq -er '.created_at' <<<"$task")
             else
                 find_request_task_rc=0
@@ -6958,9 +6971,9 @@ submit() {
                 if [ "$find_request_task_rc" -eq 0 ]; then
                     validate_visible_task_metadata "$task"
                     task_id=$(jq -r '.id' <<<"$task") ||
-                        fail "cannot read the AgentQ task id: $task_id"
+                        fail "cannot read the AgentQ task id: ${task_id-}"
                     task_created_at=$(jq -r '.created_at' <<<"$task") ||
-                        fail "cannot read the AgentQ task creation time: $task_id"
+                        fail "cannot read the AgentQ task creation time: ${task_id-}"
                     validate_task_id_precision "$task_id"
                     recovered=true
                 else
@@ -6984,9 +6997,9 @@ submit() {
             if [ "$find_request_task_rc" -eq 0 ]; then
                 validate_visible_task_metadata "$task"
                 task_id=$(jq -r '.id' <<<"$task") ||
-                    fail "cannot read the AgentQ task id: $task_id"
+                    fail "cannot read the AgentQ task id: ${task_id-}"
                 task_created_at=$(jq -r '.created_at' <<<"$task") ||
-                    fail "cannot read the AgentQ task creation time: $task_id"
+                    fail "cannot read the AgentQ task creation time: ${task_id-}"
                 validate_task_id_precision "$task_id"
                 recovered=true
             else
@@ -7004,9 +7017,9 @@ submit() {
         fi
     fi
 
-    is_task_id "$task_id" || fail "Pueue returned an invalid task id: $task_id"
+    is_task_id "$task_id" || fail "Pueue returned an invalid task id: ${task_id-}"
     validate_task_id_precision "$task_id"
-    [ -n "$task_created_at" ] || fail "Pueue returned a task without a creation time: $task_id"
+    [ -n "$task_created_at" ] || fail "Pueue returned a task without a creation time: ${task_id-}"
     # Same errexit-off `$( )` trap as the prepared/adding transitions in this
     # function: an empty record here would overwrite the `adding` record after
     # the task was already enqueued.
@@ -7020,7 +7033,7 @@ submit() {
     # previously held this recycled id: it would be read as a confirmed
     # cancellation of this task.  See remove_stale_cancellation_marker_for_task.
     remove_stale_cancellation_marker_for_task "$task_id" "$task_created_at" ||
-        fail "cannot remove stale AgentQ cancellation marker after submit: $task_id"
+        fail "cannot remove stale AgentQ cancellation marker after submit: ${task_id-}"
     request_response "$request_id" "$task_id" "$recovered"
 }
 
@@ -7053,7 +7066,7 @@ lookup() {
         [ "$read_status" -eq 1 ] || return "$read_status"
         if tombstone=$(read_request_tombstone "$request_id"); then
             task_id=$(jq -r '.task_id' <<<"$tombstone") ||
-                fail "cannot read the AgentQ task id: $task_id"
+                fail "cannot read the AgentQ task id: ${task_id-}"
             validate_task_id_precision "$task_id"
             jq -cn --arg request_id "$request_id" --argjson task_id "$task_id" '{request_id: $request_id, task_id: $task_id, state: "removed"}'
             return 5
@@ -7071,7 +7084,7 @@ lookup() {
             fail "cannot archive removed AgentQ request while looking up: $request_id"
         fi
         task_id=$(jq -r '.task_id' <<<"$record") ||
-            fail "cannot read the AgentQ task id: $task_id"
+            fail "cannot read the AgentQ task id: ${task_id-}"
         validate_task_id_precision "$task_id"
         jq -cn --arg request_id "$request_id" --argjson task_id "$task_id" '{request_id: $request_id, task_id: $task_id, state: "removed"}'
         return 5
@@ -7084,13 +7097,13 @@ lookup() {
                 fail "cannot read the AgentQ request record state: $request_id"
             [ "$recovered_state" = removing ] || fail "unexpected AgentQ request state after removal recovery: $request_id"
             task_id=$(jq -r '.task_id' <<<"$record") ||
-                fail "cannot read the AgentQ task id: $task_id"
+                fail "cannot read the AgentQ task id: ${task_id-}"
             validate_task_id_precision "$task_id"
             jq -cn --arg request_id "$request_id" --argjson task_id "$task_id" '{request_id: $request_id, task_id: $task_id, state: "removing"}'
             return 4
         elif tombstone=$(read_request_tombstone "$request_id"); then
             task_id=$(jq -r '.task_id' <<<"$tombstone") ||
-                fail "cannot read the AgentQ task id: $task_id"
+                fail "cannot read the AgentQ task id: ${task_id-}"
             validate_task_id_precision "$task_id"
             jq -cn --arg request_id "$request_id" --argjson task_id "$task_id" '{request_id: $request_id, task_id: $task_id, state: "removed"}'
             return 5
@@ -7114,13 +7127,13 @@ lookup() {
         fi
         if [ "$reconcile_accepted_rc" -eq 0 ]; then
             task_id=$(jq -r '.task_id' <<<"$record") ||
-                fail "cannot read the AgentQ task id: $task_id"
+                fail "cannot read the AgentQ task id: ${task_id-}"
             request_response "$request_id" "$task_id" true
             return 0
         fi
 
         task_id=$(jq -r '.task_id' <<<"$record") ||
-            fail "cannot read the AgentQ task id: $task_id"
+            fail "cannot read the AgentQ task id: ${task_id-}"
         validate_task_id_precision "$task_id"
         jq -cn --arg request_id "$request_id" --argjson task_id "$task_id" '{request_id: $request_id, task_id: $task_id, state: "removed"}'
         return 5
@@ -7165,9 +7178,9 @@ lookup() {
                 fail "invalid visible Pueue task metadata while looking up AgentQ request: $request_id"
             fi
             task_id=$(jq -r '.id' <<<"$task") ||
-                fail "cannot read the AgentQ task id: $task_id"
+                fail "cannot read the AgentQ task id: ${task_id-}"
             task_created_at=$(jq -r '.created_at' <<<"$task") ||
-                fail "cannot read the AgentQ task creation time: $task_id"
+                fail "cannot read the AgentQ task creation time: ${task_id-}"
             validate_task_id_precision "$task_id"
             # Same errexit-off `$( )` trap as the submit-side accepted transition.
             record=$(set_request_state "$record" accepted "$task_id" "$(jq -Rn --arg value "$task_created_at" '$value')") || {
@@ -7180,7 +7193,7 @@ lookup() {
             return 0
         else
             record_state=$(jq -r '.state' <<<"$record") ||
-                fail "cannot read the AgentQ request record state: $task_id"
+                fail "cannot read the AgentQ request record state: ${task_id-}"
             if [ "$record_state" = prepared ]; then
                 jq -cn --arg request_id "$request_id" '{request_id: $request_id, task_id: null, state: "not_started"}'
                 return 3
@@ -7233,14 +7246,14 @@ logs() {
     ensure_daemon
     task=$(compact_task "$task_id") || task_compact_status=$?
     report_compact_task_failure "$task_compact_status" "$task_id"
-    task_created_at=$(jq -er '.created_at | strings' <<<"$task") || fail "invalid creation time for AgentQ task: $task_id"
+    task_created_at=$(jq -er '.created_at | strings' <<<"$task") || fail "invalid creation time for AgentQ task: ${task_id-}"
     if ! task_identity_is_unambiguous "$task"; then
         jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
         printf '%s: task %s has an ambiguous AgentQ identity; the log is unavailable\n' "$program" "$task_id" >&2
         return 6
     fi
     if ! release_operation_lock; then
-        fail "cannot release AgentQ operation lock before reading logs: $task_id"
+        fail "cannot release AgentQ operation lock before reading logs: ${task_id-}"
     fi
     compact_log "$task_id" "$tail_lines" "$task" "$task_created_at"
 }
@@ -7624,7 +7637,7 @@ cancelled_task_replay() {
     # fail-closed consumer of a corrupt marker is
     # remove_cancellation_marker_for_task, which keeps the loud read.
     marker=$(read_cancellation_marker "$task_id" 2>/dev/null) || return 1
-    replay_marker_state=$(jq -r '.state' <<<"$marker") || fail "cannot read the AgentQ cancellation marker state: $task_id"
+    replay_marker_state=$(jq -r '.state' <<<"$marker") || fail "cannot read the AgentQ cancellation marker state: ${task_id-}"
     [ "$replay_marker_state" = requested ] || return 1
     # Pueue reuses numeric task ids, so a marker alone does not prove that the
     # task being asked about is the one that was cancelled.  Pin it to the same
@@ -7633,10 +7646,10 @@ cancelled_task_replay() {
     # tombstone.  Without this, a marker left behind by an earlier task that
     # reused the id would make an unrelated task look like a replay.
     marker_created_at=$(jq -r '.created_at' <<<"$marker") ||
-        fail "cannot read the AgentQ cancellation marker creation time: $task_id"
+        fail "cannot read the AgentQ cancellation marker creation time: ${task_id-}"
     task_instance_created_at_is_recorded "$task_id" "$marker_created_at" || return 1
     replay_requested_at=$(jq -r '.requested_at' <<<"$marker") ||
-        fail "cannot read the AgentQ cancellation request time: $task_id"
+        fail "cannot read the AgentQ cancellation request time: ${task_id-}"
     jq -cn --argjson task_id "$task_id" \
         --arg requested_at "$replay_requested_at" \
         '{task_id: $task_id, action: "cancel_requested", cancellation_requested_at: $requested_at, reused: true}'
@@ -7662,7 +7675,7 @@ cancel_task() {
         # non-empty one -- every later read of that marker would fail closed
         # (exit 2), poisoning this task id until the file is removed by hand.
         created_at=$(jq -er '.created_at' <<<"$task") ||
-            fail "cannot read the Pueue task creation time for cancellation: $task_id"
+            fail "cannot read the Pueue task creation time for cancellation: ${task_id-}"
     else
         # $? is still raw_compact_task's status at the top of the else branch.
         raw_compact_status=$?
@@ -7691,10 +7704,10 @@ cancel_task() {
             # paths reached exactly this line.
             if marker=$(read_cancellation_marker "$task_id" 2>/dev/null); then
                 marker_state=$(jq -r '.state' <<<"$marker") ||
-                    fail "cannot read the AgentQ cancellation marker state: $task_id"
+                    fail "cannot read the AgentQ cancellation marker state: ${task_id-}"
                 if [ "$marker_state" = pending ]; then
                     requested_at=$(jq -r '.requested_at' <<<"$marker") ||
-                        fail "cannot read the AgentQ cancellation request time: $task_id"
+                        fail "cannot read the AgentQ cancellation request time: ${task_id-}"
                     jq -cn --argjson task_id "$task_id" --arg requested_at "$requested_at" '{task_id: $task_id, state: "cancellation_pending", cancellation_requested_at: $requested_at}'
                     printf '%s: the task is gone while the cancellation outcome remains unresolved: %s\n' "$program" "$task_id" >&2
                     return 4
@@ -7712,18 +7725,18 @@ cancel_task() {
     # Quiet exploratory read; see cancelled_task_replay for why.
     if marker=$(read_cancellation_marker "$task_id" 2>/dev/null); then
         marker_created_at=$(jq -r '.created_at' <<<"$marker") ||
-            fail "cannot read the AgentQ cancellation marker creation time: $task_id"
+            fail "cannot read the AgentQ cancellation marker creation time: ${task_id-}"
         if [ "$marker_created_at" = "$created_at" ]; then
             marker_state=$(jq -r '.state' <<<"$marker") ||
-                fail "cannot read the AgentQ cancellation marker state: $task_id"
+                fail "cannot read the AgentQ cancellation marker state: ${task_id-}"
             requested_at=$(jq -r '.requested_at' <<<"$marker") ||
-                fail "cannot read the AgentQ cancellation request time: $task_id"
+                fail "cannot read the AgentQ cancellation request time: ${task_id-}"
         else
             # This marker names a DIFFERENT instance, so it is deleted by its
             # own created_at -- passing the current instance's (as the shared
             # helper requires) can never match here. See the helper's comment.
             remove_stale_cancellation_marker_for_task "$task_id" "$created_at" ||
-                fail "cannot remove stale AgentQ cancellation marker: $task_id"
+                fail "cannot remove stale AgentQ cancellation marker: ${task_id-}"
         fi
     fi
 
@@ -7738,7 +7751,7 @@ cancel_task() {
             printf '%s: task completed while the cancellation outcome remains unresolved: %s\n' "$program" "$task_id" >&2
             return 4
         fi
-        fail "task is not running: $task_id" task_not_running
+        fail "task is not running: ${task_id-}" task_not_running
     fi
 
     if [ "$marker_state" != pending ]; then
@@ -7921,7 +7934,7 @@ remove_task() {
             0) ;;
             1) record='' ;;
             *)
-                fail "cannot read the AgentQ request record while reconciling a removal: $task_id"
+                fail "cannot read the AgentQ request record while reconciling a removal: ${task_id-}"
                 ;;
         esac
     fi
@@ -7931,7 +7944,7 @@ remove_task() {
         # ALREADY succeeded, i.e. the task is gone and the record still says
         # removing.  A read failure is not "not removing": say so.
         remove_recovery_state=$(jq -r '.state' <<<"$record") ||
-            fail "cannot read the AgentQ request record state: $task_id"
+            fail "cannot read the AgentQ request record state: ${task_id-}"
         if [ "$remove_recovery_state" = removing ] && reconcile_removing_request "$request_id" "$record" >/dev/null; then
             jq -cn --argjson task_id "$task_id" '{task_id: $task_id, removed: true, recovered: true}'
             return 0

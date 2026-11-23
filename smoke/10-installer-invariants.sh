@@ -950,6 +950,87 @@ $k2_report
 EOF
 fi
 
+# --- RULE L: a forced kill must be identity-checked AFTER the last lookup ----
+# Stop-ManagedPueueProcessTree finds processes through CIM/Get-Process and then
+# `Stop-Process -Force`es them.  A PID looked up now may, by the time the kill
+# lands, belong to an UNRELATED process: Windows recycles PIDs, and a validated
+# descendant can exit in the gap.  So an identity confirmation has to sit
+# between the LAST lookup of the target and the kill that uses it — a check
+# made before a later re-lookup does not cover that re-lookup.
+#
+# Measured 2026-11-22 (final review, Codex P1): the descendant loop re-read the
+# process by stale ID (`Get-Process -Id ([int]$descendant.ProcessId)`) and then
+# stopped it with only a null test in between — the Test-ProcessSnapshotIdentity
+# call was in the loop BEFORE this one, i.e. BEFORE that re-lookup. Fix: gate
+# the kill itself with the identity check, in the same statement.
+#
+# The rule is a linear scan per file, tracking the line of the most recent
+# LOOKUP (`Get-Process`, `Get-CimInstance`, `Get-ProcessDescendants`) and the
+# most recent IDENTITY signal (`Test-ProcessSnapshotIdentity`, or a
+# `.StartTime`/`.CreationDate` comparison).  A forced `Stop-Process -Id ... -Force`
+# is a violation when the last lookup is at or after the last identity signal
+# (identity_last <= lookup_last): the kill trusts a lookup that nothing
+# re-confirmed.  This is what the two CORRECT forms share and the DEFECTIVE
+# form lacks:
+#   * descendant (fixed): `if (Test-ProcessSnapshotIdentity ...) { Stop-Process }`
+#     — the identity signal is on/inside the kill's own statement.
+#   * root: `Get-Process`; `if (.StartTime ... ) { throw }`; `Stop-Process`
+#     — the identity signal sits AFTER that Get-Process and BEFORE the kill.
+#   * descendant (buggy): `Get-Process -Id <stale>`; null-test; `Stop-Process`
+#     — a lookup with no identity signal after it -> FLAGGED.
+# Neither installer is runnable on this host, so this is a source-level
+# invariant by necessity, like rules F/J/K (see this file's header).  A comment
+# mentioning any of these names never counts: comment lines are skipped.
+rules_checked=$((rules_checked + 1))
+l_hits=''
+l_sites=0
+while IFS= read -r ps_kill_file; do
+    [ -n "$ps_kill_file" ] || continue
+    l_report=$(awk '
+        {
+            line = $0
+            gsub(/\r/, "", line)
+            probe = line
+            sub(/^[ \t]+/, "", probe)
+            if (probe ~ /^#/) next
+        }
+        /Get-Process([^S]|$)|Get-CimInstance|Get-ProcessDescendants/ { lookup = NR; next }
+        /Test-ProcessSnapshotIdentity|\.StartTime|\.CreationDate/ {
+            if (probe !~ /function[ \t]+Test-ProcessSnapshotIdentity/) identity = NR
+            next
+        }
+        /Stop-Process[ \t]+-Id/ && /-Force/ {
+            stopsites++
+            if (identity <= lookup)
+                printf "%d: a forced Stop-Process follows a process lookup with no identity re-check in between (PID may be recycled between the lookup and the kill)\n", NR
+        }
+        END { printf "__SITES__ %d\n", stopsites + 0 }
+    ' "$ps_kill_file")
+    l_file_sites=$(printf '%s\n' "$l_report" | sed -n 's/^__SITES__ //p')
+    l_sites=$((l_sites + ${l_file_sites:-0}))
+    while IFS= read -r l_line; do
+        [ -n "$l_line" ] || continue
+        l_hits="$l_hits$ps_kill_file:$l_line
+"
+    done <<EOF
+$(printf '%s\n' "$l_report" | grep -v '^__SITES__ ' || true)
+EOF
+done <<FILES
+$(grep -rl 'Stop-Process' "$root/skill/assets" | sort)
+FILES
+if [ -n "$l_hits" ]; then
+    while IFS= read -r l_hit; do
+        [ -n "$l_hit" ] || continue
+        fail "${l_hit%%:*}" "line $(printf '%s' "${l_hit#*:}")"
+    done <<EOF
+$l_hits
+EOF
+fi
+# L's census is the number of forced-kill statements examined (>0 expected in
+# the real assets); a rule that found none means the kill loop is gone and the
+# rule has gone blind.
+rule_sites L "$l_sites" || true
+
 if [ "$failures" -ne 0 ]; then
     printf 'installer-invariants: %s violation(s)\n' "$failures" >&2
     exit 1
@@ -957,14 +1038,21 @@ fi
 
 # Every gated rule must actually call the gate, or a rule silently goes back to
 # reading as verified when it examined nothing.  The arithmetic: B(1 file) +
-# D(2) + D2(2) + F(2) + G(2) + H(1 total) = 10 calls.  A new enumerating rule
-# must add its call here too, which is the point: the count is a reminder, not a
-# census.
-if [ "$rule_sites_checked" -ne 10 ]; then
-    printf 'installer-invariants: the coverage gate ran %s time(s), expected 10 (B 1, D 2, D2 2, F 2, G 2, H 1); a rule lost its gate call and is back to reporting green on zero sites\n' \
+# D(2) + D2(2) + F(2) + G(2) + H(1 total) + L(1 total) = 11 calls.  A new
+# enumerating rule must add its call here too, which is the point: the count is
+# a reminder, not a census.
+#
+# L's number counts VIOLATIONS, not sites -- an honest deviation, recorded
+# here rather than hidden in the arithmetic: L's population is derived by
+# grep over the assets, and its positive control runs in the self-test below,
+# so "zero" IS the pass condition and the sites-can-be-zero failure mode of
+# the other rules does not apply.  What rule_sites still buys is the
+# non-number guard and one call counted in this census.
+if [ "$rule_sites_checked" -ne 11 ]; then
+    printf 'installer-invariants: the coverage gate ran %s time(s), expected 11 (B 1, D 2, D2 2, F 2, G 2, H 1, L 1); a rule lost its gate call and is back to reporting green on zero sites\n' \
         "$rule_sites_checked" >&2
     exit 1
 fi
 
-printf 'installer-invariants checks passed: rules=%s files=%s sites=%s violations=%s acl-properties=verified posix-mv-recheck=asserted placeholder-substitution=guarded lock-release=unconditional\n' \
+printf 'installer-invariants checks passed: rules=%s files=%s sites=%s violations=%s acl-properties=verified posix-mv-recheck=asserted placeholder-substitution=guarded lock-release=unconditional forced-kill-recheck=gated\n' \
     "$rules_checked" "$census_file_count" "$rule_sites_total" "$failures"

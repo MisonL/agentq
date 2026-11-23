@@ -56,7 +56,11 @@ client=${AGENTQ_SMOKE_CLIENT:-$client}
 work=$(mktemp -d /tmp/agentq-smoke-sshp.XXXXXX)
 work=$(unset CDPATH; cd -- "$work" && pwd -P)
 cleanup_sandbox() { rm -rf -- "$work"; }
-trap cleanup_sandbox EXIT HUP INT TERM
+# A signal handler that RETURNS lets the interrupted script resume; measured
+# 2026-11-22 (Codex review P2) with a trap that printed cleanup and then
+# continued into the rest of the fixture.  Use an explicit exit on signals.
+trap 'cleanup_sandbox; exit 130' HUP INT TERM
+trap cleanup_sandbox EXIT
 
 home="$work/home"
 mkdir -p "$home" "$work/bin" "$work/tmp"
@@ -2183,6 +2187,42 @@ else
         failures=$((failures + 1))
     fi
 fi
+
+# --- BOTH PowerShell clients pin the console output encoding -----------------
+# PS 5.1 decodes a native child's stdout (and encodes this script's own) with
+# Console.OutputEncoding; on a zh-CN host that is GBK, and the repo measured
+# the corruption twice: a CJK word back from ssh came as `????` (PLAN.md
+# 2026-10-08), and install-agentq.ps1's own comment records a code-page host
+# where `& exe ... 1> file` corrupts non-ASCII payloads. The guard existed in
+# agentq.ps1 and NOT in its sibling sshp.ps1 (added 2026-11-22, the final
+# review round) -- the "guard landed in one twin, not the other" class (the
+# macOS LaunchServices probe lived nine days the same way).  Loop over both
+# clients so this lock cannot be sshp-only, and assert POSITION, not just
+# presence: the setter must come before the first ssh leg, or the probe it
+# exists to protect still runs under the console code page.
+for ps_client in "$root/skill/assets/client/windows/agentq.ps1" "$sshp_ps_client"; do
+    cases=$((cases + 1))
+    ps_client_name=$(basename "$ps_client")
+    ps_setter_line=$(grep -n 'Console\]::OutputEncoding = \[System.Text.Encoding\]::UTF8' "$ps_client" | head -1 | cut -d: -f1) || true
+    # The anchor is the main flow's DISPATCH statement -- the first top-level
+    # construct that can reach an ssh call.  `switch ($operation)` is agentq
+    # ps's, `Prepare-Remote` is sshp.ps's; a `Resolve-SshPath` call site must
+    # NOT anchor (in agentq.ps1 it sits inside a function the dispatcher calls
+    # later, so its line number predates the setter and would force the
+    # setter impossibly early).
+    ps_dispatch_line=$(grep -nE '^switch \(\$operation\) \{|^ +Prepare-Remote ' "$ps_client" | head -1 | cut -d: -f1) || true
+    if [ -z "$ps_setter_line" ]; then
+        printf '%s\n' "sshp-contract: $ps_client_name never sets [Console]::OutputEncoding; a code-page host corrupts the captured ssh output" >&2
+        failures=$((failures + 1))
+    elif [ -z "$ps_dispatch_line" ]; then
+        printf 'sshp-contract: %s has no dispatch anchor this lock recognises; the position claim is unverified\n' "$ps_client_name" >&2
+        failures=$((failures + 1))
+    elif [ "$ps_setter_line" -gt "$ps_dispatch_line" ]; then
+        printf 'sshp-contract: %s pins the encoding at line %s, after the dispatch (%s); the legs it runs through stay under the console code page\n' \
+            "$ps_client_name" "$ps_setter_line" "$ps_dispatch_line" >&2
+        failures=$((failures + 1))
+    fi
+done
 
 # --- the protocol MARKERS are case-sensitive, like the POSIX twin ------------
 # Every `__SSHP_*` marker comparison in sshp.ps1 used `-match`, PowerShell's

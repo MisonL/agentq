@@ -139,7 +139,7 @@ SSH 短断恢复、Windows `submit` 参数解析、Int32 重试参数上限和�
 - 日常验证：`run-tests.sh`（`--quick` 只跑 `01`）
 - 冒烟检查：`smoke/` 下的 31 项（`ls smoke/*.sh | wc -l`，2026-11-15 核对；此前写 30，`smoke/31-changelog-and-tags` 加入后没跟上），逐项的「覆盖什么 / 不覆盖什么」以
   `docs/verification-status.md`为准——本文件不再复制那份清单（复制过一次就漂移过一次）
-- `03`/`04`/`06`/`07` 需要 `AGENTQ_SMOKE_HOME` 指向含真实 `pueue` 的运行时，否则 SKIP；
+- `03`/`04`/`06`/`07`/`15`/`17` 需要 `AGENTQ_SMOKE_HOME` 指向含真实 `pueue` 的运行时，否则 SKIP（2026-11-23 按当前源码核对补上 `15`/`17`：两者的运行时判据与其余四项逐字相同，此前清单没跟上）；
   `03` 还要求它本身是可用运行时（`config/pueue.yml` + 已在运行的 `pueued`）。
   仓库根的 `./sandbox.sh up` 可一键搭出这个运行时（`up` / `status` / `down`），
   它打印的 `AGENTQ_SMOKE_HOME` 形如 `/tmp/aqsb/home/.agentq`

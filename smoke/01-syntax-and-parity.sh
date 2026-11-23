@@ -185,11 +185,13 @@ ps_count=0
 # `command -v pwsh` only proves the binary is on PATH, not that it RUNS.  A
 # pwsh whose startup cache is corrupt aborts on every invocation -- and then
 # every .ps1 asset is reported as "PowerShell parse FAILED", which points the
-# operator at seven correct files instead of at pwsh.  Measured twice in this
-# project (2026-09-26 and 2026-09-28): a damaged
+# operator at seven correct files instead of at pwsh.  Measured FIVE times in
+# this project (2026-09-26, 2026-09-28 twice, 2026-09-29, 2026-10-20 -- the
+# census lives in CLAUDE.md): a damaged
 # ~/.cache/powershell/StartupProfileData-NonInteractive makes pwsh die with
-# `Abort trap: 6` before it reads any script, and the two crashes did not even
-# share a message (`String cannot have zero length` vs `Stack overflow`).
+# `Abort trap: 6` before it reads any script, and the crashes did not even
+# share a message (four shapes on record: `String cannot have zero length` x2,
+# `Stack overflow` x2, `System.IO.FileLoadException`).
 # So probe it once, and if it cannot run, say THAT instead of blaming the assets.
 pwsh_state=absent
 if command -v pwsh >/dev/null 2>&1; then
@@ -1112,7 +1114,7 @@ else
 fi
 
 # --- .github/workflows: YAML parse -------------------------------------------
-# The workflows are the enforcement layer -- ci.yml pins the 29 check names, the
+# The workflows are the enforcement layer -- ci.yml pins the 31 check names, the
 # two tool-summary tokens (shellcheck/posix) and the NOT-covered allowlist;
 # release.yml is the only gate tying a tag to the recorded version.  A YAML typo
 # in one of them does not fail locally in any way (measured 2026-10-25: breaking
@@ -1735,6 +1737,47 @@ if missing or stale:
         print("ci.yml's expected_checks lists %s but smoke/%s.sh does not exist"
               " (the pin is stale)" % (c, c), file=sys.stderr)
     sys.exit(1)
+# The windows job runs a SUBSET of the checks under real PowerShell 5.1.
+# Which subset is a decision nothing records, so derive it: every check that
+# names AGENTQ_SMOKE_PWSH is a check that claims to honour the interpreter,
+# and must therefore actually be exercised by that job -- otherwise the
+# "PS 5.1 coverage" the summaries advertise quietly shrinks to whatever the
+# hand-written loop kept (measured shape: a check added later is simply not
+# in the list, and nothing anywhere says it should be).
+loop = re.search(r"for check in ([^;]*); do", text)
+if not loop:
+    print("ci.yml has no `for check in ...; do` windows loop to audit", file=sys.stderr)
+    sys.exit(2)
+running = sorted(loop.group(1).split())
+# smoke/19 reads AGENTQ_SMOKE_PWSH but its PS section self-skips with a
+# printed status on hosts without pwsh, and the windows job's per-check
+# gate refuses any log containing SKIPPED -- so adding it there would fail
+# the job for its own honest skip line.  It is the one documented
+# exemption; an unexplained membership difference is the reportable case.
+exempt = {"19-sshp-contract"}
+# A COMMENT merely naming the variable (smoke/01 documents its skip states)
+# is not a check that honours it.  The shape that counts is a DOLLAR-prefixed
+# expansion -- braced or bare -- the form a command or assignment reads.
+# (This comment deliberately spells no dollar form: the detector below scans
+# the whole file text, so writing the shape here would flag THIS file.)
+# Composed at runtime: writing the finished pattern into this file would put
+# a dollar-prefixed expansion of the name right here, and the scan below
+# would flag THIS file for honouring the interpreter.
+_expansion = r"\$" + "[{]?AGENTQ_SMOKE_PWSH"
+pwshe = sorted(
+    os.path.basename(f)[:-3]
+    for f in glob.glob(os.path.join(root, "smoke", "*.sh"))
+    if re.search(_expansion, open(f, encoding="utf-8", errors="replace").read())
+)
+want = [c for c in pwshe if c not in exempt]
+missing_w = [c for c in want if c not in running]
+extra_w = [c for c in running if c not in pwshe]
+if missing_w or extra_w:
+    for c in missing_w:
+        print("smoke/%s.sh honours AGENTQ_SMOKE_PWSH but the windows job does not run it" % c, file=sys.stderr)
+    for c in extra_w:
+        print("the windows job runs smoke/%s.sh although it never names AGENTQ_SMOKE_PWSH" % c, file=sys.stderr)
+    sys.exit(1)
 print("%d" % len(pinned))
 PY
     ) || ci_pin_rc=$?
@@ -1825,18 +1868,23 @@ def reasons(files):
 # report the fixture as a live printer of the planted word.
 # Calibration: a fixture carrying one listed and one unlisted reason must yield
 # exactly those two, so a rule that reports nothing (or everything) fails here.
-fixture = os.path.join(root, "smoke", "_ncov_calibration_fixture.txt")
+# A SIGKILL (or a second concurrent run) used to leave this calibration
+# fixture in the repository itself; measured 2026-11-22 (Codex review P2).
+# Use a PRIVATE temp directory and clean it up as a tree, so a crash can only
+# leave bytes under TMPDIR, never an untracked file in smoke/.
+import tempfile
+import shutil
+cal_dir = tempfile.mkdtemp(prefix="agentq-ncov-cal-")
+fixture = os.path.join(cal_dir, "_calibration_fixture.txt")
+cal_name = os.path.basename(fixture)
 try:
     with open(fixture, "w", encoding="utf-8") as fh:
         fh.write("x=NOT-covered(needs-Windows) y=NOT-covered(" + "planted-" + "reason-xyz)\n")
     cal = reasons([fixture])
 finally:
-    try:
-        os.unlink(fixture)
-    except OSError:
-        pass
-if cal != {"needs-Windows": "_ncov_calibration_fixture.txt",
-           "planted-reason-xyz": "_ncov_calibration_fixture.txt"}:
+    shutil.rmtree(cal_dir, ignore_errors=True)
+if cal != {"needs-Windows": cal_name,
+           "planted-reason-xyz": cal_name}:
     print("the reason extractor is miscalibrated (saw %r)" % (cal,), file=sys.stderr)
     sys.exit(2)
 
@@ -3602,6 +3650,66 @@ else
     farm_write_summary='skipped(no-python3)'
 fi
 
+# --- shell assets: no fail MESSAGE that expands a still-unset variable --------
+# Under `set -u` the message is expanded BEFORE fail() runs, so a message
+# naming a variable with no value yet does not print a blank field: it aborts
+# the shell.  At top level that skips fail()'s cleanup and its `reason=` line;
+# inside `$( )` the subshell exits 1 -- and callers read status 1 as "task /
+# record absent".  Measured 2026-11-22 (final review round): one injected
+# `jq -r length` failure inside find_request_task made `submit` enqueue a
+# DUPLICATE task and exit 0, because the message `fail "...: $task_id"`
+# expanded a caller local that was still empty.  The sanctioned spelling for
+# a message that must name a possibly-unset identifier is `${var-}`.
+#
+# Same wiring as farm_writes: classifier in its own file, `python3 -I <file>`
+# (never `./file`, so the checked-in 644 stays), the exit code load-bearing (2
+# = could not enumerate,1 = hits ONLY when output is non-empty -- a crash
+# also exits 1), and --self-test runs the SHIPPED code against embedded
+# fixtures so a detector that cannot fire never reads as clean.
+fail_msg_count=0
+if [ "$python3_state" = usable ]; then
+    fail_msg_rc=0
+    fail_msg_err=$(mktemp "${TMPDIR:-/tmp}/agentq-fail-msg-scan.XXXXXX")
+    fail_msg_hits=$(
+        python3 -I "$root/smoke/01-fail-msg-vars.py" "$root" 2>"$fail_msg_err"
+    ) || fail_msg_rc=$?
+    case $fail_msg_rc in
+    0 | 1)
+        if [ "$fail_msg_rc" -eq 1 ] && [ -z "$fail_msg_hits" ]; then
+            printf 'fail-message scan FAILED (exit 1 with no output; a crash or a syntax error in the classifier also exits 1):\n' >&2
+            sed 's/^/      /' "$fail_msg_err" >&2
+            failures=$((failures + 1))
+        fi
+        ;;
+    *)
+        printf 'fail-message scan FAILED (exit %s; a scan that could not run must not read as fail_msg_vars=0):\n' \
+            "$fail_msg_rc" >&2
+        sed 's/^/      /' "$fail_msg_err" >&2
+        failures=$((failures + 1))
+        ;;
+    esac
+    rm -f -- "$fail_msg_err"
+    if [ -n "$fail_msg_hits" ]; then
+        while IFS= read -r fail_msg_hit; do
+            [ -n "$fail_msg_hit" ] || continue
+            printf 'fail-message scan FAILED (this fail message expands a variable unset at that point under set -u; print it as ${var-} or name an identifier that is assigned on every path): %s\n' \
+                "$fail_msg_hit" >&2
+            fail_msg_count=$((fail_msg_count + 1))
+        done <<EOF
+$fail_msg_hits
+EOF
+        failures=$((failures + 1))
+    fi
+    if ! fail_msg_selftest=$(python3 -I "$root/smoke/01-fail-msg-vars.py" --self-test 2>&1); then
+        printf '%s\n' 'fail-message detector FAILED its self-check -- the detector itself is broken' >&2
+        printf '%s\n' "$fail_msg_selftest" >&2
+        failures=$((failures + 1))
+    fi
+    fail_msg_summary=$fail_msg_count
+else
+    fail_msg_summary='skipped(no-python3)'
+fi
+
 # --- checks that depend on python3 must probe that it RUNS -------------------
 # `command -v python3` is not a probe: on a zh-CN Windows 10 `python3` is the
 # Microsoft Store alias, which EXISTS, exits 49 and runs nothing.  The failure
@@ -4756,8 +4864,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s negation_captures=%s chr_ranges=%s tool_ranges=%s tr_fold=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s workflow_wiring=%s ncov_reasons=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$negation_capture_count" "$chr_range_count" "$tool_range_count" "$tr_fold_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state" "$workflow_wiring_summary" "$ncov_reasons_summary")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s negation_captures=%s chr_ranges=%s tool_ranges=%s tr_fold=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s workflow_wiring=%s ncov_reasons=%s fail_msg_vars=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$negation_capture_count" "$chr_range_count" "$tool_range_count" "$tr_fold_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state" "$workflow_wiring_summary" "$ncov_reasons_summary" "$fail_msg_summary")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
@@ -4769,7 +4877,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files negation_captures chr_ranges tool_ranges tr_fold executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census release_gate workflow_wiring ncov_reasons'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files negation_captures chr_ranges tool_ranges tr_fold executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census release_gate workflow_wiring ncov_reasons fail_msg_vars'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned

@@ -9,6 +9,8 @@
 # These are the decisions being pinned, all measured on the real server first:
 #
 #   submit: an existing record whose payload differs -> refuse (exit 2); a
+#           a transient failure while COUNTING visible tasks -> controlled exit 2,
+#           never a silent "no task visible" that re-enqueues (S16, 2026-11-22).
 #           leftover tombstone -> refuse as consumed; a record in `adding` ->
 #           exit 4 (ambiguous, never re-enqueue).
 #   cancel: first call kills/removes and writes a `requested` marker (exit 0);
@@ -1216,6 +1218,94 @@ run_case s15 submit --workdir "$work" --label smoke --request-id "$submit_id" --
 assert_rc s15 2
 assert_err_has s15 'cannot ensure AgentQ group'
 assert_reason_is s15 deployment_state
+
+# S16. A fail MESSAGE that expands an unset variable aborts the shell BEFORE
+#      fail() prints anything: inside `$( )` the subshell exits 1, which the
+#      caller reads as "no matching task visible".  Measured 2026-11-22 with
+#      one injected `jq -r length` failure inside find_request_task: a retried
+#      submit of a task that WAS visible enqueued a DUPLICATE and exited 0.
+#      The control runs first in each sub-case (shim installed, unarmed): the
+#      same fixture must reconcile to reused:true and never call `pueue add`.
+s16_stub() {
+    cat > "$work/pueue" <<SH
+#!/bin/sh
+case "\$*" in
+  *"kill "*) exit 0 ;;
+  *"remove "*) exit 0 ;;
+  *"add "*) printf 'add\n' >> "$work/add.calls"; printf '1002\n' ;;
+  *"status --json"*) printf '%s\n' '{"tasks":{"1001":{"id":1001,"created_at":"2026-09-29T00:00:00Z","command":"true","label":"agentq:$submit_id","status":{"Queued":{}},"group":"agentq"}},"groups":{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}}' ;;
+  *"group --json"*) printf '%s\n' '{"agentq":{"status":"Running","parallel_tasks":1},"default":{"status":"Running","parallel_tasks":1}}' ;;
+  *) printf '%s 4.0.4\n' pueue ;;
+esac
+SH
+    chmod 700 "$work/pueue"
+}
+mkdir -p "$work/inject-bin"
+cat > "$work/inject-bin/jq" <<'SH'
+#!/usr/bin/env bash
+if [[ ${AQ27_MODE:-control} == armed && $# -eq 2 && ${1:-} == -r && ${2:-} == length && ! -e $AQ27_HIT ]]; then
+    input=$(cat)
+    case $input in
+        '[{"id":1001'*)
+            : > "$AQ27_HIT"
+            printf 'injected length read failure\n' >&2
+            exit 7
+            ;;
+    esac
+    printf '%s' "$input" | exec "$AQ27_REAL_JQ" "$@"
+fi
+exec "$AQ27_REAL_JQ" "$@"
+SH
+chmod 700 "$work/inject-bin/jq"
+s16_run() { # $1 mode, $2 label
+    local mode=$1 label=$2 rc=0
+    ( cd "$work" && TMPDIR="$work" PATH="$work/inject-bin:$PATH" \
+        AQ27_MODE="$mode" AQ27_HIT="$work/s16.hit" AQ27_REAL_JQ="$real_jq" \
+        "$work/agentq-server" submit --workdir "$work" --label smoke --request-id "$submit_id" -- true ) \
+        >"$work/$label.out" 2>"$work/$label.err" || rc=$?
+    printf '%s' "$rc" > "$work/$label.rc"
+}
+for s16_kind in prepared no-record; do
+    clear_runtime
+    rm -f "$work/add.calls" "$work/s16.hit"
+    s16_stub
+    if [ "$s16_kind" = prepared ]; then
+        put_record "$submit_id" prepared null null
+    fi
+    s16_run control "s16ctl-$s16_kind"
+    assert_rc "s16ctl-$s16_kind" 0
+    assert_json "s16ctl-$s16_kind" '.reused == true and .task_id == 1001'
+    cases=$((cases + 1))
+    if [ -e "$work/add.calls" ]; then
+        printf 'write-paths s16ctl-%s: control enqueued a task although 1001 was visible\n' "$s16_kind" >&2
+        failures=$((failures + 1))
+    fi
+    # Snapshot AFTER the control run: the control legitimately rewrites a
+    # prepared record to accepted while recovering; what this case pins is
+    # that the ARMED (failing) run leaves the record alone.
+    cp "$work/data/agentq-requests/$submit_id.json" "$work/s16-before.json" 2>/dev/null || : > "$work/s16-before.json"
+    s16_run armed "s16-$s16_kind"
+    assert_rc "s16-$s16_kind" 2
+    assert_err_has "s16-$s16_kind" "cannot count the visible Pueue tasks for AgentQ task label: agentq:$submit_id"
+    assert_reason "s16-$s16_kind"
+    cases=$((cases + 1))
+    if [ -e "$work/add.calls" ]; then
+        printf 'write-paths s16-%s: injected read failure still enqueued a duplicate task\n' "$s16_kind" >&2
+        failures=$((failures + 1))
+    fi
+    cases=$((cases + 1))
+    if ! cmp -s "$work/s16-before.json" "$work/data/agentq-requests/$submit_id.json"; then
+        printf 'write-paths s16-%s: the request record changed on the failure path\n' "$s16_kind" >&2
+        failures=$((failures + 1))
+    fi
+    cases=$((cases + 1))
+    if [ ! -e "$work/s16.hit" ]; then
+        printf 'write-paths s16-%s: the jq injection never fired\n' "$s16_kind" >&2
+        failures=$((failures + 1))
+    fi
+done
+clear_runtime
+rm -f "$work/add.calls"
 
 # --------------------------------------------------------------- summary
 if [ "$failures" -ne 0 ]; then
