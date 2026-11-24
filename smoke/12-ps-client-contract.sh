@@ -4363,6 +4363,58 @@ if grep -qF 'iso output NOT-covered' "$work/out"; then
     printf 'ps-client: iso output NOT-covered(the pwsh on this host has no ConvertFrom-Json -DateKind, and 7.0-7.4 coerce ISO-8601 strings to DateTime)\n' >&2
 fi
 
+# --- an elapsed wait budget is the client's own exit 6 ----------------------
+# The contract says 6 is "the final state could not be confirmed", and both
+# clients produce exactly one 6 of their own: a `wait` whose local budget ran
+# out.  Measured 2026-11-24: neither client had a behavioural case for it --
+# `grep -c 'wait budget' smoke/*` found only the numeric validation of
+# AGENTQ_WAIT_TIMEOUT, never a budget that actually elapsed.  A regression
+# turning the 6 into a 1, a 255, or a hang would have been invisible, and the
+# hang is the shape a caller notices last.
+#
+# The stub must answer `-V`: this client probes the ssh binary before use
+# (measured the hard way -- a plain `sleep 30` stub is refused with
+# "did not exit within 10s of -V" and the case then asserts the wrong branch).
+cases=$((cases + 1))
+wait_budget_dir="$work/wait-budget"
+mkdir -p "$wait_budget_dir"
+wait_budget_stub="$wait_budget_dir/ssh"
+cat > "$wait_budget_stub" <<'WAIT_BUDGET_STUB'
+#!/bin/sh
+for budget_arg in "$@"; do
+    if [ "$budget_arg" = -V ]; then
+        printf 'OpenSSH_9.9p1, LibreSSL 3.3.6\n' >&2
+        exit 0
+    fi
+done
+sleep 30
+WAIT_BUDGET_STUB
+chmod 700 "$wait_budget_stub"
+if [ "$client_arg" != "$client" ]; then
+    wait_budget_win="$wait_budget_dir/ssh.cmd"
+    printf '%s\r\n' '@echo off' 'if "%~1"=="-V" (echo OpenSSH_for_Windows_9.5p1 1>&2 & exit /b 0)' 'ping -n 30 127.0.0.1 >nul' > "$wait_budget_win"
+    wait_budget_arg=$(cygpath -w "$wait_budget_win")
+else
+    wait_budget_arg="$wait_budget_stub"
+fi
+wait_budget_status=0
+AGENTQ_WAIT_TIMEOUT=1 AGENTQ_SSH="$wait_budget_arg" AGENTQ_HOST=smoke-host \
+    AGENTQ_REMOTE_PLATFORM=unix AGENTQ_OPERATION_RETRY_ATTEMPTS=1 \
+    AGENTQ_OPERATION_RETRY_DELAY=1 AGENTQ_PLATFORM_PROBE_CACHE=off \
+    AGENTQ_CONFIG="$work/absent-config" \
+    "$pwsh_binary" -NoProfile -NonInteractive -File "$client_arg" wait 1 \
+    >"$work/wait-budget.out" 2>"$work/wait-budget.err" || wait_budget_status=$?
+if [ "$wait_budget_status" -ne 6 ]; then
+    printf 'ps-client: an elapsed wait budget exited %s, expected 6 (the contract has exactly one client-local 6 per client)\n' \
+        "$wait_budget_status" >&2
+    head -3 "$work/wait-budget.err" >&2 || true
+    failures=$((failures + 1))
+elif ! grep -qF 'wait budget of 1 seconds elapsed' "$work/wait-budget.err"; then
+    printf 'ps-client: an elapsed wait budget lacked the controlled message: %s\n' \
+        "$(head -2 "$work/wait-budget.err" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+fi
+
 # The success line is printed only AFTER the failure gate: until 2026-10-16 it
 # came first, so a red run printed "checks passed: cases=..." and then the
 # failures on stderr -- a tail of stdout alone read as a green summary.

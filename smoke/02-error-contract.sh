@@ -74,6 +74,19 @@ expect_rejected remove-label-no-confirm 'remove --label requires exactly a label
 expect_rejected remove-label-missing-flag 'remove --label requires --confirm' protocol_error remove --label smoke --nope
 expect_rejected remove-label-empty 'remove --label requires a non-empty label' protocol_error remove --label '' --confirm
 expect_rejected doctor-extra-arg 'doctor accepts --full or no arguments' protocol_error doctor --bogus
+# The `submit` argv surface and the arity of `logs --tail` are validated
+# SEPARATELY by three implementations (this server, the POSIX client, the
+# PowerShell client) and none of the three was asserted anywhere: measured
+# 2026-11-24, `grep -c 'unknown submit option' smoke/*` = 0 and the same for
+# `--workdir requires a directory`, `--label requires a value` and
+# `logs accepts only --tail`.  These rows pin the SERVER's answer; the two
+# clients' answers are pinned in 05 (`--label requires a label` is their own
+# wording) and in 12.
+expect_rejected submit-workdir-no-value '--workdir requires a directory' protocol_error submit --workdir
+expect_rejected submit-label-no-value '--label requires a value' protocol_error submit --workdir "$work" --request-id smoke-argv-0001 --label
+expect_rejected submit-unknown-option 'unknown submit option: --bogus' protocol_error submit --workdir "$work" --request-id smoke-argv-0001 --bogus -- true
+expect_rejected logs-tail-extra-arg 'logs accepts only --tail <line-count|all>' protocol_error logs 1 --tail 5 extra
+expect_rejected logs-tail-misspelled 'logs accepts only --tail <line-count|all>' protocol_error logs 1 --taill 5
 # `--tail` gets an UPPER BOUND at the server as well (2026-11-19).  Both clients
 # accept any number of digits, and without the bound the value reached BSD
 # `tail -n` ("illegal offset"), failed as a Pueue log READ, and answered exit 1

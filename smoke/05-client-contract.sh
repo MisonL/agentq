@@ -1781,6 +1781,54 @@ if [ "$status" -ne 2 ] || ! grep -qF 'AGENTQ_WAIT_TIMEOUT must be a positive int
     failures=$((failures + 1))
 fi
 
+# The BUDGET-ELAPSED answer is the ONLY way this client produces exit 6 from
+# its own logic, and it had no behavioural case at all: measured 2026-11-24,
+# `grep -c 'wait budget' smoke/*` found the variable name in the numeric check
+# above and nothing else.  The documented contract says 6 means "final state
+# could not be confirmed", which is precisely this path -- a regression that
+# turned it into 1, into 255, or into a hang would have been invisible, and a
+# hang is the shape a caller notices last.
+#
+# The stub answers `-V` the way OpenSSH does and sleeps on every other
+# invocation, so the client's own launch probe passes and only the wait itself
+# is slow.  Without that, a plain `sleep 30` stub is refused by the probe
+# ("did not exit within 10s of -V") and the case would assert the wrong branch.
+wait_budget_stub="$work/bin/ssh-wait-budget"
+cat > "$wait_budget_stub" <<'WAIT_BUDGET_STUB'
+#!/bin/sh
+for budget_arg in "$@"; do
+    if [ "$budget_arg" = -V ]; then
+        printf 'OpenSSH_9.9p1, LibreSSL 3.3.6\n' >&2
+        exit 0
+    fi
+done
+sleep 30
+WAIT_BUDGET_STUB
+chmod 700 "$wait_budget_stub"
+env_rejections=$((env_rejections + 1))
+status=0
+AGENTQ_WAIT_TIMEOUT=1 AGENTQ_SSH="$wait_budget_stub" AGENTQ_HOST=smoke-host \
+    AGENTQ_REMOTE_PLATFORM=unix AGENTQ_OPERATION_RETRY_ATTEMPTS=1 \
+    AGENTQ_PLATFORM_PROBE_CACHE=off \
+    "$client" wait 1 >"$work/budget.out" 2>"$work/budget.err" || status=$?
+if [ "$status" -ne 6 ]; then
+    printf 'client-contract: an elapsed wait budget exited %s, expected 6 (the contract has exactly one client-local 6 per client)\n' \
+        "$status" >&2
+    head -3 "$work/budget.err" >&2 || true
+    failures=$((failures + 1))
+elif ! grep -qF 'wait budget of 1 seconds elapsed' "$work/budget.err"; then
+    printf 'client-contract: an elapsed wait budget lacked the controlled message: %s\n' \
+        "$(head -2 "$work/budget.err" | tr '\n' '|')" >&2
+    failures=$((failures + 1))
+fi
+# The same budget must NOT be reported as a remote failure: exit 6 is local, and
+# forwarding a reason line would tell the caller to stop retrying a task that is
+# still running for a reason that came from this side of the wire.
+if grep -qF 'remote failure reason:' "$work/budget.err"; then
+    printf '%s\n' 'client-contract: an elapsed wait budget forwarded a remote failure reason; exit 6 here is local by contract' >&2
+    failures=$((failures + 1))
+fi
+
 # AGENTQ_REMOTE_PLATFORM is matched case-insensitively, like the Windows
 # client's `switch` (a language rule there, a written-out pattern here).
 # Measured 2026-10-21: `AUTO`/`Unix` were accepted by the Windows client and

@@ -276,7 +276,7 @@ printf '2026-11-14  entry\n  |  ./run-tests.sh -> exit 0\n\n2026-11-13  older\n'
 printf '2026-11-14  entry without verification\n\n2026-11-13  older\n  |  ok\n' >"$cal_dir/no-verify.log"
 printf '2026-11-14  entry\n  |  ok\n' >"$cal_dir/only.log"
 # A bare `  |` is not a verification line: it has the marker and no record.
-printf '2026-11-14  entry\n  |\n\n2026-11-13  older\n' >"$cal_dir/bare-bar.log" 
+printf '2026-11-14  entry\n  |\n\n2026-11-13  older\n' >"$cal_dir/bare-bar.log"
 if newest_has_verification "$cal_dir/good.log"; then :; else cal=bad; printf 'calibration: good fixture was flagged\n' >&2; fi
 if newest_has_verification "$cal_dir/no-verify.log"; then cal=bad; printf 'calibration: an entry with no verification line passed\n' >&2; fi
 if newest_has_verification "$cal_dir/only.log"; then :; else cal=bad; printf 'calibration: single-entry fixture was flagged\n' >&2; fi
