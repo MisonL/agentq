@@ -20,12 +20,10 @@ name: npm
 on:
   push:
     tags: ['v*']
+  # Manual runs pack and dry-run the publish: a real publish from a dispatch
+  # would bypass the tag check above, and the tag is the only thing that ties
+  # these bytes to a version.
   workflow_dispatch:
-    inputs:
-      dry-run:
-        description: 'Pack and verify without publishing'
-        type: boolean
-        default: true
 
 # `contents: read` for the checkout; `id-token: write` for npm provenance, which
 # is what lets a consumer check that this tarball came from THIS commit of THIS
@@ -44,6 +42,13 @@ jobs:
   publish:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # Empty when the secret is absent.  Two things read it: `setup-node` writes
+    # it into the temporary .npmrc, and the Publish step's `if:` decides whether
+    # to upload.  Keeping the decision here rather than in a shell branch means a
+    # configured token that the registry rejects still fails loudly -- the failure
+    # mode we want -- while an absent one is reported and passes.
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
         with:
@@ -85,13 +90,40 @@ jobs:
       - name: Verify the tarball against the tree
         run: node scripts/verify-pack.js
 
+      # Publishing needs a credential this repository does not carry, and its
+      # absence must not turn every tag push into a red run: that would say "the
+      # release is broken" about a release that only lacks a token.  Measured on
+      # the first tag this workflow ever saw (v0.1.43): `npm publish` answered
+      # `E404 ... PUT https://registry.npmjs.org/agentq-skill` -- npm reports a
+      # missing credential as a 404 on PUT, which reads exactly like "the package
+      # does not exist" and sent me looking in the wrong place.
+      #
+      # `secrets` cannot be read in an `if:` at all, so it is mapped to `env` and
+      # the condition tests that.
       - name: Publish
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && env.NODE_AUTH_TOKEN != ''
         run: npm publish --provenance --access public --tag latest
 
-      - name: Publish (dry run)
-        if: github.event_name == 'workflow_dispatch' && inputs.dry-run
+      - name: Report that publishing is not configured
+        if: github.event_name == 'push' && env.NODE_AUTH_TOKEN == ''
         run: |
           set -eu
-          npm publish --dry-run --provenance --access public
+          echo "::notice title=npm: verified but not published::No NPM_TOKEN is configured, so this run verified the tarball and stopped. Nothing was uploaded."
+          {
+            echo '### npm: verified, not published'
+            echo
+            echo 'No `NPM_TOKEN` repository secret is configured, so `npm publish` was skipped.'
+            echo '`scripts/verify-pack.js` did run and pass: the tarball matches the committed'
+            echo 'tree in file set, bytes and modes.'
+            echo
+            echo 'To publish: create the package on npmjs.com (or a token with publish rights)'
+            echo 'and store it as the `NPM_TOKEN` secret. Provenance comes from OIDC, which'
+            echo 'this workflow already requests.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish (dry run)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -eu
+          npm publish --dry-run --access public
           echo "dry run only: nothing was published"
