@@ -1463,6 +1463,8 @@ wait 的 record 批量扫描（`request_record_path_guards_or_fail "$path" || { 
 - `.github/workflows/npm.yml` —— `on: push: tags: ['v*']` + `workflow_dispatch`（dry-run）；`permissions: contents: read, id-token: write`（provenance，**不用长期 NPM_TOKEN**）；发布前跑 `verify-pack.js`。**刻意不塞进 `release.yml`**：那个文件的注释承诺「no job writes to the repository or calls the API」，为第二个关注点扩权会悄悄废掉那条承诺。
 - `smoke/01` 新增 `npm=` 臂：两个 JS 必须 `node --check` 通过，且 copier 的执行位清单必须**等于** `skill_modes_expected_exec`（两份清单一处漂移就红——这是「清单抄两份」的检测，不是共享）。
 
+**发布门禁上线后，第一次真 tag push 就把工作流自己的一个缺陷照了出来**（这一条值得留，因为它是「表达式看起来在做判断、其实什么都没判断」的又一个实例）：`setup-node` 的 `token` 输入默认是 `github.token`，它会把该值导出为 `NODE_AUTH_TOKEN`；于是 `Publish` 步骤的 `if: env.NODE_AUTH_TOKEN != ''` 在**仓库里根本没有 npm 凭据**时也为真，`npm publish` 拿着无效凭据去 PUT，npm 回 **`E404 ... Not found`**——与「这个包不存在」完全同形，我先怀疑包名被占、再怀疑 registry，两轮之后才去读日志里被导出的那个变量。两个 tag 的两次红都是它。修法：`setup-node` 显式 `token: ${{ secrets.NPM_TOKEN }}`（不给它注入的机会），判断挪进 shell（`if [ -z "${NPM_TOKEN:-}" ]`），无 token 时打 notice + 写 job summary + 退 0，dispatch 走 `--dry-run`，否则发布。判断用 shell 而不是表达式还有一个好处：**它能在本地被测试**——本轮实测「空 token → notice + exit 0」「有 token + dispatch → dry-run + exit 0」两条。0.1.43 的 tag push 之后 `npm` 工作流转绿：`verify-pack: 30 files, bytes identical, modes identical, 34 entries`。
+
 写这套东西时被抓到的**三个自己的错误**（都记在代码注释里）：① 目的地链检查拒绝一切祖先符号链接，而 macOS 的 `/var` 与 `/tmp` 就是符号链接，于是它拒绝了自己的测试目录（改为只查叶子）；② `npm pack --json` 在 npm ≥7 答的是**以包名为键的对象**，第一版按数组读，报「读不出报告」；③ `fs.statSync` 在删除临时目录**之后**才读 tarball 大小，成功路径报 ENOENT。
 
 #### 边界（不声称的）
