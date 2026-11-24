@@ -213,6 +213,29 @@ UTF-16LE（三组读字节全为 `FF FE` 开头），BOM 感知读取是**必需
 否则服务端在解析参数**之前**就因缺少可执行文件退出 2——那样即使参数校验
 完全损坏，检查也照样通过。每个用例同时断言 stderr 内容，所以失败可归因。
 
+### 2026-11-24（0.1.43）的增量
+
+上表每一行内部的历史都按当时字节记录，**现行计数以各检查自己的摘要行为准**；
+本节只记这一轮新增或改动的部分，避免与上面的长历史重复。
+
+| 检查 | 本轮变化 | 红证 |
+| --- | --- | --- |
+| `01-syntax-and-parity` | 新增 `format=` 臂：尾随空白 / 行首 TAB / 缺末行换行，扫 9 个 shell 资产 + 31 个 `smoke/*.sh` + `run-tests.sh` + `sandbox.sh`（`files=42`），双向自检 + 盲枚举闸门（`< 20` 个文件即失败）。新增 `npm=` 臂：两个 JS 文件必须 `node --check` 通过（附自检夹具），且 `bin/agentq-skill.js` 的执行位清单必须**等于** `skill_modes_expected_exec`。`shfmt` 评估后否决：它要重写 `agentq-server` 565 行（`-ci`）/2595 行（不带），等于以检查之名重排部署资产 | 种一个尾随空格 → `sandbox.sh:2` 点名退 1；种一个行首 TAB → `run-tests.sh:2` 点名退 1；删末行换行 → `smoke/02` 点名退 1；删 JS 清单一行 → `chmods a different set of files` 退 1。三条缺陷本身在基线上就存在：`agentq-server` 与其孪生各一处 `# ` 行尾空格（同日同形，正是会让 `cmp` 分叉的那类字节）、`smoke/31` 一处 |
+| `02-error-contract` | `cases=46 → 51`：`submit` 的 argv 面五条（`--workdir` 缺值、`--label` 缺值、未知选项、`logs --tail` 多余参数、`--taill` 拼错）。这五条在**三份实现**（服务端 + 两份客户端）里各写一遍，而 `grep` 在 `smoke/` 全库零命中 | 把 `unknown submit option` 改成别的文本 → `submit-unknown-option: stderr does not contain` 退 1 |
+| `05-client-contract` | `env=39 → 40`，`cases=121`：`wait` 预算真的耗尽必须本地退 **6** 并打印 `wait budget of 1 seconds elapsed`，且**不得**转发 `remote failure reason`（6 在这里是本地结论）。桩必须对 `-V` 答 OpenSSH 的版本行，否则先撞启动探针、用例断言的是错分支（实测踩过） | 把 `return 6` 改成 `return 1` → `an elapsed wait budget exited 1, expected 6` 退 1（该次运行共 3 条失败） |
+| `12-ps-client-contract` | `cases=227 → 228`：孪生侧的同一条等待预算用例（`.cmd` 桩同样要先答 `-V`） | 把 `return 6` 改成 `return 1` 的 `.ps1` 变异体 → `an elapsed wait budget exited 1, expected 6` 退 1 |
+| `31-changelog-and-tags` | 无规则变化；`v0.1.43` 的索引行与 tag 按既有三层规则落地 | — |
+
+**npm 包本身不是覆盖项**：`scripts/verify-pack.js` 是**发布门禁**而不是 smoke 检查
+（跑一次要 `npm pack` + 解包）。它断言四件事，各有红证：文件集与 `git ls-files` 全等
+（`files:` 是目录白名单、**不受** `.gitignore` 约束——种一个 `skill/assets/planted.key`
+会被打进 tarball，而它的第一版把这个报成「一致」，因为它在拿磁盘比 tarball）、逐字节
+相同、模式与索引相同（`npm pack` 读的是**磁盘模式**，本仓工作区里 `client/windows/*.bash`
+曾是 700 而索引是 755，门禁因此先红了一次）、两份 canonical 副本相同。`npx` 侧的
+`bin/agentq-skill.js` 有 `--check`（不写盘、逐文件 sha256 + 8 个执行位）与漂移退 1。
+**它仍然只是「拿到某个版本的 30 个文件」**：部署仍是暂存 + 平台安装器，成功行自己会
+说明这一点。
+
 ## 防假绿（`run-tests.sh` 自身）
 
 ### 这套检查不证明什么
