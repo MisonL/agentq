@@ -440,3 +440,9 @@ daemon 时会走 `launchctl kickstart gui/<uid>/com.agentq.pueued`——那是�
 - `smoke/05`的 uuidgen 误诊分支改为匹配真实措辞 `--request-id must`；`smoke/12`的 blank-guard 变异锚点随变量改名同步，cfgpath 的 Windows 诊断行纳入独立 floor；`smoke/27`的 text-mode-jq 夹具增加「确实产生行内 CR」的阳性对照。
 
 **2026-11-22 第十轮终审新增覆盖**：`11-installer-contract`加 4 个用例（cases=51）：维护锁只含安装器自己的 `.agentq-lock-metadata.*`残留时必须回收、非该前缀的未知条目必须保留；`19-sshp-contract`加 3 个用例（cases=155）：真实 resolver 对 unsafe 候选 skip 而非 throw、`--check`对 unix 探针的 `:Windows`标记必须再跑 Windows 探针（含 `ssh -V`占一行计划）；`27-record-write-paths`加 2 个用例（cases=164）：服务端对维护锁元数据残留的自愈与 prefix 边界。**仍未验证**：原生 Windows 真机上的 WinGet/WinGet Links reparse、GBK 主机、本地化 ACL、.NET4.5.2 API、环境块溢出、`AGENTQ_PLATFORM_CACHE_DIR`路径转换。
+
+### 2026-11-24 第十二轮（0.1.42）：检查自身 + 第一次真机验收
+
+**检查自身**：`smoke/11` 新增 `stage-once` 组（+6 例，51 → 57，摘要 `stage-once=asserted`）——按锚点从资产抽出**真实的** `prepare_service_stage`，逐平台臂驱动，断言 staging 文件每臂恰好创建一次、且父目录里只剩函数返回的那一个；红证是把 0.1.41 的重复创建行原位还原（四条例全红并点名两个残留路径）。覆盖表 `11` 行首已同步。
+
+**真机验收（用户当轮点名的两台测试机；地址不入库）**：Linux 服务端与 Windows 客户端各从 0.1.30 升到 0.1.42，跨主机 `status/submit/wait/logs/lookup/remove` 全通、日志正文逐字回读。**它证明了什么**：0.1.42 的安装器在一台真实 Linux 上成功执行（pueue/pueued 走既有二进制复用、哈希与 pin 相符、未联网）、升级后队列 261 个任务原样保留、成功安装后 `~/.agentq.*stage.*` 零残留（即本轮缺陷在真实安装路径上不再复现）；Windows 客户端安装器在真实 Windows 10 + PS 5.1 上成功、`-Check` 判 match、`--version` 报 0.1.42。**它不证明什么**：① 13 台**生产**主机一台未碰，生产凭证/生产队列/跨主机并发与真实运维中断仍无证据；② 那台 Windows 是**客户端**主机，Windows **服务端**安装路径本轮仍无真机证据；③ GBK 主机、.NET 4.5.2 宿主、原生 Windows 上的 WinGet/reparse、本地化 ACL、`AGENTQ_PLATFORM_CACHE_DIR` 路径转换**仍未验证**（Windows 那台是 zh-CN 但本轮没有触发 GBK 解码路径的用例）；④ 安装器成功路径的**失败注入**（中断、下载失败）仍未在真机上演练。
