@@ -1430,7 +1430,7 @@ wait 的 record 批量扫描（`request_record_path_guards_or_fail "$path" || { 
 
 审计指出 `smoke/` 里真正可删的重复断言只有 2 处（`smoke/18` 的 `shortname`、`smoke/06` 的 `reused`，合计约 10 行），另有 7 个 fixture 块约 200 行重复（其中两份「文本模式 jq shim」**已经漂移**：`smoke/26` 的 sed 版只给行间加 CR、`smoke/27` 的 perl 版给所有行加 CR，两边都自称忠实，因为各自有实测理由——26 写了「末行 CR 是真实路径不可能产生的形状」、27 则需要过 NUL 而 BSD sed 在 NUL+LF 上崩溃）。
 
-**决定：不删、不抽取。** 理由有三条，都是本仓踩过的形态：① 那 200 行重复的功能是「同一夹具被三个检查各自持有」，抽成共享文件后**一处改错三处一起错**，而本项目的立场是漂移应被**检测**、不该靠共享消除；② 那 2 条冗余各有一个「只有它钉住的 fail-closed 方向」，省 10 行而把该方向变成无人值守，与本仓历史上多次「删掉看似重复的用例后才发现它是唯一守卫」相反；③ 本轮的真实缺口不在这里——审计按服务端 428 个 `fail` 站点反查，找到 19 条用户可达但零断言的出口，其中两条最值得先补（见下）。
+**决定：不删、不抽取。** 理由有三条，都是本仓踩过的形态：① 那 200 行重复的功能是「同一夹具被三个检查各自持有」，抽成共享文件后**一处改错三处一起错**，而本项目的立场是漂移应被**检测**、不该靠共享消除；② 那 2 条冗余各有一个「只有它钉住的 fail-closed 方向」，省 10 行而把该方向变成无人值守，与本仓历史上多次「删掉看似重复的用例后才发现它是唯一守卫」相反；③ 本轮的真实缺口不在这里——审计按服务端 428 个 `fail` 站点反查，找到一批用户可达但零断言的出口，其中两条最值得先补（见下）。**当时记的「19 条」里剩余部分的编号没有落盘，2026-11-25 重新审计后得到 15 条，逐条列在本节末尾。**
 
 补掉的（每一条都先量出修复前的红）：
 
@@ -1466,6 +1466,32 @@ wait 的 record 批量扫描（`request_record_path_guards_or_fail "$path" || { 
 **发布门禁上线后，第一次真 tag push 就把工作流自己的一个缺陷照了出来**（这一条值得留，因为它是「表达式看起来在做判断、其实什么都没判断」的又一个实例）：`setup-node` 的 `token` 输入默认是 `github.token`，它会把该值导出为 `NODE_AUTH_TOKEN`；于是 `Publish` 步骤的 `if: env.NODE_AUTH_TOKEN != ''` 在**仓库里根本没有 npm 凭据**时也为真，`npm publish` 拿着无效凭据去 PUT，npm 回 **`E404 ... Not found`**——与「这个包不存在」完全同形，我先怀疑包名被占、再怀疑 registry，两轮之后才去读日志里被导出的那个变量。两个 tag 的两次红都是它。修法：`setup-node` 显式 `token: ${{ secrets.NPM_TOKEN }}`（不给它注入的机会），判断挪进 shell（`if [ -z "${NPM_TOKEN:-}" ]`），无 token 时打 notice + 写 job summary + 退 0，dispatch 走 `--dry-run`，否则发布。判断用 shell 而不是表达式还有一个好处：**它能在本地被测试**——本轮实测「空 token → notice + exit 0」「有 token + dispatch → dry-run + exit 0」两条。0.1.43 的 tag push 之后 `npm` 工作流转绿：`verify-pack: 30 files, bytes identical, modes identical, 34 entries`。
 
 写这套东西时被抓到的**三个自己的错误**（都记在代码注释里）：① 目的地链检查拒绝一切祖先符号链接，而 macOS 的 `/var` 与 `/tmp` 就是符号链接，于是它拒绝了自己的测试目录（改为只查叶子）；② `npm pack --json` 在 npm ≥7 答的是**以包名为键的对象**，第一版按数组读，报「读不出报告」；③ `fs.statSync` 在删除临时目录**之后**才读 tarball 大小，成功路径报 ENOENT。
+
+#### 剩余零断言缺口：15 条（2026-11-25 重新审计，落盘）
+
+第一次审计的 19 条只补了 7 条，剩下 12 条的编号只存在于当时的 agent 报告里、**没有落盘**，于是「19 条」这个数字在仓库里无法复核。本轮重新独立审计了一遍（当前树、`grep -rF` 消息原文对全部 31 个检查零命中），得到 **15** 条，列在这里以便下次不必再重推。
+
+判据是**服务端消息原文在 `smoke/` 全库零命中**，或只在**客户端本地校验**里命中（客户端先拒、服务端那条路径根本没被走到）。「有 exit/状态间接断言但消息文本未锁」的路径不在此表。
+
+| # | 触发 | 消息 | 函数 | 备注 |
+| ---: | --- | --- | --- | --- |
+| 1 | `submit --workdir rel -- true` | `working directory must be absolute` | `normalize_workdir` | 最该补；`27` 只锁了「不存在」与「尾部换行」 |
+| 2 | `submit` 不给 `-- ...` | `submit requires a command after --` | `submit` | `smoke/12:227` 命中的是 **PowerShell 客户端**本地拒绝 |
+| 3 | `submit --request-id`（缺值） | `--request-id requires a value` | `submit` | 同上，`12:231` 也是客户端 |
+| 4 | `lookup` 无参 / 两参 | `lookup requires one request id` | 主分发器 | `05:1266`、`12:168-169` 都是客户端 |
+| 5 | `submit --workdir <不存在>` 的 Windows 分支 | `working directory does not exist` | `normalize_workdir` | `27:559` 只覆盖 unix 分支 |
+| 6 | 低精度 jq 上 `wait 9007199254740992` | `task id exceeds the exact-integer range` | `validate_task_id_precision` | |
+| 7 | 低精度 jq 读 Pueue 元数据 | `Pueue task id exceeds the exact-integer range` | `validate_pueue_task_id_precision_in_file` | |
+| 8 | Pueue 写出畸形任务对象 | `Pueue returned an invalid task identity in status` | `validate_pueue_task_shape_in_file` | 被 status/logs/wait/remove 共用；`04`/`15` 只注入非零退出 |
+| 9 | Pueue 写出畸形 log 结果 | `Pueue returned an invalid task identity in logs` | `validate_pueue_log_shape_in_file` | |
+| 10 | `status --summary` 的 Pueue 瞬态失败 | `cannot summarise Pueue status for AgentQ` | `compact_status_summary` | |
+| 11 | 单任务读取时 Pueue 瞬态失败 | `cannot inspect Pueue while reading AgentQ status` | `compact_status` | |
+| 12 | `wait`/`logs` 读不出 `created_at` | `invalid creation time for AgentQ task` | `wait_for_task` / `logs` | |
+| 13 | 非规范 id 进入日志/标记路径 | `non-canonical AgentQ task id` | `task_log_path` / `cancellation_marker_path` | `02` 的 `wait abc` 走的是通用形状消息 |
+| 14 | 日志路径存在但渲染失败 | `cannot render the empty task log` | `compact_log` | |
+| 15 | 非 UTF-8 日志且 `base64` 缺失 / raw 日志不可读 | `base64 is required to return a non-UTF-8 task log` | `compact_log` | |
+
+**#1-#5 可达性最高**（普通用户用错参数即可），#6-#15 需要低精度 jq、Pueue 写出畸形 JSON、或损坏的文件系统——属「防御性路径」，是否值得为它们造注入夹具另说。本轮**不补**：每一条都要一个真 oracle（不能靠消息正则自证）加一次红证，那是下一轮的量。
 
 #### 边界（不声称的）
 
