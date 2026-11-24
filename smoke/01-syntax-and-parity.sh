@@ -4854,18 +4854,214 @@ fi
 # static rules scanned) are the same set by construction -- both derive from
 # $shell_assets.  Pin it anyway: for one day they were 9 and 7, printed side by
 # side in this summary line, and nothing compared them.
+# --- the npm copier and its verifier ------------------------------------------
+# `bin/agentq-skill.js` and `scripts/verify-pack.js` are the only JavaScript in
+# the repository, and nothing checked them: they are not shell assets (the parse
+# arm skips them), not smoke checks, and not repo entry points.  Two things are
+# worth locking, and only these two:
+#
+#   1. They PARSE.  `node --check` is the equivalent of `bash -n`, and a syntax
+#      error in a `bin` entry surfaces to the user as a stack trace from npm
+#      rather than a message.
+#   2. The copier's executable list EQUALS `skill_modes_expected_exec` above.
+#      The list exists twice because the copier is JavaScript and cannot read a
+#      shell variable; a second list is a liability, a second list that a check
+#      compares is a detection.  If they drift, `npm`-copied trees get the wrong
+#      modes and every installer-side refusal that keys on them misfires.
+#
+# No node on the host is NOT a failure: `node --check` is the only thing that
+# needs it, so the token says so and the mode comparison still runs (it is pure
+# text).  That asymmetry is deliberate -- a package nobody can parse locally is
+# still a package whose mode list must agree with the deployment unit.
+node_state='skipped(no-node)'
+node_failures=0
+if command -v node >/dev/null 2>&1 && [ "$(node -e 'process.stdout.write("ok")' 2>/dev/null || true)" = ok ]; then
+    node_checked=0
+    for node_file in "$root/bin/agentq-skill.js" "$root/scripts/verify-pack.js"; do
+        [ -f "$node_file" ] || {
+            printf 'npm FAILED (missing script): %s\n' "${node_file#"$root"/}" >&2
+            node_failures=$((node_failures + 1))
+            continue
+        }
+        node_checked=$((node_checked + 1))
+        if ! node --check "$node_file" 2>/dev/null; then
+            printf 'npm FAILED (the file does not parse; a bin entry with a syntax error reaches the user as an npm stack trace): %s\n' \
+                "${node_file#"$root"/}" >&2
+            node_failures=$((node_failures + 1))
+        fi
+    done
+    node_state="checked($node_checked)"
+    # Self-check: the detector must be able to fail.  A `node --check` whose
+    # status was swallowed reads exactly like a clean tree.
+    node_selftest=$(mktemp "${TMPDIR:-/tmp}/agentq-node-parse.XXXXXX")
+    printf 'function broken( {\n' > "$node_selftest"
+    if node --check "$node_selftest" 2>/dev/null; then
+        printf '%s\n' 'npm FAILED (node --check parsed a file with an unterminated function -- the detector itself is broken)' >&2
+        node_failures=$((node_failures + 1))
+    fi
+    rm -f "$node_selftest"
+fi
+# The copier's list vs the check's own list.  Read the JS array with the same
+# literal-quote shape it is written in, so a reformat that changes the quotes is
+# a red rather than a silent empty comparison.
+# `\,?` is a GNU extension: BSD sed needs `\{0,1\}`.  Measured 2026-11-24 --
+# the GNU spelling matched nothing here and the guard below reported an empty
+# list, which is exactly why that guard exists.
+npm_exec_js=$(sed -n "/^const EXECUTABLE = \[/,/^\];/p" "$root/bin/agentq-skill.js" 2>/dev/null |
+    sed -n "s/^  '\(skill\/[^']*\)',\{0,1\}$/\1/p" | sort)
+npm_exec_sh=$(printf '%s\n' "$skill_modes_expected_exec" | sort)
+if [ -z "$npm_exec_js" ]; then
+    printf '%s\n' 'npm FAILED (the copier''s EXECUTABLE list could not be read; the comparison below would be vacuous)' >&2
+    node_failures=$((node_failures + 1))
+elif [ "$npm_exec_js" != "$npm_exec_sh" ]; then
+    printf '%s\n' 'npm FAILED (bin/agentq-skill.js chmods a different set of files than skill_modes_expected_exec in this check; a copied tree then carries the wrong modes and the installers refuse it):' >&2
+    diff <(printf '%s\n' "$npm_exec_sh") <(printf '%s\n' "$npm_exec_js") >&2 || true
+    node_failures=$((node_failures + 1))
+fi
+if [ "$node_failures" -ne 0 ]; then
+    failures=$((failures + node_failures))
+fi
+# package.json carries a version too, and it is NOT part of the deployment
+# unit (so it is deliberately absent from the eight-record census and from
+# release.yml's tag comparison).  It still must not drift: `npm publish` names a
+# version that never changes afterwards, so a manifest left behind would publish
+# new bytes under an old version number -- the one thing npm cannot undo.
+#
+# The pair of checks is deliberate, and each covers what the other cannot:
+# this one compares the manifest with the deployment unit on any host; npm.yml
+# compares it with the pushed TAG, which only exists at publish time.
+npm_manifest_version=$(sed -n 's/^  "version": "\([^"]*\)",$/\1/p' "$root/package.json" 2>/dev/null | head -1)
+if [ -z "$npm_manifest_version" ]; then
+    printf '%s\n' 'npm FAILED (package.json records no version in the shape this check reads)' >&2
+    failures=$((failures + 1))
+elif [ "$npm_manifest_version" != "$version_summary" ]; then
+    printf 'npm FAILED (package.json says %s but the deployment unit is %s; npm cannot republish a version, so this would ship wrong bytes under an old number)\n' \
+        "$npm_manifest_version" "$version_summary" >&2
+    failures=$((failures + 1))
+fi
+npm_state="node=$node_state exec-list=checked version=$npm_manifest_version"
+
 if [ "$shell_count" -ne "$local_hazard_file_count" ]; then
     printf 'syntax-and-parity FAILED (the parse arm checked %s shell assets but the static rules scanned %s -- the two lists have drifted apart)\n' \
         "$shell_count" "$local_hazard_file_count" >&2
     failures=$((failures + 1))
 fi
 
+# --- byte hygiene: whitespace a reader cannot see ---------------------------
+# Every asset is deployed verbatim and the two canonical servers must stay
+# byte-identical, so an invisible byte here is payload, not cosmetics.  Three
+# shapes are decidable without a formatter, and each has a real failure mode:
+# a trailing blank changes what a heredoc carries and pollutes `git diff` in a
+# repository whose diffs ARE the evidence; a leading TAB is legal shell but
+# .editorconfig promises `indent_style = space` for everything outside
+# skill/assets, so the tree currently honours a promise nothing checked; and a
+# missing final newline breaks `git diff`'s contract and glues two files
+# together under `cat`.
+#
+# Measured before this rule existed: one trailing blank in agentq-server AND in
+# its twin -- a lone `# ` on line 714, i.e. exactly the byte that would have
+# silently diverged the pair had only one side been edited -- and one in
+# smoke/31.  Markdown is deliberately out of scope: two trailing spaces there
+# are a hard line break, so `.md` is not in this list.
+#
+# `shfmt` was tried and rejected as the instrument: it wants to rewrite 565
+# lines of agentq-server (`-ci`) and 2595 without, i.e. it would reformat the
+# assets under the guise of checking them, and a formatter cannot tell a
+# deliberate `;;` at column 4 from a mistake.  These three rules are the part
+# of "formatting" that is objectively wrong rather than stylistically
+# different, and they leave every other byte alone.
+format_targets=$(printf '%s\n' $shell_assets
+    find "$root/smoke" -type f -name '*.sh' | sort
+    printf '%s\n' "$root/run-tests.sh" "$root/sandbox.sh"
+    # The JavaScript this repository now carries (`bin/` = the npm copier,
+    # `scripts/` = the release-time pack verifier).  They are authored here like
+    # everything else, so the same three shapes apply; without this they would be
+    # the only hand-written source files nothing checks for invisible bytes.
+    find "$root/bin" "$root/scripts" -type f -name '*.js' 2>/dev/null | sort)
+format_scanned=0
+format_trailing=0
+format_tabs=0
+format_final=0
+for format_file in $format_targets; do
+    [ -f "$format_file" ] || continue
+    format_scanned=$((format_scanned + 1))
+    format_report=$(grep -n '[[:blank:]]$' "$format_file" 2>/dev/null || true)
+    if [ -n "$format_report" ]; then
+        while IFS= read -r format_line; do
+            [ -n "$format_line" ] || continue
+            printf 'shell FAILED (trailing blank in a file that is deployed verbatim): %s:%s\n' \
+                "${format_file#"$root"/}" "$format_line" >&2
+            format_trailing=$((format_trailing + 1))
+        done <<FORMAT_EOF
+$format_report
+FORMAT_EOF
+    fi
+    format_report=$(grep -n '^[ ]*	' "$format_file" 2>/dev/null || true)
+    if [ -n "$format_report" ]; then
+        while IFS= read -r format_line; do
+            [ -n "$format_line" ] || continue
+            printf 'shell FAILED (leading TAB: .editorconfig promises spaces outside skill/assets): %s:%s\n' \
+                "${format_file#"$root"/}" "$format_line" >&2
+            format_tabs=$((format_tabs + 1))
+        done <<FORMAT_EOF
+$format_report
+FORMAT_EOF
+    fi
+    if [ -s "$format_file" ] && [ -n "$(tail -c 1 "$format_file")" ]; then
+        printf 'shell FAILED (no final newline: the file cannot be concatenated or diffed cleanly): %s\n' \
+            "${format_file#"$root"/}" >&2
+        format_final=$((format_final + 1))
+    fi
+done
+format_hits=$((format_trailing + format_tabs + format_final))
+[ "$format_hits" -eq 0 ] || failures=$((failures + 1))
+# Blind-enumerator guard.  Measured today: 40 files.  A rule that scanned
+# nothing reports exactly the same thing as a clean tree, which is the failure
+# mode that has eaten two earlier rules in this file.
+if [ "$format_scanned" -lt 20 ]; then
+    printf 'shell FAILED (the byte-hygiene rule scanned only %s file(s); it is no longer reading the tree)\n' \
+        "$format_scanned" >&2
+    failures=$((failures + 1))
+fi
+# Self-check in both directions on one fixture, using the same three one-liners
+# the loop above uses.  A detector that fires on everything and one that fires
+# on nothing are indistinguishable from a passing run unless both directions are
+# planted.
+format_selftest=$(mktemp "${TMPDIR:-/tmp}/agentq-format.XXXXXX")
+printf '#!/bin/sh\nclean() {\n    echo clean\n}\n' > "$format_selftest"
+if [ -n "$(grep -n '[[:blank:]]$' "$format_selftest" 2>/dev/null || true)" ]; then
+    printf '%s\n' 'shell FAILED (the trailing-blank rule reports a CLEAN fixture: it matches every line)' >&2
+    failures=$((failures + 1))
+fi
+if [ -n "$(grep -n '^[ ]*	' "$format_selftest" 2>/dev/null || true)" ]; then
+    printf '%s\n' 'shell FAILED (the leading-TAB rule reports a CLEAN fixture)' >&2
+    failures=$((failures + 1))
+fi
+# Plant one defect of each shape.  `printf 'x \n'` writes the trailing blank
+# explicitly; a format string ending in a space would lose it in some shells.
+printf '#!/bin/sh\nzz_trailing() { \n\techo t\n}\nzz_no_final_newline' > "$format_selftest"
+if [ -z "$(grep -n '[[:blank:]]$' "$format_selftest" 2>/dev/null || true)" ]; then
+    printf '%s\n' 'shell FAILED (the trailing-blank rule is silent on a planted blank: the detector itself is broken)' >&2
+    failures=$((failures + 1))
+fi
+if [ -z "$(grep -n '^[ ]*	' "$format_selftest" 2>/dev/null || true)" ]; then
+    printf '%s\n' 'shell FAILED (the leading-TAB rule is silent on a planted TAB)' >&2
+    failures=$((failures + 1))
+fi
+if [ -z "$(tail -c 1 "$format_selftest")" ]; then
+    printf '%s\n' 'shell FAILED (the final-newline rule is silent on a file that has no final newline)' >&2
+    failures=$((failures + 1))
+fi
+rm -f "$format_selftest"
+format_state="trailing=$format_trailing tabs=$format_tabs no-final-newline=$format_final files=$format_scanned"
+
+
 if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s negation_captures=%s chr_ranges=%s tool_ranges=%s tr_fold=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s workflow_wiring=%s ncov_reasons=%s fail_msg_vars=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$negation_capture_count" "$chr_range_count" "$tool_range_count" "$tr_fold_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state" "$workflow_wiring_summary" "$ncov_reasons_summary" "$fail_msg_summary")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s negation_captures=%s chr_ranges=%s tool_ranges=%s tr_fold=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s workflow_wiring=%s ncov_reasons=%s fail_msg_vars=%s format=%s npm=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$negation_capture_count" "$chr_range_count" "$tool_range_count" "$tr_fold_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state" "$workflow_wiring_summary" "$ncov_reasons_summary" "$fail_msg_summary" "$format_state" "$npm_state")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
@@ -4877,7 +5073,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files negation_captures chr_ranges tool_ranges tr_fold executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census release_gate workflow_wiring ncov_reasons fail_msg_vars'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files negation_captures chr_ranges tool_ranges tr_fold executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census release_gate workflow_wiring ncov_reasons fail_msg_vars format npm'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned
