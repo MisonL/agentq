@@ -1,0 +1,97 @@
+# Publish the Skill directory to npm when a version tag is pushed.
+#
+# What this workflow can and cannot do, stated here because the distinction is
+# the whole point of the package:
+#
+#   * It publishes the 30 files under `skill/` plus `bin/agentq-skill.js`, whose
+#     only job is to COPY them somewhere.  `npx agentq-skill@<version> --dest ..`
+#     gets a user the right bytes for a version; it does NOT install AgentQ.
+#     Deployment is still: stage a platform directory on the TARGET host and run
+#     that host's installer (skill/references/install.md).
+#   * npm is not required on the target host, and no step here talks to one.
+#
+# Why a separate workflow instead of a job inside release.yml: that file's own
+# comment promises least privilege -- "no job writes to the repository or calls
+# the API" -- and publishing needs an OIDC token.  Widening the release gate's
+# permissions to cover a second concern would quietly retire that promise.
+# Here the wider permission is scoped to one job and justified below.
+name: npm
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: 'Pack and verify without publishing'
+        type: boolean
+        default: true
+
+# `contents: read` for the checkout; `id-token: write` for npm provenance, which
+# is what lets a consumer check that this tarball came from THIS commit of THIS
+# repository rather than from a laptop.  There is no NPM_TOKEN: a long-lived
+# publish token in repository secrets is a credential that outlives the person
+# who added it, and provenance is the stronger claim anyway.
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5
+        with:
+          # The pack verifier compares the tarball against `git ls-files`, so a
+          # shallow checkout is enough -- but the tag is also compared with the
+          # recorded version, and that needs the tag object.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          # The copier only uses `fs` and `crypto`; 18 is the floor declared in
+          # package.json's engines, so that is what is tested here.
+          node-version: '18'
+          registry-url: 'https://registry.npmjs.org'
+
+      # The tag must name the version every record carries.  release.yml already
+      # asserts this for its own trigger; repeating the ONE comparison here is
+      # deliberate rather than extracting a shared script: this workflow can run
+      # on workflow_dispatch (no tag), and a shared script would then need a
+      # no-tag mode whose absence would be invisible.
+      - name: Check the tag against package.json
+        if: github.event_name == 'push'
+        run: |
+          set -eu
+          tag_version=${GITHUB_REF_NAME#v}
+          manifest_version=$(node -p 'require("./package.json").version')
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $manifest_version" >&2
+            exit 1
+          fi
+          echo "package.json version $manifest_version matches tag $GITHUB_REF_NAME"
+
+      # The gate that makes publishing safe.  It packs with the same npm that
+      # will publish, unpacks the result, and compares file set, bytes, modes and
+      # the two canonical copies against the git index.  A mismatch means the
+      # tarball is not what the repository holds, and a published tarball cannot
+      # be taken back after 72 hours.
+      - name: Verify the tarball against the tree
+        run: node scripts/verify-pack.js
+
+      - name: Publish
+        if: github.event_name == 'push'
+        run: npm publish --provenance --access public --tag latest
+
+      - name: Publish (dry run)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry-run
+        run: |
+          set -eu
+          npm publish --dry-run --provenance --access public
+          echo "dry run only: nothing was published"

@@ -74,3 +74,9 @@ __pycache__/
 # None of it is the product; a worktree committed here would also nest a full
 # copy of the repo inside itself.
 .claude/
+
+# npm.  `node_modules/` appears only if someone runs `npm install` here to test
+# the packaging; the tarball is a build artifact, and publishing is verified by
+# scripts/verify-pack.js rather than by whatever happens to be lying around.
+node_modules/
+*.tgz

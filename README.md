@@ -2,7 +2,7 @@
 
 Remote task queue over SSH, backed by [Pueue](https://github.com/Nukesor/pueue) 4.0.4.
 
-**Version:** 0.1.42 — the deployment unit (`skill/assets/`, 23 files) ships as one
+**Version:** 0.1.43 — the deployment unit (`skill/assets/`, 23 files) ships as one
 version; releases are tagged in git, indexed at the top of [`CHANGELOG.md`](CHANGELOG.md),
 and verified by the [`release.yml`](.github/workflows/release.yml) tag/version gate.
 
@@ -96,6 +96,35 @@ The installer refuses to update while the queue has active or non-terminal tasks
 without `HOME` set), and anything else — including `--check`, which belongs to
 the *client* installer above — is refused with exit `2` rather than ignored. It
 used to ignore argv entirely, so `--check` performed a full, irreversible install.
+
+### npm (getting the files for a version, not installing AgentQ)
+
+`agentq-skill` on npm carries the same 30 files plus a copier:
+
+```sh
+npx agentq-skill@<version> --dest ~/.agents/skills/agentq
+npx agentq-skill@<version> --dest ~/.agents/skills/agentq --check
+```
+
+`<version>` is this release's version, `0.1.43`. (Written as a placeholder on
+purpose: a literal `<package>@<digits>` reads as an SSH `user@host` to the
+host-identifier check, which is fail-closed and stays that way.)
+
+**That is a file copy, not a deployment.** It writes on the machine you are
+sitting at and nothing else; the target host is still reached by staging a
+platform directory and running that host's installer, exactly as above. The
+command says so on its own success line so the distinction does not depend on
+reading this paragraph.
+
+Pin the version: a bare `npx agentq-skill` takes whatever is latest, and the
+deployment unit is one version across clients and server. The package needs no
+`node` on the target host — only on the machine doing the copying.
+
+Why a package at all: it is a versioned, content-addressed way to obtain the
+files, and it is what a CI job or a colleague without this repository can pin.
+It is not a substitute for any installer, and publishing is gated by
+`scripts/verify-pack.js`, which refuses a tarball whose file set, bytes, modes or
+canonical pair differ from the committed tree.
 
 ## Development
 

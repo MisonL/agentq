@@ -97,7 +97,7 @@ Each document has one job. Where two disagree, the one whose job it is wins.
 | `skill/references/` | The details behind `SKILL.md`, verbatim: `contract.md` (JSON shapes, `cancel` replay, `reason` classes), `clients.md` (client env vars, credentials, probes, Windows terminals, `sshp`), `install.md` (onboarding and installers), `windows-installer-invariants.md` (32 path-chain invariants), `doctor.md` |
 | [`README.md`](README.md) | The front door: what this is, how to install it, how to run the tests |
 | [`CLAUDE.md`](CLAUDE.md) | Development order: the entry point — what is verified, what is not, and the boundaries that are not todos |
-| [`docs/PLAN.md`](docs/PLAN.md) | **The only authoritative list of open work**; A/B entry records live in `docs/plan/` |
+| [`docs/PLAN.md`](docs/PLAN.md) | **The only authoritative list of open work**; A/B entry records live in `docs/plan/`, and the per-round execution history (up to and including round five through twelve) lives in [`docs/plan/execution-log.md`](docs/plan/execution-log.md) — that file is evidence, not a todo list |
 | [`docs/HANDOFF.md`](docs/HANDOFF.md) | Operating rules and limits |
 | [`docs/verification-status.md`](docs/verification-status.md) | What is verified and what is not: the per-check coverage table, the false-green guards, the sandbox how-to |
 | [`docs/performance.md`](docs/performance.md) | Subprocess and timing facts for `status` — read before touching a hot path |
@@ -121,6 +121,16 @@ AgentQ version rather than Pueue's. The two client constants joined on
 2026-10-21 after a one-sided client bump left every check green — the deployment
 unit is all 23 assets, so a version recorded in only some of them is not a
 version at all.
+
+`package.json` carries a version too, and it is deliberately **not** one of the
+eight: it names what `npm publish` would upload, not what gets deployed, and the
+deployment unit is `skill/assets/`. It is still pinned at both ends —
+`01`'s `npm=` arm compares the manifest with the deployment unit on any host, and
+`.github/workflows/npm.yml` compares it with the pushed tag, because npm cannot
+republish a version and a stale manifest would ship new bytes under an old
+number. Publishing is gated by `scripts/verify-pack.js`, which refuses a tarball
+whose file set (against `git ls-files`), bytes, modes or canonical pair differ
+from the tree.
 
 The record set is **derived from the tree**, never hand-listed: check `01`
 enumerates every file under `skill/assets/` that declares one of the constant

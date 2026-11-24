@@ -1,0 +1,35 @@
+{
+  "name": "agentq-skill",
+  "version": "0.1.43",
+  "description": "AgentQ: SSH + Pueue 4.0.4 remote task queue. This package carries the Skill directory (docs + the 23 deployable assets) and a copier; it is not an installer.",
+  "license": "MIT",
+  "private": false,
+  "files": [
+    "skill"
+  ],
+  "bin": {
+    "agentq-skill": "bin/agentq-skill.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MisonL/agentq.git"
+  },
+  "homepage": "https://github.com/MisonL/agentq#readme",
+  "bugs": {
+    "url": "https://github.com/MisonL/agentq/issues"
+  },
+  "keywords": [
+    "agentq",
+    "pueue",
+    "ssh",
+    "remote",
+    "task-queue",
+    "skill"
+  ],
+  "scripts": {
+    "verify:pack": "node scripts/verify-pack.js"
+  }
+}
