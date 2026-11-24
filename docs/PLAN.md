@@ -1467,33 +1467,35 @@ wait 的 record 批量扫描（`request_record_path_guards_or_fail "$path" || { 
 
 写这套东西时被抓到的**三个自己的错误**（都记在代码注释里）：① 目的地链检查拒绝一切祖先符号链接，而 macOS 的 `/var` 与 `/tmp` 就是符号链接，于是它拒绝了自己的测试目录（改为只查叶子）；② `npm pack --json` 在 npm ≥7 答的是**以包名为键的对象**，第一版按数组读，报「读不出报告」；③ `fs.statSync` 在删除临时目录**之后**才读 tarball 大小，成功路径报 ENOENT。
 
-#### 剩余零断言缺口：15 条（2026-11-25 重新审计，落盘）
+#### 剩余零断言缺口：15 条（2026-11-25 两轮独立审计合并，落盘）
 
-第一次审计的 19 条只补了 7 条，剩下 12 条的编号只存在于当时的 agent 报告里、**没有落盘**，于是「19 条」这个数字在仓库里无法复核。本轮重新独立审计了一遍（当前树、`grep -rF` 消息原文对全部 31 个检查零命中），得到 **15** 条，列在这里以便下次不必再重推。
+第一次审计的「19 条」只补了 7 条，剩余编号只存在于当时的 agent 报告里、**没有落盘**，于是那个数字在仓库里无法复核。本轮重新审计了**两遍**（两个互不知情的只读 agent，判据相同、独立取证），第二轮按复核结果把第一轮 3 条可达性最低的项移出表外，又补入 3 条被「消息子串相同」掩盖的普通用户缺口。合并后 **15 条**。
 
-判据是**服务端消息原文在 `smoke/` 全库零命中**，或只在**客户端本地校验**里命中（客户端先拒、服务端那条路径根本没被走到）。「有 exit/状态间接断言但消息文本未锁」的路径不在此表。
+判据：服务端那条 `fail` 的消息原文在 `smoke/` 全库 `grep -rF` **零命中**，或只命中**客户端本地校验**/桩脚本的模拟输出——服务端那条路径从未被执行过。「有 exit/状态间接断言但消息未锁」不在此表。
 
-| # | 触发 | 消息 | 函数 | 备注 |
+| # | 触发 | 服务端消息原文 | 函数 | 为什么零断言 |
 | ---: | --- | --- | --- | --- |
-| 1 | `submit --workdir rel -- true` | `working directory must be absolute` | `normalize_workdir` | 最该补；`27` 只锁了「不存在」与「尾部换行」 |
-| 2 | `submit` 不给 `-- ...` | `submit requires a command after --` | `submit` | `smoke/12:227` 命中的是 **PowerShell 客户端**本地拒绝 |
-| 3 | `submit --request-id`（缺值） | `--request-id requires a value` | `submit` | 同上，`12:231` 也是客户端 |
-| 4 | `lookup` 无参 / 两参 | `lookup requires one request id` | 主分发器 | `05:1266`、`12:168-169` 都是客户端 |
-| 5 | `submit --workdir <不存在>` 的 Windows 分支 | `working directory does not exist` | `normalize_workdir` | `27:559` 只覆盖 unix 分支 |
-| 6 | 低精度 jq 上 `wait 9007199254740992` | `task id exceeds the exact-integer range` | `validate_task_id_precision` | |
-| 7 | 低精度 jq 读 Pueue 元数据 | `Pueue task id exceeds the exact-integer range` | `validate_pueue_task_id_precision_in_file` | |
-| 8 | Pueue 写出畸形任务对象 | `Pueue returned an invalid task identity in status` | `validate_pueue_task_shape_in_file` | 被 status/logs/wait/remove 共用；`04`/`15` 只注入非零退出 |
-| 9 | Pueue 写出畸形 log 结果 | `Pueue returned an invalid task identity in logs` | `validate_pueue_log_shape_in_file` | |
-| 10 | `status --summary` 的 Pueue 瞬态失败 | `cannot summarise Pueue status for AgentQ` | `compact_status_summary` | |
-| 11 | 单任务读取时 Pueue 瞬态失败 | `cannot inspect Pueue while reading AgentQ status` | `compact_status` | |
-| 12 | `wait`/`logs` 读不出 `created_at` | `invalid creation time for AgentQ task` | `wait_for_task` / `logs` | |
-| 13 | 非规范 id 进入日志/标记路径 | `non-canonical AgentQ task id` | `task_log_path` / `cancellation_marker_path` | `02` 的 `wait abc` 走的是通用形状消息 |
-| 14 | 日志路径存在但渲染失败 | `cannot render the empty task log` | `compact_log` | |
-| 15 | 非 UTF-8 日志且 `base64` 缺失 / raw 日志不可读 | `base64 is required to return a non-UTF-8 task log` | `compact_log` | |
+| 1 | `submit --workdir rel -- true` | `working directory must be absolute: rel` | `normalize_workdir` | `grep` 零命中；`27:559` 只锁「不存在」、`27:593` 只锁尾部换行 |
+| 2 | `submit` 不给 `-- ...` | `submit requires a command after --` | `submit` | 唯一命中 `12:227`，那是 PowerShell 客户端在 SSH 之前的本地拒绝 |
+| 3 | `submit ... --request-id`（缺值） | `--request-id requires a value` | `submit` | 唯一命中 `12:231`，同为客户端本地拒绝 |
+| 4 | `submit --request-id <id> -- true`（无 `--workdir`） | `--workdir is required` | `submit` | 6 处命中全是客户端本地拒绝（`05:337/339/1297`、`12:225`），服务端站点从未被执行 |
+| 5 | `lookup` / `lookup <id> extra` | `lookup requires one request id` | `lookup` | `02:65` 只测 id 形状；`05:1266`、`12:168-169` 是客户端 |
+| 6 | `wait`（无参数） | `wait requires one task id` | `main` | `05:123/127` 是**桩打印**这行来模拟服务端，不是对服务端的断言 |
+| 7 | Windows：`submit --workdir C:\nope -- true` | `working directory does not exist` | `normalize_workdir` Windows 臂 | `27:559` 只驱动 unix 臂；Windows 臂未被任何检查执行 |
+| 8 | `remove --label $'x\xff' --confirm` | `label must be valid UTF-8` | `remove_tasks_by_label`（7830） | 4 处命中全是 **submit** 的 `--label must be valid UTF-8`（6771），remove 分支未走到 |
+| 9 | 低精度 jq 上 `status --task 9007199254740992` | `task id exceeds the exact-integer range of the configured jq` | `validate_task_id_precision` | `grep` 零命中；`26:1131` 的低精度夹具只驱动 marker 校验器 |
+| 10 | 低精度 jq 读 Pueue 元数据 | `Pueue task id exceeds the exact-integer range …` | `validate_pueue_task_id_precision_in_file` | `grep` 零命中；没有检查同时强制低精度 jq 与超大 Pueue id |
+| 11 | `status --summary` 的 Pueue 瞬态失败 | `cannot summarise Pueue status for AgentQ` | `compact_status_summary` | `grep` 零命中；`04`/`15` 只注入非零退出 |
+| 12 | `status` 全量的 Pueue 瞬态失败 | `cannot inspect Pueue while reading AgentQ status` | `compact_status` | `grep` 零命中；`15:199` 命中的是 lookup 的另一个 `cannot inspect Pueue` |
+| 13 | Pueue 写出畸形 task 对象 | `Pueue returned an invalid task identity in status` | `validate_pueue_task_shape_in_file` | 被 status/logs/wait/remove 共用；没有任何检查构造畸形 task |
+| 14 | Pueue 写出畸形 log 结果 | `Pueue returned an invalid task identity in logs` | `validate_pueue_log_shape_in_file` | 同上；`03` 的非 UTF-8 用例不构造畸形形状 |
+| 15 | `wait`/`logs` 读不出 `created_at` | `invalid creation time for AgentQ task` | `wait_for_task` / `logs` | `grep` 零命中；只有 jq 瞬态失败或竞态才到这条 |
 
-**#1-#5 可达性最高**（普通用户用错参数即可），#6-#15 需要低精度 jq、Pueue 写出畸形 JSON、或损坏的文件系统——属「防御性路径」，是否值得为它们造注入夹具另说。本轮**不补**：每一条都要一个真 oracle（不能靠消息正则自证）加一次红证，那是下一轮的量。
+**#1-#8 可达性最高**（普通用户用错参数即可触发），#9-#15 需要低精度 jq 或 Pueue 写出畸形 JSON。**表外仍有零断言但可达性最低的**：`non-canonical AgentQ task id`（5968/5996）、`cannot render the empty task log`（6495）、`base64 is required to return a non-UTF-8 task log`（6579）、以及一组 tombstone/recovery 分支（`cannot archive removed AgentQ request during repair`、`missing AgentQ request tombstone during wait recovery`、`AgentQ request disappeared while recovering removal`）——它们只在内部不变式、缺工具或并发窗口下可达。
 
-#### 边界（不声称的）
+**本轮不补**：每条都要一个真 oracle（不能靠消息正则自证）加一次红证，那是下一轮的量。把清单落盘才是这次缺的东西。
+
+#### 边界（不声称的）#### 边界（不声称的）
 
 - **npm 包从未发布过**：本轮只做到「能打包、门禁能拦、`npx` 本地路径实测可用」。`npm publish` 需要账号与凭据，**未执行**；`agentq-skill` 这个包名在 registry 上当前 404（看起来可用），但**404 不保证可注册**；provenance 需要公开仓库 + OIDC，本会话到 github 不通，**未验证**。
 - **格式化只覆盖「客观错误」三类字节**：缩进风格、`case` 分隔符空格、`$( )` 单行与否都没动，因为那些要么被工具要求重排部署资产、要么是刻意形状。`smoke/` 与文档的 Markdown 也没有跑任何格式化器。
