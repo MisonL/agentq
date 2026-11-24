@@ -67,7 +67,14 @@ sh skill/assets/client/unix/install-client.sh --check          # read-only drift
 Installs `agentq` and `sshp` into `~/.local/bin`. `--check` reports `0` when the
 installed clients match the canonical assets **and are executable**, `1` on drift
 (missing, different bytes, or a lost execute bit), `2` on an unsafe path — and
-never writes anything.
+never writes anything. On a host that also runs the *server*, `~/.local/bin/agentq`
+is a 60-byte wrapper and this installer refuses to write over it — use
+`--bin-dir <dir>` there.
+
+Both POSIX installers answer `--help` even when `HOME` is unset, and refuse to
+*install* without it: exit `2`, one message, nothing written. The PowerShell
+installers have no help switch at all — `-Help` fails parameter binding, so read
+the comment block at the top of each file instead.
 
 **Client** (Windows): `skill/assets/client/windows/install-client.ps1`, with the same
 `-Check` contract.
@@ -84,6 +91,11 @@ the five server assets (`agentq`, `agentq-launcher.ps1`, `agentq-start-daemon.ps
 `agentq-durable-move.ps1`, `pueue.yml`); adding `pueue-x86_64-pc-windows-msvc.exe` and
 `pueued-x86_64-pc-windows-msvc.exe` selects the same-SHA-256 offline binary path.
 The installer refuses to update while the queue has active or non-terminal tasks.
+
+`install-agentq.sh` takes **no arguments**: `--help` prints its usage (and works
+without `HOME` set), and anything else — including `--check`, which belongs to
+the *client* installer above — is refused with exit `2` rather than ignored. It
+used to ignore argv entirely, so `--check` performed a full, irreversible install.
 
 ## Development
 
@@ -169,8 +181,15 @@ proven and what is not. In particular:
   rather than assuming either way — `agentq-server` is untyped shell with no
   compiler and no type system, so "it parsed" and "it works" are different
   claims, and the table keeps them apart.
-- Real remote services, TLS/shared-key setups, and production credentials are
-  **not** verified. Do not claim otherwise.
+- **Dedicated test machines are verified; production is not.** Real remote
+  service has been exercised end to end on machines named by the user for that
+  purpose — a Linux server (install/upgrade, `status`/`submit`/`lookup`/`wait`/
+  `logs`/`remove`) and a Windows 10 client — most recently at 0.1.42, with the
+  queue surviving the upgrade. That is the whole of the claim. Production hosts,
+  production credentials, TLS/shared-key setups, cross-host concurrency and
+  behaviour under real operational interruption are **not** verified; neither is
+  a Windows *server* install, GBK hosts, or .NET 4.5.2. Do not claim otherwise —
+  `docs/verification-status.md` keeps the itemised version of this boundary.
 - `doctor` is **not** read-only: it starts the daemon if it is not running, which
   on macOS means `launchctl kickstart` and on Linux `systemctl --user start`.
 

@@ -71,6 +71,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
 
 
+2026-11-24  文档：把两条**用户会踩到但此前没写清**的安装器行为写进 `README.md` 与 `skill/references/install.md`——（1）服务端安装器 `install-agentq.sh` **不接受任何参数**，只认 `--help`，其余（含属于**客户端**安装器的 `--check`）一律退 2 而不是被忽略；（2）`$HOME` 下的 `.agentq-service.stage.*` / `.agentq-plist.stage.*` 是服务定义暂存件，由 EXIT trap 在正常结束时删除，「安装器已退出而它们还在」= 那次运行连 trap 都没跑到，可直接删，并点名它们与 `.agentq.stage.*` 事务目录**只差一个连字符、不是同一类**（正是这个前缀差异让第十二轮的残留既删不掉也没人认领）。同时把 README 的 `--bin-dir` 与无 `HOME` 行为写成实测结论。无代码变更
+  |  `env -u HOME sh install-agentq.sh --help` → exit 0、`env -u HOME sh install-client.sh --help` → exit 0，两者不带参数 → exit 2 且只打一行、沙箱目录零写入；`./run-tests.sh --quick` → exit 0（version=0.1.42）；`smoke/16` → violations=0；`smoke/31` → index=43 tags=43 entries=252
+
 2026-11-24  真机验收（用户当面点名的两台测试机；地址不入库）：Linux 服务端与 Windows 客户端从 0.1.30 升到 0.1.42，两侧同版本。安装器一次成功，pueue/pueued 走既有二进制复用（哈希与 pin 相符，未联网），升级后队列 261 个任务全部仍在且 Done——升级不丢队列。**本轮缺陷拿到现场证据**：安装成功后 `~/.agentq.*stage.*` 零命中，而修复前每次成功安装都会留下一个 staging 文件；此前 PLAN 把这条记为「抽取函数夹具、非完整安装现场」的边界，现在有真实现场了。跨主机端到端（Windows 客户端 → Linux 服务端）`status/submit/wait/logs/lookup/remove` 全通、日志正文逐字回读；本机 POSIX 客户端对同一服务端另跑一套同通。过程中确认两条既存调用姿势而非缺陷：Git Bash 直调 `agentq.ps1` 时 `--workdir /tmp` 会被 MSYS 转成 Windows 路径并被服务端正确拒（需 `MSYS_NO_PATHCONV=1` 且 `AGENTQ_SSH` 用 Windows 形态路径），以及 Windows 侧无密钥时客户端按 A16/A18 点名 `class=authentication`
   |  Linux 安装器 exit 0 后 `agentq_version='0.1.42'`、`systemctl --user is-active`=active、队列 261→261 全 Done、stage 残留 0；Windows `install-client.ps1 -Check` → `match canonical assets`、`agentq --version` → 0.1.42；两端 CLI 证据均含 `removed:true` 与回读的日志正文。清理已复核：测试任务按标签筛为 0、两条请求墓碑（仅这两个 id）已删（墓碑目录 59→57）、两台临时目录全删、`authorized_keys` 还原 2 行（一次性密钥引用 0）、Windows `known_hosts` 用 OpenSSH 自写的 `known_hosts.old` 还原到测试前的 6 行（我第一遍按主机名正则清理时删掉了一条原本就存在的主机键，已还原并记进 PLAN）、本机临时 ssh-agent 已收。仓库零改动
 
