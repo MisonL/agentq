@@ -2866,3 +2866,17 @@ A5b 随之修复并经两列双向验证——见 A5b 正文与本节 A5b 行。
 
 - 本轮仍未触碰任何真实主机；Windows 安装器侧**没有**同名形态的缺陷（其临时文件创建是单一 `New-AgentQInstallerTemporaryFile` 站点，已核对），但 `.ps1` 侧本轮**未新增**行为锁。
 - 真实安装成功路径仍不可在沙箱内跑通（要下载 pueue、写 `~/.agentq`、注册服务），因此 `stage-once` 锁证明的是**该函数被抽取真跑时的创建次数**，不是一次完整安装的现场；两者的差别只在「函数被调用前的状态」，而创建次数在函数内决定，故认为等价——这一推理本身在注释里写明，未当成实测。
+
+### 真机验收（2026-11-24，用户当面点名的两台测试机）
+
+用户在本轮点名两台测试机后执行；**地址不入库**（`smoke/16` 仍是 0 violations）。两台都从 0.1.30 升到 0.1.42，部署单元两侧同版本。
+
+- **Linux 服务端（0.1.30 → 0.1.42）**：把 7 个 unix 资产拷到临时目录，`sh ./install-agentq.sh` 一次成功（`AgentQ 0.1.42 installed at ~/.agentq`，exit 0），pueue/pueued 走**既有二进制复用**分支（哈希与 pin 相符，未联网）。验收：`agentq_version='0.1.42'`、wrapper 仍 60 字节、组服务 `is-active=active`、**队列 261 个任务全部 Done 且仍在**（升级不丢队列，实测计数前后一致）。
+  - **本轮缺陷的行为级证据**：安装成功后 `ls -d ~/.agentq.*stage.*` **零命中** —— 修复前每次成功安装都会留下一个 `.agentq-service.stage.*`。这是「抽取函数夹具」之外的**真实现场**，也就是第十二轮 PLAN 里记为边界的那一条，现在有证据了。
+- **Windows 客户端（0.1.30 → 0.1.42）**：`install-client.ps1 -SkipPathUpdate` 一次成功，`-Check` 复跑答 `match canonical assets`；`agentq --version` 答 `agentq 0.1.42`，`sshp.ps1` 与 `agentq.ps1` 同步更新。
+- **跨主机端到端**（Windows 客户端 → Linux 服务端，**两侧都是 0.1.42**）：`status --summary`、`submit`、`wait`、`logs`、`lookup`、`remove` 全部成功；日志正文逐字回读为 `from-windows-client`；本地 POSIX 客户端对同一台服务端也跑了 `submit/wait/logs/lookup/remove` 全套，日志正文 `real-host-ok`。
+- **过程中实测到两条既存行为（都不是本轮改动引起的，记录以免下次误判）**：
+  - 从 **Git Bash** 里调 `agentq.ps1` 时，`--workdir /tmp` 会被 MSYS 转成 `C:/Users/.../Temp` 再发给服务端，服务端正确拒绝（`working directory must be absolute: C:/…`，`reason=protocol_error`）。需要 `MSYS_NO_PATHCONV=1` + `AGENTQ_SSH` 用 **Windows 形态路径**（`/tmp/…` 形态会被 `AGENTQ_SSH is not an executable file` 拒，判据是 Windows 侧 `Get-Item`）。这是调用姿势，不是缺陷；`agentq.bash` 启动器已设 `MSYS_NO_PATHCONV=1`，手工直调 `agentq.ps1` 才需要自己设。
+  - Windows 侧没有到服务端的密钥/agent 时，客户端会点名 `class=authentication` 并说明 `BatchMode=yes` 不能应答密码——这是 A16/A18 那套提示，按设计工作。
+- **清理（已逐项执行并复核）**：测试任务两次 `remove`（队列里按标签筛选为 0），两条请求墓碑（`.tombstones/` 下仅这两个 id，`task_id=842`、`removed_at` 均为本轮时刻）一并删除，墓碑目录 59 → 57、两台临时目录全删、Linux 的 `authorized_keys` 用备份还原到 2 行且 `agentq-e2e-throwaway` 引用为 0、Windows 的 `known_hosts` 回到**测试前的 6 行**——这里有一次我自己的清理过头：测试用 accept-new 新增了 2 条 `.190` 主机键，我的第一遍清理按 `^172\.16\.81\.190 ` 删掉了**全部 3 条**，而其中 1 条（`ssh-ed25519`）在测试前就存在；发现方式是回看 OpenSSH 自己写的 `known_hosts.old`（正是加键前的快照：6 行、含 1 条 `.190`），用它还原后才与测试前逐行一致。**清理必须对着「测试前快照」核对，不能对着「我猜的行数」核对**——按主机名正则删更是会连带删掉用户原有的条目、本机临时 ssh-agent 已收、macOS launchd 自带的 ssh-agent（08:28 起，早于本轮）未动。仓库零改动。
+- **边界**：只验证了「测试机」这一层，13 台生产主机一台未碰；Windows 侧仍是**客户端**（该机不是服务端部署点），所以 Windows 服务端安装路径本轮没有真机证据。
