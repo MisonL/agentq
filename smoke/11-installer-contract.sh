@@ -1296,6 +1296,105 @@ else
     fi
 fi
 
+# --- the service stage is created EXACTLY ONCE per platform arm --------------
+#
+# The 0.1.41 revision of `prepare_service_stage()` added the creation-time
+# identity recording by INSERTING a block that still carried its own
+# `service_stage=$(create_installer_temporary_file ...)` line, so BOTH arms
+# created the staging file twice: the second path replaced the first in the
+# variable, and the first file stayed behind, unnamed, in `$agentq_parent` --
+# on every SUCCESSFUL install, not only on an interrupted one.  That is the
+# exact residue the same round set out to eliminate, and nothing could ever
+# remove it: no variable names it, the EXIT trap only knows the second path,
+# and the crash-leftover guard looks for `.agentq.stage.*` / `.agentq.backup.*`
+# / `.agentq.failed.*` (it is built from `agentq_base`), which does not match
+# `.agentq-service.stage.*`.  Measured 2026-11-24 while auditing the
+# round-eleven handoff: two creations and one leaked file per arm before the
+# fix, one and zero after, in both arms.
+#
+# The case drives the REAL function, extracted from the asset exactly the way
+# the plist-guard case above extracts its block, with the helpers it calls
+# stubbed.  Two assertions per arm: the creation count is exactly one, and the
+# only stage file left in the parent IS the path the function returns -- so
+# "created once" cannot be satisfied by creating twice and discarding one.
+stage_once_dir="$work/stage-once"
+mkdir -p "$stage_once_dir"
+python3 - "$installer_source" > "$stage_once_dir/run.sh" <<'PY'
+import io, sys
+src = io.open(sys.argv[1], encoding='utf-8').read()
+start = src.index('prepare_service_stage() {')
+end = src.index('\n}\n', start) + 3   # the closing brace at column 0
+sys.stdout.write('''#!/bin/sh
+set -eu
+program=agentq
+fail() { printf "%s: %s\\n" "$program" "$1" >&2; exit 2; }
+create_installer_temporary_file() {
+    created_path=$(mktemp "$1/$2.XXXXXX") || return 1
+    printf '%s\\n' "$created_path" >> "$stage_created_log"
+    printf '%s\\n' "$created_path"
+}
+installer_file_identity() { printf 'identity:%s\\n' "$(basename "$1")"; }
+require_installer_stage_file() { [ -f "$1" ] || fail "stage file missing: $1"; }
+installer_path_is_safe() { return 0; }
+plutil() { return 0; }
+resolve_macos_launch_domain() { :; }
+agentq_home="$stage_home/.agentq"
+''')
+sys.stdout.write(src[start:end])
+sys.stdout.write('''
+prepare_service_stage
+printf 'STAGE=%s\\n' "$service_stage"
+printf 'CREATED=%s\\n' "$(grep -c . "$stage_created_log" || true)"
+''')
+PY
+# The extractor must have found the function, or this case would silently test
+# an empty script (the shape smoke/22 and the plist guard above also refuse).
+if ! grep -q 'create_installer_temporary_file' "$stage_once_dir/run.sh"; then
+    printf '%s\n' 'installer stage-once case: prepare_service_stage was not extracted from the installer' >&2
+    failures=$((failures + 1))
+else
+    for stage_arm in linux macos; do
+        stage_arm_home="$stage_once_dir/home-$stage_arm"
+        rm -rf "$stage_arm_home"
+        mkdir -p "$stage_arm_home"
+        : > "$stage_once_dir/created-$stage_arm.log"
+        stage_status=0
+        HOME="$stage_arm_home" stage_home="$stage_arm_home" \
+        stage_created_log="$stage_once_dir/created-$stage_arm.log" \
+        platform_kind="$stage_arm" agentq_parent="$stage_arm_home" agentq_base=agentq \
+        asset_directory="$real_assets" macos_system_service_directory="$stage_arm_home" \
+            /bin/sh "$stage_once_dir/run.sh" \
+            >"$stage_once_dir/$stage_arm.out" 2>"$stage_once_dir/$stage_arm.err" || stage_status=$?
+        cases=$((cases + 1))
+        if [ "$stage_status" -ne 0 ]; then
+            printf 'installer stage-once (%s): the extracted function failed (exit %s)\n' \
+                "$stage_arm" "$stage_status" >&2
+            sed 's/^/      /' "$stage_once_dir/$stage_arm.err" >&2 || true
+            failures=$((failures + 1))
+            continue
+        fi
+        stage_created=$(sed -n 's/^CREATED=//p' "$stage_once_dir/$stage_arm.out")
+        stage_path=$(sed -n 's/^STAGE=//p' "$stage_once_dir/$stage_arm.out")
+        cases=$((cases + 1))
+        if [ "$stage_created" != 1 ]; then
+            printf 'installer stage-once (%s): the service stage was created %s times; the file named by $service_stage is the last one, so any earlier creation is leaked into the parent directory and nothing can remove it\n' \
+                "$stage_arm" "${stage_created:-0}" >&2
+            sed 's/^/      /' "$stage_once_dir/created-$stage_arm.log" >&2 || true
+            failures=$((failures + 1))
+        fi
+        # The leftover check is what makes the count meaningful: a fix that
+        # created two and deleted one would pass the count assertion above.
+        stage_leftovers=$(find "$stage_arm_home" -mindepth 1 -maxdepth 1 -name '.agentq*.stage.*' -print 2>/dev/null) || true
+        stage_leftover_count=$(printf '%s\n' "$stage_leftovers" | grep -c . || true)
+        cases=$((cases + 1))
+        if [ "$stage_leftover_count" != 1 ] || [ "$stage_leftovers" != "$stage_path" ]; then
+            printf 'installer stage-once (%s): expected exactly the returned stage file (%s) in the parent, found %s entr(y/ies): %s\n' \
+                "$stage_arm" "${stage_path:-<none>}" "${stage_leftover_count:-0}" "${stage_leftovers:-<none>}" >&2
+            failures=$((failures + 1))
+        fi
+    done
+fi
+
 # --- installer temporaries are not named after the pid -----------------------
 # Every temporary the installer creates used to be "${destination}.new.$$" -- a
 # pid-derived name paired with a check-then-write (require_installer_absent_path
@@ -1634,4 +1733,4 @@ if [ "$failures" -ne 0 ]; then
     printf 'installer-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'installer-contract checks passed: cases=%s sandbox-home=yes stub-path=yes download-path=covered toctou-path=covered empty-lock-recovery=covered dead-holder-recovery=covered unconfirmable-owner=covered argv-refused=covered plist-placeholder=guarded crash-leftover=covered system-service-ownership=pinned\n' "$cases"
+printf 'installer-contract checks passed: cases=%s sandbox-home=yes stub-path=yes download-path=covered toctou-path=covered empty-lock-recovery=covered dead-holder-recovery=covered unconfirmable-owner=covered argv-refused=covered plist-placeholder=guarded crash-leftover=covered system-service-ownership=pinned stage-once=asserted\n' "$cases"

@@ -4,7 +4,7 @@ set -eu
 
 program=${0##*/}
 release_version='4.0.4'
-agentq_version='0.1.41'
+agentq_version='0.1.42'
 asset_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 # HOME is required for a real install, but NOT for `--help`: answering a
 # help request must not depend on it.  Measured 2026-11-22 (Codex review P2):
@@ -1921,15 +1921,23 @@ prepare_service_stage() {
             service_destination="$HOME/.config/systemd/user/agentq-pueued.service"
             service_stage=$(create_installer_temporary_file "$agentq_parent" '.agentq-service.stage') ||
                 fail "failed to create the AgentQ service staging path in: $agentq_parent"
-# Record the identity IMMEDIATELY after creation: every step below
-# (`cp`, `chmod`, the `sed` redirect, the guards) can fail, and cleanup
-# refuses an unattributed stage file -- measured 2026-11-22 (review
-# agent B): two interrupted runs left two `.agentq-plist.stage.*` files
-# that nothing would ever remove. The identity of a file this installer
-# just created through O_EXCL can only change if something replaced it,
-# which the post-content check below catches.
-            service_stage=$(create_installer_temporary_file "$agentq_parent" '.agentq-service.stage') ||
-                fail "failed to create the AgentQ service staging path in: $agentq_parent"
+            # Record the identity IMMEDIATELY after creation: every step below
+            # (`cp`, `chmod`, the `sed` redirect, the guards) can fail, and cleanup
+            # refuses an unattributed stage file -- measured 2026-11-22 (review
+            # agent B): two interrupted runs left two `.agentq-plist.stage.*` files
+            # that nothing would ever remove. The identity of a file this installer
+            # just created through O_EXCL can only change if something replaced it,
+            # which the post-content check below catches.
+            #
+            # EXACTLY ONE creation per arm.  The 0.1.41 revision of this block
+            # called create_installer_temporary_file a SECOND time (the line above
+            # was left in place and the new block carried a copy), so every real
+            # install created two staging files and the first one -- never named
+            # by any variable -- was leaked into the AgentQ parent directory with
+            # nothing able to remove it: the very residue this block exists to
+            # prevent, now on the success path.  smoke/11 drives this function and
+            # counts the creations (measured 2026-11-24, reviewing the round-eleven
+            # handoff: 2 before the fix, 1 after, in both arms).
             service_stage_identity=$(installer_file_identity "$service_stage") ||
                 fail "failed to inspect the AgentQ service staging path: $service_stage"
             cp "$asset_directory/agentq-pueued.service" "$service_stage"
@@ -1940,15 +1948,16 @@ prepare_service_stage() {
             service_destination="$macos_system_service_directory/com.agentq.pueued.plist"
             service_stage=$(create_installer_temporary_file "$agentq_parent" '.agentq-plist.stage') ||
                 fail "failed to create the AgentQ service staging path in: $agentq_parent"
-# Record the identity IMMEDIATELY after creation: every step below
-# (`cp`, `chmod`, the `sed` redirect, the guards) can fail, and cleanup
-# refuses an unattributed stage file -- measured 2026-11-22 (review
-# agent B): two interrupted runs left two `.agentq-plist.stage.*` files
-# that nothing would ever remove. The identity of a file this installer
-# just created through O_EXCL can only change if something replaced it,
-# which the post-content check below catches.
-            service_stage=$(create_installer_temporary_file "$agentq_parent" '.agentq-plist.stage') ||
-                fail "failed to create the AgentQ service staging path in: $agentq_parent"
+            # Record the identity IMMEDIATELY after creation: every step below
+            # (`cp`, `chmod`, the `sed` redirect, the guards) can fail, and cleanup
+            # refuses an unattributed stage file -- measured 2026-11-22 (review
+            # agent B): two interrupted runs left two `.agentq-plist.stage.*` files
+            # that nothing would ever remove. The identity of a file this installer
+            # just created through O_EXCL can only change if something replaced it,
+            # which the post-content check below catches.
+            #
+            # EXACTLY ONE creation per arm -- see the linux arm above for the
+            # measured leak the 0.1.41 duplicate caused (smoke/11 counts both).
             service_stage_identity=$(installer_file_identity "$service_stage") ||
                 fail "failed to inspect the AgentQ service staging path: $service_stage"
             escaped_home=$(printf '%s' "$agentq_home" | sed 's/[\\&|]/\\&/g')

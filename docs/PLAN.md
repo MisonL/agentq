@@ -45,8 +45,8 @@ CHANGELOG 里的过程记录）都是历史，不是任务。
    Windows 客户端内嵌 wrapper、POSIX 客户端内嵌 wrapper 各自必须能独立发出同一份
    payload 协议，无法合并。漂移由 `smoke/10` 规则 E 检测（比较 token 序列而非字节），
    四类分叉实测全部被抓。**所以这一项是「已加护栏」，不是「已消除重复」。**
-2. **一半代码凭什么被相信** —— 现役口径为 **417 行 / 37,227 = 1.12%**
-   （2026-11-23 按 0.1.41 的当前字节重算分母，见第十一轮节；`docs/verification-status.md` 的覆盖表是它的逐项账本）。
+2. **一半代码凭什么被相信** —— 现役口径为 **417 行 / 37,236 = 1.12%**
+   （2026-11-24 按 0.1.42 的当前字节重算分母，见第十二轮节；`docs/verification-status.md` 的覆盖表是它的逐项账本）。
    14.2%（9 个资产 / 3,498 行）是 2026-09-24 的历史口径，**只作对照、不要再引用**；另有更大
    一片是「只有源码断言、没有行为执行」。**这一项本质未变**，只靠逐项补契约检查
    推进（A1/B4 已做 3 个）。
@@ -1687,8 +1687,8 @@ A5b 随之修复并经两列双向验证——见 A5b 正文与本节 A5b 行。
 `agentq`/`sshp`），此前只有 `01` 的 `bash -n`。剩下的 417 行里，**没有一个资产超过 294 行**，
 且其中 294 行的那个（`agentq-start-daemon.ps1`）已实测确认在 macOS 上不可**整体**执行（`smoke/22` 覆盖的守卫等除外，见上）；余下的是
 2 个 `.cmd`（8 行，`01` 已有结构断言）与声明式配置（`.plist`/`.yml`/`.service`，110 行）。
-分母已于 **2026-11-23 重算为 37,227**（`skill/assets/` 全部 23 个资产 `wc -l` 之和，实测；此前 2026-11-22 记 37,121，两轮修复的注释与代码使 +106；再早 2026-11-12 记 34,514、更早 27,821）。**分子仍是 417**：`git diff v0.1.40..HEAD -- <分子的四项资产>` 实测为空（`agentq-start-daemon.ps1`、两个 `.cmd`、两个 `.plist`、两个 `pueue.yml`、`.service`、`unix/agent`）。**分子 417 的构成**（逐项按当前字节）：`agentq-start-daemon.ps1` 294（整个资产仍不可执行，`smoke/22` 只覆盖它的两个路径守卫、`Set-AgentQUserEnvironment` 与三处拒绝站点）、2 个 `.cmd` 8（`01` 有结构断言）、2 个 `.plist` + 2 个 `pueue.yml` + 1 个 `.service` 共 110（声明式配置：`01` 做 XML/YAML/结构解析、`10` 做渲染占位符守卫）、`unix/agentq` 5（转发 shim）。**分子未变，但它的账要从两处并成一处**：2026-11-12 那 391→417 的增量全部来自 `agentq-start-daemon.ps1`，而自 0.1.38 以来的改动只发生在两份客户端、服务端与安装器里（`git diff v0.1.38..HEAD -- <分子的四项>` 实测为空），所以本轮只改分母。
-别再引用旧的 25.9%、13.8%、4.8%、1.6%、1.5%、1.4%、391、27,821、25,536、26,264、34,514、37,121 或 1.21%。
+分母已于 **2026-11-24 重算为 37,236**（`skill/assets/` 全部 23 个资产 `wc -l` 之和，实测；+9 来自第十二轮删掉两行重复创建、注释缩进扩写，此前 2026-11-23 记 37,227；此前 2026-11-22 记 37,121，两轮修复的注释与代码使 +106；再早 2026-11-12 记 34,514、更早 27,821）。**分子仍是 417**：`git diff v0.1.40..HEAD -- <分子的四项资产>` 实测为空（`agentq-start-daemon.ps1`、两个 `.cmd`、两个 `.plist`、两个 `pueue.yml`、`.service`、`unix/agent`）。**分子 417 的构成**（逐项按当前字节）：`agentq-start-daemon.ps1` 294（整个资产仍不可执行，`smoke/22` 只覆盖它的两个路径守卫、`Set-AgentQUserEnvironment` 与三处拒绝站点）、2 个 `.cmd` 8（`01` 有结构断言）、2 个 `.plist` + 2 个 `pueue.yml` + 1 个 `.service` 共 110（声明式配置：`01` 做 XML/YAML/结构解析、`10` 做渲染占位符守卫）、`unix/agentq` 5（转发 shim）。**分子未变，但它的账要从两处并成一处**：2026-11-12 那 391→417 的增量全部来自 `agentq-start-daemon.ps1`，而自 0.1.38 以来的改动只发生在两份客户端、服务端与安装器里（`git diff v0.1.38..HEAD -- <分子的四项>` 实测为空），所以本轮只改分母。
+别再引用旧的 25.9%、13.8%、4.8%、1.6%、1.5%、1.4%、391、27,821、25,536、26,264、34,514、37,121、37,227 或 1.21%。
 
 **0.1.13 修复之后的平行实现清查（2026-10-16，用户「继续」）**：0.1.13 修了 POSIX 安装器的
 不可粘贴占位符；两份安装器是平行实现，Windows 侧按同一类缺陷清查，**查实同类缺陷仍在**
@@ -2834,3 +2834,35 @@ A5b 随之修复并经两列双向验证——见 A5b 正文与本节 A5b 行。
 - 本轮未触碰任何真实主机（用户未点名）；Windows 生产、.NET 4.5.2、GBK 真机、PID 复用的内核级竞态全部是脚本模型。
 - Codex 的 sandbox P0/P1 修复针对**本机可达面**（文件层、argv 层）；OS 层 PID 复用窗口只能收窄不能消除（复核与 signal 之间仍有理论窗口）。
 - `fail_msg_vars` 静态规则看不到跨函数动态作用域读；该家族由 S16 行为锁 + 全量消息改造覆盖现状，新代码若再引入需行为锁跟进。
+
+## 第十二轮（0.1.42，2026-11-24）：交接复核——0.1.41 自己引入的 stage 残留
+
+范围：按第十一轮交接汇总逐条复核（HEAD/tag/CI/覆盖账/修复站点），**只**动复核中实测发现的新缺陷。用户未点名任何主机，本轮未触碰真实主机。版本 0.1.41 → 0.1.42。
+
+### 复核实测通过的部分（不重复记账）
+
+- `HEAD = origin/main = 75a1a45`，annotated tag `v0.1.41` → 75a1a45（`git cat-file -t` = `tag`）；工作树干净、无 stash；五个 review worktree 都是**本地分支**，与远端无关。
+- CI run 45134831509 三 job 全 success（windows/linux/macos），linux 日志行 `PASS checks: 31 ran, 1 skipped, 0 partial, 0 failed (728s)`；release run 45134844620 success（`tag v0.1.41 is an annotated tag` + 八处版本记录）。
+- 版本常量 8 处（两个安装器、服务端与孪生、README、SKILL.md frontmatter、两个客户端）**全部**是 0.1.41；孪生 `cmp` = 0；`diff -rq skill ~/.agents/skills/agentq` 无输出。
+- 覆盖账可复核：`skill/assets` 23 个资产 `wc -l` 合计 **37,227**；分子九项逐项等于 417（294 + 8 + 110 + 5）；`git diff v0.1.40..HEAD -- <分子九项>` 为空。
+- 修复站点逐条在树上核对：`${task_id-}` 恰好 **90** 处、`find_request_task` 计数失败消息报 `$task_label`、`marker_token='agentq-sandbox v1'` 且 `owns_sandbox_root` 三处读点、两份 POSIX 安装器无 HOME 时 `--help` 退 0 / 安装退 2（实测）、`sshp.ps1` 的 `[Console]::OutputEncoding` 守卫在位、`Read-PlatformProbeCache` 的 ttl/age 两行在 try 内、smoke/10 规则 L 的 sites=34 violations=0、7 个 smoke 的 `exit 130`。
+- **两侧红证复跑**：把 90 处 `$task_id` 在副本里全部退回裸形态 → `smoke/01` 的 `fail_msg_vars` 报 3 条并退 1；只把 `find_request_task` 的计数失败消息退回 v0.1.40 原文（含 `$task_id`）→ smoke/27 S16 报 4 条失败，stderr 里是 `line 4872: task_id: unbound variable` 与「记录在失败路径上被改写」，与交接汇总描述的机理逐字一致。
+- 全量套件（本机 macOS + `/tmp/aqsb` 真 pueue 沙箱）：`PASS checks: 31 ran, 0 skipped, 0 partial, 0 failed (4432s)`，`FULL-EXIT=0`。
+
+### 新缺陷（P1）：`prepare_service_stage` 每个平台臂建了**两个** staging 文件，第一个成为永久残留
+
+- **机理与实测**：0.1.41 为「创建后立刻记录身份」插入的块**自带一行** `service_stage=$(create_installer_temporary_file …)`，而原有的创建行仍在——于是两个臂都创建两次：第二次的路径覆盖变量，第一次的文件**没有任何变量指向它**，留在 `$agentq_parent` 里。这不是中断才发生的残留，而是**每一次成功安装**都在制造它，且任何清理路径都够不到：EXIT trap 只认识第二个路径，崩溃残留守卫扫的是 `.${agentq_base}.${crash_kind}.*`（= `.agentq.stage.*` / `.agentq.backup.*` / `.agentq.failed.*`），**与 `.agentq-service.stage.*` / `.agentq-plist.stage.*` 不匹配**（实测 `find -name '.agentq.stage.*'` 对这四个残留零命中）。讽刺之处：同一轮加这段代码的**理由**正是「两次中断各留一个 `.agentq-plist.stage.*` 孤儿」，而修法本身往成功路径上装了同一个孤儿。
+- **发现方式**：读 diff 时注意到插入块的第一行与上一行完全相同；随后用**抽取真函数**的夹具复现：v0.1.40 的臂创建 1 次、0.1.41 创建 2 次（两个臂都是），修后回到 1 次、父目录只剩返回的那一个。
+- **修法**：删掉两个臂里**重复的创建行**（连同挤在列 0 的注释一并缩进到块内），注释写明「EXACTLY ONE creation per arm」与这次回归的由来。不改任何语义顺序：身份仍在创建后立刻记录、内容渲染后仍**比对**而非重记。
+- **锁（smoke/11 +6 例，51 → 57）**：`stage-once` 组从资产里按锚点抽出**真实的 `prepare_service_stage`**（锚 `\n}\n` 定位函数尾；抽不到即报「function was not extracted」，不静默测空脚本），助手全部桩化后逐臂驱动，每臂两条断言：**创建次数恰为 1**、**父目录里 `.agentq*.stage.*` 恰有一个且等于函数返回的 `$service_stage`**。第二条是承重的——「建 2 个再删 1 个」能过第一条。摘要行新增 `stage-once=asserted`。
+- **双向红证**：把重复创建行按原位还原到两个臂 → 四条例全红（每臂「created 2 times」+「expected exactly the returned stage file … found 2」），并点名两个残留路径；还原后 57 例全绿。
+- **一个必须在注释里说清的邻近事实**：`stage_verified_binary` 与 `assert_existing_queue_has_no_active_tasks` 里也有同名变量多次赋值，但那些是**互斥分支**（`artifact_source_directory` 有/无、离线 gzip 分支）或**已丢弃后重建**，逐个核实过不是同一形态；判定不是「同名赋值多于一次即违规」而是「同一臂内连续创建且前一实例无名字」。
+
+### 覆盖账更新
+
+分母 **37,227 → 37,236**（+9：删掉 2 行重复创建、注释缩进并扩写）。分子**仍是 417**——本轮只改 `install-agentq.sh` 与 `smoke/11`，九项分子资产 `git diff v0.1.41..HEAD` 实测为空。比例 417/37,236 = **1.12%**。
+
+### 记为边界
+
+- 本轮仍未触碰任何真实主机；Windows 安装器侧**没有**同名形态的缺陷（其临时文件创建是单一 `New-AgentQInstallerTemporaryFile` 站点，已核对），但 `.ps1` 侧本轮**未新增**行为锁。
+- 真实安装成功路径仍不可在沙箱内跑通（要下载 pueue、写 `~/.agentq`、注册服务），因此 `stage-once` 锁证明的是**该函数被抽取真跑时的创建次数**，不是一次完整安装的现场；两者的差别只在「函数被调用前的状态」，而创建次数在函数内决定，故认为等价——这一推理本身在注释里写明，未当成实测。
