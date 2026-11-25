@@ -1467,35 +1467,70 @@ wait 的 record 批量扫描（`request_record_path_guards_or_fail "$path" || { 
 
 写这套东西时被抓到的**三个自己的错误**（都记在代码注释里）：① 目的地链检查拒绝一切祖先符号链接，而 macOS 的 `/var` 与 `/tmp` 就是符号链接，于是它拒绝了自己的测试目录（改为只查叶子）；② `npm pack --json` 在 npm ≥7 答的是**以包名为键的对象**，第一版按数组读，报「读不出报告」；③ `fs.statSync` 在删除临时目录**之后**才读 tarball 大小，成功路径报 ENOENT。
 
-#### 剩余零断言缺口：15 条（2026-11-25 两轮独立审计合并，落盘）
+#### 剩余零断言缺口：15 条 → **全部关闭**（2026-11-25）
 
-第一次审计的「19 条」只补了 7 条，剩余编号只存在于当时的 agent 报告里、**没有落盘**，于是那个数字在仓库里无法复核。本轮重新审计了**两遍**（两个互不知情的只读 agent，判据相同、独立取证），第二轮按复核结果把第一轮 3 条可达性最低的项移出表外，又补入 3 条被「消息子串相同」掩盖的普通用户缺口。合并后 **15 条**。
+第一次审计的「19 条」只补了 7 条，剩余编号没有落盘；两轮独立重审得到 15 条并写进本文件（上一版）。**本轮把这 15 条逐条实现**，过程中抓到**两个真缺陷**，所以 0.1.44 不只是补测试。
 
-判据：服务端那条 `fail` 的消息原文在 `smoke/` 全库 `grep -rF` **零命中**，或只命中**客户端本地校验**/桩脚本的模拟输出——服务端那条路径从未被执行过。「有 exit/状态间接断言但消息未锁」不在此表。
+落地分布：
 
-| # | 触发 | 服务端消息原文 | 函数 | 为什么零断言 |
-| ---: | --- | --- | --- | --- |
-| 1 | `submit --workdir rel -- true` | `working directory must be absolute: rel` | `normalize_workdir` | `grep` 零命中；`27:559` 只锁「不存在」、`27:593` 只锁尾部换行 |
-| 2 | `submit` 不给 `-- ...` | `submit requires a command after --` | `submit` | 唯一命中 `12:227`，那是 PowerShell 客户端在 SSH 之前的本地拒绝 |
-| 3 | `submit ... --request-id`（缺值） | `--request-id requires a value` | `submit` | 唯一命中 `12:231`，同为客户端本地拒绝 |
-| 4 | `submit --request-id <id> -- true`（无 `--workdir`） | `--workdir is required` | `submit` | 6 处命中全是客户端本地拒绝（`05:337/339/1297`、`12:225`），服务端站点从未被执行 |
-| 5 | `lookup` / `lookup <id> extra` | `lookup requires one request id` | `lookup` | `02:65` 只测 id 形状；`05:1266`、`12:168-169` 是客户端 |
-| 6 | `wait`（无参数） | `wait requires one task id` | `main` | `05:123/127` 是**桩打印**这行来模拟服务端，不是对服务端的断言 |
-| 7 | Windows：`submit --workdir C:\nope -- true` | `working directory does not exist` | `normalize_workdir` Windows 臂 | `27:559` 只驱动 unix 臂；Windows 臂未被任何检查执行 |
-| 8 | `remove --label $'x\xff' --confirm` | `label must be valid UTF-8` | `remove_tasks_by_label`（7830） | 4 处命中全是 **submit** 的 `--label must be valid UTF-8`（6771），remove 分支未走到 |
-| 9 | 低精度 jq 上 `status --task 9007199254740992` | `task id exceeds the exact-integer range of the configured jq` | `validate_task_id_precision` | `grep` 零命中；`26:1131` 的低精度夹具只驱动 marker 校验器 |
-| 10 | 低精度 jq 读 Pueue 元数据 | `Pueue task id exceeds the exact-integer range …` | `validate_pueue_task_id_precision_in_file` | `grep` 零命中；没有检查同时强制低精度 jq 与超大 Pueue id |
-| 11 | `status --summary` 的 Pueue 瞬态失败 | `cannot summarise Pueue status for AgentQ` | `compact_status_summary` | `grep` 零命中；`04`/`15` 只注入非零退出 |
-| 12 | `status` 全量的 Pueue 瞬态失败 | `cannot inspect Pueue while reading AgentQ status` | `compact_status` | `grep` 零命中；`15:199` 命中的是 lookup 的另一个 `cannot inspect Pueue` |
-| 13 | Pueue 写出畸形 task 对象 | `Pueue returned an invalid task identity in status` | `validate_pueue_task_shape_in_file` | 被 status/logs/wait/remove 共用；没有任何检查构造畸形 task |
-| 14 | Pueue 写出畸形 log 结果 | `Pueue returned an invalid task identity in logs` | `validate_pueue_log_shape_in_file` | 同上；`03` 的非 UTF-8 用例不构造畸形形状 |
-| 15 | `wait`/`logs` 读不出 `created_at` | `invalid creation time for AgentQ task` | `wait_for_task` / `logs` | `grep` 零命中；只有 jq 瞬态失败或竞态才到这条 |
+| 原 # | 出口 | 落地 | 用例数 |
+| ---: | --- | --- | --- |
+| 1 | `working directory must be absolute` | `smoke/02` | 1 |
+| 2 | `submit requires a command after --` | `smoke/02` | 1 |
+| 3 | `--request-id requires a value` | `smoke/02` | 1 |
+| 4 | `--workdir is required` | `smoke/02` | 1 |
+| 5 | `lookup requires one request id`（零参/两参） | `smoke/02` | 2 |
+| 6 | `wait requires one task id`（零参） | `smoke/02` | 1 |
+| 7 | `working directory does not exist`（**Windows 臂**） | `smoke/02` 抽函数驱动 | 3 |
+| 8 | `label must be valid UTF-8`（`remove --label`） | `smoke/02` | 1 |
+| 9 | `task id exceeds the exact-integer range`（argv） | `smoke/32` 低精度副本 | 2 |
+| 10 | `Pueue task id exceeds the exact-integer range`（Pueue JSON） | `smoke/32` | 2 |
+| 11 | `cannot summarise Pueue status for AgentQ` | `smoke/32` | 1 |
+| 12 | `cannot inspect Pueue while reading AgentQ status` | `smoke/32` | 1 |
+| 13 | `Pueue returned an invalid task identity in status` | `smoke/32`（4 个调用方） | 5 |
+| 14 | `Pueue returned an invalid task identity in logs` | `smoke/32` | 1 |
+| 15 | `invalid creation time for AgentQ task` | `smoke/32`（改成走 Pueue 畸形答案） | 3 |
 
-**#1-#8 可达性最高**（普通用户用错参数即可触发），#9-#15 需要低精度 jq 或 Pueue 写出畸形 JSON。**表外仍有零断言但可达性最低的**：`non-canonical AgentQ task id`（5968/5996）、`cannot render the empty task log`（6495）、`base64 is required to return a non-UTF-8 task log`（6579）、以及一组 tombstone/recovery 分支（`cannot archive removed AgentQ request during repair`、`missing AgentQ request tombstone during wait recovery`、`AgentQ request disappeared while recovering removal`）——它们只在内部不变式、缺工具或并发窗口下可达。
+表里的「用例数」是**代表例**，不是该出口的全部断言：unix 臂的 `must be absolute` 与
+`does not exist` 各有**两条**（整程序一次 + 抽函数一次），Windows 臂三条是
+「拒绝×2 + 接受×1」。
 
-**本轮不补**：每条都要一个真 oracle（不能靠消息正则自证）加一次红证，那是下一轮的量。把清单落盘才是这次缺的东西。
+新增合计：`smoke/02` cases 51 → **66**（+15 = argv 面 9 条 + `normalize_workdir` 两臂 6 条），
+`smoke/32` 新建 **26** 例。
 
-#### 边界（不声称的）#### 边界（不声称的）
+**同时补掉表外那几条低可达项**：非规范持久化 marker 文件名、损坏的 marker 内容、损坏的 request record、损坏的 tombstone，各有用例，并各自带「文件移除后同一命令必须成功」的对照（一个「永远拒绝」的服务端能通过拒绝用例）。
+
+**两个真缺陷（由这些用例逼出，不是补测试的副产品）**：
+
+1. **`wait` 把「读不懂」说成「你参数错了」。** `compact_task` 的返回码里只有 4 表示「Pueue 答了、这个 id 不可见」；1（读失败）、2/5（形状不可解）都表示**不知道**。`wait` 把它们全折进 `wait_reconcile_missing_task`，最终打印 `unknown AgentQ task id` —— 而 `logs`/`status --task`/`remove`/`cancel` 早就用 `report_compact_task_failure` 分开了。实测（本机 pueue 4.0.4，任务 `created_at` 非字符串）：`wait 1` → exit 2 + `unknown AgentQ task id: 1`。现在按 4 / 非 4 分开。
+2. **六处 jq 校验器的原始诊断泄漏到 stderr。** `jq` 在本仓经常是**校验器**：它 `error(...)` 退出 5，调用方随即打印受控消息。但 jq 自己的 `jq: error (at <stdin>:1): invalid visible Pueue task metadata` / `jq: parse error: ...` 会**排在 `reason=` 之前**落到 stderr，而两份客户端正是扫描这个流去找 `reason=`。实测：损坏的 record/marker/tombstone 各打印一行 `jq: parse error`。六处（Pueue task 形状、Pueue log 形状、summary 聚合、log 聚合、marker 聚合、单 marker、record、tombstone）全部改为 `2>/dev/null`，受控消息保留。
+
+**我自己被规则抓了一次**：第一版 `wait` 修法写成 `if ! task=$(compact_task ...); then st=$?`，`$?` 取的是**取反结果**的 0（`smoke/01` 的 `negation_captures` 规则当场报红）。改成 `task=$(...) || st=$?` 的显式捕获形态——这条规则这轮第一次真的挡住了一个人写的缺陷。
+
+**边界**：`smoke/32` 需要真 pueue 运行时（`AGENTQ_SMOKE_HOME`），CI 的 linux job 有，本地没有时整条 SKIP 并如实打印。低精度 jq 分支靠**给副本打补丁**进入（本机 jq 1.7 保留全部数字），补丁点断言恰好一处，函数改名会让检查失败而不是静默。
+
+#### 本轮留下的一个新缺陷（已定位、未修）：管道里的 `fail` 折成 exit 1
+
+`32-hostile-pueue` 在写「非规范 marker 文件名」用例时撞到的：`load_cancellation_markers`
+的循环体在 `{ ... } | jq ...` 的管道左端，`fail` 的 `exit 2` **只结束那个子 shell**，
+管道状态变成非零，调用方 `prepare_request_metadata_files` 把它折成 `return 1`，
+于是 stderr 上是**一行 `reason=protocol_error` 配 exit 1**——码与类别自相矛盾，
+而 exit 1 在契约里只是「一般失败」，调用方会当成可重试。
+
+实测（本机 pueue 4.0.4）：marker 文件名为 `0001.json`（非规范）或内容为 `not json`
+时，`status` 退 **1**；同一棵树上 `logs 1` 因为自己的读取路径先拦住而退 **2**。
+同一处损坏，两个命令给两个码。
+
+**修法方向**（下一轮，未做）：管道左端不能承重 `fail`——要么把校验移进管道的 `jq`
+（让它 `error(...)`，状态由调用方统一分类），要么先写临时文件再 `jq < file`，让
+`fail` 落在**当前** shell。这不是孤例：`smoke/01` 的 `return2-sites` 审计
+（`reason-gaps=0`）覆盖「每条 exit 2 都带 reason」，**不覆盖**「冒了 reason 却没退 2」。
+要不要加这条规则，下一轮定。
+
+用例现在只钉住「拒绝对了、点名对了、jq 噪声没有」，**不把 1 当正确**——把错误的码
+写进断言，等于把它变成契约。
+
+#### 边界（不声称的）
 
 - **npm 包从未发布过**：本轮只做到「能打包、门禁能拦、`npx` 本地路径实测可用」。`npm publish` 需要账号与凭据，**未执行**；`agentq-skill` 这个包名在 registry 上当前 404（看起来可用），但**404 不保证可注册**；provenance 需要公开仓库 + OIDC，本会话到 github 不通，**未验证**。
 - **格式化只覆盖「客观错误」三类字节**：缩进风格、`case` 分隔符空格、`$( )` 单行与否都没动，因为那些要么被工具要求重排部署资产、要么是刻意形状。`smoke/` 与文档的 Markdown 也没有跑任何格式化器。

@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.43'
+agentq_version='0.1.44'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -2958,7 +2958,7 @@ load_cancellation_markers() {
             fi
             printf '%s\n' "$marker"
         done
-    } | jq -cse '
+    } | jq -cse 2>/dev/null '
         def valid_task_id:
             if type != "number" then
                 false
@@ -3229,7 +3229,12 @@ request_tombstone_is_valid() {
         tracked_path_vanished "$tombstone_path" && return 1
         fail "invalid AgentQ request tombstone: $tombstone_path"
     fi
-    jq -ce --arg request_id "$request_id" "$request_tombstone_filter" <<<"$tombstone_body" ||
+    # `2>/dev/null`: jq validates the body here, so its parse diagnostic is the
+    # raw probe text the controlled message below replaces.  Measured
+    # 2026-11-25: a tombstone containing `not json` printed
+    # `jq: parse error: ...` on stderr ahead of the refusal, and the clients
+    # scan that stream for `reason=`.
+    jq -ce 2>/dev/null --arg request_id "$request_id" "$request_tombstone_filter" <<<"$tombstone_body" ||
         fail "invalid AgentQ request tombstone: $tombstone_path"
 }
 
@@ -3448,7 +3453,7 @@ load_request_records() {
         }
         printf '%s\n' "$record"
         done
-    } | jq -cse --args "$request_records_filter" -- "${record_ids[@]}"
+    } | jq -cse 2>/dev/null --args "$request_records_filter" -- "${record_ids[@]}"
 }
 
 release_request_metadata_files() {
@@ -3665,7 +3670,8 @@ read_request_record() {
         tracked_path_vanished "$record_path" && return 1
         fail "invalid AgentQ request record: $record_path"
     fi
-    jq -ce --arg request_id "$request_id" "$request_record_filter" <<<"$record_body" ||
+    # Same reason as the tombstone reader above (measured 2026-11-25).
+    jq -ce 2>/dev/null --arg request_id "$request_id" "$request_record_filter" <<<"$record_body" ||
         fail "invalid AgentQ request record: $record_path"
 }
 
@@ -5449,7 +5455,7 @@ compact_status() {
         require_runtime_temporary_file "$raw_status_file" &&
         validate_pueue_task_shape_in_file "$raw_status_file" &&
         require_runtime_temporary_file "$raw_status_file" &&
-        jq -c --arg group "$group_name" \
+        jq -c 2>/dev/null --arg group "$group_name" \
         --slurpfile markers "$cancellation_markers_jq_file" \
         --slurpfile requests "$request_records_jq_file" "
         $compact_filter
@@ -5518,7 +5524,7 @@ raw_compact_task() {
     require_runtime_temporary_file "$raw_status_file"
     validate_pueue_task_shape_in_file "$raw_status_file"
     require_runtime_temporary_file "$raw_status_file"
-    jq -ce --arg id "$task_id" --arg group "$group_name" "
+    jq -ce 2>/dev/null --arg id "$task_id" --arg group "$group_name" "
         $compact_filter
         .tasks[\$id]
         | select(.group == \$group)
@@ -5555,7 +5561,7 @@ compact_task() {
         require_runtime_temporary_file "$raw_task_file" &&
         require_runtime_temporary_file "$raw_task_file" &&
         raw_compact_task "$task_id" > "$raw_task_file" &&
-        require_runtime_temporary_file "$raw_task_file" && jq -ce \
+        require_runtime_temporary_file "$raw_task_file" && jq -ce 2>/dev/null \
         --slurpfile markers "$cancellation_markers_jq_file" \
         --slurpfile requests "$request_records_jq_file" "
         $compact_filter
@@ -6031,7 +6037,13 @@ cancellation_marker_is_valid() {
         tracked_path_vanished "$marker_path" && return 1
         fail "invalid AgentQ cancellation marker path: $marker_path"
     fi
-    jq -ce --arg task_id "$task_id" '
+    # `2>/dev/null`: jq is the VALIDATOR here, so its parse diagnostic is the
+    # raw probe text the caller's controlled message replaces.  The clients scan
+    # the remote stderr for `reason=`, and a `jq: parse error` line above it is
+    # the leak this repository has closed at five other sites.  Measured
+    # 2026-11-25: a marker file containing `not json` printed that line before
+    # `invalid AgentQ cancellation marker`.
+    jq -ce 2>/dev/null --arg task_id "$task_id" '
         def valid_task_id:
             if type != "number" then
                 false
@@ -6214,9 +6226,16 @@ wait_for_task() {
     local task_created_at
     local wait_status=0
     local reconcile_status=0
+    local wait_missing_status=0
 
     validate_task_id_precision "$task_id"
     ensure_daemon
+    # 4 means Pueue ANSWERED and this id is not visible -> reconcile below.
+    # 1/2/5 mean the answer could not be understood; folding those into the
+    # same branch reported "unknown AgentQ task id" and sent the caller to
+    # check its arguments (measured 2026-11-25 with a task whose created_at
+    # was not a string: exit 2, "unknown AgentQ task id: 1", plus a raw
+    # `jq: error` line on stderr).
     if task=$(compact_task "$task_id"); then
         task_created_at=$(jq -er '.created_at | strings' <<<"$task") || fail "invalid creation time for AgentQ task: ${task_id-}"
         if ! task_identity_is_unambiguous "$task"; then
@@ -6225,6 +6244,10 @@ wait_for_task() {
             return 6
         fi
     else
+        wait_missing_status=$?
+        if [ "$wait_missing_status" -ne 4 ]; then
+            report_compact_task_failure "$wait_missing_status" "$task_id"
+        fi
         if wait_reconcile_missing_task "$task_id"; then
             reconcile_status=0
         else
@@ -6251,7 +6274,17 @@ wait_for_task() {
         wait_status=$?
     fi
 
-    if ! task=$(compact_task "$task_id"); then
+    # `|| { ... }`, NOT `if ! task=$(...)`: inside a negated condition `$?` is
+    # the NEGATION's status, which is 0 whenever the branch runs.  That is the
+    # trap `smoke/01`'s negation_captures rule exists for, and my first version
+    # of this fix walked straight into it -- the rule caught it here, on the
+    # tree, before any test ran.
+    task=$(compact_task "$task_id") || wait_missing_status=$?
+    if [ "$wait_missing_status" -ne 0 ]; then
+        if [ "$wait_missing_status" -ne 4 ]; then
+            report_compact_task_failure "$wait_missing_status" "$task_id"
+        fi
+        wait_missing_status=0
         if wait_reconcile_missing_task "$task_id" true; then
             reconcile_status=0
         else
@@ -6657,7 +6690,7 @@ compact_log() {
         return "$command_status"
     fi
     require_runtime_temporary_file "$compact_log_raw_file"
-    if jq -ce --arg id "$task_id" \
+    if jq -ce 2>/dev/null --arg id "$task_id" \
         --slurpfile markers "$cancellation_markers_jq_file" \
         --slurpfile requests "$request_records_jq_file" "
         $compact_filter

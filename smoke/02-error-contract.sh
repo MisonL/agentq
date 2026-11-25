@@ -87,6 +87,43 @@ expect_rejected submit-label-no-value '--label requires a value' protocol_error 
 expect_rejected submit-unknown-option 'unknown submit option: --bogus' protocol_error submit --workdir "$work" --request-id smoke-argv-0001 --bogus -- true
 expect_rejected logs-tail-extra-arg 'logs accepts only --tail <line-count|all>' protocol_error logs 1 --tail 5 extra
 expect_rejected logs-tail-misspelled 'logs accepts only --tail <line-count|all>' protocol_error logs 1 --taill 5
+# The rest of the same surface: every one of these is a `fail` the server can
+# reach from argv alone, and every one of them was asserted ONLY against a
+# client's local rejection or a stub's imitation of the server (measured
+# 2026-11-25: `--workdir is required` has six hits under smoke/ and all six are
+# a client refusing the argv before ssh; `wait requires one task id` has three
+# and all three are the stub PRINTING that line).  A message that appears in a
+# fixture proves the fixture runs, not that the server does.
+#
+# The request id below is 16 characters, unlike the `smoke-argv-0001` above, and
+# that is load-bearing: the server validates the id's SHAPE before it normalizes
+# the workdir, so a 15-character id makes `submit --workdir rel` answer
+# `--request-id must be 16-128 ...` instead of the workdir complaint.  Measured
+# 2026-11-25 while writing these rows.  The ordering is part of the contract
+# being pinned: an argv error that reports a DIFFERENT argv error sends the
+# operator off to fix the wrong argument.
+submit_id_ok=smoke-argv-00001
+expect_rejected submit-workdir-relative 'working directory must be absolute: rel' protocol_error \
+    submit --workdir rel --request-id "$submit_id_ok" -- true
+expect_rejected submit-workdir-missing 'working directory does not exist' protocol_error \
+    submit --workdir "$work/no-such-directory" --request-id "$submit_id_ok" -- true
+expect_rejected submit-no-command 'submit requires a command after --' protocol_error \
+    submit --workdir "$work" --request-id "$submit_id_ok"
+expect_rejected submit-request-id-no-value '--request-id requires a value' protocol_error \
+    submit --workdir "$work" --request-id
+expect_rejected submit-no-workdir '--workdir is required' protocol_error \
+    submit --request-id "$submit_id_ok" -- true
+expect_rejected lookup-no-id 'lookup requires one request id' protocol_error lookup
+expect_rejected lookup-two-ids 'lookup requires one request id' protocol_error lookup aaa bbb
+expect_rejected wait-no-id 'wait requires one task id' protocol_error wait
+# The batch removal's label goes through the same UTF-8 predicate as submit's,
+# but it is a DIFFERENT `fail` with a different string (no leading `--`), and
+# the four `label must be valid UTF-8` hits under smoke/ are all submit's.  A
+# label that jq rewrites to U+FFFD would match tasks whose stored label was
+# rewritten the same way -- measured 2026-11-20: one such removal deleted two
+# tasks belonging to two different labels.
+expect_rejected remove-label-non-utf8 'label must be valid UTF-8' protocol_error \
+    remove --label "$(printf 'smoke\377')" --confirm
 # `--tail` gets an UPPER BOUND at the server as well (2026-11-19).  Both clients
 # accept any number of digits, and without the bound the value reached BSD
 # `tail -n` ("illegal offset"), failed as a Pueue log READ, and answered exit 1
@@ -1145,6 +1182,125 @@ if grep -qE '^jq: ' "$work/jq-leak.stderr"; then
     printf 'jq-stderr-leak: a raw jq diagnostic reached the server stderr: %s\n' \
         "$(grep -E '^jq: ' "$work/jq-leak.stderr" | head -1)" >&2
     failures=$((failures + 1))
+fi
+
+# --- the WINDOWS arm of normalize_workdir ---------------------------------------
+# The unix arm of `working directory must be absolute` / `... does not exist` is
+# reachable by asking this server (the rows above do it).  The WINDOWS arm is a
+# different `case` branch thirty lines further down, and reaching it through the
+# whole program needs `uname -s` AND `cygpath` AND `powershell.exe` AND MSYSTEM
+# AND the two launcher binaries AND a v2 layout marker -- all before the argv
+# under test is even looked at.  smoke/02's sibling cases do drive that far for
+# `doctor`, but for a submit-path check the setup would dwarf the assertion.
+#
+# So this case extracts normalize_workdir VERBATIM from the asset (the way
+# smoke/11 drives prepare_service_stage and smoke/22 drives PowerShell
+# functions) and calls it with platform_kind set.  It is the real function body,
+# not a copy: change either arm and this fails.  Only cygpath is stubbed, with
+# the two shapes the function uses -- `-u` (windows -> POSIX) and `-aw` (POSIX
+# -> windows).
+# python3 is a real dependency of this block: the extraction below is what makes
+# the case test the asset's OWN function instead of a copy.  Probe that it RUNS,
+# not just that it is on PATH -- a Microsoft Store alias answers `command -v`
+# and then exits 49 with no output, which reads as a contract failure instead of
+# an environment fault (smoke/01's python3 census enforces this shape).
+if ! python3 -c 'import sys' >/dev/null 2>&1; then
+    printf '%s\n' 'normalize-workdir: python3 cannot execute, so the extraction cannot be trusted' >&2
+    failures=$((failures + 1))
+fi
+norm_fn="$work/normalize-workdir.sh"
+# From `$server`, the COPY under test -- not from `$root`.  Measured while
+# writing this: pointing the extractor at the repository asset made the case
+# blind to AGENTQ_SMOKE_SERVER, so both arms' mutants passed.
+python3 - "$server" > "$norm_fn" <<'PY'
+import io, sys
+src = io.open(sys.argv[1], encoding='utf-8').read()
+start = src.index('normalize_workdir() {')
+end = src.index('\n}\n', start) + 3
+sys.stdout.write(src[start:end])
+PY
+# A silent extractor would make every assertion below vacuous: an empty file
+# sources cleanly, so the driver would fail for an unrelated reason.
+if ! grep -q 'working directory must be absolute' "$norm_fn" ||
+    ! grep -q 'cygpath -u' "$norm_fn"; then
+    printf '%s\n' 'normalize-workdir: the function was not extracted from the asset; the case below would prove nothing' >&2
+    failures=$((failures + 1))
+else
+    norm_bin="$work/normalize-bin"
+    mkdir -p "$norm_bin"
+    cat > "$norm_bin/cygpath" <<'CYG'
+#!/bin/sh
+case "$1" in
+  -u) case "$2" in [Cc]:*) printf '/c%s\n' "${2#?:}" ;; *) printf '%s\n' "$2" ;; esac ;;
+  -aw) printf '%s\n' "$2" ;;
+  *) printf '%s\n' "${2:-$1}" ;;
+esac
+CYG
+    chmod 700 "$norm_bin/cygpath"
+    # Driven by BASH, not `sh`: normalize_workdir is bash (the asset's shebang
+    # is `#!/usr/bin/env bash`) and uses `$'\n'` in the sentinel strip.  Under
+    # dash -- /bin/sh on Debian and Ubuntu -- `$'\n'` is the literal four
+    # characters, so the trailing newline of `pwd` is NOT stripped and the
+    # success path emits one extra byte.  Measured here: `dash drive` gives
+    # `/private/tmp\n\n`, `bash drive` gives `/private/tmp\n`.  Both satisfy a
+    # "printed something" assertion, so sh would have hidden the difference
+    # until the day a case compared the path exactly.
+    cat > "$work/normalize-drive.sh" <<'DRIVE'
+#!/usr/bin/env bash
+platform_kind=$1
+fail() { printf 'FAIL: %s\n' "$1" >&2; exit 2; }
+. "$2"
+shift 2
+normalize_workdir "$@"
+DRIVE
+    chmod 700 "$work/normalize-drive.sh"
+
+    # normalize_case <label> <arm> <expected-message-or-empty> <path>
+    #
+    # An empty expected message means "must succeed and print the path".
+    normalize_case() {
+        local label=$1 arm=$2 expected=$3 candidate=$4
+        local state=0
+        cases=$((cases + 1))
+        if [ "$arm" = windows ]; then
+            PATH="$norm_bin:$PATH" bash "$work/normalize-drive.sh" windows "$norm_fn" "$candidate" \
+                >"$work/norm-$label.out" 2>"$work/norm-$label.err" || state=$?
+        else
+            bash "$work/normalize-drive.sh" unix "$norm_fn" "$candidate" \
+                >"$work/norm-$label.out" 2>"$work/norm-$label.err" || state=$?
+        fi
+        if [ -n "$expected" ]; then
+            if [ "$state" -ne 2 ]; then
+                printf 'normalize-workdir [%s/%s]: expected the refusal exit 2, got %s\n' \
+                    "$arm" "$label" "$state" >&2
+                failures=$((failures + 1))
+            elif ! grep -qF -- "$expected" "$work/norm-$label.err"; then
+                printf 'normalize-workdir [%s/%s]: stderr does not contain %s\n' \
+                    "$arm" "$label" "$expected" >&2
+                head -2 "$work/norm-$label.err" >&2 || true
+                failures=$((failures + 1))
+            fi
+        else
+            if [ "$state" -ne 0 ]; then
+                printf 'normalize-workdir [%s/%s]: a valid directory was refused (exit %s): %s\n' \
+                    "$arm" "$label" "$state" "$(head -2 "$work/norm-$label.err" | tr '\n' '|')" >&2
+                failures=$((failures + 1))
+            elif [ ! -s "$work/norm-$label.out" ]; then
+                printf 'normalize-workdir [%s/%s]: accepted a valid directory but printed nothing\n' \
+                    "$arm" "$label" >&2
+                failures=$((failures + 1))
+            fi
+        fi
+    }
+    # Both arms, both refusals, plus an acceptance on each: an arm that refuses
+    # EVERYTHING passes the two refusals, so the accept case is what makes them
+    # mean anything.
+    normalize_case relative unix 'working directory must be absolute' relative/path
+    normalize_case absent unix 'working directory does not exist' "$work/normalize-not-here"
+    normalize_case valid unix '' "$work"
+    normalize_case relwin windows 'working directory must be absolute' 'relative\path'
+    normalize_case absentwin windows 'working directory does not exist' 'C:\definitely-not-here'
+    normalize_case validwin windows '' "$work"
 fi
 
 if [ "$failures" -ne 0 ]; then
