@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.44'
+agentq_version='0.1.45'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -2903,6 +2903,16 @@ load_cancellation_markers() {
         return 0
     fi
 
+    # Redirected, not piped -- the same fix and the same measurement as
+    # `load_request_records`: this loop's `fail` used to end only its own
+    # subshell, so a non-canonical marker filename answered exit 1 with
+    # `reason=protocol_error` on stderr while the same tree answered exit 2 from
+    # every other reader.  Measured 2026-11-25.
+    local markers_raw
+    local marker_command_status=0
+    markers_raw=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-markers-raw' '.txt') || return 1
+    require_runtime_temporary_file "$markers_raw" || return 1
+
     {
         for marker_path in "${marker_files[@]}"; do
             marker_task_id=${marker_path##*/}
@@ -2958,7 +2968,12 @@ load_cancellation_markers() {
             fi
             printf '%s\n' "$marker"
         done
-    } | jq -cse 2>/dev/null '
+    } > "$markers_raw" || {
+        remove_runtime_temporary_file "$markers_raw" 'raw AgentQ cancellation markers file' || true
+        return 1
+    }
+
+    jq -cse 2>/dev/null '
         def valid_task_id:
             if type != "number" then
                 false
@@ -2978,7 +2993,9 @@ load_cancellation_markers() {
             map(if .state? == null then . + {state: "requested"} else . end)
         else error("invalid AgentQ cancellation marker")
         end
-    '
+    ' < "$markers_raw" || marker_command_status=$?
+    remove_runtime_temporary_file "$markers_raw" 'raw AgentQ cancellation markers file' || marker_command_status=1
+    return "$marker_command_status"
 }
 
 request_record_path() {
@@ -3372,6 +3389,24 @@ load_request_records() {
         record_ids+=("${request_id%.json}")
     done
 
+    # Why this is a REDIRECTION and not the original pipeline
+    # --------------------------------------------------------
+    # The loop below used to be the left side of `{ ... } | jq ...`.  A pipe runs
+    # that side in a SUBSHELL, so a `fail` in the body could only end the
+    # subshell: its exit 2 became the pipeline's status 1, the caller folded that
+    # into `return 1`, and the operator saw `reason=protocol_error` attached to
+    # exit 1 -- the code the contract reads as "general failure, retry".
+    # Measured 2026-11-25: a record containing `not json` made `status` exit 1
+    # with that reason line, while the SAME tree made `status --summary` exit 0
+    # (its path never loads records).  One corruption, two answers.
+    #
+    # With a redirect the body keeps the current shell and its `fail` is the
+    # process's real exit 2.  The cost is one temporary file per load.
+    local records_raw
+    local command_status=0
+    records_raw=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-records-raw' '.txt') || return 1
+    require_runtime_temporary_file "$records_raw" || return 1
+
     {
     for record_path in "${record_files[@]}"; do
         request_id=${record_path##*/}
@@ -3453,7 +3488,19 @@ load_request_records() {
         }
         printf '%s\n' "$record"
         done
-    } | jq -cse 2>/dev/null --args "$request_records_filter" -- "${record_ids[@]}"
+    } > "$records_raw" || {
+        remove_runtime_temporary_file "$records_raw" 'raw AgentQ request records file' || true
+        return 1
+    }
+
+    # jq reads a FILE, not a pipe, for the same reason: a pipe would put the
+    # producer above in a subshell and neuter every `fail` in it.  See the block
+    # comment at the producer's opening brace.
+    command_status=0
+    jq -cse 2>/dev/null --args "$request_records_filter" -- "${record_ids[@]}" \
+        < "$records_raw" || command_status=$?
+    remove_runtime_temporary_file "$records_raw" 'raw AgentQ request records file' || command_status=1
+    return "$command_status"
 }
 
 release_request_metadata_files() {
@@ -5377,7 +5424,18 @@ compact_status_summary() {
         require_runtime_temporary_file "$raw_status_file"
         validate_pueue_task_shape_in_file "$raw_status_file"
         require_runtime_temporary_file "$raw_status_file"
-        if jq -c --arg group "$group_name" '
+        # `2>/dev/null`: this jq is the VALIDATOR for the summary shape, and its
+        # `error(...)` text is the raw probe diagnostic the controlled
+        # `cannot summarise Pueue status for AgentQ` replaces.  Measured
+        # 2026-11-25: a task whose `created_at` is an object passed
+        # `validate_pueue_task_shape_in_file` (that filter only checks the id and
+        # its key) and then leaked
+        # `jq: error (at <stdin>:1): invalid task in AgentQ status summary`
+        # onto stderr ahead of the reason line.  This is the NINTH site of the
+        # same family -- the eight fixed on 2026-11-25 were found by grepping
+        # for `invalid visible Pueue task metadata`, and this one carries a
+        # different message, so the grep missed it.
+        if jq -c 2>/dev/null --arg group "$group_name" '
             . as $status
             | {
                 tasks: (

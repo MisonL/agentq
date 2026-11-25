@@ -46,8 +46,8 @@ CHANGELOG 里的过程记录）都是历史，不是任务。
    Windows 客户端内嵌 wrapper、POSIX 客户端内嵌 wrapper 各自必须能独立发出同一份
    payload 协议，无法合并。漂移由 `smoke/10` 规则 E 检测（比较 token 序列而非字节），
    四类分叉实测全部被抓。**所以这一项是「已加护栏」，不是「已消除重复」。**
-2. **一半代码凭什么被相信** —— 现役口径为 **417 行 / 37,236 = 1.12%**
-   （2026-11-24 按 0.1.42 的当前字节重算分母，见第十二轮节；`docs/verification-status.md` 的覆盖表是它的逐项账本）。
+2. **一半代码凭什么被相信** —— 现役口径为 **417 行 / 37,302 = 1.12%**
+   （2026-11-25 按 0.1.44 的当前字节重算分母；37,236 是 0.1.42 的值，见第十二轮节；`docs/verification-status.md` 的覆盖表是它的逐项账本）。
    14.2%（9 个资产 / 3,498 行）是 2026-09-24 的历史口径，**只作对照、不要再引用**；另有更大
    一片是「只有源码断言、没有行为执行」。**这一项本质未变**，只靠逐项补契约检查
    推进（A1/B4 已做 3 个）。
@@ -1489,7 +1489,7 @@ wait 的 record 批量扫描（`request_record_path_guards_or_fail "$path" || { 
 | 12 | `cannot inspect Pueue while reading AgentQ status` | `smoke/32` | 1 |
 | 13 | `Pueue returned an invalid task identity in status` | `smoke/32`（4 个调用方） | 5 |
 | 14 | `Pueue returned an invalid task identity in logs` | `smoke/32` | 1 |
-| 15 | `invalid creation time for AgentQ task` | `smoke/32`（改成走 Pueue 畸形答案） | 3 |
+| 15 | `invalid creation time for AgentQ task` | **不可通过公开契约断言**（见下） | 0 |
 
 表里的「用例数」是**代表例**，不是该出口的全部断言：unix 臂的 `must be absolute` 与
 `does not exist` 各有**两条**（整程序一次 + 抽函数一次），Windows 臂三条是
@@ -1497,6 +1497,22 @@ wait 的 record 批量扫描（`request_record_path_guards_or_fail "$path" || { 
 
 新增合计：`smoke/02` cases 51 → **66**（+15 = argv 面 9 条 + `normalize_workdir` 两臂 6 条），
 `smoke/32` 新建 **26** 例。
+
+**第 15 条是这一轮唯一没能真正关闭的，原因值得记下来**：它不可达，不是因为难造，而是
+因为**同一条链上还有第二个守卫**。`wait`（6298 行）与 `logs`（7340 行）都在
+`compact_task "$task_id"` **成功之后**才执行 `jq -er '.created_at | strings'`；而
+`compact_task` 自己的 jq 已经要求 `(.created_at | type) == "string"` 且
+`length > 0`（5594–5600 行），形状不合格时它先 `error("invalid visible Pueue task
+metadata")`。所以那个 `strings` 只会在**第一个守卫被删掉**之后才失败。
+
+这不是「补一条用例」能解决的。硬造的方法是**抽函数直接驱动**（像 `02` 对
+`normalize_workdir` 那样），但那会把一段内联在两处、靠外层不变量成立的防御代码
+当成独立契约来断言——而它恰恰**不是**独立契约：删掉外层守卫，行为会立刻变成
+「畸形快照被当成缺时间」。#15 因此按**不可达的重复守卫**记录，`smoke/32` 里那三条
+`created` 用例实际断言的是**可达的那个**（`cannot inspect Pueue while reading
+AgentQ task`），文档不再声称它们覆盖了 `invalid creation time`。
+**要真正处理它，只有两条路**：删掉这条冗余守卫（少一个 fail 站点），或者把它
+和外层合并成一个（一处判定、一处消息）。本轮不做——它是本轮唯一诚实的「没关掉」。
 
 **同时补掉表外那几条低可达项**：非规范持久化 marker 文件名、损坏的 marker 内容、损坏的 request record、损坏的 tombstone，各有用例，并各自带「文件移除后同一命令必须成功」的对照（一个「永远拒绝」的服务端能通过拒绝用例）。
 
@@ -1509,27 +1525,29 @@ wait 的 record 批量扫描（`request_record_path_guards_or_fail "$path" || { 
 
 **边界**：`smoke/32` 需要真 pueue 运行时（`AGENTQ_SMOKE_HOME`），CI 的 linux job 有，本地没有时整条 SKIP 并如实打印。低精度 jq 分支靠**给副本打补丁**进入（本机 jq 1.7 保留全部数字），补丁点断言恰好一处，函数改名会让检查失败而不是静默。
 
-#### 本轮留下的一个新缺陷（已定位、未修）：管道里的 `fail` 折成 exit 1
+#### 本轮修复的第三个缺陷：管道里的 `fail` 折成 exit 1
 
-`32-hostile-pueue` 在写「非规范 marker 文件名」用例时撞到的：`load_cancellation_markers`
-的循环体在 `{ ... } | jq ...` 的管道左端，`fail` 的 `exit 2` **只结束那个子 shell**，
-管道状态变成非零，调用方 `prepare_request_metadata_files` 把它折成 `return 1`，
-于是 stderr 上是**一行 `reason=protocol_error` 配 exit 1**——码与类别自相矛盾，
-而 exit 1 在契约里只是「一般失败」，调用方会当成可重试。
+写「非规范 marker 文件名」用例时撞到的：`load_cancellation_markers` 的循环体在
+`{ ... } | jq ...` 的管道左端，`fail` 的 `exit 2` **只结束那个子 shell**，管道状态
+变成非零，调用方 `prepare_request_metadata_files` 把它折成 `return 1`——于是 stderr
+上是**一行 `reason=protocol_error` 配 exit 1**，码与类别自相矛盾，而 exit 1 在契约里
+只是「一般失败」，调用方会当成可重试。
 
-实测（本机 pueue 4.0.4）：marker 文件名为 `0001.json`（非规范）或内容为 `not json`
-时，`status` 退 **1**；同一棵树上 `logs 1` 因为自己的读取路径先拦住而退 **2**。
-同一处损坏，两个命令给两个码。
+**同一棵树给出三个答案**（实测，本机 pueue 4.0.4，一个 `0001.json` 的非规范 marker）：
+`status` 1、`remove --label` 1、`status --summary` **0**（它的路径根本不加载 marker）。
+`load_request_records` 是**同一个形状**，只是一直没人测过它的文件名臂。
 
-**修法方向**（下一轮，未做）：管道左端不能承重 `fail`——要么把校验移进管道的 `jq`
-（让它 `error(...)`，状态由调用方统一分类），要么先写临时文件再 `jq < file`，让
-`fail` 落在**当前** shell。这不是孤例：`smoke/01` 的 `return2-sites` 审计
-（`reason-gaps=0`）覆盖「每条 exit 2 都带 reason」，**不覆盖**「冒了 reason 却没退 2」。
-要不要加这条规则，下一轮定。
+**修法**：两处生产者都从 `| jq` 改成 `} > "$raw"` 加 `jq ... < "$raw"`。重定向让循环体
+留在**当前** shell，`fail` 就是进程真正的 exit 2；代价是每次加载多一个临时文件。
+`smoke/32` 新增 6 条用例（marker 与 record 各 3），断言**严格 2**——第一版写的是
+「1 或 2」，那等于把缺陷留在绿灯底下。
 
-用例现在只钉住「拒绝对了、点名对了、jq 噪声没有」，**不把 1 当正确**——把错误的码
-写进断言，等于把它变成契约。
+**顺带**：`smoke/01` 的 `return2-sites` 审计（`reason-gaps=0`）覆盖「每条 exit 2 都带
+reason」，**不覆盖**「冒了 reason 却没退 2」。本轮是靠人工读懂管道语义发现的；要不要
+把这条做成静态规则，下一轮定——难点是它需要沿调用链判断「这个 `fail` 是否在子 shell
+里」，不是一次 grep 能给的。
 
+#### 边界（不声称的）
 #### 边界（不声称的）
 
 - **npm 包从未发布过**：本轮只做到「能打包、门禁能拦、`npx` 本地路径实测可用」。`npm publish` 需要账号与凭据，**未执行**；`agentq-skill` 这个包名在 registry 上当前 404（看起来可用），但**404 不保证可注册**；provenance 需要公开仓库 + OIDC，本会话到 github 不通，**未验证**。

@@ -139,6 +139,19 @@ if [ "$subcommand" = status ] && [ "$hostile" = bad-created ]; then
     exit 0
 fi
 
+# A task that PASSES `validate_pueue_task_shape_in_file` -- the id is a number,
+# it is integral and non-negative, and the key equals it -- but whose
+# `created_at` is an object.  That filter only looks at the id and the key, so
+# the object sails through it and dies in the summary's own `error(...)`.  This
+# is a DIFFERENT message from the one the task-shape filter emits, which is
+# exactly why the round that silenced eight jq leaks missed it: the hunt grepped
+# for `invalid visible Pueue task metadata` and this says `invalid task in
+# AgentQ status summary`.
+if [ "$subcommand" = status ] && [ "$hostile" = bad-created-summary ]; then
+    cat "$control/hostile-summary"
+    exit 0
+fi
+
 # Valid JSON of the wrong shape entirely.
 if [ "$subcommand" = status ] && [ "$hostile" = not-json ]; then
     printf 'definitely not json\n'
@@ -303,6 +316,18 @@ printf 'bad-task\n' > "$control/hostile"
 expect_fail status-bad-task "$server" 'Pueue returned an invalid task identity in status' status
 expect_fail summary-bad-task "$server" 'Pueue returned an invalid task identity in status' status --summary
 
+# The summary's own validator, reached by a shape that passes the shared one.
+cat > "$control/hostile-summary" <<'JSON'
+{"tasks":{"1":{"id":1,"created_at":{"not":"a string"},"command":"true","path":"/tmp","group":"agentq","label":"agentq:h","status":{"Done":{"enqueued_at":"2026-11-25T00:00:00Z","start":"2026-11-25T00:00:00Z","end":"2026-11-25T00:00:01Z","result":{"Success":0}}}}},"groups":{"agentq":{"status":"Running","parallel_tasks":1}}}
+JSON
+printf 'bad-created-summary\n' > "$control/hostile"
+expect_fail summary-bad-created "$server" 'cannot summarise Pueue status for AgentQ' status --summary
+# Back to bad-task, NOT to none: the four callers below still need the malformed
+# task shape.  Restoring the wrong value made `wait`/`logs` answer
+# `unknown AgentQ task id` instead -- measured here, and the two failures it
+# produced are the reason this line is explicit about what it restores.
+printf 'bad-task\n' > "$control/hostile"
+
 # The same malformed answer must be refused on EVERY command that compacts a
 # task, not just on the one that happened to be tested.  These four share
 # `compact_task`, and a guard that only one caller honours is a guard the other
@@ -427,40 +452,32 @@ mkdir -p "$cursor_dir"
 printf '{"version":1,"task_id":"0001","task_created_at":"2026-11-25T00:00:00Z","state":"requested","requested_at":"2026-11-25T00:00:00Z","created_at":"2026-11-25T00:00:00Z","reason":"hostile"}\n' \
     > "$cursor_dir/0001.json"
 printf 'none\n' > "$control/hostile"
-# NOTE: this one exits **1**, not 2.  The marker loop runs inside a pipeline
-# whose jq reads the whole stream, so the `fail` kills its subshell, the
-# pipeline status becomes non-zero, and the caller folds that into a plain
-# return 1 -- with a `reason=protocol_error` line attached, which is why the
-# code and the class disagree.  That contradiction is recorded in PLAN as a
-# known defect rather than asserted as correct here; what this case pins is
-# that the refusal names the file and that no path is built from the value.
-cases=$((cases + 1))
-state=0
-"$server" status >"$work/noncanonical.out" 2>"$work/noncanonical.err" || state=$?
-if [ "$state" -ne 1 ] && [ "$state" -ne 2 ]; then
-    note "non-canonical marker: exit=$state, expected the refusal (1 or 2): $(head -2 "$work/noncanonical.err" | tr '\n' '|')"
-    failures=$((failures + 1))
-elif ! grep -qF 'non-canonical AgentQ cancellation marker filename' "$work/noncanonical.err"; then
-    note "non-canonical marker: stderr does not name the guard: $(head -2 "$work/noncanonical.err" | tr '\n' '|')"
-    failures=$((failures + 1))
-fi
+# Strict 2, not "1 or 2".  When this case was first written, the marker loader
+# was the left side of a pipeline, so its `fail` ended only the subshell and the
+# caller folded the status into `return 1` -- stderr said reason=protocol_error
+# on top of exit 1, code and class disagreeing.  The loader now redirects to a
+# file instead of piping, so the body keeps the main shell and the 2 is real.
+# The assertion is strict on purpose: asserting "1 or 2" would have let the
+# defect live on underneath a green check.
+expect_fail non-canonical-marker "$server" 'non-canonical AgentQ cancellation marker filename' status
 rm -f "$cursor_dir/0001.json"
 
-# A marker file whose CONTENT is not JSON at all.  The loader's jq rejects the
-# stream, and the same pipeline shape folds the status into 1 -- measured
-# 2026-11-25 on this host: exit 1, `invalid AgentQ cancellation marker: <path>`,
-# then a `reason=protocol_error` line contradicting the code.  `logs` on the same
-# tree answers what its own reader needs, so the two commands disagree about the
-# same corruption; that is the defect this case exists to keep visible.
+# A marker file whose CONTENT is not JSON at all.  Same family, same fix: this
+# used to answer exit 1 with a `reason=protocol_error` line attached, because the
+# loader's `fail` sat in a pipeline subshell.  With the redirect it is a real
+# exit 2, so the assertion is strict.
 printf 'not json at all\n' > "$cursor_dir/1.json"
 cases=$((cases + 1))
 state=0
 "$server" status >"$work/corrupt-marker.out" 2>"$work/corrupt-marker.err" || state=$?
-if [ "$state" -eq 0 ]; then
-    note 'corrupt-marker: status answered 0 on a marker file that is not JSON'
+if [ "$state" -ne 2 ]; then
+    note "corrupt-marker: exit=$state, expected the controlled 2: $(head -2 "$work/corrupt-marker.err" | tr '\n' '|')"
     failures=$((failures + 1))
 elif ! grep -qF 'invalid AgentQ cancellation marker' "$work/corrupt-marker.err"; then
     note "corrupt-marker: stderr does not name the guard: $(head -2 "$work/corrupt-marker.err" | tr '\n' '|')"
+    failures=$((failures + 1))
+elif ! grep -qE ': reason=protocol_error$' "$work/corrupt-marker.err"; then
+    note 'corrupt-marker: stderr does not carry reason=protocol_error'
     failures=$((failures + 1))
 fi
 # jq's own parse error must NOT reach stderr: the clients scan that stream for
@@ -495,6 +512,41 @@ expect_fail wait-bad-created "$server" 'cannot inspect Pueue while reading Agent
 expect_fail logs-bad-created "$server" 'cannot inspect Pueue while reading AgentQ task' logs 1
 expect_fail status-bad-created "$server" 'cannot inspect Pueue while reading AgentQ task' status --task 1
 printf 'none\n' > "$control/hostile"
+
+# ---------------------------------------------------------------------------
+# 5b. A marker or a member of the request-record set whose FILENAME is not a
+#     usable id at all.  Both loaders used to be the left side of a pipeline, so
+#     their `fail` could only end a subshell: the exit 2 became the pipeline's
+#     status 1, the caller folded it into `return 1`, and stderr carried
+#     `reason=protocol_error` on top of exit 1 -- a code the contract reads as
+#     "general failure, retry" for a corruption that no retry can clear.
+#     Measured 2026-11-25 before the fix: `status` 1, `remove --label` 1, while
+#     `status --summary` answered 0 (its path loads neither file).  One
+#     corruption, three answers.
+#
+#     Both loaders now REDIRECT into a temp file instead of piping, so the loop
+#     keeps the main shell and its `fail` is the process's real exit 2.  These
+#     rows are strict about it: asserting "1 or 2" would let the defect survive
+#     under a green check, which is exactly what the first version of this
+#     check did.
+# ---------------------------------------------------------------------------
+printf '{"version":1,"task_id":"1","task_created_at":"2026-11-25T00:00:00Z","state":"requested","requested_at":"2026-11-25T00:00:00Z","created_at":"2026-11-25T00:00:00Z","reason":"hostile"}\n' \
+    > "$cursor_dir/notanid.json"
+expect_fail marker-bad-filename "$server" 'invalid AgentQ cancellation marker filename' status
+expect_fail marker-bad-filename-batch "$server" 'invalid AgentQ cancellation marker filename' remove --label hostile --confirm
+rm -f "$cursor_dir/notanid.json"
+
+# The request-record twin: a filename that is not a request id.  This one is
+# reached by every command that reads records, so it is asserted from three.
+printf '{"version":1,"request_id":"notanid","label":"hostile","workdir":"/tmp","task_id":1,"task_created_at":"2026-11-25T00:00:00Z","state":"accepted","created_at":"2026-11-25T00:00:00Z"}\n' \
+    > "$home/data/agentq-requests/notanid.json"
+expect_fail record-bad-filename "$server" 'invalid AgentQ request record filename' status
+expect_fail record-bad-filename-summary "$server" 'invalid AgentQ request record filename' status --summary
+expect_fail record-bad-filename-doctor "$server" 'invalid AgentQ request record filename' doctor
+# The summary and the full status used to DISAGREE about the same tree (0 vs 1)
+# because only one of them loads records.  Both must now refuse, which is what
+# these two rows together pin.
+rm -f "$home/data/agentq-requests/notanid.json"
 
 # ---------------------------------------------------------------------------
 # 6. The same "raw validator diagnostic must not reach the caller" rule, applied
