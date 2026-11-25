@@ -1105,6 +1105,179 @@ if [ -n "$return2_gap_sites" ]; then
     failures=$((failures + 1))
 fi
 
+# Fourth structural rule: a `fail` inside a PIPELINE's left side can never be the
+# process's exit 2.
+#
+# `{ ...; } | jq ...` runs the brace group in a SUBSHELL (POSIX: every
+# component of a pipeline runs in its own subshell).  So the `fail` inside it
+# exits that subshell with 2, the pipeline's status becomes the jq's status or
+# a plain non-zero, and the caller folds it into `return 1` -- the operator sees
+# `reason=protocol_error` on top of exit 1, a code the contract reads as
+# "retry me".  Measured 2026-11-25 on the real server: one corrupt marker file
+# made `status` exit 1, `remove --label` exit 1, and `status --summary` exit 0.
+#
+# The rule is structural (no fixed line window -- smoke/10's rule G already
+# proved windows wrong in both directions): it tracks brace/paren/loop nesting,
+# and when a block CLOSES INTO A PIPE it reports every `fail` and every
+# `exit 2` inside that block.  The predicate is the pipe, not the message,
+# which is the lesson from the same round's jq hunt: a text-anchored search
+# missed a ninth site that worded its error differently.
+#
+# Self-test below: a piped block with a fail MUST be reported, the same block
+# redirected to a file MUST NOT, and a bare fail in a function MUST NOT.  A
+# detector that reported nothing on the fixture would be blind, and one that
+# reported the redirect would be useless.
+pipe_fail_scan() { # $1 = file -> gap lines + a final __PIPED__N line
+    awk '
+        function report(i, why) {
+            printf "%d %s: %s\n", phys[i], why, joined[i]
+        }
+        function opening_of(closer, from,    k, u) {
+            # Nearest preceding opener of the right kind, found by scanning
+            # BACKWARDS.  A running depth counter was tried first and drifted:
+            # one unmatched `{` (a PowerShell here-doc, a jq program) put the
+            # opening line at 1, so the rule reported every `exit 2` in the file
+            # as a site inside the first "block".  Backwards resolution cannot
+            # drift -- it either finds an opener or gives up on that closer.
+            for (k = from - 1; k >= 1; k--) {
+                u = joined[k]
+                sub(/^[[:space:]]+/, "", u)
+                if (u ~ /^#/) continue
+                if (closer == "brace" && u == "{") return k
+                if (closer == "loop" && (u == "do" || u ~ /;[[:space:]]*do[[:space:]]*$/)) return k
+            }
+            return 0
+        }
+        {
+            line = $0
+            if (pending != "") { line = pending " " line; startline = pendline; pending = "" }
+            else startline = NR
+            if (line ~ /\\[[:space:]]*$/) {
+                sub(/\\[[:space:]]*$/, "", line)
+                pending = line
+                pendline = startline
+                next
+            }
+            joined[++n] = line
+            phys[n] = startline
+        }
+        END {
+            if (pending != "") { joined[++n] = pending; phys[n] = pendline }
+            for (i = 1; i <= n; i++) {
+                t = joined[i]
+                sub(/^[[:space:]]+/, "", t)
+                if (t ~ /^#/) continue
+                # A pipeline separator is a SINGLE bar.  `||` is a logical OR and
+                # leaves the block in the current shell -- the first draft read
+                # `) || {` as "closes into a pipe" and reported four correct
+                # sites in compact_log.
+                if (t ~ /^\}[[:space:]]*\|[^|]/) closer = "brace"
+                else if (t ~ /^done[[:space:]]*\|[^|]/) closer = "loop"
+                else continue
+                startl = opening_of(closer, i)
+                if (startl == 0) continue
+                piped_regions++
+                for (j = startl; j <= i; j++) {
+                    u = joined[j]
+                    sub(/^[[:space:]]+/, "", u)
+                    if (u ~ /^#/) continue
+                    if (u ~ /(^|[^a-zA-Z0-9_])fail([[:space:]]|$)/ ||
+                        u ~ /^exit[[:space:]]+2([[:space:]]|$)/) {
+                        sites++
+                        report(j, "[" closer " block closing into a pipe]")
+                    }
+                }
+            }
+            printf "__PIPED__%d\n", piped_regions
+        }' "$1"
+}
+
+pipe_fixture=$work/pipe-fail.fixture
+cat >"$pipe_fixture" <<'PIPEFIX'
+# negative: a redirected block keeps `fail` in the current shell
+load_a() {
+    {
+        printf '%s\n' x || fail "cannot print"
+    } > /tmp/out || return 1
+}
+# positive: a piped block swallows the fail
+load_b() {
+    {
+        printf '%s\n' x || fail "cannot print"
+    } | jq -cse . || return 1
+}
+# positive: the same shape on a loop
+load_c() {
+    for item in a b; do
+        printf '%s\n' "$item" || fail "cannot print $item"
+    done | jq -cse . || return 1
+}
+# negative: a bare fail in a function is the process exit 2
+load_d() {
+    fail "cannot load"
+}
+PIPEFIX
+pipe_fixture_raw=$(pipe_fail_scan "$pipe_fixture")
+pipe_fixture_regions=$(printf '%s\n' "$pipe_fixture_raw" | sed -n 's/^__PIPED__//p')
+pipe_fixture_sites=$(printf '%s\n' "$pipe_fixture_raw" | grep -vc '^__PIPED__' || true)
+cases=$((cases + 1))
+if [ "$pipe_fixture_regions" != 2 ] || [ "$pipe_fixture_sites" != 2 ]; then
+    printf 'error-contract: the pipe-fail scan failed its self-test (expected 2 piped blocks / 2 sites, got %s / %s); a blind scan would read as a clean server\n' \
+        "$pipe_fixture_regions" "$pipe_fixture_sites" >&2
+    printf '%s\n' "$pipe_fixture_raw" | head -6 >&2
+    failures=$((failures + 1))
+fi
+
+pipe_raw=$(pipe_fail_scan "$server")
+pipe_regions=$(printf '%s\n' "$pipe_raw" | sed -n 's/^__PIPED__//p')
+case ${pipe_regions:-} in
+    '' | *[!0-9]*) pipe_regions=0 ;;
+esac
+# Positive control that survives a server with no piped block left: 0 regions
+# would make the site scan vacuously green, exactly the "examined nothing"
+# failure this repository keeps hitting.
+cases=$((cases + 1))
+if [ "$pipe_regions" -eq 0 ]; then
+    printf '%s\n' 'error-contract: the pipe-fail scan found no piped block at all in the server; the rule would be vacuous' >&2
+    failures=$((failures + 1))
+fi
+pipe_sites=$(printf '%s\n' "$pipe_raw" | grep -v '^__PIPED__' || true)
+pipe_site_count=0
+if [ -n "$pipe_sites" ]; then
+    pipe_site_count=$(printf '%s\n' "$pipe_sites" | grep -c . || true)
+fi
+cases=$((cases + 1))
+if [ -n "$pipe_sites" ]; then
+    printf 'a `fail` inside a pipeline left side folds to exit 1 with reason=protocol_error on it:\n%s\n' "$pipe_sites" >&2
+    failures=$((failures + 1))
+fi
+
+# Fifth structural rule: the "a task's created_at is a non-empty string"
+# predicate lives in exactly ONE place.
+#
+# It was written twice before 0.1.46 -- `jq -er '.created_at | strings'` in
+# `wait` and again in `logs`, plus three sibling messages that say the same
+# thing in different words ("cannot read the AgentQ task creation time",
+# "cannot read the AgentQ observed task creation time").  Copies of one
+# predicate are this repository's most-repeated defect class: the round that
+# fixed the loaders found the SAME `fail`-in-a-pipeline mistake written twice.
+#
+# The rule cannot assert the guard by behaviour (it is unreachable: compact_task
+# already rejects a non-string created_at, which is why smoke/32's
+# `wait-bad-created` proves the reachable half), so it asserts the SHAPE:
+# exactly one raw `.created_at | strings` read, and at least two call sites of
+# the helper that owns it.  Both directions matter -- two raw reads mean the
+# copies came back, zero call sites mean the helper is dead and the next reader
+# will re-inline it.
+cases=$((cases + 1))
+creation_raw_reads=$(grep -cF "jq -er '.created_at | strings'" "$server" || true)
+creation_call_sites=$(grep -cF 'task_creation_time_or_fail "$task"' "$server" || true)
+if [ "$creation_raw_reads" != 1 ] || [ "$creation_call_sites" -lt 2 ]; then
+    printf 'error-contract: the created_at guard is not in one place (raw reads=%s, helper call sites=%s); expected 1 and >=2\n' \
+        "$creation_raw_reads" "$creation_call_sites" >&2
+    failures=$((failures + 1))
+fi
+
 # Third structural rule: the server's EXIT trap must be `|| true`-guarded.
 # Measured 2026-10-13 on bash and dash: under `set -e`, a non-zero return from
 # the trap body trips errexit and the process exits with the CLEANUP's code --
@@ -1307,8 +1480,8 @@ if [ "$failures" -ne 0 ]; then
     printf 'error-contract: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'error-contract checks passed: cases=%s commands=%s runtime=synthetic reasons=asserted reason-sites=%s return2-sites=%s reason-gaps=%s\n' \
+printf 'error-contract checks passed: cases=%s commands=%s runtime=synthetic reasons=asserted reason-sites=%s return2-sites=%s reason-gaps=%s pipe-fail-sites=%s piped-blocks=%s\n' \
     "$cases" \
     "$(printf '%s\n' $documented_commands | wc -l | tr -d ' ')" \
-    "$reason_sites" "$return2_sites" "$reason_gap_count"
+    "$reason_sites" "$return2_sites" "$reason_gap_count" "$pipe_site_count" "$pipe_regions"
 printf 'error-contract return-2 audit: bare-functions=%s\n' "$return2_bare_funcs" >&2

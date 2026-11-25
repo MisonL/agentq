@@ -1489,7 +1489,7 @@ wait 的 record 批量扫描（`request_record_path_guards_or_fail "$path" || { 
 | 12 | `cannot inspect Pueue while reading AgentQ status` | `smoke/32` | 1 |
 | 13 | `Pueue returned an invalid task identity in status` | `smoke/32`（4 个调用方） | 5 |
 | 14 | `Pueue returned an invalid task identity in logs` | `smoke/32` | 1 |
-| 15 | `invalid creation time for AgentQ task` | **不可通过公开契约断言**（见下） | 0 |
+| 15 | `invalid creation time for AgentQ task` | **0.1.46 合并为 `task_creation_time_or_fail`**（不可达的重复守卫，见下） | 0（可达半边由 `smoke/32` 的 `wait-bad-created` 守） |
 
 表里的「用例数」是**代表例**，不是该出口的全部断言：unix 臂的 `must be absolute` 与
 `does not exist` 各有**两条**（整程序一次 + 抽函数一次），Windows 臂三条是
@@ -1511,8 +1511,17 @@ metadata")`。所以那个 `strings` 只会在**第一个守卫被删掉**之后
 「畸形快照被当成缺时间」。#15 因此按**不可达的重复守卫**记录，`smoke/32` 里那三条
 `created` 用例实际断言的是**可达的那个**（`cannot inspect Pueue while reading
 AgentQ task`），文档不再声称它们覆盖了 `invalid creation time`。
-**要真正处理它，只有两条路**：删掉这条冗余守卫（少一个 fail 站点），或者把它
-和外层合并成一个（一处判定、一处消息）。本轮不做——它是本轮唯一诚实的「没关掉」。
+
+**0.1.46 的处置：合并成一个函数，而不是删掉。** 这段判定在服务端写了两遍（`wait` 与
+`logs`，缩进不同），外面还各有三个措辞不同的兄弟消息（`cannot read the AgentQ task
+creation time` / `... observed task creation time`）。现在是一处：
+`task_creation_time_or_fail`，两个调用点都是
+`task_created_at=$(task_creation_time_or_fail "$task" "$task_id") || return $?`。
+**为什么不是删掉**：外层判据若哪天被放松，空 `created_at` 会流进**取消 marker 的实例
+绑定**——那里一次不匹配会让一个**活着**的 marker 被判成陈旧并删除。**为什么不是硬造
+用例**：它是同一条规则的消费者半边，不是独立契约；`smoke/32` 的
+`wait-bad-created` 断言的是**可达的那半边**。也就是说 #15 的处置结论是
+「**合并掉重复**，并用现有可达用例守住同一条规则」，不是「补一条抽函数的用例」。
 
 **同时补掉表外那几条低可达项**：非规范持久化 marker 文件名、损坏的 marker 内容、损坏的 request record、损坏的 tombstone，各有用例，并各自带「文件移除后同一命令必须成功」的对照（一个「永远拒绝」的服务端能通过拒绝用例）。
 
@@ -1542,10 +1551,36 @@ AgentQ task`），文档不再声称它们覆盖了 `invalid creation time`。
 `smoke/32` 新增 6 条用例（marker 与 record 各 3），断言**严格 2**——第一版写的是
 「1 或 2」，那等于把缺陷留在绿灯底下。
 
-**顺带**：`smoke/01` 的 `return2-sites` 审计（`reason-gaps=0`）覆盖「每条 exit 2 都带
-reason」，**不覆盖**「冒了 reason 却没退 2」。本轮是靠人工读懂管道语义发现的；要不要
-把这条做成静态规则，下一轮定——难点是它需要沿调用链判断「这个 `fail` 是否在子 shell
-里」，不是一次 grep 能给的。
+**顺带把这套审计的缺口补上了**：`smoke/02` 的 `return2-sites` 审计
+（`reason-gaps=0`）只覆盖「每条 exit 2 都带 reason」，**不覆盖**「冒了 reason 却没退 2」。
+本轮先是用人工读管道语义发现的，随后把它做成了 `smoke/02` 的**第四条静态规则**
+`pipe-fail`（下节）。
+
+#### 第四条静态规则：管道左端的 `fail`（2026-11-26，0.1.46）
+
+判据不是消息文本，是**语法形状**：`{ ...; } | jq …` 的左端跑在子 shell 里，所以块内的
+`fail` 永远不是进程的 exit 2。规则扫「关闭行带单个 `|` 的块」（`} |` 与 `done |`），
+**反向**找最近的开启行（`{` 或 `do`），把块内每个 `fail` / `exit 2` 报出来。
+
+三次自我纠错都在写规则的过程中发生，都值得记：
+
+1. **`break` 写在函数收尾的花括号上**：识别 `}` 为 closer 后立刻 `break`，于是在第一个
+   函数后就停了，自检报 `regions=0 / sites=0`。自检救的，不是真机救的。
+2. **`pending` 忘了清空**：续行合并后 `pending` 未置空，第一处续行把**此后每一行**都
+   永久前缀化，于是真实服务端读作「没有任何管道块」。这正是这条规则要防的「静默空转」，
+   而它自己先犯了一次。
+3. **`|| ` 被当成管道**：第一版用 `\|` 匹配，把 `) || {` 判成「关闭进管道」，把
+   `compact_log` 里四个**正确**的站点报了出来。`||` 是逻辑或、留在当前 shell。
+   自检的夹具里当时没有 `||` 形状，所以自检没抓到——是**逐条读那四条报告**发现的，
+   夹具随后补了这个形状。
+
+最终形态的判据只有单 `|`（`^}[[:space:]]*\|[^|]`），且**正向控制是「扫到了几个管道块」
+而不是「报了几个站点」**：真实服务端现在是 `piped-blocks=4 pipe-fail-sites=0`，四个
+`done | jq` 里都没有 `fail`；一旦某天这些块被删光，`piped-blocks=0` 会让规则自己红，
+而不是安静地绿。
+
+**红证**（`v0.1.44` 的 server 副本）：`piped-blocks=6 pipe-fail-sites=13`，点名的正是
+本轮修掉的两处加载器（marker 与 record 各有文件名臂与路径臂）。修复后 4/0。
 
 #### 边界（不声称的）
 #### 边界（不声称的）

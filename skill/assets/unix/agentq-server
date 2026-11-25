@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.45'
+agentq_version='0.1.46'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -6158,6 +6158,37 @@ read_cancellation_marker() {
     return 0
 }
 
+# The creation time of a COMPACTED task, or the server's refusal.
+#
+# This is ONE function because the rule it states -- a task's `created_at` is a
+# non-empty string -- was written out more than once, in two spellings and three
+# messages, before 2026-11-25 (`| strings` vs plain `-r`; "invalid creation
+# time", "cannot read the AgentQ task creation time", "cannot read the AgentQ
+# observed task creation time").  Copies of one predicate are this repository's
+# most-repeated defect class.
+#
+# The predicate itself is enforced ONE STEP EARLIER, in `compact_task`'s and
+# `raw_compact_task`'s jq: they reject a task whose `created_at` is not a
+# non-empty string with `invalid visible Pueue task metadata`, which callers
+# turn into `cannot inspect Pueue while reading AgentQ task`.  So this function
+# cannot fire on a value that came from either of them -- deliberately: it is
+# the consumer-side half of one rule, not an independent contract, and
+# `smoke/32`'s `wait-bad-created` proves the REACHABLE half (it drives a Pueue
+# answer whose `created_at` is an object and asserts the refusal).
+#
+# The reason it is not simply deleted: if the upstream predicate were ever
+# relaxed, an empty `created_at` would reach the cancellation-marker binding,
+# where a mismatch makes a LIVE marker look stale and get deleted.  `smoke/02`'s
+# `creation-time` shape rule (one raw read, at least two call sites) keeps the
+# predicate from being re-inlined into a second copy.
+task_creation_time_or_fail() {
+    local task=$1
+    local task_id=${2-}
+
+    jq -er '.created_at | strings' <<<"$task" ||
+        fail "invalid creation time for AgentQ task: ${task_id-}"
+}
+
 # compact_task/raw_compact_task exit 4 only when Pueue ANSWERED and this id is
 # not visible; 1 (read failure) and 2/5 (malformed status) mean the task's
 # existence is UNKNOWN.  Folding all of them into "unknown AgentQ task id"
@@ -6295,7 +6326,7 @@ wait_for_task() {
     # was not a string: exit 2, "unknown AgentQ task id: 1", plus a raw
     # `jq: error` line on stderr).
     if task=$(compact_task "$task_id"); then
-        task_created_at=$(jq -er '.created_at | strings' <<<"$task") || fail "invalid creation time for AgentQ task: ${task_id-}"
+        task_created_at=$(task_creation_time_or_fail "$task" "$task_id") || return $?
         if ! task_identity_is_unambiguous "$task"; then
             jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
             printf '%s: task %s has an ambiguous AgentQ identity; the final state is unavailable\n' "$program" "$task_id" >&2
@@ -7337,7 +7368,7 @@ logs() {
     ensure_daemon
     task=$(compact_task "$task_id") || task_compact_status=$?
     report_compact_task_failure "$task_compact_status" "$task_id"
-    task_created_at=$(jq -er '.created_at | strings' <<<"$task") || fail "invalid creation time for AgentQ task: ${task_id-}"
+    task_created_at=$(task_creation_time_or_fail "$task" "$task_id") || return $?
     if ! task_identity_is_unambiguous "$task"; then
         jq -cn --argjson task_id "$task_id" '{task_id: $task_id, state: "unavailable"}'
         printf '%s: task %s has an ambiguous AgentQ identity; the log is unavailable\n' "$program" "$task_id" >&2
