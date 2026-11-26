@@ -1212,17 +1212,39 @@ load_c() {
         printf '%s\n' "$item" || fail "cannot print $item"
     done | jq -cse . || return 1
 }
-# negative: a bare fail in a function is the process exit 2
-load_d() {
-    fail "cannot load"
+# negative: `||` is a LOGICAL OR, not a pipeline.  `) || {` must not be read as
+# "the block closes into a pipe": the first draft of this rule did exactly that
+# and reported four CORRECT sites in compact_log (the `$( ... ) || { fail ... }`
+# guards there are fail-closed by design).  This row is what stops that
+# regression from coming back silently -- the self-test caught everything else
+# the first draft got wrong, but not this one, because this shape was missing.
+load_e() {
+    value=$(jq -e --arg id "$id" '.[$id]' < "$raw" 2>/dev/null) || value=''
+    {
+        printf '%s\n' "$value"
+    } || {
+        cleanup_raw || true
+        fail "cannot read the Pueue status while reading AgentQ task logs"
+    }
+}
+# negative: a redirected block that also uses a pipe INSIDE its body.  The inner
+# pipe is not the closing operator, so the block is still not piped-out.
+load_f() {
+    {
+        : "$(printf '%s\n' x | head -n 1)"
+        printf '%s\n' x > "$inner" || fail "cannot write"
+    } > "$out" || return 1
 }
 PIPEFIX
 pipe_fixture_raw=$(pipe_fail_scan "$pipe_fixture")
 pipe_fixture_regions=$(printf '%s\n' "$pipe_fixture_raw" | sed -n 's/^__PIPED__//p')
 pipe_fixture_sites=$(printf '%s\n' "$pipe_fixture_raw" | grep -vc '^__PIPED__' || true)
 cases=$((cases + 1))
+# The fixture now carries FOUR negative rows (redirect / `||` / inner pipe /
+# bare fail) and TWO positive ones, so a rule that fired on `||` or on a
+# redirect would over-count here instead of only being noticed in review.
 if [ "$pipe_fixture_regions" != 2 ] || [ "$pipe_fixture_sites" != 2 ]; then
-    printf 'error-contract: the pipe-fail scan failed its self-test (expected 2 piped blocks / 2 sites, got %s / %s); a blind scan would read as a clean server\n' \
+    printf 'error-contract: the pipe-fail scan failed its self-test (expected 2 piped blocks / 2 sites, got %s / %s); a blind or over-eager scan would mis-report the server\n' \
         "$pipe_fixture_regions" "$pipe_fixture_sites" >&2
     printf '%s\n' "$pipe_fixture_raw" | head -6 >&2
     failures=$((failures + 1))
