@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.46'
+agentq_version='0.1.47'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -2701,9 +2701,6 @@ ensure_group() {
         fail 'cannot allocate a group status temporary file'
     group_raw_file=$group_file
     require_runtime_temporary_file "$group_file"
-    require_runtime_temporary_file "$group_file"
-    require_runtime_temporary_file "$group_file"
-    require_runtime_temporary_file "$group_file"
     if ! run_pueue group --json > "$group_file"; then
         fail 'cannot inspect the AgentQ group'
     fi
@@ -2739,9 +2736,6 @@ verify_group() {
     group_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-group' '.json') ||
         fail 'cannot allocate a group status temporary file'
     group_raw_file=$group_file
-    require_runtime_temporary_file "$group_file"
-    require_runtime_temporary_file "$group_file"
-    require_runtime_temporary_file "$group_file"
     require_runtime_temporary_file "$group_file"
     run_pueue group --json > "$group_file" || fail 'cannot inspect the AgentQ group'
     require_runtime_temporary_file "$group_file"
@@ -3571,12 +3565,7 @@ prepare_request_metadata_files() {
 
     if ! require_runtime_temporary_file "$request_records_file" ||
         ! require_runtime_temporary_file "$request_records_file" ||
-        ! require_runtime_temporary_file "$request_records_file" ||
-        ! require_runtime_temporary_file "$request_records_file" ||
         ! load_request_records > "$request_records_file" ||
-        ! require_runtime_temporary_file "$cancellation_markers_file" ||
-        ! require_runtime_temporary_file "$cancellation_markers_file" ||
-        ! require_runtime_temporary_file "$cancellation_markers_file" ||
         ! require_runtime_temporary_file "$cancellation_markers_file" ||
         ! load_cancellation_markers > "$cancellation_markers_file" ||
         ! require_runtime_temporary_file "$request_records_file" ||
@@ -4159,7 +4148,6 @@ create_request_record() {
     payload_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-payload') || return 1
     if ! require_runtime_temporary_file "$payload_file" ||
         ! require_runtime_temporary_file "$payload_file" ||
-        ! require_runtime_temporary_file "$payload_file" ||
         ! printf '%s\n' "$payload" > "$payload_file" ||
         ! require_runtime_temporary_file "$payload_file"; then
         cleanup_request_payload_after_failure "$payload_file" || return 1
@@ -4505,7 +4493,6 @@ migrate_removed_request_records() {
     quarantine_legacy_request_records
     if [ -e "$request_layout_marker" ] || [ -L "$request_layout_marker" ]; then
         runtime_marker_file_is_safe "$request_layout_marker" || fail "invalid AgentQ request layout marker: $request_layout_marker"
-        runtime_marker_file_is_safe "$request_layout_marker" || fail "invalid AgentQ request layout marker: $request_layout_marker"
         IFS= read -r marker_value < "$request_layout_marker" || marker_value=''
         [ "$marker_value" = v2 ] || fail "unsupported AgentQ request layout marker: $request_layout_marker"
     else
@@ -4524,7 +4511,6 @@ request_tombstones_need_pruning() {
     if [ ! -e "$request_tombstone_prune_marker" ] && [ ! -L "$request_tombstone_prune_marker" ]; then
         return 0
     fi
-    runtime_marker_file_is_safe "$request_tombstone_prune_marker" || fail "invalid AgentQ tombstone prune marker: $request_tombstone_prune_marker"
     runtime_marker_file_is_safe "$request_tombstone_prune_marker" || fail "invalid AgentQ tombstone prune marker: $request_tombstone_prune_marker"
     IFS= read -r marker_epoch < "$request_tombstone_prune_marker" || marker_epoch=''
     is_positive_integer "$marker_epoch" || return 0
@@ -4774,7 +4760,6 @@ request_payload_matches() {
     payload_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-payload') || return 1
     if ! require_runtime_temporary_file "$payload_file" ||
         ! require_runtime_temporary_file "$payload_file" ||
-        ! require_runtime_temporary_file "$payload_file" ||
         ! printf '%s\n' "$payload" > "$payload_file" ||
         ! require_runtime_temporary_file "$payload_file"; then
         cleanup_request_payload_after_failure "$payload_file" || return 1
@@ -4881,9 +4866,6 @@ find_request_task() {
     raw_status_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-reconcile-status' '.json') ||
         fail 'cannot allocate a reconciliation status temporary file'
     reconcile_raw_status_file=$raw_status_file
-    require_runtime_temporary_file "$raw_status_file"
-    require_runtime_temporary_file "$raw_status_file"
-    require_runtime_temporary_file "$raw_status_file"
     require_runtime_temporary_file "$raw_status_file"
     # A transient Pueue read failure must NOT be reported as "no matching task".
     # `fail` is `exit 2`, and `exit` inside the `$( )` at every call site ends only
@@ -5505,8 +5487,6 @@ compact_status() {
     fi
     if require_runtime_temporary_file "$raw_status_file" &&
         require_runtime_temporary_file "$raw_status_file" &&
-        require_runtime_temporary_file "$raw_status_file" &&
-        require_runtime_temporary_file "$raw_status_file" &&
         run_pueue status --json > "$raw_status_file" &&
         require_runtime_temporary_file "$raw_status_file" &&
         validate_pueue_task_id_precision_in_file "$raw_status_file" &&
@@ -5571,8 +5551,6 @@ raw_compact_task() {
 
     if ! require_runtime_temporary_file "$raw_status_file" ||
         ! require_runtime_temporary_file "$raw_status_file" ||
-        ! require_runtime_temporary_file "$raw_status_file" ||
-        ! require_runtime_temporary_file "$raw_status_file" ||
         ! run_pueue status --json > "$raw_status_file" ||
         ! require_runtime_temporary_file "$raw_status_file"; then
         cleanup_raw_compact_task_raw_status_after_failure "$raw_status_file" || return 1
@@ -5615,8 +5593,6 @@ compact_task() {
         return 1
     fi
     if require_runtime_temporary_file "$raw_task_file" &&
-        require_runtime_temporary_file "$raw_task_file" &&
-        require_runtime_temporary_file "$raw_task_file" &&
         require_runtime_temporary_file "$raw_task_file" &&
         raw_compact_task "$task_id" > "$raw_task_file" &&
         require_runtime_temporary_file "$raw_task_file" && jq -ce 2>/dev/null \
@@ -5914,9 +5890,6 @@ wait_reconcile_missing_task() {
         return 6
     }
     reconcile_raw_status_file=$raw_status_file
-    require_runtime_temporary_file "$raw_status_file"
-    require_runtime_temporary_file "$raw_status_file"
-    require_runtime_temporary_file "$raw_status_file"
     require_runtime_temporary_file "$raw_status_file"
     if ! run_pueue status --json > "$raw_status_file"; then
         if ! remove_runtime_temporary_file "$raw_status_file" 'reconciliation raw status file'; then

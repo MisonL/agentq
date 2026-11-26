@@ -4,6 +4,7 @@
 版本（tag）是**部署单元的版本**，与 Pueue 版本无关（见 README）。
 
 ## 版本索引（Releases）
+- **[v0.1.47](https://github.com/MisonL/agentq/releases/tag/v0.1.47)**（2026-11-26）— 第一百零一类：删掉 27 行死代码。6 组相邻重复的 `require_runtime_temporary_file`（它有幂等、连调 4 次与调 1 次等价）与 2 处逐字相同的 `runtime_marker_file_is_safe … || fail`（第一条已经 exit 2，第二条永远到不了）。行为零变更，属于仓库自己反复记录的「同一机制写两遍」缺陷类。
 - **[v0.1.46](https://github.com/MisonL/agentq/releases/tag/v0.1.46)**（2026-11-26）— 第一百类：把上一轮「人工读出来的」缺口做成机器规则。`smoke/02` 新增第四条静态规则 `pipe-fail`：`{ … } | jq …` 左端的 `fail` 在子 shell 里，永远不是进程的 exit 2；判据是**语法**（闭合行带单个 `|`），不是消息文本。摘要新增 `pipe-fail-sites=0 piped-blocks=4`，红证在 v0.1.44 的副本上是 6/13，点名的正是上一轮修掉的两处加载器。服务端另把写了两遍的 `created_at` 判定合并成 `task_creation_time_or_fail`（#15 的处置：合并重复，而不是给不可达的守卫硬造用例）。
 - **[v0.1.45](https://github.com/MisonL/agentq/releases/tag/v0.1.45)**（2026-11-25）— 第九十九类：复查 0.1.44 时又抓到两个真缺陷。① 两处加载器（`load_request_records` / `load_cancellation_markers`）的 `fail` 在管道左端，只结束子 shell，于是 `reason=protocol_error` 配着 exit 1 出现——同一个损坏的 `status` 1、`remove --label` 1、`status --summary` 0，一处损坏三个答案；改为重定向到临时文件，循环体留在当前 shell。② 第九处 jq 泄漏：`compact_status_summary` 的 `error("invalid task in AgentQ status summary")`，上一轮按消息文本 `invalid visible Pueue task metadata` 去找，措辞不同就漏了。顺带把 0.1.44 里「15 条全部关闭」的口径改正：第 15 条查证为不可达的重复守卫（外层 `compact_task` 已先拒绝同一形状），如实记为未关闭。
 - **[v0.1.44](https://github.com/MisonL/agentq/releases/tag/v0.1.44)**（2026-11-25）— 第九十八类：把上一轮落盘的 15 条零断言出口实现（14 条真断言，第 15 条经查为不可达的重复守卫，已如实记录），并因此抓到**两个真缺陷**——`wait` 把「Pueue 答了但形状不可解」折成「unknown AgentQ task id」（把读不懂说成参数错），六处 jq 校验器的原始诊断泄漏到 stderr（会出现在 `reason=` 之前，而客户端正扫描那个流）。新增 `smoke/32-hostile-pueue`（cases=26：畸形 task/log 对象、非 JSON、status 与 summary 的瞬态失败、低精度 jq 的两条精度路径、`created_at` 不可读、非规范 id 的标记、损坏的 record/tombstone/marker）；`smoke/02` cases 51→66（服务端 argv 面 8 条 + Windows 臂 6 条，此前全是客户端本地拒绝或桩脚本打印的**假覆盖**——`grep 'wait requires one task id'` 的三处命中全是桩在模仿服务端）
@@ -74,6 +75,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
 
+
+2026-11-26  删掉 27 行死代码，行为零变更。① 6 组相邻重复的 `require_runtime_temporary_file`（`$group_file` ×2、`$raw_status_file` ×3、`$raw_task_file`、`$request_records_file`、`$cancellation_markers_file`、`$payload_file`）：它是一个 stat+形状检查、没有任何副作用，连调 4 次与调 1 次结果完全相同。② 2 处逐字相同的 `runtime_marker_file_is_safe … || fail "…"`（`request_layout_marker` 与 `request_tombstone_prune_marker`）：第一条已经 `exit 2`，第二条永远执行不到。这是本仓反复记录的「同一机制写两遍」缺陷类——上一轮把 `created_at` 判定从两处合并为 `task_creation_time_or_fail` 是同一个理由。
+  |  `./run-tests.sh`（`AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq`，真 pueue 4.0.4）→ **32 ran, 0 skipped, 0 partial, 0 failed（3775s）**；`smoke/02` cases=70 pipe-fail-sites=0 piped-blocks=4
 
 2026-11-26  「冒了 reason 却没退 2」这条缺口从人工发现变成机器规则。`smoke/02` 新增第四条静态规则 `pipe-fail`：管道左端跑在子 shell 里，`{ … } | jq …` 里的 `fail` 只能结束子 shell，调用方把它折成 exit 1 而 stderr 上仍挂着 `reason=protocol_error`。判据是**语法形状**（闭合行带**单个** `|` 的块，反向找开启行），不是消息文本——上一轮按消息文本找 jq 泄漏就漏掉了措辞不同的第九处。摘要新增 `pipe-fail-sites=0 piped-blocks=4`；正向控制是「扫到几个管道块」，块被删光时规则自己红而不是安静地绿。红证：v0.1.44 的 server 副本 `piped-blocks=6 pipe-fail-sites=13`。服务端另把 `created_at` 判定从两处合并为 `task_creation_time_or_fail`（#15 的处置：合并重复，不给不可达的守卫硬造用例）。
   |  `smoke/02` cases 66→70（`pipe-fail` 自检 + 空转闸门 + 站点闸门，加 `creation-time` 形状锁：原始读取恰 1 处、helper 调用点 ≥2）；`./run-tests.sh`（`AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq`，真 pueue 4.0.4）→ **32 ran, 0 skipped, 0 partial, 0 failed（2317s）**
