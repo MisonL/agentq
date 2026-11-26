@@ -2,7 +2,7 @@
 
 Remote task queue over SSH, backed by [Pueue](https://github.com/Nukesor/pueue) 4.0.4.
 
-**Version:** 0.1.48 — the deployment unit (`skill/assets/`, 23 files) ships as one
+**Version:** 0.1.49 — the deployment unit (`skill/assets/`, 23 files) ships as one
 version; releases are tagged in git, indexed at the top of [`CHANGELOG.md`](CHANGELOG.md),
 and verified by the [`release.yml`](.github/workflows/release.yml) tag/version gate.
 
@@ -106,7 +106,7 @@ npx agentq-skill@<version> --dest ~/.agents/skills/agentq
 npx agentq-skill@<version> --dest ~/.agents/skills/agentq --check
 ```
 
-`<version>` is this release's version, `0.1.48`. (Written as a placeholder on
+`<version>` is this release's version, `0.1.49`. (Written as a placeholder on
 purpose: a literal `<package>@<digits>` reads as an SSH `user@host` to the
 host-identifier check, which is fail-closed and stays that way.)
 
@@ -166,6 +166,19 @@ dropping out is better coverage, an unknown name — a check newly claiming a ga
 nobody has seen before — is red), so a new gap cannot hide as a green check.
 The gate is by check name: a known check adding a further token is not
 distinguished.
+
+**A green CI run is not a gate on the tag.** `ci.yml` publishes only on
+`push` to `main`/`pull_request`, and GitHub skips branch-filtered runs for tag
+pushes, so pushing a tag starts `release` and `npm` immediately while the suite
+for that same commit may still be running — or may already be red. Measured
+2026-11-26: on v0.1.45 the three workflows started within five seconds of each
+other, and `ci` needs ~13 minutes. Both tag workflows do their own cheap
+checks (annotated tag, tag against every version constant, tarball against the
+index), and `npm.yml` refuses to publish without `NPM_TOKEN`, so nothing ships
+by accident — but "the suite was green" is a property of the COMMIT, and you
+have to look at it yourself before pushing the tag. Making the tag wait would
+mean triggering `release`/`npm` from `workflow_run` instead of `push`; that has
+not been done and is not claimed.
 
 **After changing anything under `skill/`, sync the whole directory** — it is the
 install source, and nothing keeps the two in step automatically:

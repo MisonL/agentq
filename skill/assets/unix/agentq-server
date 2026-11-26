@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.48'
+agentq_version='0.1.49'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -297,6 +297,17 @@ stat_flavor=''
 compact_log_raw_file=''
 reconcile_raw_status_file=''
 group_raw_file=''
+# The two loaders' redirect targets.  Globals, not locals, for the same reason
+# repair_guard_stderr_file is: `fail` inside those loops exits the PROCESS, so
+# the function's own trailing `remove_runtime_temporary_file` never runs and the
+# EXIT trap's `cleanup()` is the only chance to remove the file -- and it can
+# only remove what it can name.  Measured 2026-11-26: they were locals, so one
+# refused `status`/`remove`/`doctor` leaked one 0600 file PERMANENTLY, unbounded,
+# and `prune_runtime_temporary_files` did not reclaim them either (its prefix
+# list predates both names).  This is the third time this shape bit: the
+# 2026-11-20 repair-guard capture and 0.1.47's own comment on it say the same.
+request_records_raw_file=''
+cancellation_markers_raw_file=''
 # repair_removed_request_records' fallback-only stderr capture.  It is a global,
 # not a local, because `archive_removed_request` calls `fail` on a tombstone
 # conflict -- `exit 2` from inside the loop, so the function's own trailing
@@ -2093,6 +2104,14 @@ release_operation_lock() {
 cleanup() {
     local cleanup_status=0
 
+    if [ -n "$request_records_raw_file" ]; then
+        remove_runtime_temporary_file "$request_records_raw_file" 'raw AgentQ request records file' || cleanup_status=1
+        request_records_raw_file=''
+    fi
+    if [ -n "$cancellation_markers_raw_file" ]; then
+        remove_runtime_temporary_file "$cancellation_markers_raw_file" 'raw AgentQ cancellation markers file' || cleanup_status=1
+        cancellation_markers_raw_file=''
+    fi
     if [ -n "$compact_log_raw_file" ]; then
         remove_runtime_temporary_file "$compact_log_raw_file" 'compact log raw log file' || cleanup_status=1
         compact_log_raw_file=''
@@ -2905,10 +2924,9 @@ load_cancellation_markers() {
     # subshell, so a non-canonical marker filename answered exit 1 with
     # `reason=protocol_error` on stderr while the same tree answered exit 2 from
     # every other reader.  Measured 2026-11-25.
-    local markers_raw
     local marker_command_status=0
-    markers_raw=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-markers-raw' '.txt') || return 1
-    require_runtime_temporary_file "$markers_raw" || return 1
+    cancellation_markers_raw_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-markers-raw' '.txt') || return 1
+    require_runtime_temporary_file "$cancellation_markers_raw_file" || return 1
 
     {
         for marker_path in "${marker_files[@]}"; do
@@ -2965,8 +2983,9 @@ load_cancellation_markers() {
             fi
             printf '%s\n' "$marker"
         done
-    } > "$markers_raw" || {
-        remove_runtime_temporary_file "$markers_raw" 'raw AgentQ cancellation markers file' || true
+    } > "$cancellation_markers_raw_file" || {
+        remove_runtime_temporary_file "$cancellation_markers_raw_file" 'raw AgentQ cancellation markers file' || true
+        cancellation_markers_raw_file=''
         return 1
     }
 
@@ -2990,8 +3009,9 @@ load_cancellation_markers() {
             map(if .state? == null then . + {state: "requested"} else . end)
         else error("invalid AgentQ cancellation marker")
         end
-    ' < "$markers_raw" || marker_command_status=$?
-    remove_runtime_temporary_file "$markers_raw" 'raw AgentQ cancellation markers file' || marker_command_status=1
+    ' < "$cancellation_markers_raw_file" || marker_command_status=$?
+    remove_runtime_temporary_file "$cancellation_markers_raw_file" 'raw AgentQ cancellation markers file' || marker_command_status=1
+    cancellation_markers_raw_file=''
     return "$marker_command_status"
 }
 
@@ -3399,10 +3419,9 @@ load_request_records() {
     #
     # With a redirect the body keeps the current shell and its `fail` is the
     # process's real exit 2.  The cost is one temporary file per load.
-    local records_raw
     local command_status=0
-    records_raw=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-records-raw' '.txt') || return 1
-    require_runtime_temporary_file "$records_raw" || return 1
+    request_records_raw_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-records-raw' '.txt') || return 1
+    require_runtime_temporary_file "$request_records_raw_file" || return 1
 
     {
     for record_path in "${record_files[@]}"; do
@@ -3485,8 +3504,9 @@ load_request_records() {
         }
         printf '%s\n' "$record"
         done
-    } > "$records_raw" || {
-        remove_runtime_temporary_file "$records_raw" 'raw AgentQ request records file' || true
+    } > "$request_records_raw_file" || {
+        remove_runtime_temporary_file "$request_records_raw_file" 'raw AgentQ request records file' || true
+        request_records_raw_file=''
         return 1
     }
 
@@ -3495,8 +3515,9 @@ load_request_records() {
     # comment at the producer's opening brace.
     command_status=0
     jq -cse 2>/dev/null --args "$request_records_filter" -- "${record_ids[@]}" \
-        < "$records_raw" || command_status=$?
-    remove_runtime_temporary_file "$records_raw" 'raw AgentQ request records file' || command_status=1
+        < "$request_records_raw_file" || command_status=$?
+    remove_runtime_temporary_file "$request_records_raw_file" 'raw AgentQ request records file' || command_status=1
+    request_records_raw_file=''
     return "$command_status"
 }
 
@@ -3567,7 +3588,6 @@ prepare_request_metadata_files() {
     }
 
     if ! require_runtime_temporary_file "$request_records_file" ||
-        ! require_runtime_temporary_file "$request_records_file" ||
         ! load_request_records > "$request_records_file" ||
         ! require_runtime_temporary_file "$cancellation_markers_file" ||
         ! load_cancellation_markers > "$cancellation_markers_file" ||
@@ -3929,7 +3949,9 @@ prune_runtime_temporary_files() {
         "$runtime_directory"/.agentq-request-tombstones-pruned-at.*.new \
         "$runtime_directory"/.agentq-group.*.json \
         "$runtime_directory"/.agentq-reconcile-status.*.json \
-        "$runtime_directory"/.agentq-log.*.json; do
+        "$runtime_directory"/.agentq-log.*.json \
+        "$runtime_directory"/.agentq-markers-raw.*.txt \
+        "$runtime_directory"/.agentq-records-raw.*.txt; do
         path_chain_is_safe "$temporary_path" ||
             fail "invalid AgentQ runtime temporary file path: $temporary_path"
         # A live owner deletes its OWN temp between this glob and the test:
@@ -3997,6 +4019,23 @@ prune_runtime_temporary_files() {
             .agentq-request-tombstones-pruned-at.*.new)
                 temporary_stem=${temporary_name#.agentq-request-tombstones-pruned-at.}
                 temporary_stem=${temporary_stem%.new}
+                temporary_pid=${temporary_stem%%.*}
+                ;;
+            # The two loaders' redirect targets (added 0.1.49).  The GLOB above
+            # would have matched them without these arms, and the default branch
+            # then FAILED the whole command on a file the server itself had
+            # written -- measured while red-testing this very fix: `corrupt-
+            # tombstone` and `lookup` both exited 2 with "invalid AgentQ runtime
+            # temporary file path".  A prune list and its case arms are one unit;
+            # smoke/32 now fails if a glob entry has no arm.
+            .agentq-markers-raw.*.txt)
+                temporary_stem=${temporary_name#.agentq-markers-raw.}
+                temporary_stem=${temporary_stem%.txt}
+                temporary_pid=${temporary_stem%%.*}
+                ;;
+            .agentq-records-raw.*.txt)
+                temporary_stem=${temporary_name#.agentq-records-raw.}
+                temporary_stem=${temporary_stem%.txt}
                 temporary_pid=${temporary_stem%%.*}
                 ;;
             *)
@@ -4150,7 +4189,6 @@ create_request_record() {
     # the same $() family guarded everywhere else; remaining site (2026-10-13).
     payload_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-payload') || return 1
     if ! require_runtime_temporary_file "$payload_file" ||
-        ! require_runtime_temporary_file "$payload_file" ||
         ! printf '%s\n' "$payload" > "$payload_file" ||
         ! require_runtime_temporary_file "$payload_file"; then
         cleanup_request_payload_after_failure "$payload_file" || return 1
@@ -4762,7 +4800,6 @@ request_payload_matches() {
 
     payload_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-payload') || return 1
     if ! require_runtime_temporary_file "$payload_file" ||
-        ! require_runtime_temporary_file "$payload_file" ||
         ! printf '%s\n' "$payload" > "$payload_file" ||
         ! require_runtime_temporary_file "$payload_file"; then
         cleanup_request_payload_after_failure "$payload_file" || return 1
@@ -5489,7 +5526,6 @@ compact_status() {
         return 1
     fi
     if require_runtime_temporary_file "$raw_status_file" &&
-        require_runtime_temporary_file "$raw_status_file" &&
         run_pueue status --json > "$raw_status_file" &&
         require_runtime_temporary_file "$raw_status_file" &&
         validate_pueue_task_id_precision_in_file "$raw_status_file" &&
@@ -5553,7 +5589,6 @@ raw_compact_task() {
     raw_status_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-status' '.json') || return 1
 
     if ! require_runtime_temporary_file "$raw_status_file" ||
-        ! require_runtime_temporary_file "$raw_status_file" ||
         ! run_pueue status --json > "$raw_status_file" ||
         ! require_runtime_temporary_file "$raw_status_file"; then
         cleanup_raw_compact_task_raw_status_after_failure "$raw_status_file" || return 1
@@ -5596,7 +5631,6 @@ compact_task() {
         return 1
     fi
     if require_runtime_temporary_file "$raw_task_file" &&
-        require_runtime_temporary_file "$raw_task_file" &&
         raw_compact_task "$task_id" > "$raw_task_file" &&
         require_runtime_temporary_file "$raw_task_file" && jq -ce 2>/dev/null \
         --slurpfile markers "$cancellation_markers_jq_file" \

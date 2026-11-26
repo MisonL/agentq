@@ -2398,13 +2398,26 @@ fi
 # answered `commit` for an annotated tag; in a throwaway clone, fetch-by-sha
 # into refs/tags/<name> -> `commit`, fetch of the tag refspec -> `tag`).  So
 # the workflow must re-fetch the tag ref itself; both constructs are required.
+# npm.yml publishes the same tag, so it has to answer the same question the same
+# way.  Measured 2026-11-26: it did not assert the annotation at all, and v0.1.43
+# (a lightweight tag) went green there four times, three of them past the point
+# where it decides whether to publish.  A tag that release.yml refuses must not
+# be publishable by npm.yml.
 release_gate_annotation=missing
-if release_gate_reads "$release_gate_workflow" 'refs/tags/' 'git cat-file -t' &&
-    release_gate_reads "$release_gate_workflow" 'refs/tags/' 'git fetch'; then
-    release_gate_annotation=asserted
-else
-    printf '%s\n' 'release-gate FAILED (release.yml either never asserts that the pushed tag is ANNOTATED, or never re-fetches the tag ref first -- actions/checkout points refs/tags/<name> at the COMMIT, so cat-file alone answers commit for a correct annotated tag; smoke/31 rule E only runs on branch pushes, so a lightweight tag would release green)' >&2
+for release_gate_candidate in "$release_gate_workflow" "$root/.github/workflows/npm.yml"; do
+    if release_gate_reads "$release_gate_candidate" 'refs/tags/' 'git cat-file -t' &&
+        release_gate_reads "$release_gate_candidate" 'refs/tags/' 'git fetch'; then
+        continue
+    fi
+    printf 'release-gate FAILED (%s either never asserts that the pushed tag is ANNOTATED, or never re-fetches the tag ref first -- actions/checkout points refs/tags/<name> at the COMMIT, so cat-file alone answers commit for a correct annotated tag; smoke/31 rule E only runs on branch pushes, so a lightweight tag would release green): %s\n' \
+        "$(basename "$release_gate_candidate")" "$(basename "$release_gate_candidate")" >&2
     release_gate_gaps=$((release_gate_gaps + 1))
+    release_gate_annotation=missing
+done
+# The summary must not claim `asserted` for a red gate, and must not claim
+# `missing` for a green one: derive it from the gap count after the loop.
+if [ "$release_gate_gaps" -eq 0 ]; then
+    release_gate_annotation=asserted
 fi
 # Two-way calibration for the fetch half: the comment-only shape must NOT count
 # (the same "prose is not a read" lesson as the records above), and the real
@@ -5068,8 +5081,28 @@ format_state="trailing=$format_trailing tabs=$format_tabs no-final-newline=$form
 # a blank separator, two identical `case` arms).
 dup_guard_scan() { # $1 = file -> offending line numbers, one per line
     awk '
-        { cur = $0; sub(/^[[:space:]]+/, "", cur) }
-        cur == prev && cur != "" && cur !~ /^#/ && cur ~ /\|\|/ && cur ~ /^[a-z_][a-z0-9_]*[[:space:]]+"?\$/ {
+        {
+            cur = $0
+            sub(/^[[:space:]]+/, "", cur)
+            # Remove the GUARD KEYWORD before comparing.  The real shape is
+            # `if ! require_x "$f" ||` followed by `! require_x "$f" ||`: the
+            # second line is byte-identical to the first only after `if ` is
+            # gone, and requiring byte equality made the rule report 0 on
+            # prepare_request_metadata_files, which carried exactly that pair
+            # (measured 2026-11-26).  Stripping the keyword cannot create a hit
+            # that was not a repetition of the same CALL.
+            sub(/^(if|elif|while|until)[[:space:]]+/, "", cur)
+        }
+        # The leading `!` is part of the shape: `! require_x "$f" ||` repeated in
+        # an `if` condition is the same dead second call as the bare form, and
+        # the first version of this rule required `^[a-z_]` so it never matched
+        # one.  Measured 2026-11-26: prepare_request_metadata_files carried such a
+        # pair and dup_guards reported 0.  `!` is now allowed, and a fixture row
+        # pins it.
+        # `! is_safe "$p" ||` ends in a bare `|` on the CONTINUATION line, not in
+        # `||`, so `\|\|` alone misses it.  Either spelling counts: the call is
+        # the thing that repeats, the operator after it is incidental.
+        cur == prev && cur != "" && cur !~ /^#/ && cur ~ /\|/ && cur ~ /^!?[[:space:]]*[a-z_][a-z0-9_]*[[:space:]]+"?\$/ {
             print NR ": " cur
         }
         { prev = cur }' "$1"
@@ -5083,6 +5116,13 @@ guard_a() {
 guard_b() {
     is_safe "$p" || return 1
     also_safe "$p" || return 1
+}
+guard_neg() {
+    if ! is_safe "$p" ||
+        ! is_safe "$p" ||
+        ! is_safe "$p"; then
+        return 1
+    fi
 }
 guard_c() {
     if [ -n "$x" ]; then
@@ -5098,8 +5138,8 @@ rm -f "$dup_guard_fixture"
 dup_guard_self_count=$(printf '%s\n' "$dup_guard_self" | grep -c . || true)
 # Exactly one: the repeated guard in guard_a.  guard_b is two DIFFERENT calls and
 # guard_c repeats a multi-line construct, whose inner lines are not guard calls.
-if [ "$dup_guard_self_count" != 1 ]; then
-    printf 'syntax-and-parity: shell FAILED (the duplicate-guard rule failed its self-test: expected 1 hit, got %s)\n' \
+if [ "$dup_guard_self_count" != 2 ]; then
+    printf 'syntax-and-parity: shell FAILED (the duplicate-guard rule failed its self-test: expected 2 hits -- the bare form and the `!`-prefixed form -- got %s)\n' \
         "$dup_guard_self_count" >&2
     failures=$((failures + 1))
 fi

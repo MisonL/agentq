@@ -74,6 +74,21 @@ control="$work/control"
 mkdir -p "$home/config" "$home/data/task_logs" "$home/data/agentq-cancellations" \
     "$home/data/agentq-requests/.locks" "$home/data/agentq-requests/.tombstones" \
     "$home/runtime" "$control"
+# Zero scratch files before the first case, so the end-of-run check below is a
+# real assertion rather than a comparison of two dirty states.
+raw_start=$(find "$home/runtime" -maxdepth 1 \
+    \( -name '.agentq-markers-raw.*' -o -name '.agentq-records-raw.*' \) 2>/dev/null | wc -l | tr -d ' ')
+# The recovery half: a scratch file whose OWNER IS DEAD must be reclaimed by the
+# next command, because the direct half (cleanup removing its own file) cannot
+# help a process that was SIGKILLed or that ran the loader in a subshell.  Pid
+# 999999 is chosen to be dead; `kill -0` on it fails, which is exactly the
+# pruner's test.  Before 0.1.49 neither prefix appeared in its glob list, so
+# these two files survived forever.
+planted_markers_raw="$home/runtime/.agentq-markers-raw.999999.deadXX.txt"
+planted_records_raw="$home/runtime/.agentq-records-raw.999999.deadYY.txt"
+: >"$planted_markers_raw"
+: >"$planted_records_raw"
+chmod 600 "$planted_markers_raw" "$planted_records_raw"
 
 cp "$source_home/pueue" "$home/pueue.real"
 cp "$source_home/pueued" "$home/pueued"
@@ -536,6 +551,7 @@ expect_fail marker-bad-filename "$server" 'invalid AgentQ cancellation marker fi
 expect_fail marker-bad-filename-batch "$server" 'invalid AgentQ cancellation marker filename' remove --label hostile --confirm
 rm -f "$cursor_dir/notanid.json"
 
+
 # The request-record twin: a filename that is not a request id.  This one is
 # reached by every command that reads records, so it is asserted from three.
 printf '{"version":1,"request_id":"notanid","label":"hostile","workdir":"/tmp","task_id":1,"task_created_at":"2026-11-25T00:00:00Z","state":"accepted","created_at":"2026-11-25T00:00:00Z"}\n' \
@@ -584,6 +600,42 @@ state=0
 "$server" lookup "smoke-hostile-tomb-$$" >/dev/null 2>"$work/recovered-lookup.err" || state=$?
 if [ "$state" -ne 3 ]; then
     note "lookup on an absent id exited $state, expected 3/not_found: $(head -2 "$work/recovered-lookup.err" | tr '\n' '|')"
+    failures=$((failures + 1))
+fi
+
+# The pruner must reclaim the two planted files (see the note beside them).
+"$server" status >/dev/null 2>"$work/prune-reclaim.err" || true
+cases=$((cases + 1))
+if [ -e "$planted_markers_raw" ] || [ -e "$planted_records_raw" ]; then
+    note "the runtime pruner did not reclaim a dead owner's scratch file: $(ls "$planted_markers_raw" "$planted_records_raw" 2>/dev/null | tr '\n' ' ')"
+    failures=$((failures + 1))
+fi
+
+# A refused load must not leave its scratch file behind.
+#
+# The two loaders were converted from `{ ... } | jq` to `{ ... } > "$raw"` in
+# 0.1.45; the redirect target is a runtime temporary file, and `fail` inside
+# those loops exits the PROCESS (2), so `cleanup()` is the only thing that can
+# remove it -- and it can only remove what it can NAME.  They were locals until
+# 0.1.49, so `cleanup` never saw them, and `prune_runtime_temporary_files` did
+# not reclaim them either (its prefix list predates both names).  Measured
+# 2026-11-26: one refused command leaked one 0600 file PERMANENTLY, unbounded;
+# three `status` calls plus a SUCCESSFUL `doctor` did not clear it.
+#
+# Asserted at the END, over the whole run, so no single case has to be singled
+# out -- but only if the run STARTED clean, which the first check proves.  A
+# mid-file delta was tried first and read `before=1 after=1`: it could not tell
+# "nothing leaked" from "one file leaked earlier", which is the same
+# vacuous-comparison mistake the two loader prefixes are about.
+raw_leftovers() {
+    find "$home/runtime" -maxdepth 1 \
+        \( -name '.agentq-markers-raw.*' -o -name '.agentq-records-raw.*' \) 2>/dev/null |
+        wc -l | tr -d ' '
+}
+raw_after=$(raw_leftovers)
+cases=$((cases + 1))
+if [ "$raw_start" != 0 ] || [ "$raw_after" != 0 ]; then
+    note "loaders left their scratch file in the runtime directory (at start=$raw_start, at end=$raw_after): $(find "$home/runtime" -maxdepth 1 \( -name '.agentq-markers-raw.*' -o -name '.agentq-records-raw.*' \) 2>/dev/null | tr '\n' ' ')"
     failures=$((failures + 1))
 fi
 

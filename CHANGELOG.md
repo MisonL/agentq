@@ -4,6 +4,7 @@
 版本（tag）是**部署单元的版本**，与 Pueue 版本无关（见 README）。
 
 ## 版本索引（Releases）
+- **[v0.1.49](https://github.com/MisonL/agentq/releases/tag/v0.1.49)**（2026-11-26）— 第一百零三类：审计发现的四个真问题。`npm run verify:pack` 的字节比对原来读**工作树**（和它自己打出的 tarball 同源，永远相等）；`npm.yml` 不查 annotated tag；0.1.45 引入的两个加载器临时文件既不在 `cleanup()` 也不在 pruner 里，一次失败永久泄漏一个 0600 文件。
 - **[v0.1.48](https://github.com/MisonL/agentq/releases/tag/v0.1.48)**（2026-11-26）— 第一百零二类：把上一轮「手工扫了一遍重复守卫」变成机器规则。`smoke/01` 新增 `dup_guards`（相邻两行是同一个带 `||` 兜底的守卫调用即违规，双向自检 + 红证），它当场在**上一轮没看过的三个文件**里又抓到 5 行同类死代码（服务端 `write_temporary_contents` 三连、客户端 `agentq` 两处、`sshp` 一处）。
 - **[v0.1.47](https://github.com/MisonL/agentq/releases/tag/v0.1.47)**（2026-11-26）— 第一百零一类：删掉 27 行死代码。6 组相邻重复的 `require_runtime_temporary_file`（它有幂等、连调 4 次与调 1 次等价）与 2 处逐字相同的 `runtime_marker_file_is_safe … || fail`（第一条已经 exit 2，第二条永远到不了）。行为零变更，属于仓库自己反复记录的「同一机制写两遍」缺陷类。
 - **[v0.1.46](https://github.com/MisonL/agentq/releases/tag/v0.1.46)**（2026-11-26）— 第一百类：把上一轮「人工读出来的」缺口做成机器规则。`smoke/02` 新增第四条静态规则 `pipe-fail`：`{ … } | jq …` 左端的 `fail` 在子 shell 里，永远不是进程的 exit 2；判据是**语法**（闭合行带单个 `|`），不是消息文本。摘要新增 `pipe-fail-sites=0 piped-blocks=4`，红证在 v0.1.44 的副本上是 6/13，点名的正是上一轮修掉的两处加载器。服务端另把写了两遍的 `created_at` 判定合并成 `task_creation_time_or_fail`（#15 的处置：合并重复，而不是给不可达的守卫硬造用例）。
@@ -76,6 +77,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
 
+
+2026-11-26  审计出四个真问题，全部修掉并各自补上红证。①`scripts/verify-pack.js` 的字节比对读的是**工作树**：`npm pack` 也从工作树取字节，于是两边同源、永远"bytes identical"——未提交的篡改可以静默进入 tarball。改为 `git cat-file blob :<path>` 读索引（同一文件上层"文件集"检查早就用 `git ls-files` 比索引，字节比对照抄了它没学的那一半）。②同一个脚本不读 `package.json`：`version: 9.9.9` 与 `bin` 指向不存在文件都绿，现按部署资产里的 `agentq_version` 交叉核对并检查 bin 目标在 tarball 内。③`npm.yml` 缺 `release.yml` 自 2026-11-20 就有的 annotated-tag 断言——轻量 tag 能走到 publish 判定（实测 v0.1.43 是轻量 tag，npm.yml 在它上面绿过四次）。④0.1.45 把两个加载器从管道改成重定向时，新建的 `.agentq-markers-raw` / `.agentq-records-raw` 既不在 `cleanup()` 也不在 pruner 里：`fail` 是 `exit 2`，函数自己那句删除永远跑不到，实测一次失败泄漏一个 0600 文件、连跑三条命令都不清。改为全局 + `cleanup()` + pruner 前缀与 case 分支（加前缀忘了 case 分支会让 pruner 在服务器自己写的文件上 `fail`，实测踩到）。另：`smoke/01` 的 `dup_guards` 放宽到 `!`/`if` 引导的续行形态，又在服务端清掉 5 行同类重复。
+  |  `./run-tests.sh`（`AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq`，真 pueue 4.0.4）→ **32 ran, 0 skipped, 0 partial, 0 failed（1344s）**；`smoke/32` cases=34（含新增的 scratch 残留与 pruner 回收用例）；`smoke/01` → `dup_guards=0 release_gate=...annotated=asserted`；红证：篡改未暂存 / `version: 9.9.9` / `bin` 指向不存在 → verify-pack 各 exit 1；0.1.48 服务端 → `smoke/32` 报 4 个残留；删掉 npm.yml 的 tag re-fetch → `smoke/01` 报 release-gate FAILED。附带：新门禁在 v0.1.49 的第一次 CI 上就抓到我自己写的 `cat-file` 少了 re-fetch（GitHub 把 tag ref 指到 commit），已修
 
 2026-11-26  把「重复守卫」从人工清扫变成机器规则，并清掉它抓出来的剩余死代码。`smoke/01` 新增 `dup_guards`：相邻两行若是同一个「带 `||` 兜底的守卫调用」，即判违规——判据是**行形状**（单行调用 + 带参数 + 带 `||`），不是函数名白名单，所以换名字、换文件都躲不开；自检夹具三向（重复必报 / 两个不同调用不报 / 重复的多行构造不报），红证：把一行守卫种回去 → 2 条失败。它第一次跑就在上一轮没扫到的三个文件里抓到 5 行：服务端 `write_temporary_contents` 里 `temporary_file_is_safe` 连写三遍、客户端 `agentq` 的 `write_ssh_diagnostic_metadata` 与 `write_response_metadata`、`sshp` 的 `write_ssh_diagnostic_metadata` 各重复一遍。这些守卫全是纯谓词（路径链/文件类型/符号链接），失败即 `|| return`，所以第二遍永远到不了。
   |  `./run-tests.sh`（`AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq`，真 pueue 4.0.4）→ **32 ran, 0 skipped, 0 partial, 0 failed（4833s）**；`smoke/01` → `dup_guards=0`；红证：种回一行重复守卫 → 2 条失败

@@ -81,6 +81,39 @@ jobs:
       # deliberate rather than extracting a shared script: this workflow can run
       # on workflow_dispatch (no tag), and a shared script would then need a
       # no-tag mode whose absence would be invisible.
+      # The tag must be ANNOTATED before its name is trusted to identify a
+      # release.  release.yml has asserted this since 2026-11-20; this workflow
+      # did not, so a lightweight tag could reach `npm publish` while the release
+      # workflow refused the same tag -- two workflows disagreeing about whether
+      # a tag is publishable.  Measured 2026-11-26 (audit): v0.1.43 is a
+      # lightweight tag and npm.yml went green on it four times, three of which
+      # reached the publish decision.
+      #
+      # `git cat-file -t refs/tags/<name>` reads the object the REF points at,
+      # and actions/checkout on a tag push points that ref at the COMMIT -- so
+      # cat-file alone answers `commit` for a correctly annotated tag.  The ref
+      # must be re-fetched first.  I first wrote this step without the fetch,
+      # reasoning that `fetch-depth: 0` would keep the tag object; the CI run
+      # for v0.1.49 answered `commit` and failed, which is the gate doing its
+      # job on its own author.  release.yml has carried both halves since
+      # 2026-11-20 for the same measured reason.
+      - name: Require an annotated tag
+        if: github.event_name == 'push'
+        run: |
+          set -eu
+          if ! git fetch --no-tags --depth=1 origin "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"; then
+            echo "cannot fetch refs/tags/${GITHUB_REF_NAME} to inspect its object type" >&2
+            echo "The publish gate inspects the ref itself; retry the tag push." >&2
+            exit 1
+          fi
+          object_type=$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}" 2>/dev/null || true)
+          if [ "$object_type" != tag ]; then
+            echo "tag $GITHUB_REF_NAME is not an annotated tag (git cat-file -t answered '${object_type:-unknown}')." >&2
+            echo "Create it with \`git tag -a\` and push it again: the annotation carries the release notes and the back-link." >&2
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME is an annotated tag"
+
       - name: Check the tag against package.json
         if: github.event_name == 'push'
         run: |

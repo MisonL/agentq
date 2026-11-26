@@ -52,6 +52,22 @@ function sha256(file) {
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
 
+// The bytes the COMMIT holds, not the bytes on disk.
+//
+// Measured 2026-11-26: appending a line to skill/SKILL.md without staging it
+// still printed `bytes identical`, because `npm pack` reads the working tree and
+// the comparison read the same working tree -- both sides came from the dirty
+// source, so the assertion could never fail.  The file-set check two screens up
+// already compared against the INDEX for exactly this reason (the planted.key
+// incident); the byte check never got the same treatment.  `git cat-file blob
+// :<path>` is the index copy, so an unstaged or half-staged edit is caught.
+function sha256Index(root, file) {
+  return crypto
+    .createHash('sha256')
+    .update(execFileSync('git', ['cat-file', 'blob', ':' + file], { cwd: root }))
+    .digest('hex');
+}
+
 function walk(absolute, relative, out) {
   for (const entry of fs.readdirSync(absolute, { withFileTypes: true })) {
     const childRelative = relative === '' ? entry.name : relative + '/' + entry.name;
@@ -170,10 +186,44 @@ function main() {
     failures += 1;
   }
 
+  // The manifest is the other half of what a consumer receives, and the file-set
+  // check exempts it by NAME.  Measured 2026-11-26: `version: "9.9.9"` and a
+  // `bin` pointing at a file that does not exist both passed, because nothing
+  // read them.  A version that disagrees with the deployed assets publishes a
+  // package that lies about what it carries; a bin that points nowhere ships a
+  // package with no CLI at all.  npm.yml compares the version against the TAG,
+  // but that only runs in CI on a tag push -- not on a local `npm run verify:pack`.
+  const manifestRaw = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8'));
+  const serverVersion = /^agentq_version='([^']+)'$/m.exec(
+    fs.readFileSync(path.join(packageRoot, 'skill/assets/unix/agentq-server'), 'utf8')
+  );
+  if (!serverVersion) {
+    process.stderr.write(PROGRAM + ': the tarball\'s agentq-server has no agentq_version line; the manifest version cannot be cross-checked\n');
+    failures += 1;
+  } else if (manifestRaw.version !== serverVersion[1]) {
+    process.stderr.write(
+      PROGRAM + ': package.json version ' + JSON.stringify(manifestRaw.version) +
+      ' does not match the deployed assets (' + JSON.stringify(serverVersion[1]) + '); a consumer would get files of another version\n'
+    );
+    failures += 1;
+  }
+  const manifestBins = typeof manifestRaw.bin === 'string' ? [manifestRaw.bin] : Object.values(manifestRaw.bin || {});
+  if (manifestBins.length === 0) {
+    process.stderr.write(PROGRAM + ': package.json declares no bin; the package would ship without a CLI\n');
+    failures += 1;
+  }
+  for (const entry of manifestBins) {
+    const cleaned = String(entry).replace(/^\.\//, '');
+    if (!fs.existsSync(path.join(packageRoot, cleaned))) {
+      process.stderr.write(PROGRAM + ': package.json bin points at ' + JSON.stringify(cleaned) + ', which is not in the tarball\n');
+      failures += 1;
+    }
+  }
+
   for (const file of repoFiles) {
     if (!packedFiles.includes(file)) continue;
-    if (sha256(path.join(root, file)) !== sha256(path.join(packageRoot, file))) {
-      process.stderr.write(PROGRAM + ': bytes differ from the repository copy: ' + file + '\n');
+    if (sha256Index(root, file) !== sha256(path.join(packageRoot, file))) {
+      process.stderr.write(PROGRAM + ': bytes differ from the COMMITTED copy (the tarball carries the working tree, so an unstaged edit ships silently): ' + file + '\n');
       failures += 1;
     }
   }
