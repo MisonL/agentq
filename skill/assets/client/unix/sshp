@@ -315,7 +315,6 @@ ssh_transport_error() {
 write_ssh_diagnostic_metadata() {
     ssh_metadata_file=$1
     require_existing_runtime_file "$ssh_metadata_file" || return $?
-    require_existing_runtime_file "$ssh_metadata_file" || return $?
     ssh_metadata_bytes=$(wc -c < "$ssh_metadata_file") && ssh_metadata_bytes=$(printf '%s' "$ssh_metadata_bytes" | tr -d '[:space:]') || return 1
     case "$ssh_metadata_bytes" in
         ''|*[!0123456789]*) return 1 ;;

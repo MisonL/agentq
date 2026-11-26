@@ -4,6 +4,7 @@
 版本（tag）是**部署单元的版本**，与 Pueue 版本无关（见 README）。
 
 ## 版本索引（Releases）
+- **[v0.1.48](https://github.com/MisonL/agentq/releases/tag/v0.1.48)**（2026-11-26）— 第一百零二类：把上一轮「手工扫了一遍重复守卫」变成机器规则。`smoke/01` 新增 `dup_guards`（相邻两行是同一个带 `||` 兜底的守卫调用即违规，双向自检 + 红证），它当场在**上一轮没看过的三个文件**里又抓到 5 行同类死代码（服务端 `write_temporary_contents` 三连、客户端 `agentq` 两处、`sshp` 一处）。
 - **[v0.1.47](https://github.com/MisonL/agentq/releases/tag/v0.1.47)**（2026-11-26）— 第一百零一类：删掉 27 行死代码。6 组相邻重复的 `require_runtime_temporary_file`（它有幂等、连调 4 次与调 1 次等价）与 2 处逐字相同的 `runtime_marker_file_is_safe … || fail`（第一条已经 exit 2，第二条永远到不了）。行为零变更，属于仓库自己反复记录的「同一机制写两遍」缺陷类。
 - **[v0.1.46](https://github.com/MisonL/agentq/releases/tag/v0.1.46)**（2026-11-26）— 第一百类：把上一轮「人工读出来的」缺口做成机器规则。`smoke/02` 新增第四条静态规则 `pipe-fail`：`{ … } | jq …` 左端的 `fail` 在子 shell 里，永远不是进程的 exit 2；判据是**语法**（闭合行带单个 `|`），不是消息文本。摘要新增 `pipe-fail-sites=0 piped-blocks=4`，红证在 v0.1.44 的副本上是 6/13，点名的正是上一轮修掉的两处加载器。服务端另把写了两遍的 `created_at` 判定合并成 `task_creation_time_or_fail`（#15 的处置：合并重复，而不是给不可达的守卫硬造用例）。
 - **[v0.1.45](https://github.com/MisonL/agentq/releases/tag/v0.1.45)**（2026-11-25）— 第九十九类：复查 0.1.44 时又抓到两个真缺陷。① 两处加载器（`load_request_records` / `load_cancellation_markers`）的 `fail` 在管道左端，只结束子 shell，于是 `reason=protocol_error` 配着 exit 1 出现——同一个损坏的 `status` 1、`remove --label` 1、`status --summary` 0，一处损坏三个答案；改为重定向到临时文件，循环体留在当前 shell。② 第九处 jq 泄漏：`compact_status_summary` 的 `error("invalid task in AgentQ status summary")`，上一轮按消息文本 `invalid visible Pueue task metadata` 去找，措辞不同就漏了。顺带把 0.1.44 里「15 条全部关闭」的口径改正：第 15 条查证为不可达的重复守卫（外层 `compact_task` 已先拒绝同一形状），如实记为未关闭。
@@ -75,6 +76,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
 
+
+2026-11-26  把「重复守卫」从人工清扫变成机器规则，并清掉它抓出来的剩余死代码。`smoke/01` 新增 `dup_guards`：相邻两行若是同一个「带 `||` 兜底的守卫调用」，即判违规——判据是**行形状**（单行调用 + 带参数 + 带 `||`），不是函数名白名单，所以换名字、换文件都躲不开；自检夹具三向（重复必报 / 两个不同调用不报 / 重复的多行构造不报），红证：把一行守卫种回去 → 2 条失败。它第一次跑就在上一轮没扫到的三个文件里抓到 5 行：服务端 `write_temporary_contents` 里 `temporary_file_is_safe` 连写三遍、客户端 `agentq` 的 `write_ssh_diagnostic_metadata` 与 `write_response_metadata`、`sshp` 的 `write_ssh_diagnostic_metadata` 各重复一遍。这些守卫全是纯谓词（路径链/文件类型/符号链接），失败即 `|| return`，所以第二遍永远到不了。
+  |  `./run-tests.sh`（`AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq`，真 pueue 4.0.4）→ **32 ran, 0 skipped, 0 partial, 0 failed（4833s）**；`smoke/01` → `dup_guards=0`；红证：种回一行重复守卫 → 2 条失败
 
 2026-11-26  删掉 27 行死代码，行为零变更。① 6 组相邻重复的 `require_runtime_temporary_file`（`$group_file` ×2、`$raw_status_file` ×3、`$raw_task_file`、`$request_records_file`、`$cancellation_markers_file`、`$payload_file`）：它是一个 stat+形状检查、没有任何副作用，连调 4 次与调 1 次结果完全相同。② 2 处逐字相同的 `runtime_marker_file_is_safe … || fail "…"`（`request_layout_marker` 与 `request_tombstone_prune_marker`）：第一条已经 `exit 2`，第二条永远执行不到。这是本仓反复记录的「同一机制写两遍」缺陷类——上一轮把 `created_at` 判定从两处合并为 `task_creation_time_or_fail` 是同一个理由。
   |  `./run-tests.sh`（`AGENTQ_SMOKE_HOME=/tmp/aqsb/home/.agentq`，真 pueue 4.0.4）→ **32 ran, 0 skipped, 0 partial, 0 failed（3775s）**；`smoke/02` cases=70 pipe-fail-sites=0 piped-blocks=4

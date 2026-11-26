@@ -5055,13 +5055,77 @@ fi
 rm -f "$format_selftest"
 format_state="trailing=$format_trailing tabs=$format_tabs no-final-newline=$format_final files=$format_scanned"
 
+# A repeated guard call is dead code, not defence in depth.  `temporary_file_is_
+# safe` is a pure predicate and `require_runtime_temporary_file` only adds a
+# stat, so `x || return 1` written three times in a row makes exactly the same
+# decision three times.  Three such runs (16 lines) were removed in 0.1.47 and
+# the last two in 0.1.48 -- all four survived every other check, because none of
+# them looks at the LINE SHAPE.
+#
+# The predicate is deliberately narrow: only a line that is a single function
+# call taking an argument and carrying a `||` fallback.  A blanket "no two
+# adjacent identical lines" rule would fire on legitimate repeats (`fi`, `esac`,
+# a blank separator, two identical `case` arms).
+dup_guard_scan() { # $1 = file -> offending line numbers, one per line
+    awk '
+        { cur = $0; sub(/^[[:space:]]+/, "", cur) }
+        cur == prev && cur != "" && cur !~ /^#/ && cur ~ /\|\|/ && cur ~ /^[a-z_][a-z0-9_]*[[:space:]]+"?\$/ {
+            print NR ": " cur
+        }
+        { prev = cur }' "$1"
+}
+dup_guard_fixture=$(mktemp "${TMPDIR:-/tmp}/agentq-dup-guard.XXXXXX")
+cat >"$dup_guard_fixture" <<'DUPGUARD'
+guard_a() {
+    is_safe "$p" || return 1
+    is_safe "$p" || return 1
+}
+guard_b() {
+    is_safe "$p" || return 1
+    also_safe "$p" || return 1
+}
+guard_c() {
+    if [ -n "$x" ]; then
+        return 0
+    fi
+    if [ -n "$x" ]; then
+        return 0
+    fi
+}
+DUPGUARD
+dup_guard_self=$(dup_guard_scan "$dup_guard_fixture")
+rm -f "$dup_guard_fixture"
+dup_guard_self_count=$(printf '%s\n' "$dup_guard_self" | grep -c . || true)
+# Exactly one: the repeated guard in guard_a.  guard_b is two DIFFERENT calls and
+# guard_c repeats a multi-line construct, whose inner lines are not guard calls.
+if [ "$dup_guard_self_count" != 1 ]; then
+    printf 'syntax-and-parity: shell FAILED (the duplicate-guard rule failed its self-test: expected 1 hit, got %s)\n' \
+        "$dup_guard_self_count" >&2
+    failures=$((failures + 1))
+fi
+dup_guards=0
+for dup_target in "$root"/skill/assets/unix/* "$root"/skill/assets/client/unix/* "$root"/skill/assets/windows-git-bash/*; do
+    [ -f "$dup_target" ] || continue
+    dup_hits=$(dup_guard_scan "$dup_target")
+    [ -n "$dup_hits" ] || continue
+    printf '%s\n' "$dup_hits" | while IFS= read -r dup_line; do
+        printf 'syntax-and-parity: shell FAILED (%s repeats a guard call; the second call is dead code): %s\n' \
+            "$dup_target" "$dup_line" >&2
+    done
+    dup_guards=$((dup_guards + $(printf '%s\n' "$dup_hits" | grep -c . || true)))
+done
+if [ "$dup_guards" -ne 0 ]; then
+    failures=$((failures + 1))
+fi
+dup_guard_state=$dup_guards
+
 
 if [ "$failures" -ne 0 ]; then
     printf 'syntax-and-parity: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s negation_captures=%s chr_ranges=%s tool_ranges=%s tr_fold=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s workflow_wiring=%s ncov_reasons=%s fail_msg_vars=%s format=%s npm=%s' \
-    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$negation_capture_count" "$chr_range_count" "$tool_range_count" "$tr_fold_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state" "$workflow_wiring_summary" "$ncov_reasons_summary" "$fail_msg_summary" "$format_state" "$npm_state")
+summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s ps1_encoding=%s plist=%s yml=%s service=%s cmd=%s configpaths=%s parity=ok version=%s tool_full=%s/%s repo_scripts=%s repo_pipes=%s ps_help=%s redir_noop=%s mktemp_suffix=%s local_hazards=%s local_hazard_files=%s negation_captures=%s chr_ranges=%s tool_ranges=%s tr_fold=%s executable_shape=%s exec_sites=%s launch_probe=%s launch_probe_sites=%s uncalled=%s unclassified=%s farm_writes=%s python3_users=%s entrypoints=%s workflows=%s workflow_pipes=%s ci_pin=%s gitattr=%s gitignore=%s skill_modes=%s kinds=%s summary_census=%s release_gate=%s workflow_wiring=%s ncov_reasons=%s fail_msg_vars=%s dup_guards=%s format=%s npm=%s' \
+    "$shell_count" "$ps_summary" "$ps_static_rules" "$ps1_encoding_summary" "$plist_summary" "$yaml_summary" "$service_summary" "$cmd_summary" "$config_patterns" "$version_summary" "$tool_present" "$tool_total" "$repo_script_count" "$repo_pipe_count" "$ps_help_count" "$redir_noop_count" "$mktemp_suffix_count" "$local_hazard_count" "$local_hazard_file_count" "$negation_capture_count" "$chr_range_count" "$tool_range_count" "$tr_fold_count" "$executable_shape_count" "$executable_shape_sites" "$launch_probe_count" "$launch_probe_sites" "$unused_fn_count" "$unclassified_assets" "$farm_write_summary" "$python3_users" "$repo_entry_count" "$workflow_summary" "${workflow_pipe_summary#workflow_pipes=}" "$ci_pin_summary" "$gitattr_state" "$gitignore_state" "$skill_modes_state" "$kind_census_checked" "$summary_census_checked" "$release_gate_state" "$workflow_wiring_summary" "$ncov_reasons_summary" "$fail_msg_summary" "$dup_guard_state" "$format_state" "$npm_state")
 [ "$tool_summary" = 0 ] || summary="$summary $tool_summary"
 
 # Every token this check promises must actually appear in the line.  Why this
@@ -5073,7 +5137,7 @@ summary=$(printf 'syntax-and-parity checks passed: shell=%s ps1=%s ps1_static=%s
 # token that never gets a value, without trying to parse control flow.
 #
 # `tool_full` is formatted as `tool_full=%s/%s`, so it is matched by prefix.
-summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files negation_captures chr_ranges tool_ranges tr_fold executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census release_gate workflow_wiring ncov_reasons fail_msg_vars format npm'
+summary_tokens='shell ps1 ps1_static ps1_encoding plist yml service cmd configpaths parity version tool_full repo_scripts repo_pipes ps_help redir_noop mktemp_suffix local_hazards local_hazard_files negation_captures chr_ranges tool_ranges tr_fold executable_shape exec_sites launch_probe launch_probe_sites uncalled unclassified farm_writes python3_users entrypoints workflows workflow_pipes ci_pin gitattr gitignore skill_modes kinds summary_census release_gate workflow_wiring ncov_reasons fail_msg_vars dup_guards format npm'
 missing_tokens=''
 for tok in $summary_tokens; do
     # An EMPTY value counts as missing.  Measured 2026-10-25: a token assigned

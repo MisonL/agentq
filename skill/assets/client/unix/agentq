@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.47'
+agentq_client_version='0.1.48'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072), and the unix bound keeps a
 # safety margin under it.
@@ -1860,7 +1860,6 @@ refuse_unlaunchable_json_parser() {
 write_response_metadata() {
     response_file=$1
     response_metadata_require_file "$response_file" || return $?
-    response_metadata_require_file "$response_file" || return $?
     response_bytes=$(wc -c < "$response_file") && response_bytes=$(printf '%s' "$response_bytes" | tr -d '[:space:]') || return 1
     case "$response_bytes" in
         ''|*[!0123456789]*) return 1 ;;
@@ -1916,7 +1915,6 @@ agentq_remote_exit_token() {
 
 write_ssh_diagnostic_metadata() {
     ssh_metadata_file=$1
-    agentq_ssh_log_require_existing_file "$ssh_metadata_file" || return $?
     agentq_ssh_log_require_existing_file "$ssh_metadata_file" || return $?
     ssh_metadata_bytes=$(wc -c < "$ssh_metadata_file") && ssh_metadata_bytes=$(printf '%s' "$ssh_metadata_bytes" | tr -d '[:space:]') || return 1
     case "$ssh_metadata_bytes" in

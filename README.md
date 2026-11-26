@@ -2,7 +2,7 @@
 
 Remote task queue over SSH, backed by [Pueue](https://github.com/Nukesor/pueue) 4.0.4.
 
-**Version:** 0.1.47 — the deployment unit (`skill/assets/`, 23 files) ships as one
+**Version:** 0.1.48 — the deployment unit (`skill/assets/`, 23 files) ships as one
 version; releases are tagged in git, indexed at the top of [`CHANGELOG.md`](CHANGELOG.md),
 and verified by the [`release.yml`](.github/workflows/release.yml) tag/version gate.
 
@@ -106,7 +106,7 @@ npx agentq-skill@<version> --dest ~/.agents/skills/agentq
 npx agentq-skill@<version> --dest ~/.agents/skills/agentq --check
 ```
 
-`<version>` is this release's version, `0.1.47`. (Written as a placeholder on
+`<version>` is this release's version, `0.1.48`. (Written as a placeholder on
 purpose: a literal `<package>@<digits>` reads as an SSH `user@host` to the
 host-identifier check, which is fail-closed and stays that way.)
 
