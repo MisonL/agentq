@@ -790,6 +790,16 @@ StrictMode 下未设，顶层 trap 再读它时二次报错），exit 1、副本
 -文档：`release.yml`自 2026-11-20 起有 `Require an annotated tag`步骤（轻量 tag 退 1），
  `CLAUDE.md`/`CONTRIBUTING.md`仍写「轻量 tag 也能过」——已改。
 
+**2026-11-27（0.1.51）再修掉一条**：POSIX 平台探针临时文件在命令替换里的泄漏路径。
+`run_platform_probe` 在 `$( )` 里跑，而子 shell **不继承** EXIT trap，`cleanup_client_runtime`
+在那里永远不执行；于是四处早退（stdin 临时未登记 / 已消失、身份校验失败、输出长度测量读到空）
+在创建 `agentq-platform-output.*` 与 `agentq-platform-log.*` 之后**直接 return**，两个文件永久
+留在 `$TMPDIR`。现在统一走 `platform_probe_release_temporaries`。写这个助手时先踩了一次：
+失败（身份不可证）时也清空全局名，等于把「保留并点名」变成「丢失」——实测 `kept=0`，
+改为只在删除成功时清空。红证：换回修复前，`smoke/05` 的该用例报 `leftover=2`。
+**注意这是低可达性缺陷**：触发需要 Windows 探针的 stdin 临时文件中途消失这类竞态，
+所以覆盖是「助手的两个方向 + 四个调用点的静态审查」，不是端到端触发。
+
 **2026-11-27（0.1.50）从上面这份清单里修掉两条**：平台缓存归一化在孪生间的分叉，以及
 `probed_at` 残渣。实测三处，方向相反：`{"platform":"UNIX"}` 在 POSIX 是 MISS、在 Windows 是
 HIT（`-ne` 不分大小写）；`{"probed_at":"<epoch>"}` 同样（`[int64]::TryParse` 接受字符串）；
@@ -799,7 +809,7 @@ HIT（`-ne` 不分大小写）；`{"probed_at":"<epoch>"}` 同样（`[int64]::Tr
 `AGENTQ_REMOTE_PLATFORM` 环境变量本身的大小写早在 2026-10-21 就已两侧一致（POSIX 读取即
 `tr` 归一成小写，PowerShell 的 `switch` 本身不分大小写），这次只是把同一份缓存文件也统一了。
 
-**未修边界（不声称覆盖）**：POSIX 平台探针临时文件在命令替换里的泄漏路径；
+**未修边界（不声称覆盖）**：
 `smoke/10`的 D2/规则 B 已知窗口；`smoke/11`的零断言形态；`smoke/02`站点扫描的覆盖
 边界；`smoke/16` R4 的路径字面豁免；部分跨文档计数；安全 agent 的 P3-1/P3-3/P3-4
 （只读协议即可构造的低价值信息面，未改动）；pwsh7.0–7.4 无 `-DateKind`；生产环境

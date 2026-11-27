@@ -1773,6 +1773,108 @@ if [ "$posix_cache_verdicts" != 'HIT:unix MISS MISS MISS MISS MISS ' ]; then
     failures=$((failures + 1))
 fi
 
+# The platform-probe temporaries must be released on the EARLY returns too.
+#
+# `run_platform_probe` runs inside a command substitution, and a subshell does
+# not inherit the caller's EXIT trap, so `cleanup_client_runtime` never runs
+# there: an early return that skipped the inline removal left an
+# `agentq-platform-{output,log}.*` pair in $TMPDIR for good.  Measured
+# 2026-11-27: four such returns existed, recorded in docs/PLAN.md as an unfixed
+# boundary.  The helper they now call is driven here directly -- reaching the
+# four sites end to end needs a Windows platform probe whose stdin temporary
+# vanishes mid-flight, which this check cannot stage.
+#
+# What this proves: the helper removes BOTH files and forgets both identities,
+# and it still REFUSES (and preserves) a file whose identity cannot be proven --
+# the identity gate must not be traded away for the leak fix.
+probe_release_fns="$work/probe-release-fns.sh"
+# The extraction is the transitive closure the helper needs: the safety test
+# reaches the client's temp-path guard, and the identity test reaches
+# `stat_device_inode`.  Listing them here (rather than hand-copying bodies) is
+# what keeps this case honest against the shipped asset.
+probe_fn_list='stat_device_inode() {
+agentq_client_temp_path_is_safe() {
+platform_probe_file_is_safe() {
+platform_probe_file_identity() {
+platform_probe_remove_file() {
+platform_probe_release_temporaries() {'
+while IFS= read -r probe_fn; do
+    awk -v fn="$probe_fn" 'index($0, fn) == 1 { f = 1 } f { print } f && /^}$/ { exit }' \
+        "$client" >>"$probe_release_fns"
+done <<<"$probe_fn_list"
+cases=$((cases + 1))
+probe_release_dir=$work/probe-release
+mkdir -p "$probe_release_dir"
+probe_release_verdict=$(
+    # shellcheck disable=SC1090  # extracted from the asset under test, by design
+    . "$probe_release_fns"
+    program=agentq
+    agentq_temp_directory=$probe_release_dir
+    # The real client caches this at startup; `detect_stat_flavor` itself needs
+    # the script path and a subshell-scoped cache, so the probe is spelled here
+    # exactly as that function does it.  Supplying the cache is not stubbing the
+    # identity COMPUTATION -- `stat_device_inode` below is the shipped one.
+    if stat -c '%d:%i' -- "$agentq_temp_directory" >/dev/null 2>&1; then
+        stat_flavor=gnu
+    else
+        stat_flavor=bsd
+    fi
+    : "$program" "$agentq_temp_directory" "$stat_flavor"
+    platform_probe_output_file=$probe_release_dir/agentq-platform-output.test1
+    platform_probe_log_file=$probe_release_dir/agentq-platform-log.test1
+    : >"$platform_probe_output_file"
+    : >"$platform_probe_log_file"
+    platform_probe_output_identity=$(platform_probe_file_identity "$platform_probe_output_file") || exit 3
+    platform_probe_log_identity=$(platform_probe_file_identity "$platform_probe_log_file") || exit 3
+    # Read through dynamic scope by the extracted helper; referenced here for
+    # the same reason the cache case above does it -- the locked SC2034 rule
+    # treats a `disable=` directive as a violation.
+    : "$platform_probe_output_identity" "$platform_probe_log_identity"
+    platform_probe_release_temporaries
+    release_status=$?
+    leftover=0
+    [ -e "$platform_probe_output_file" ] && leftover=$((leftover + 1))
+    [ -e "$platform_probe_log_file" ] && leftover=$((leftover + 1))
+    printf 'status=%s leftover=%s names=[%s|%s]' "$release_status" "$leftover" \
+        "$platform_probe_output_file" "$platform_probe_log_file"
+)
+# The globals must be cleared as well: a stale name would make the NEXT call's
+# remover run with a path it no longer owns.
+if [ "$probe_release_verdict" != 'status=0 leftover=0 names=[|]' ]; then
+    printf 'client-contract: the probe-temporary release helper answered [%s]; expected [status=0 leftover=0 names=[|] ] (both files removed, both identities forgotten)\n' "$probe_release_verdict" >&2
+    failures=$((failures + 1))
+fi
+
+# And the identity gate still holds: a file with no recorded identity must be
+# left alone and reported, never removed.
+cases=$((cases + 1))
+probe_release_gate=$(
+    # shellcheck disable=SC1090  # extracted from the asset under test, by design
+    . "$probe_release_fns"
+    program=agentq
+    agentq_temp_directory=$probe_release_dir
+    if stat -c '%d:%i' -- "$agentq_temp_directory" >/dev/null 2>&1; then
+        stat_flavor=gnu
+    else
+        stat_flavor=bsd
+    fi
+    : "$program" "$agentq_temp_directory" "$stat_flavor"
+    platform_probe_output_file=$probe_release_dir/agentq-platform-output.test2
+    platform_probe_log_file=''
+    : >"$platform_probe_output_file"
+    platform_probe_output_identity=''
+    platform_probe_release_temporaries >/dev/null 2>&1
+    gate_status=$?
+    if [ -e "$platform_probe_output_file" ]; then gate_kept=1; else gate_kept=0; fi
+    if [ -n "$platform_probe_output_file" ]; then gate_named=1; else gate_named=0; fi
+    rm -f "$probe_release_dir/agentq-platform-output.test2"
+    printf 'status=%s kept=%s named=%s' "$gate_status" "$gate_kept" "$gate_named"
+)
+if [ "$probe_release_gate" != 'status=2 kept=1 named=1' ]; then
+    printf 'client-contract: an identity-less probe temporary was [%s]; expected [status=2 kept=1 named=1 ] (the file must be preserved, still NAMED so it can be retried, and the failure reported)\n' "$probe_release_gate" >&2
+    failures=$((failures + 1))
+fi
+
 # AGENTQ_WAIT_TIMEOUT is validated on the WAIT path, not at startup (both
 # clients do it there, so the loop above cannot see it: `--help` never reaches
 # the check).  Driven through a stub ssh that fails immediately -- the refusal

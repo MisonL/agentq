@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.50'
+agentq_client_version='0.1.51'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072), and the unix bound keeps a
 # safety margin under it.
@@ -2532,6 +2532,45 @@ windows_encoding_remove_file() {
     return 2
 }
 
+# Release the two platform-probe temporaries and forget their identities.
+#
+# Why a helper rather than the inline pairs: `run_platform_probe` is called
+# INSIDE a command substitution (`local_platform_output=$(run_platform_probe_
+# with_recovery ...)`), and a subshell does NOT inherit the caller's EXIT trap,
+# so `cleanup_client_runtime` never runs there.  Any early return that skips
+# the inline removal therefore leaks `agentq-platform-output.*` and
+# `agentq-platform-log.*` into $TMPDIR permanently -- measured 2026-11-27: four
+# such returns (an untracked or vanished stdin temporary, a failed identity
+# check, and a zero-length output measurement).  This was recorded in
+# docs/PLAN.md as an unfixed boundary; the four sites now call this.
+#
+# The removal stays identity-gated (same rule as run_ssh_logged), so a file
+# whose identity cannot be proven is PRESERVED, not deleted -- the caller's
+# message about preserving it is what makes that visible.
+platform_probe_release_temporaries() {
+    local release_status=0
+    # The name is cleared ONLY when the removal succeeded.  Clearing it after a
+    # refusal would drop the one thing that lets the caller (or the EXIT trap)
+    # retry, and would make the "preserving it: <path>" message the remover
+    # prints the last mention of a file that is still there -- measured
+    # 2026-11-27 while red-testing this helper.
+    if [ -n "$platform_probe_output_file" ]; then
+        if platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity"; then
+            platform_probe_output_file=''
+        else
+            release_status=$?
+        fi
+    fi
+    if [ -n "$platform_probe_log_file" ]; then
+        if platform_probe_remove_file "$platform_probe_log_file" "$platform_probe_log_identity"; then
+            platform_probe_log_file=''
+        else
+            release_status=$?
+        fi
+    fi
+    return "$release_status"
+}
+
 run_platform_probe() {
     platform_probe_command=$1
     # Optional: a file whose contents are fed to the remote command on stdin.
@@ -2680,12 +2719,15 @@ run_platform_probe() {
 
     if [ -n "$platform_probe_stdin_file" ]; then
         if platform_probe_stdin_identity=$(windows_argument_identity_for_path "$platform_probe_stdin_file"); then
-            windows_argument_verify_identity "$platform_probe_stdin_file" "$platform_probe_stdin_identity" 'before platform probe SSH consumption' || return $?
+            windows_argument_verify_identity "$platform_probe_stdin_file" "$platform_probe_stdin_identity" 'before platform probe SSH consumption' ||
+                { platform_probe_verify_status=$?; platform_probe_release_temporaries || true; return "$platform_probe_verify_status"; }
         else
             printf '%s: refusing to consume an untracked platform probe stdin temporary: %s\n' "$program" "$platform_probe_stdin_file" >&2
+            platform_probe_release_temporaries || true
             return 2
         fi
-        platform_probe_require_existing_file "$platform_probe_stdin_file" || return $?
+        platform_probe_require_existing_file "$platform_probe_stdin_file" ||
+            { platform_probe_verify_status=$?; platform_probe_release_temporaries || true; return "$platform_probe_verify_status"; }
     fi
 
     # The remote command's stderr must NOT be inherited.  OpenSSH sends it to the
@@ -2842,6 +2884,7 @@ run_platform_probe() {
     case "$platform_probe_output_bytes" in
         ''|*[!0123456789]*)
             printf '%s: cannot measure platform probe output size\n' "$program" >&2
+            platform_probe_release_temporaries || true
             return 2
             ;;
     esac
