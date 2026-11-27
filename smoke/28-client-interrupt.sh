@@ -147,7 +147,11 @@ if [ "$int_calibration" -ne 130 ]; then
 fi
 for signal_name in TERM INT HUP; do
     cases=$((cases + 1))
-    : > "$work/ssh-invoked"
+    # REMOVED, not created: the stub at line 81 is what creates this marker when
+    # it is reached, and pre-creating it here made the `reached` assertion below
+    # report success even if the client never made an SSH call at all (measured
+    # 2026-11-27 -- the file existed before the client was even started).
+    rm -f "$work/ssh-invoked"
     before=$(find "$client_tmp" -mindepth 1 | wc -l | tr -d ' ')
 
     if [ "$signal_name" = INT ] && [ "$int_ready" = false ]; then

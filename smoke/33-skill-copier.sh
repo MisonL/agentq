@@ -53,23 +53,48 @@ if [ "$listed_count" -lt 25 ]; then
     failures=$((failures + 1))
 fi
 
-# Every listed file must exist on disk with the same bytes.
+# Every listed file must exist on disk with the same bytes -- under the
+# DESTINATION name, which drops the package's `skill/` prefix.  `--dest` names a
+# Skill directory, the thing a loader looks for `SKILL.md` in, and the package
+# root is the repository root.
 cases=$((cases + 1))
 missing=0
 for manifest_file in $listed; do
-    if [ ! -f "$dest/$manifest_file" ]; then
-        note "listed but not installed: $manifest_file"
+    installed_name=${manifest_file#skill/}
+    if [ ! -f "$dest/$installed_name" ]; then
+        note "listed but not installed: $installed_name"
         missing=$((missing + 1))
-    elif ! cmp -s "$root/$manifest_file" "$dest/$manifest_file"; then
-        note "bytes differ after the copy: $manifest_file"
+    elif ! cmp -s "$root/$manifest_file" "$dest/$installed_name"; then
+        note "bytes differ after the copy: $installed_name"
         missing=$((missing + 1))
     fi
 done
 [ "$missing" -eq 0 ] || failures=$((failures + 1))
 
+# --- 1b. the layout a Skill loader actually needs --------------------------
+# Measured 2026-11-27: the copier joined the manifest path straight onto
+# `--dest`, so `--dest ~/.agents/skills/agentq` (also the default) produced
+# `~/.agents/skills/agentq/skill/SKILL.md`.  A loader asking for
+# `<dir>/SKILL.md` found nothing, and `--check` could not validate a correctly
+# installed Skill either.  Asserting the SHAPE is what keeps this from coming
+# back: the byte loop above would happily follow the prefix anywhere.
+cases=$((cases + 1))
+layout_gaps=0
+for required in SKILL.md agents references assets; do
+    if [ ! -e "$dest/$required" ]; then
+        note "the destination is missing $required at its root (the copier nested the package prefix?)"
+        layout_gaps=$((layout_gaps + 1))
+    fi
+done
+if [ -e "$dest/skill" ]; then
+    note "the destination contains a nested skill/ directory: --dest is a Skill root, not the package root"
+    layout_gaps=$((layout_gaps + 1))
+fi
+[ "$layout_gaps" -eq 0 ] || failures=$((failures + 1))
+
 # The canonical pair is the package's hard invariant; it must survive a copy.
 cases=$((cases + 1))
-if ! cmp -s "$dest/skill/assets/unix/agentq-server" "$dest/skill/assets/windows-git-bash/agentq"; then
+if ! cmp -s "$dest/assets/unix/agentq-server" "$dest/assets/windows-git-bash/agentq"; then
     note 'the two canonical server copies differ after the copy'
     failures=$((failures + 1))
 fi
@@ -124,19 +149,19 @@ rm -f "$dest/stale.txt"
 # A stray file in a SUBDIRECTORY is the shape that matters: a renamed reference
 # would leave one behind, and a top-level-only scan would miss it.
 expect_drift extra-nested 'not part of this package' \
-    ': >"$dest/skill/references/stale-note.md"'
-rm -f "$dest/skill/references/stale-note.md"
+    ': >"$dest/references/stale-note.md"'
+rm -f "$dest/references/stale-note.md"
 
 expect_drift missing-file 'missing or different' \
-    'rm -f "$dest/skill/SKILL.md"'
+    'rm -f "$dest/SKILL.md"'
 node "$copier" --dest "$dest" >/dev/null 2>&1 || true
 
 expect_drift tampered-bytes 'missing or different' \
-    'printf "\n# tampered\n" >>"$dest/skill/SKILL.md"'
+    'printf "\n# tampered\n" >>"$dest/SKILL.md"'
 node "$copier" --dest "$dest" >/dev/null 2>&1 || true
 
 expect_drift no-execute-bit 'not executable' \
-    'chmod 644 "$dest/skill/assets/unix/agentq-server"'
+    'chmod 644 "$dest/assets/unix/agentq-server"'
 node "$copier" --dest "$dest" >/dev/null 2>&1 || true
 
 # --- 5. an unsafe destination is refused with the controlled 2 ------------
@@ -164,5 +189,5 @@ if [ "$failures" -ne 0 ]; then
     printf 'skill-copier: %s failure(s)\n' "$failures" >&2
     exit 1
 fi
-printf 'skill-copier checks passed: cases=%s manifest=%s extras=named drift=named/extra/nested/missing/tampered/mode unsafe=symlink+file canonical=equal\n' \
+printf 'skill-copier checks passed: cases=%s manifest=%s layout=skill-root extras=named drift=named/extra/nested/missing/tampered/mode unsafe=symlink+file canonical=equal\n' \
     "$cases" "$listed_count"

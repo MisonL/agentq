@@ -268,9 +268,20 @@ function main() {
   }
 
   // The package's own hard invariant, checked on the packed bytes.
+  // `a && b && !equal` answers "fine" when either file is ABSENT, which is the
+  // opposite of fine: a tarball missing the Windows server asset shipped
+  // green (measured 2026-11-27 by deleting it).  Absence is now its own
+  // failure -- the same "make the check decide, do not let it skip" rule the
+  // mode loop above follows.
   const left = path.join(packageRoot, 'skill/assets/unix/agentq-server');
   const right = path.join(packageRoot, 'skill/assets/windows-git-bash/agentq');
-  if (fs.existsSync(left) && fs.existsSync(right) && !fs.readFileSync(left).equals(fs.readFileSync(right))) {
+  if (!fs.existsSync(left) || !fs.existsSync(right)) {
+    process.stderr.write(
+      PROGRAM + ': the tarball is missing a canonical server copy (' +
+        (!fs.existsSync(left) ? right : left) + ' present, the other absent)\n'
+    );
+    failures += 1;
+  } else if (!fs.readFileSync(left).equals(fs.readFileSync(right))) {
     process.stderr.write(PROGRAM + ': the two canonical server copies differ in the tarball\n');
     failures += 1;
   }

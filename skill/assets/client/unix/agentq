@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.51'
+agentq_client_version='0.1.52'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072), and the unix bound keeps a
 # safety margin under it.
@@ -79,6 +79,17 @@ json_parser=${AGENTQ_JQ:-}
 # of the same instruction must not mean different things per client.  The
 # value is normalised rather than the `case` pattern widened so everything
 # downstream (the cache comparison at 3005, the launcher probe) sees one form.
+# Run under `zsh` and the POSIX word-splitting this script is written against
+# is OFF by default: `$ssh_credential_option_lines` then expands to ONE argv
+# element holding `-o BatchMode=no\n-o NumberOfPasswordPrompts=1`, and real ssh
+# answers `unsupported option` (measured 2026-11-27: zsh gave 1 argv element,
+# sh/bash gave 4).  The installed client runs under its `#!/bin/sh` shebang, so
+# this only bites when a caller spells `zsh <path>/agentq` -- which is a
+# documented invocation, so it has to behave the same.  `shwordsplit` restores
+# sh semantics for the whole script rather than patching the one expansion.
+if [ -n "${ZSH_VERSION:-}" ]; then
+    setopt shwordsplit
+fi
 remote_platform=${AGENTQ_REMOTE_PLATFORM:-auto}
 remote_platform=$(printf '%s' "$remote_platform" | LC_ALL=C tr '[:upper:]' '[:lower:]')
 remote_argument_file=''
@@ -2548,7 +2559,13 @@ windows_encoding_remove_file() {
 # whose identity cannot be proven is PRESERVED, not deleted -- the caller's
 # message about preserving it is what makes that visible.
 platform_probe_release_temporaries() {
-    local release_status=0
+    # No `local`: this file uses none anywhere (it is `#!/bin/sh`, and a shell
+    # without `local` would turn the declaration into a command-not-found and
+    # leave the name unset -- measured 2026-11-27 with ksh: the helper then hit
+    # `release_status: parameter not set` under set -u and the whole client
+    # exited 1 instead of the contract's 2).  Every other function here uses a
+    # prefixed global for the same reason.
+    platform_probe_release_status=0
     # The name is cleared ONLY when the removal succeeded.  Clearing it after a
     # refusal would drop the one thing that lets the caller (or the EXIT trap)
     # retry, and would make the "preserving it: <path>" message the remover
@@ -2558,17 +2575,17 @@ platform_probe_release_temporaries() {
         if platform_probe_remove_file "$platform_probe_output_file" "$platform_probe_output_identity"; then
             platform_probe_output_file=''
         else
-            release_status=$?
+            platform_probe_release_status=$?
         fi
     fi
     if [ -n "$platform_probe_log_file" ]; then
         if platform_probe_remove_file "$platform_probe_log_file" "$platform_probe_log_identity"; then
             platform_probe_log_file=''
         else
-            release_status=$?
+            platform_probe_release_status=$?
         fi
     fi
-    return "$release_status"
+    return "$platform_probe_release_status"
 }
 
 run_platform_probe() {

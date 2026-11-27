@@ -41,6 +41,25 @@ const EXECUTABLE = [
   'skill/assets/windows-git-bash/agentq',
 ];
 
+// The package root is the REPOSITORY root, so every manifest path starts with
+// `skill/`.  `--dest` names a Skill DIRECTORY, i.e. the thing a loader looks
+// for `SKILL.md` in -- so that one segment is stripped on the way out.
+//
+// Measured 2026-11-27: it was not, and `--dest ~/.agents/skills/agentq` (also
+// the default) produced `~/.agents/skills/agentq/skill/SKILL.md`.  A loader
+// asking for `<dir>/SKILL.md` found nothing, and `--check` could not validate
+// any correctly installed Skill either: run against a real one it reported all
+// 30 files missing and all 30 real files as extras.  The whole npm channel
+// produced a directory nothing could load.
+const SKILL_PREFIX = 'skill/';
+
+function destinationPath(destination, packagedFile) {
+  if (!packagedFile.startsWith(SKILL_PREFIX)) {
+    fail('packaged path is outside skill/: ' + packagedFile);
+  }
+  return path.join(destination, packagedFile.slice(SKILL_PREFIX.length));
+}
+
 function usage(out) {
   const lines = [
     'Usage: agentq-skill [--dest <dir>] [--check] [--list] [--quiet]',
@@ -182,7 +201,7 @@ function main(argv) {
   if (check) {
     let drifted = 0;
     for (const file of files) {
-      const target = path.join(destination, file);
+      const target = destinationPath(destination, file);
       let same = false;
       try {
         same = sha256(path.join(packageRoot, file)) === sha256(target);
@@ -195,7 +214,7 @@ function main(argv) {
       }
     }
     for (const file of EXECUTABLE) {
-      const target = path.join(destination, file);
+      const target = destinationPath(destination, file);
       let mode = 0;
       try {
         mode = fs.statSync(target).mode;
@@ -223,7 +242,12 @@ function main(argv) {
         const childRelative = relative === '' ? entry.name : relative + '/' + entry.name;
         const childAbsolute = path.join(absolute, entry.name);
         if (entry.isDirectory()) walkDestination(childAbsolute, childRelative);
-        else if (entry.isFile() && !files.includes(childRelative)) extras.push(childRelative);
+        else if (
+          entry.isFile() &&
+          !files.some((packaged) => packaged.slice(SKILL_PREFIX.length) === childRelative)
+        ) {
+          extras.push(childRelative);
+        }
       }
     };
     if (fs.existsSync(destination)) walkDestination(destination, '');
@@ -239,27 +263,27 @@ function main(argv) {
   }
 
   for (const file of files) {
-    const target = path.join(destination, file);
+    const target = destinationPath(destination, file);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     // `fs.copyFileSync` copies bytes only -- no newline or encoding conversion
     // happens here, which is what keeps the two canonical server copies
     // byte-identical after a copy.
     fs.copyFileSync(path.join(packageRoot, file), target);
   }
-  for (const file of EXECUTABLE) fs.chmodSync(path.join(destination, file), 0o755);
+  for (const file of EXECUTABLE) fs.chmodSync(destinationPath(destination, file), 0o755);
 
   // The canonical pair is the package's own hard invariant; re-checking it here
   // costs one comparison and turns a corrupted copy or a mangled tarball into a
   // loud failure at the moment it happens.
-  const left = path.join(destination, 'skill/assets/unix/agentq-server');
-  const right = path.join(destination, 'skill/assets/windows-git-bash/agentq');
+  const left = destinationPath(destination, 'skill/assets/unix/agentq-server');
+  const right = destinationPath(destination, 'skill/assets/windows-git-bash/agentq');
   if (!fs.readFileSync(left).equals(fs.readFileSync(right))) {
     fail('the two canonical server copies differ after the copy: ' + destination);
   }
 
   if (!quiet) {
     process.stdout.write(
-      PROGRAM + ': copied ' + files.length + ' files to ' + destination + '\n' +
+      PROGRAM + ': copied ' + files.length + ' files to ' + destination + ' (SKILL.md is at its root)\n' +
       PROGRAM + ': this is not a deployment. Stage the platform directory on the target host and run its installer.\n'
     );
   }

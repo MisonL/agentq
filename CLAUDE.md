@@ -368,7 +368,7 @@ diff -rq "$AGENTQ_REPO_ROOT/skill" "$SKILL_DIR"   # 必须无输出
 
 - 新主机先跑：`agentq --host <host> doctor`。但注意 `doctor` **不是只读的**：
   它先 `ensure_daemon`，daemon 未运行时会在 macOS 走
-  `launchctl kickstart gui/<uid>/com.agentq.pueued`、在 Linux 走
+  `launchctl kickstart system/com.agentq.pueued`（默认部署是 `/Library/LaunchDaemons`；``gui/<uid>`` 只是找不到 system 服务时的兜底）、在 Linux 走
   `systemctl --user start agentq-pueued.service`——那是**服务变更**；成功路径还会
   经 `recover_removing_requests` 改写 request record。要只读地探查一台机器，就别
   走 AgentQ 协议：直接 ssh 过去看 `~/.local/bin/agentq` 在不在、版本多少。

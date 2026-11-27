@@ -1,6 +1,6 @@
 {
   "name": "agentq-skill",
-  "version": "0.1.51",
+  "version": "0.1.52",
   "description": "AgentQ: SSH + Pueue 4.0.4 remote task queue. This package carries the Skill directory (docs + the 23 deployable assets) and a copier; it is not an installer.",
   "license": "MIT",
   "private": false,

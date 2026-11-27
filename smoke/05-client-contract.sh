@@ -157,10 +157,16 @@ assert_credentials() {
     : > "$work/argv"
     : > "$work/argv.env"
     local status=0
+    # CREDENTIAL_RUNNER lets a case run the client under another shell (`zsh`)
+    # without spelling a command inside the env-assignment list, where `env`
+    # would read it as an assignment and never run it -- measured here: the
+    # first version passed `zsh` through `$@` and zsh was handed
+    # `AGENTQ_PASSWORD=...` as its SCRIPT name, so ssh was never invoked.
+    # shellcheck disable=SC2086  # empty by default, and intentionally unquoted
     env -u AGENTQ_ASKPASS -u AGENTQ_PASSWORD -u AGENTQ_PASSWORD_PROMPT \
         AGENTQ_ARGV_CAPTURE="$work/argv" AGENTQ_SSH="$work/bin/ssh-argv" \
         AGENTQ_HOST=smoke-host AGENTQ_CONFIG="$work/absent-config" \
-        "$@" "$client" status >"$work/out" 2>"$work/err" || status=$?
+        "$@" ${CREDENTIAL_RUNNER:-} "$client" status >"$work/out" 2>"$work/err" || status=$?
     if [ ! -s "$work/argv" ]; then
         printf 'client %s: ssh was never invoked, so the options cannot be checked\n' "$label" >&2
         failures=$((failures + 1))
@@ -2689,6 +2695,17 @@ fi
 
 # --- credential sources -------------------------------------------------------
 # What the client tells ssh, which no static check can see.
+# The same argv under `zsh`: the client is written for POSIX splitting, and
+# zsh does NOT split unquoted expansions by default, so the credential options
+# collapsed into a single `-o BatchMode=no\n-o NumberOfPasswordPrompts=1`
+# element and real ssh rejected it (measured 2026-11-27).  The installed client
+# runs under its sh shebang, but `zsh <path>/agentq` is a documented invocation,
+# so both spellings must produce the same ssh argv.
+if command -v zsh >/dev/null 2>&1; then
+    CREDENTIAL_RUNNER=zsh assert_credentials no 'under zsh, without a credential source'
+    CREDENTIAL_RUNNER=zsh assert_credentials yes 'under zsh, with AGENTQ_PASSWORD' AGENTQ_PASSWORD=smoke-secret
+fi
+
 assert_credentials no 'without a credential source'
 
 printf '#!/bin/sh\nprintf "pw\\n"\n' > "$work/askpass-ok"
