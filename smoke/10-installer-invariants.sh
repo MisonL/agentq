@@ -906,6 +906,14 @@ fi
 # (rule J owns that shape, and its throw is an accepted trade-off).
 k2_blocks=0
 k2_report=''
+# A temporary file, not `/tmp/aq-k2-count.$$`: the fixed name was removed on the
+# normal path only, and this script had no trap, so a SIGKILL between the two
+# lines left it in /tmp for good -- and a predictable name under a shared /tmp
+# is the shape the runtime-side checks refuse everywhere else.  `mktemp` also
+# keeps parallel runs of this check apart.
+k2_count_file=$(mktemp "${TMPDIR:-/tmp}/agentq-k2-count.XXXXXX")
+k2_cleanup() { rm -f -- "$k2_count_file"; }
+trap k2_cleanup EXIT
 for k2_installer in "$server_installer" "$client_installer"; do
     k2_out=$(awk '
         function flush() {
@@ -928,9 +936,9 @@ for k2_installer in "$server_installer" "$client_installer"; do
             if (depth <= 0) flush()
         }
         END { flush(); printf "__BLOCKS__%d\n", k2_blocks > "/dev/stderr" }
-    ' "$k2_installer" 2>"/tmp/aq-k2-count.$$")
-    k2_blocks=$(sed -n 's/^__BLOCKS__//p' "/tmp/aq-k2-count.$$")
-    rm -f "/tmp/aq-k2-count.$$"
+    ' "$k2_installer" 2>"$k2_count_file")
+    k2_blocks=$(sed -n 's/^__BLOCKS__//p' "$k2_count_file")
+    rm -f "$k2_count_file"
     if [ -z "$k2_blocks" ] || [ "$k2_blocks" -eq 0 ]; then
         fail "$k2_installer" "could not extract any finally block; rule K2 cannot conclude"
     fi

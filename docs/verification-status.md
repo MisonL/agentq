@@ -245,6 +245,20 @@ UTF-16LE（三组读字节全为 `FF FE` 开头），BOM 感知读取是**必需
 | `02-error-contract` 新增第四条静态规则 `pipe-fail` | 「闭合行带**单个** `\|` 的块」（`} \|`、`done \|`）里的 `fail`/`exit 2` 永远不是进程的 exit 2；反向找开启行，不靠深度计数（计数会漂移，第一版把整份文件当成一个块）。摘要新增 `pipe-fail-sites=0 piped-blocks=4`。 | v0.1.44 的 server 副本 → `piped-blocks=6 pipe-fail-sites=13`，点名两处加载器的文件名臂与路径臂；修复后 4/0。夹具三向自校准（管道块必报 / `> file` 重定向不报 / 裸 `fail` 不报，另加 `\|\|` 不算管道的正控）。 |
 | 服务端 `task_creation_time_or_fail` + `smoke/02` 的 `creation-time` 形状锁 | 把写了两遍的 `created_at` 判定合并成一处，两个调用点统一为 `return $?`；形状锁断言「原始 `.created_at \| strings` 读取恰 1 处、helper 调用点 ≥2」，**双向**：两处原始读取=重复回来了，0 处调用=helper 成死代码、下一个读者会重新内联。 | 行为级不可断言（外层 `compact_task` 先拒同一形状），可达半边由 `smoke/32` 的 `wait-bad-created` 守；形状锁的反向证明：把两个调用点内联回 `jq -er …` → 原始读取 3、调用点 0。 |
 
+### 2026-11-26（0.1.49）的增量
+
+这一轮的四个缺陷全是**审计**（安全面 / 可移植性与资源泄漏 / CI 与 npm 供应链）发现的，前两类干净、后两类各有真问题。两个是「检查其实什么都没证明」。
+
+| 项 | 断言了什么 | 红证 |
+|---|---|---|
+| `scripts/verify-pack.js` 的字节比对改读**索引** | 原来读工作树，而 `npm pack` 也从工作树取字节——两边同源，永远相等。同一文件上方「文件集」检查的注释（`planted.key` 事件）早就写了「比索引才有意义」，字节比对没学到。现在 `git cat-file blob :<path>`，未暂存的编辑会被抓 | 往 `skill/SKILL.md` 追加一行不暂存 → 旧版打印 `bytes identical` 退 0，新版点名该文件退 1 |
+| 同一脚本新增 manifest 两臂 | 按部署资产里的 `agentq_version` 交叉核对 `package.json` 的 `version`；每个 `bin` 目标必须真的在 tarball 里。此前 `version: "9.9.9"` 与 `bin` 指向不存在文件都退 0 | 两个变异各退 1 并点名 |
+| `npm.yml` 新增 annotated-tag 断言 | `release.yml` 自 2026-11-20 就有，`npm.yml` 没有——同一个 tag 一个拒一个放。实测 v0.1.43 是轻量 tag，`npm.yml` 在它上面绿过四次，三次走到 publish 判定 | 删掉该步骤 → `smoke/01` 的 `release-gate` 两文件都查，报 FAILED。**上线后第一次 CI 就抓到作者自己**：`cat-file` 少了 tag ref 的 re-fetch（`actions/checkout` 把 `refs/tags/<name>` 指到 commit），CI 答 `commit` 并退 1，补 fetch 后全绿 |
+| 两个加载器的临时文件纳入 `cleanup()` 与 pruner | 0.1.45 把加载器从 `{ ... } \| jq` 改成 `{ ... } > "$raw"`，两个 redirect 目标是**函数 local**；`fail` 是 `exit 2`，函数自己那句删除永远跑不到，`cleanup()` 也叫不出它们的名字。改为全局 + `cleanup()` + pruner 前缀**与该前缀的 case 分支**（只加 glob 不加分支，pruner 会在服务器自己写的文件上 `fail`——实测踩到） | `smoke/32` 新增两例：结束时零残留、死进程的残留必须被回收。0.1.48 的 server 副本 → `at start=0, at end=4` 且回收例失败；修复后 `cases=34` 全绿 |
+| `smoke/01` 的 `dup_guards` 放宽 | 原来只匹配裸 `name "$arg" \|\|`，漏掉 `if ! name "$arg" \|\|` / `! name "$arg" \|\|` 形态（首行多 `if `，续行以单 `\|` 结尾）。现在先剥掉 `if`/`elif`/`while`/`until` 再比，且接受单 `\|` | 放宽后当场在服务端清掉 5 行同类重复；夹具加 `guard_neg` 一行钉住新形态 |
+
+**边界**：`verify-pack` 只证明「tarball 的字节等于**索引**里的字节」——工作树与索引不一致时它报的是后者，仍需作者自己去看；`npm.yml` 的 annotated 断言只证明 tag 对象类型，不证明 tag 指向的提交跑过完整套件（见 README 里那条「CI 绿不是 tag 的门禁」）。
+
 ### 2026-11-25（0.1.44）的增量
 
 这一轮把上一版 `docs/PLAN.md` 里那张「15 条零断言缺口」表逐条处理：**14 条**落成真断言，
