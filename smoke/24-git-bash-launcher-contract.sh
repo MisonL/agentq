@@ -101,6 +101,37 @@ run_launcher() {
     printf '%s' "$status"
 }
 
+# expect_cygpath_aw <label>
+#
+# The stub answers `WIN(<last arg>)` whatever the flags are, so the value
+# assertions above cannot tell `cygpath -aw <path>` from `cygpath -a <path>` or
+# even `cygpath <path>`: all three produce the same converted value.  The flag
+# matters -- `-a` alone yields a Windows-style path in the ANSI code page and
+# `-w` is the UTF-16-aware form Git Bash documents -- so the CALL ITSELF is
+# asserted from the stub's own log, which `run_launcher` clears every time.
+# Measured 2026-11-27: the log was collected and then never read by any case.
+expect_cygpath_aw() {
+    local label=$1
+    cases=$((cases + 1))
+    if [ ! -s "$work/cygpath.log" ]; then
+        printf 'git-bash-launcher %s: cygpath was never invoked, so the conversion flags cannot be checked\n' "$label" >&2
+        failures=$((failures + 1))
+        return
+    fi
+    local drifts=0
+    while IFS= read -r call; do
+        case "$call" in
+            '-aw '*) ;;
+            *)
+                printf 'git-bash-launcher %s: cygpath was called as [%s]; every conversion must use -aw\n' \
+                    "$label" "$call" >&2
+                drifts=$((drifts + 1))
+                ;;
+        esac
+    done < "$work/cygpath.log"
+    [ "$drifts" -eq 0 ] || failures=$((failures + 1))
+}
+
 failures=0
 cases=0
 
@@ -136,6 +167,7 @@ run_launcher agentq >/dev/null
 expect_line 'agentq argv (agentq.ps1 path)' "$work/ps.out" 'ARGV [-NoProfile] [-NonInteractive] [-ExecutionPolicy] [Bypass] [-File] [WIN('"$work"'/agentq/agentq.ps1)] [--host] [smoke-host] [submit] [--] [echo a*b]'
 expect_line 'agentq MSYS_NO_PATHCONV' "$work/ps.out" 'MSYS_NO_PATHCONV=1'
 expect_line 'agentq MSYS2_ARG_CONV_EXCL' "$work/ps.out" 'MSYS2_ARG_CONV_EXCL=*'
+expect_cygpath_aw 'agentq ps1 path conversion'
 
 run_launcher sshp >/dev/null
 expect_line 'sshp argv (sshp.ps1 path)' "$work/ps.out" 'ARGV [-NoProfile] [-ExecutionPolicy] [Bypass] [-File] [WIN('"$work"'/sshp/sshp.ps1)] [--host] [smoke-host] [submit] [--] [echo a*b]'
@@ -151,6 +183,7 @@ expect_line 'sshp MSYS2_ARG_CONV_EXCL' "$work/ps.out" 'MSYS2_ARG_CONV_EXCL=*'
 run_launcher agentq AGENTQ_SSH=/c/keys/id AGENTQ_CONFIG=/c/cfg >/dev/null
 expect_line 'agentq AGENTQ_SSH absolute -> converted' "$work/ps.out" 'AGENTQ_SSH=WIN(/c/keys/id)'
 expect_line 'agentq AGENTQ_CONFIG absolute -> converted' "$work/ps.out" 'AGENTQ_CONFIG=WIN(/c/cfg)'
+expect_cygpath_aw 'agentq AGENTQ_SSH/CONFIG conversions'
 
 run_launcher agentq AGENTQ_SSH=relative/key AGENTQ_CONFIG=relative/cfg >/dev/null
 expect_line 'agentq AGENTQ_SSH relative -> unchanged' "$work/ps.out" 'AGENTQ_SSH=relative/key'
@@ -166,6 +199,7 @@ expect_line 'agentq AGENTQ_CONFIG unset -> unset' "$work/ps.out" 'AGENTQ_CONFIG=
 # password.  All three directions, like the two variables above.
 run_launcher agentq AGENTQ_ASKPASS=/c/ask/pass >/dev/null
 expect_line 'agentq AGENTQ_ASKPASS absolute -> converted' "$work/ps.out" 'AGENTQ_ASKPASS=WIN(/c/ask/pass)'
+expect_cygpath_aw 'agentq AGENTQ_ASKPASS conversion'
 run_launcher agentq AGENTQ_ASKPASS=relative/askpass >/dev/null
 expect_line 'agentq AGENTQ_ASKPASS relative -> unchanged' "$work/ps.out" 'AGENTQ_ASKPASS=relative/askpass'
 run_launcher agentq >/dev/null
@@ -173,6 +207,7 @@ expect_line 'agentq AGENTQ_ASKPASS unset -> unset' "$work/ps.out" 'AGENTQ_ASKPAS
 
 run_launcher sshp SSHP_SSH=/c/keys/id >/dev/null
 expect_line 'sshp SSHP_SSH absolute -> converted' "$work/ps.out" 'SSHP_SSH=WIN(/c/keys/id)'
+expect_cygpath_aw 'sshp SSHP_SSH conversion'
 
 run_launcher sshp SSHP_SSH=relative/key >/dev/null
 expect_line 'sshp SSHP_SSH relative -> unchanged' "$work/ps.out" 'SSHP_SSH=relative/key'

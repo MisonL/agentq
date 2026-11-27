@@ -245,11 +245,22 @@ fi
 # FlushFileBuffers must be reached with that handle, i.e. OpenForFlush must feed
 # FlushPath.  If a future edit inlined a read-only CreateFile elsewhere the line
 # above would still pass; this ties the constant to its only consumer.
+#
+# Scoped to FlushPath's OWN BODY.  The file-wide greps this replaces could not
+# tell "FlushPath calls OpenForFlush" from "OpenForFlush is defined somewhere in
+# this file": rewriting FlushPath to open a read-only handle left both strings in
+# place -- the definition and the unrelated call inside OpenForFlush itself --
+# and the case stayed green (measured 2026-11-27).  The body is the only thing
+# that answers the question being asked.
 cases=$((cases + 1))
-if ! grep -q 'OpenForFlush' "$asset" || ! grep -q 'FlushFileBuffers(handle)' "$asset"; then
-    printf 'durable-move: the flush path no longer goes through OpenForFlush\n' >&2
-    failures=$((failures + 1))
-fi
+flush_body=$(awk '/private static void FlushPath\(/ { inside = 1 } inside { print } inside && /^    }$/ { exit }' "$asset")
+flush_gaps=0
+[ -n "$flush_body" ] || { printf 'durable-move: FlushPath is no longer defined in the asset\n' >&2; flush_gaps=$((flush_gaps + 1)); }
+printf '%s\n' "$flush_body" | grep -q 'OpenForFlush(path, directory)' ||
+    { printf 'durable-move: FlushPath no longer opens its handle through OpenForFlush(path, directory)\n' >&2; flush_gaps=$((flush_gaps + 1)); }
+printf '%s\n' "$flush_body" | grep -q 'FlushFileBuffers(handle)' ||
+    { printf 'durable-move: FlushPath no longer calls FlushFileBuffers(handle)\n' >&2; flush_gaps=$((flush_gaps + 1)); }
+[ "$flush_gaps" -eq 0 ] || failures=$((failures + 1))
 
 # MoveFileEx must ask for write-through, or the rename is not durable.
 cases=$((cases + 1))

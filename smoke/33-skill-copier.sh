@@ -48,6 +48,21 @@ listed=$(node "$copier" --list) || { note 'the copier cannot list its own manife
 listed_count=$(printf '%s\n' "$listed" | grep -c . || true)
 
 cases=$((cases + 1))
+# Cross-check against GIT, not against a number.  A lower bound of 25 tolerated
+# a manifest that had silently lost five files (measured 2026-11-27): every
+# remaining file would still compare byte-for-byte, because `--list`, the copy
+# and `--check` all read the SAME list.  `git ls-files` is the independent side.
+if [ -d "$root/.git" ] && command -v git >/dev/null 2>&1; then
+    cases=$((cases + 1))
+    git_listed=$(git -C "$root" ls-files skill | LC_ALL=C sort)
+    if [ "$(printf '%s\n' "$git_listed")" != "$(printf '%s\n' "$listed" | LC_ALL=C sort)" ]; then
+        note "the copier's manifest and 'git ls-files skill' disagree:"
+        printf '%s\n' "$listed" | LC_ALL=C sort > "$work/manifest.sorted"
+        printf '%s\n' "$git_listed" > "$work/git.sorted"
+        diff -u "$work/git.sorted" "$work/manifest.sorted" | sed 's/^/    /' >&2
+        failures=$((failures + 1))
+    fi
+fi
 if [ "$listed_count" -lt 25 ]; then
     note "the manifest lists only $listed_count files; refusing to compare against that"
     failures=$((failures + 1))

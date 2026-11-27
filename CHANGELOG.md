@@ -82,6 +82,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
 
 
+2026-11-28  三条**看起来在检查、其实什么都没证明**的用例补成真的（只有 `smoke/` 与文档变化，不动部署资产，所以不升版本）。`smoke/24` 一直在 `run_launcher` 里清空并导出 `cygpath.log`，却**从没有任何用例读它**——而桩对任何参数都回 `WIN(<最后一参>)`，所以 `cygpath -a` 与 `-aw` 的输出不可区分；现在断言每次调用都以 `-aw ` 开头。`smoke/23` 用两条文件级 `grep` 证明「FlushPath 走 OpenForFlush」，可把 FlushPath 改成自己开只读句柄后这两条字符串**仍然存在**（定义还在、OpenForFlush 里那个无关调用还在），用例照绿；改成把断言**限定在 FlushPath 函数体内**。`smoke/33` 的清单下限是 25，而 `--list`、拷贝、`--check` 读的是**同一份**列表，于是少列 5 个文件也能全绿；改为与 `git ls-files skill` 对表。三条都各有一向红证。另把复审测到但**刻意不改**的三项记进 `docs/performance.md` 与 `docs/PLAN.md` 的未修边界：`logs` 窗口以内的固有倍数、request record 无保留期（条数无界 × 每条命令扫 3–4 遍）、`lookup`/`remove` 与 `wait`/`logs` 对同一状态给 2 与 6 两个码（改属契约变更）。
+  |  `smoke/23` cases=8、`smoke/24` cases=26、`smoke/33` cases=16 全过；红证：`cygpath -a` → `smoke/24` 报「every conversion must use -aw」；FlushPath 改只读句柄 → `smoke/23` 报「no longer opens its handle through OpenForFlush」；清单漏一个文件 → `smoke/33` 报「manifest and 'git ls-files skill' disagree」
+
 2026-11-27  `logs` 没有内存上界：`--tail` 限的是**行数**，而响应把整个窗口作为一个 JSON 字符串带出去，非 UTF-8 分支还要先 base64 进 shell 变量。实测 50 MiB 单行日志峰值 RSS 420 MiB、临时副本是文件的 8 倍——在一台小内存主机上就是 OOM，而且发生在「读取一个已经在磁盘上的东西」这条最简单的路径上。新增窗口字节上限 `agentq_log_window_limit_bytes=16777216`，在**花任何代价之前**用 `wc -c`/`tail | wc -c` 量一下（两者都流式），超限输出 `{task_id, state:"unavailable", limit_bytes}` 退 `6`，stderr 点名字节数与上限、建议改用更小的 `--tail`。**不做截断**：截断后的日志看起来是完整的，那是比拒绝更坏的答案。`smoke/03` 加一例（把日志直接写成 16 MiB+ 再读）。另删掉 `compact_log` 里**重复了一次**的 `runtime_temporary_path_is_safe` 守卫——`smoke/01` 的 `dup_guards` 只覆盖带 `|` 的守卫形态，这一处是纯路径变量，规则看不见。
   |  `./run-tests.sh`（`AGENTQ_SMOKE_HOME=/tmp/aqsb2/home/.agentq`，真 pueue 4.0.4）→ **33 ran, 0 skipped, 0 partial, 0 failed（1721s）**；`smoke/03` 新增的 16 MiB 窗口用例通过；红证：把上限设成 999999999999 → 该例报 `logs on an over-limit window exited 0, expected 6`（它自己第一版也因为 `[ -f ]` 恒假而空转，已改为无条件构造）
 

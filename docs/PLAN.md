@@ -813,7 +813,12 @@ HIT（`-ne` 不分大小写）；`{"probed_at":"<epoch>"}` 同样（`[int64]::Tr
 `smoke/10`的 D2/规则 B 已知窗口；`smoke/11`的零断言形态；`smoke/02`站点扫描的覆盖
 边界；`smoke/16` R4 的路径字面豁免；部分跨文档计数；安全 agent 的 P3-1/P3-3/P3-4
 （只读协议即可构造的低价值信息面，未改动）；pwsh7.0–7.4 无 `-DateKind`；生产环境
-仍未验证。
+仍未验证；**`lookup`/`remove` 对「记录绑定不上这个任务实例」答 `2/protocol_error`，
+而 `wait`/`logs`/`status --task` 对同一状态答 `6/unavailable`**——同一状态两个码，
+改成 `6` 属契约变更，见 `docs/performance.md` 2026-11-27 第 ③ 条；**request record
+无保留期**，增长是「条数无界 × 每条命令扫 3–4 遍」双重（同文档第 ② 条）；安装器把
+8 类临时名留给 EXIT trap 而不纳进崩溃守卫（`skill/references/install.md:23` 明说
+那类文件可直接删，属记录而非缺陷）。
 
 ### 2026-11-19 第四轮终审（7 个只读 agent + Orca Codex，审的是 v0.1.34）——修 12 处，其中 1 条 P1 是客户端的中断语义（编号里有 13 条：第 3 条是本轮我自己的修复引入的回归，不算独立发现）
 
