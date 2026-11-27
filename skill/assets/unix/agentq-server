@@ -6,7 +6,7 @@ program=${0##*/}
 # 部署单元的版本：`skill/assets/` 的 23 个文件是同一个版本，整体替换。与队列实现的
 # 版本无关——doctor 的 pueue=/pueued= 报的是 Pueue 的版本，本值由 doctor 以 agentq=
 # 报出，并与两处安装器、README.md 对账（smoke/01 的版本一致性规则）。
-agentq_version='0.1.52'
+agentq_version='0.1.53'
 # 所有 fail 调用的默认类别；锁竞争与 cancel 两类会显式覆盖它。
 agentq_default_failure_reason='protocol_error'
 group_name='agentq'
@@ -670,6 +670,43 @@ is_positive_integer() {
 # failure for what is simply an argument a human typed wrong.  With it the server
 # answers 2 / protocol_error, which is what the exit-code table promises for bad
 # arguments, and no log path is touched.
+# The most a single `logs` answer may carry, in bytes of task log.
+#
+# `--tail` bounds LINES, and a line can be arbitrarily long, so it never bounded
+# memory: the answer embeds the whole window as one JSON string, and the
+# non-UTF-8 arm base64s it into a shell variable first.  Measured 2026-11-27 on a
+# 50 MiB single-line log: peak RSS 420 MiB and 8x the file size of temporary
+# copies, before jq even sees it -- an OOM risk on a small host, on the one
+# command whose whole job is reading something already on disk.
+#
+# 16 MiB is far above any real task log and far below trouble on a 256 MiB host.
+# Above it the answer is the contract's `6` (unavailable) with an actionable
+# message, because a truncated log would be an answer that LOOKS complete.
+agentq_log_window_limit_bytes=16777216
+
+# Bytes in the window `logs` is about to render: the whole file for `--tail all`,
+# or the last N lines.  Reads the same span the renderer will, so a huge log is
+# still scanned here -- but only through `tail`/`wc`, which stream.
+log_window_size_bytes() {
+    local window_path=$1
+    local window_tail=$2
+    local window_size=0
+    if [ ! -f "$window_path" ]; then
+        printf '%s\n' 0
+        return 0
+    fi
+    if [ "$window_tail" = all ]; then
+        window_size=$({ wc -c < "$window_path"; } 2>/dev/null) || window_size=0
+    else
+        window_size=$(tail -n "$window_tail" "$window_path" 2>/dev/null | wc -c) || window_size=0
+    fi
+    window_size=$(printf '%s' "$window_size" | tr -d '[:space:]')
+    case "$window_size" in
+        ''|*[!0123456789]*) window_size=0 ;;
+    esac
+    printf '%s\n' "$window_size"
+}
+
 is_bounded_line_count() {
     # No leading-zero exception, unlike the earlier form: `--tail 00` was
     # ACCEPTED here and answered "0 lines" while `--tail 0` was refused, and the
@@ -6490,6 +6527,16 @@ compact_log() {
             "$program" "$task_id" >&2
         return 6
     fi
+    # Bound the answer BEFORE spending anything on it.  See the constant's note:
+    # `--tail` limits lines, not bytes, and the response embeds the window whole.
+    if log_window_bytes=$(log_window_size_bytes "$log_path" "$tail_lines") &&
+        [ "$log_window_bytes" -gt "$agentq_log_window_limit_bytes" ]; then
+        jq -cn --argjson task_id "$task_id" --argjson limit "$agentq_log_window_limit_bytes" \
+            '{task_id: $task_id, state: "unavailable", limit_bytes: $limit}'
+        printf '%s: the log window for task %s is %s bytes, over the %s byte limit; retry with a smaller --tail\n' \
+            "$program" "$task_id" "$log_window_bytes" "$agentq_log_window_limit_bytes" >&2
+        return 6
+    fi
     if [ "$tail_lines" = all ]; then
         log_args+=(--full)
     else
@@ -6497,9 +6544,6 @@ compact_log() {
     fi
 
     compact_log_raw_file=$(umask 077; make_temporary_file "$runtime_directory" '.agentq-log' '.json') || return 1
-    if ! runtime_temporary_path_is_safe "$compact_log_raw_file"; then
-        fail "unsafe AgentQ runtime temporary file: $compact_log_raw_file"
-    fi
     if ! runtime_temporary_path_is_safe "$compact_log_raw_file"; then
         fail "unsafe AgentQ runtime temporary file: $compact_log_raw_file"
     fi

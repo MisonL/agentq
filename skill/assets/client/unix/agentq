@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.52'
+agentq_client_version='0.1.53'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072), and the unix bound keeps a
 # safety margin under it.

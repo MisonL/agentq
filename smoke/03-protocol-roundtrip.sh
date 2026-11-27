@@ -796,6 +796,55 @@ if [ "$deleted_log_status" -ne 6 ]; then
     exit 1
 fi
 
+# A log window bigger than the limit must answer `6/unavailable`, not a
+# 50 MiB JSON string (measured 2026-11-27: that answered 0 with ~420 MiB peak
+# RSS and several copies of the file in temp).  A truncated answer would be
+# worse than no answer -- it LOOKS complete -- so the response names the limit
+# and the caller can retry with a smaller --tail.  The log is grown in place
+# after the task finished; no new submit is needed.
+# NOTE: no `[ -f "$deleted_log_path" ]` guard here.  The previous case just
+# REMOVED that file, so the guard would be permanently false and this whole
+# block would never run -- measured 2026-11-27: the first version of this case
+# passed with the limit set to a trillion bytes, i.e. it asserted nothing.
+if true; then
+    # Re-create the log with content over the 16 MiB cap rather than 17M lines.
+    oversize_bytes=$((16777216 + 4096))
+    mkdir -p "$(dirname "$deleted_log_path")"
+    oversize_block=$(printf '%016384d' 0)
+    oversize_blocks=$((oversize_bytes / 16384 + 1))
+    oversize_tmp="$work/oversize.log"
+    : > "$oversize_tmp"
+    block_index=0
+    while [ "$block_index" -lt "$oversize_blocks" ]; do
+        printf '%s' "$oversize_block" >> "$oversize_tmp"
+        block_index=$((block_index + 1))
+    done
+    cp "$oversize_tmp" "$deleted_log_path"
+    chmod 600 "$deleted_log_path"
+    oversize_status=0
+    oversize_out=$("$server" logs "$binary_task_id" --tail all 2>"$work/oversize.err") || oversize_status=$?
+    if [ "$oversize_status" -ne 6 ]; then
+        printf 'logs on an over-limit window exited %s, expected 6: %s\n' \
+            "$oversize_status" "$(head -c 200 "$work/oversize.err")" >&2
+        exit 1
+    fi
+    jq -e --argjson id "$binary_task_id" \
+        '.task_id == $id and .state == "unavailable" and .limit_bytes == 16777216' \
+        <<<"$oversize_out" >/dev/null 2>&1 || {
+        printf 'logs on an over-limit window did not name the cap: %s\n' \
+            "$(head -c 300 <<<"$oversize_out")" >&2
+        exit 1
+    }
+    if grep -q 'retry with a smaller --tail' "$work/oversize.err" || [ ! -s "$work/oversize.err" ]; then
+        :
+    else
+        printf 'the over-limit refusal gave no actionable stderr: %s\n' \
+            "$(head -1 "$work/oversize.err")" >&2
+        exit 1
+    fi
+    rm -f "$deleted_log_path" "$oversize_tmp"
+fi
+
 # Queued means "no slot free": the victim has to be behind a task that is
 # Running when it is submitted.
 #
