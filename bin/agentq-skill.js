@@ -207,8 +207,32 @@ function main(argv) {
         process.stderr.write(PROGRAM + ': not executable: ' + target + '\n');
       }
     }
+    // A file the package does not ship is drift too.  Without this, `--check`
+    // printed `matches (30 files)` for a directory holding 31 -- measured
+    // 2026-11-27 by planting `stale.txt` -- so it answered "does this look like
+    // the package" while never looking at part of the state.  An old
+    // `references/*.md` left behind by a rename is exactly what an agent
+    // reading the Skill directory would pick up.
+    //
+    // REPORTED, never deleted: `--dest` is the user's directory, and removing
+    // files there is not this command's business.  The install path stays
+    // non-destructive for the same reason.
+    const extras = [];
+    const walkDestination = (absolute, relative) => {
+      for (const entry of fs.readdirSync(absolute, { withFileTypes: true })) {
+        const childRelative = relative === '' ? entry.name : relative + '/' + entry.name;
+        const childAbsolute = path.join(absolute, entry.name);
+        if (entry.isDirectory()) walkDestination(childAbsolute, childRelative);
+        else if (entry.isFile() && !files.includes(childRelative)) extras.push(childRelative);
+      }
+    };
+    if (fs.existsSync(destination)) walkDestination(destination, '');
+    for (const extra of extras.sort()) {
+      drifted += 1;
+      process.stderr.write(PROGRAM + ': not part of this package: ' + path.join(destination, extra) + '\n');
+    }
     if (drifted === 0) {
-      if (!quiet) process.stdout.write(PROGRAM + ': ' + destination + ' matches (' + files.length + ' files)\n');
+      if (!quiet) process.stdout.write(PROGRAM + ': ' + destination + ' matches (' + files.length + ' files, no extras)\n');
       return 0;
     }
     return 1;

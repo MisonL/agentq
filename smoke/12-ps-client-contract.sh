@@ -4054,7 +4054,14 @@ $bad = 0
 $nowShape = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 foreach ($body in @('{}', 'null', '{"platform":"unix"}', '{"platform":"bogus","probed_at":1}', 'not json at all',
         ('[{"platform":"unix","probed_at":' + $nowShape + '}]'),
-        ('{"platform":"unix","probed_at":' + $nowShape + '}{"platform":"unix","probed_at":' + $nowShape + '}'))) {
+        ('{"platform":"unix","probed_at":' + $nowShape + '}{"platform":"unix","probed_at":' + $nowShape + '}'),
+        # The 2026-11-27 twin-alignment shapes.  See smoke/05's twin of this
+        # list: `-ne` is case-INSENSITIVE in PowerShell, so an upper-case
+        # platform was a HIT here and a MISS there; `[int64]::TryParse` accepts
+        # a JSON STRING, so a quoted probed_at was a HIT here and a MISS there.
+        ('{"platform":"UNIX","probed_at":' + $nowShape + '}'),
+        ('{"platform":"unix","probed_at":"' + $nowShape + '"}'),
+        ('{"platform":"unix","probed_at":' + $nowShape + '.5}'))) {
     [System.IO.File]::WriteAllText($path, $body)
     $script:RemotePlatform = "auto"
     try {

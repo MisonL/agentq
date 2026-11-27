@@ -790,8 +790,16 @@ StrictMode 下未设，顶层 trap 再读它时二次报错），exit 1、副本
 -文档：`release.yml`自 2026-11-20 起有 `Require an annotated tag`步骤（轻量 tag 退 1），
  `CLAUDE.md`/`CONTRIBUTING.md`仍写「轻量 tag 也能过」——已改。
 
-**未修边界（不声称覆盖）**：`AGENTQ_REMOTE_PLATFORM`大小写与平台缓存归一化在孪生间的
-分叉；平台缓存 `probed_at`残渣；POSIX 平台探针临时文件在命令替换里的泄漏路径；
+**2026-11-27（0.1.50）从上面这份清单里修掉两条**：平台缓存归一化在孪生间的分叉，以及
+`probed_at` 残渣。实测三处，方向相反：`{"platform":"UNIX"}` 在 POSIX 是 MISS、在 Windows 是
+HIT（`-ne` 不分大小写）；`{"probed_at":"<epoch>"}` 同样（`[int64]::TryParse` 接受字符串）；
+`{"probed_at":1.5}` 反过来——POSIX 的 `[0123456789]*` 把 `1.5` 读成 1 并判 HIT，Windows 拒绝。
+现在 PS 用 `-cne` 且拒绝字符串型 `probed_at`，POSIX 的捕获改成「冒号后的整个 token」再交给
+`is_bounded_positive_integer`；`smoke/05` 与 `smoke/12` 的同一份形状清单各加三行，两侧都判 MISS。
+`AGENTQ_REMOTE_PLATFORM` 环境变量本身的大小写早在 2026-10-21 就已两侧一致（POSIX 读取即
+`tr` 归一成小写，PowerShell 的 `switch` 本身不分大小写），这次只是把同一份缓存文件也统一了。
+
+**未修边界（不声称覆盖）**：POSIX 平台探针临时文件在命令替换里的泄漏路径；
 `smoke/10`的 D2/规则 B 已知窗口；`smoke/11`的零断言形态；`smoke/02`站点扫描的覆盖
 边界；`smoke/16` R4 的路径字面豁免；部分跨文档计数；安全 agent 的 P3-1/P3-3/P3-4
 （只读协议即可构造的低价值信息面，未改动）；pwsh7.0–7.4 无 `-DateKind`；生产环境

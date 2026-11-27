@@ -35,7 +35,7 @@ wait_timeout=${AGENTQ_WAIT_TIMEOUT:-}
 # Kept in step with the four version constants smoke/01 pins (POSIX installer,
 # Windows installer, server asset, README); the client carries its own copy
 # because --version must answer without an SSH round trip.
-agentq_client_version='0.1.49'
+agentq_client_version='0.1.50'
 # --stdin-script's payload must fit in ONE argv element on the target.  Linux
 # caps a single argument at MAX_ARG_STRLEN (131072), and the unix bound keeps a
 # safety margin under it.
@@ -3507,7 +3507,14 @@ platform_cache_read() {
         unix|windows) ;;
         *) return 1 ;;
     esac
-    platform_cache_age=$(printf '%s' "$platform_cache_text" | LC_ALL=C sed -n 's/^.*"probed_at"[[:space:]]*:[[:space:]]*\([0123456789]*\).*$/\1/p')
+    # The capture is the WHOLE token after the colon, not just its leading
+    # digits.  `[0123456789]*` read `1.5` as age 1 and answered a cache HIT,
+    # while the Windows twin's `[int64]::TryParse("1.5")` refuses it -- one
+    # cache file, two answers, which is the divergence smoke/05 and smoke/12
+    # exist to forbid.  A trailing quote (`"probed_at":"123"`, a JSON STRING the
+    # twin also refuses) and a fractional part are now both rejected by
+    # is_bounded_positive_integer below.
+    platform_cache_age=$(printf '%s' "$platform_cache_text" | LC_ALL=C sed -n 's/^.*"probed_at"[[:space:]]*:[[:space:]]*\([^,}[:space:]]*\).*$/\1/p')
     # is_bounded_positive_integer, not a bare charset test: a leading-zero
     # value passes `[ !0-9 ]` and `[ -le ]` (test parses decimal), then dies
     # INSIDE `$((now - age))` -- dash parses `0…` as octal, "Illegal number:

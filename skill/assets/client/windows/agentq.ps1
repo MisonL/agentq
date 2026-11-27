@@ -203,7 +203,7 @@ $script:PlatformProbeCacheTtl = if (![string]::IsNullOrEmpty($env:AGENTQ_PLATFOR
 }
 # Kept in step with the four version constants smoke/01 pins; the client
 # carries its own copy because --version must answer without an SSH round trip.
-$script:ClientVersion = "0.1.49"
+$script:ClientVersion = "0.1.50"
 # --stdin-script's payload must fit in ONE argv element on the TARGET, so the
 # cap follows the target's Pueue command ceiling, not this machine's platform: a
 # unix target takes up to 100000 base64 characters (the POSIX twin's
@@ -1984,10 +1984,24 @@ function Read-PlatformProbeCache {
             return $false
         }
         $platform = "$($platformProperty.Value)"
-        if (($platform -ne "unix") -and ($platform -ne "windows")) {
+        # `-cne`, not `-ne`: PowerShell's comparison operators are
+        # CASE-INSENSITIVE by default, so `{"platform":"UNIX"}` was a cache HIT
+        # here while the POSIX twin's `case unix|windows` answered MISS and
+        # re-probed -- one cache file, two answers, measured 2026-11-27.  The
+        # writer emits only lowercase, so anything else is a corrupted cache,
+        # and this function's own contract says a corrupted cache is a MISS.
+        if (($platform -cne "unix") -and ($platform -cne "windows")) {
             return $false
         }
         $probedAt = 0
+        # A JSON STRING is not an integer.  `TryParse` accepts "1764000000", so
+        # `{"probed_at":"1764000000"}` was a HIT here and a MISS in the POSIX
+        # twin (its capture now takes the whole token and its digits-only test
+        # rejects the quotes).  The type test closes the same divergence from
+        # the other side; `TryParse` still rejects a fractional value.
+        if ($probedAtProperty.Value -is [string]) {
+            return $false
+        }
         if (!([int64]::TryParse("$($probedAtProperty.Value)", [ref]$probedAt))) {
             return $false
         }

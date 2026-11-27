@@ -245,6 +245,16 @@ UTF-16LE（三组读字节全为 `FF FE` 开头），BOM 感知读取是**必需
 | `02-error-contract` 新增第四条静态规则 `pipe-fail` | 「闭合行带**单个** `\|` 的块」（`} \|`、`done \|`）里的 `fail`/`exit 2` 永远不是进程的 exit 2；反向找开启行，不靠深度计数（计数会漂移，第一版把整份文件当成一个块）。摘要新增 `pipe-fail-sites=0 piped-blocks=4`。 | v0.1.44 的 server 副本 → `piped-blocks=6 pipe-fail-sites=13`，点名两处加载器的文件名臂与路径臂；修复后 4/0。夹具三向自校准（管道块必报 / `> file` 重定向不报 / 裸 `fail` 不报，另加 `\|\|` 不算管道的正控）。 |
 | 服务端 `task_creation_time_or_fail` + `smoke/02` 的 `creation-time` 形状锁 | 把写了两遍的 `created_at` 判定合并成一处，两个调用点统一为 `return $?`；形状锁断言「原始 `.created_at \| strings` 读取恰 1 处、helper 调用点 ≥2」，**双向**：两处原始读取=重复回来了，0 处调用=helper 成死代码、下一个读者会重新内联。 | 行为级不可断言（外层 `compact_task` 先拒同一形状），可达半边由 `smoke/32` 的 `wait-bad-created` 守；形状锁的反向证明：把两个调用点内联回 `jq -er …` → 原始读取 3、调用点 0。 |
 
+### 2026-11-27（0.1.50）的增量
+
+| 项 | 断言了什么 | 红证 |
+|---|---|---|
+| 新增 `33-skill-copier`（`cases=14`） | 真跑 `bin/agentq-skill.js`：首装写全 30 个 manifest 文件且逐字节一致、两份 canonical 拷贝仍相等、二次安装幂等、`--check` 在干净树上退 0 且输出 `no extras`、五种漂移各自被**点名**（顶层多余文件 / 子目录多余文件 / 文件缺失 / 字节被改 / 执行位丢失）、符号链接目标与普通文件目标被拒为 2。这是该产物第一次有行为测试——此前只有 `node --check` 与执行位清单 | 把 copier 换回修复前 → 3 例失败（`--check` 不再报 extras 扫描、两种多余文件都没被抓） |
+| `--check` 枚举目标目录 | 「`matches` 必须意味着这个目录就是这个包」。原来只比对 manifest 里的文件，多出来的从不看——实测种一个 `stale.txt` 仍打印 `matches (30 files)` | 同上；修复后 `not part of this package: <path>` 并退 1。**只报告不删除**，安装路径保持非破坏性 |
+| 平台探针缓存三处孪生分叉 | 同一份缓存文件，两个客户端必须给同一答案。实测三个形状方向相反：`{"platform":"UNIX"}`（POSIX MISS / Windows HIT，`-ne` 不分大小写）、`{"probed_at":"<epoch>"}`（同上，`TryParse` 收字符串）、`{"probed_at":1.5}`（POSIX 把 `1.5` 读成 1 判 HIT / Windows 拒绝）。`smoke/05` 的形状清单与 `smoke/12` 的同一份清单各加三行，两侧都要求 MISS | 两个客户端换回修复前：`smoke/05` 答 `HIT:unix MISS MISS MISS MISS HIT:unix`（第 6 个形状是 `1.5`）、`smoke/12` 报 1 条失败 |
+
+**边界**：`33-skill-copier` 不证明 npm 打包内容对（那是 `scripts/verify-pack.js`），也不证明拷贝出来的 Skill 好用（那是各条 summary 检查）；`--check` 的 extras 扫描只认普通文件，目标目录里的目录本身不报（写成 `<dir>/x.txt` 仍会被报）。平台缓存的其余字段（额外键、键序）两侧都不看。
+
 ### 2026-11-26（0.1.49）的增量
 
 这一轮的四个缺陷全是**审计**（安全面 / 可移植性与资源泄漏 / CI 与 npm 供应链）发现的，前两类干净、后两类各有真问题。两个是「检查其实什么都没证明」。

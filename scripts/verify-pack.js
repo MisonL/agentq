@@ -223,7 +223,7 @@ function main() {
   for (const file of repoFiles) {
     if (!packedFiles.includes(file)) continue;
     if (sha256Index(root, file) !== sha256(path.join(packageRoot, file))) {
-      process.stderr.write(PROGRAM + ': bytes differ from the COMMITTED copy (the tarball carries the working tree, so an unstaged edit ships silently): ' + file + '\n');
+      process.stderr.write(PROGRAM + ': bytes differ from the INDEX copy (the tarball carries the working tree, so an unstaged edit would ship silently; stage the change, or revert it): ' + file + '\n');
       failures += 1;
     }
   }

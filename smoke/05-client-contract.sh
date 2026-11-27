@@ -1748,7 +1748,10 @@ posix_cache_verdicts=$(
     posix_cache_file=$(platform_cache_path_for_host) || exit 3
     cache_bodies='{"platform":"unix","probed_at":__NOW__}
 [{"platform":"unix","probed_at":__NOW__}]
-{"platform":"unix","probed_at":__NOW__}{"platform":"windows","probed_at":__NOW__}'
+{"platform":"unix","probed_at":__NOW__}{"platform":"windows","probed_at":__NOW__}
+{"platform":"UNIX","probed_at":__NOW__}
+{"platform":"unix","probed_at":"__NOW__"}
+{"platform":"unix","probed_at":__NOW__.5}'
     while IFS= read -r body; do
         body=${body//__NOW__/$posix_cache_now}
         printf '%s\n' "$body" >"$posix_cache_file"
@@ -1760,8 +1763,13 @@ posix_cache_verdicts=$(
         fi
     done <<<"$cache_bodies"
 )
-if [ "$posix_cache_verdicts" != 'HIT:unix MISS MISS ' ]; then
-    printf 'client-contract: the platform-cache reader answered [%s] for (object / array root / trailing object); expected [HIT:unix MISS MISS ] -- the Windows twin refuses the last two\n' "$posix_cache_verdicts" >&2
+# The last three are the 2026-11-27 twin-alignment shapes: an upper-case
+# platform name (PowerShell's `-ne` was case-insensitive, so Windows took it as
+# a HIT), a quoted probed_at (its TryParse accepted a JSON string), and a
+# FRACTIONAL probed_at (this side's `[0123456789]*` read `1.5` as age 1 and took
+# it as a HIT while Windows refused it).  All three are misses on both sides now.
+if [ "$posix_cache_verdicts" != 'HIT:unix MISS MISS MISS MISS MISS ' ]; then
+    printf 'client-contract: the platform-cache reader answered [%s] for (object / array root / trailing object / upper-case platform / quoted probed_at / fractional probed_at); expected [HIT:unix MISS MISS MISS MISS MISS ] -- the Windows twin refuses the last five\n' "$posix_cache_verdicts" >&2
     failures=$((failures + 1))
 fi
 

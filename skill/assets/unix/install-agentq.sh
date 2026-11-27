@@ -4,7 +4,7 @@ set -eu
 
 program=${0##*/}
 release_version='4.0.4'
-agentq_version='0.1.49'
+agentq_version='0.1.50'
 asset_directory=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
 # HOME is required for a real install, but NOT for `--help`: answering a
 # help request must not depend on it.  Measured 2026-11-22 (Codex review P2):
