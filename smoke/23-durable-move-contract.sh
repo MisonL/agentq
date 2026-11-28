@@ -256,10 +256,24 @@ cases=$((cases + 1))
 flush_body=$(awk '/private static void FlushPath\(/ { inside = 1 } inside { print } inside && /^    }$/ { exit }' "$asset")
 flush_gaps=0
 [ -n "$flush_body" ] || { printf 'durable-move: FlushPath is no longer defined in the asset\n' >&2; flush_gaps=$((flush_gaps + 1)); }
-printf '%s\n' "$flush_body" | grep -q 'OpenForFlush(path, directory)' ||
-    { printf 'durable-move: FlushPath no longer opens its handle through OpenForFlush(path, directory)\n' >&2; flush_gaps=$((flush_gaps + 1)); }
-printf '%s\n' "$flush_body" | grep -q 'FlushFileBuffers(handle)' ||
-    { printf 'durable-move: FlushPath no longer calls FlushFileBuffers(handle)\n' >&2; flush_gaps=$((flush_gaps + 1)); }
+# `case`, not `printf | grep -q`: under pipefail a quiet grep exits as soon as it
+# matches, printf takes SIGPIPE, and the pipeline reports 141 -- so a FOUND match
+# reads as absent.  smoke/01's repo_pipes rule rejects that shape, and it is
+# exactly the one this file would have shipped (measured 2026-11-28).
+case "$flush_body" in
+    *'OpenForFlush(path, directory)'*) ;;
+    *)
+        printf 'durable-move: FlushPath no longer opens its handle through OpenForFlush(path, directory)\n' >&2
+        flush_gaps=$((flush_gaps + 1))
+        ;;
+esac
+case "$flush_body" in
+    *'FlushFileBuffers(handle)'*) ;;
+    *)
+        printf 'durable-move: FlushPath no longer calls FlushFileBuffers(handle)\n' >&2
+        flush_gaps=$((flush_gaps + 1))
+        ;;
+esac
 [ "$flush_gaps" -eq 0 ] || failures=$((failures + 1))
 
 # MoveFileEx must ask for write-through, or the rename is not durable.
