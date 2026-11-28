@@ -82,6 +82,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
 
 
+2026-11-28  续：`smoke/03` 对「失败任务的 `wait`」只否定了一个值——`jq -e '.task.status.Done.result == "Success"'` 为真才报错，于是**空正文**与**非 JSON 正文**（正好是坏掉的 wait 会产出的两种形态）都被放行。改成肯定式断言（必须能解析出非 `Success` 的 `Done.result`），并把两条坏形态**内联钉死**，因为它们在真服务端上造不出来。另把 `dup_guards` 的盲区如实记进 `docs/PLAN.md`：它只比相邻两行，而重复的守卫几乎总是两段 `if <guard> "$x"; then … fi`，中间隔着函数体——**试过放宽并撤回**，`; then` 结尾仍要求相邻，真要抓得按函数体归一化守卫块，成本高于它拦下的东西。
+  |  `smoke/03` 全过（`fail-task` 断言含内联自检）；`smoke/01` 复核通过；上一条条目里的 `smoke/23`/`smoke/24`/`smoke/33` 各自红证仍在
+
 2026-11-28  三条**看起来在检查、其实什么都没证明**的用例补成真的（只有 `smoke/` 与文档变化，不动部署资产，所以不升版本）。`smoke/24` 一直在 `run_launcher` 里清空并导出 `cygpath.log`，却**从没有任何用例读它**——而桩对任何参数都回 `WIN(<最后一参>)`，所以 `cygpath -a` 与 `-aw` 的输出不可区分；现在断言每次调用都以 `-aw ` 开头。`smoke/23` 用两条文件级 `grep` 证明「FlushPath 走 OpenForFlush」，可把 FlushPath 改成自己开只读句柄后这两条字符串**仍然存在**（定义还在、OpenForFlush 里那个无关调用还在），用例照绿；改成把断言**限定在 FlushPath 函数体内**。`smoke/33` 的清单下限是 25，而 `--list`、拷贝、`--check` 读的是**同一份**列表，于是少列 5 个文件也能全绿；改为与 `git ls-files skill` 对表。三条都各有一向红证。另把复审测到但**刻意不改**的三项记进 `docs/performance.md` 与 `docs/PLAN.md` 的未修边界：`logs` 窗口以内的固有倍数、request record 无保留期（条数无界 × 每条命令扫 3–4 遍）、`lookup`/`remove` 与 `wait`/`logs` 对同一状态给 2 与 6 两个码（改属契约变更）。
   |  `smoke/23` cases=8、`smoke/24` cases=26、`smoke/33` cases=16 全过；红证：`cygpath -a` → `smoke/24` 报「every conversion must use -aw」；FlushPath 改只读句柄 → `smoke/23` 报「no longer opens its handle through OpenForFlush」；清单漏一个文件 → `smoke/33` 报「manifest and 'git ls-files skill' disagree」
 

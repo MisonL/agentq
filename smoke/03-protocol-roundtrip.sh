@@ -365,10 +365,25 @@ if [ "$failure_status" -ne 1 ]; then
         "$failure_status" "$failure_output" >&2
     exit 1
 fi
-if jq -e '.task.status.Done.result == "Success"' <<<"$failure_output" >/dev/null 2>&1; then
-    printf 'wait reported Done.result Success for a failing task: %s\n' "$failure_output" >&2
+# Positive assertion, not "the one bad value is absent".  The previous form only
+# failed when jq PARSED the body and found "Success", so an empty body and a
+# non-JSON body both passed the check (measured 2026-11-28): exactly the two
+# shapes a broken wait would produce.  Requiring a parseable, non-Success Done
+# result makes those fail here instead of three steps later.
+if ! jq -e '.task.status.Done.result != "Success"' <<<"$failure_output" >/dev/null 2>&1; then
+    printf 'wait for a failing task did not report a parseable non-Success Done result: %s\n' \
+        "$(head -c 300 <<<"$failure_output")" >&2
     exit 1
 fi
+# And the predicate must actually REJECT the shapes the old one accepted, or
+# this is just a differently-worded no-op.  Pinned inline because the two bad
+# bodies cannot be produced through the real server on demand.
+for bad_body in '' 'not json at all' '{"task":{"status":{"Done":{"result":"Success"}}}}'; do
+    if jq -e '.task.status.Done.result != "Success"' <<<"$bad_body" >/dev/null 2>&1; then
+        printf 'the failed-task wait assertion would accept a bad body: [%s]\n' "$bad_body" >&2
+        exit 1
+    fi
+done
 
 # cancel on a task that has already finished: exit 2, but with the
 # `task_not_running` class -- NOT `protocol_error`.  This is the case 02 cannot
