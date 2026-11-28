@@ -245,6 +245,24 @@ UTF-16LE（三组读字节全为 `FF FE` 开头），BOM 感知读取是**必需
 | `02-error-contract` 新增第四条静态规则 `pipe-fail` | 「闭合行带**单个** `\|` 的块」（`} \|`、`done \|`）里的 `fail`/`exit 2` 永远不是进程的 exit 2；反向找开启行，不靠深度计数（计数会漂移，第一版把整份文件当成一个块）。摘要新增 `pipe-fail-sites=0 piped-blocks=4`。 | v0.1.44 的 server 副本 → `piped-blocks=6 pipe-fail-sites=13`，点名两处加载器的文件名臂与路径臂；修复后 4/0。夹具三向自校准（管道块必报 / `> file` 重定向不报 / 裸 `fail` 不报，另加 `\|\|` 不算管道的正控）。 |
 | 服务端 `task_creation_time_or_fail` + `smoke/02` 的 `creation-time` 形状锁 | 把写了两遍的 `created_at` 判定合并成一处，两个调用点统一为 `return $?`；形状锁断言「原始 `.created_at \| strings` 读取恰 1 处、helper 调用点 ≥2」，**双向**：两处原始读取=重复回来了，0 处调用=helper 成死代码、下一个读者会重新内联。 | 行为级不可断言（外层 `compact_task` 先拒同一形状），可达半边由 `smoke/32` 的 `wait-bad-created` 守；形状锁的反向证明：把两个调用点内联回 `jq -er …` → 原始读取 3、调用点 0。 |
 
+### 2026-11-28（0.1.53）的真机增量
+
+用户点名三台测试机，本轮把 **0.1.53** 整体推到三台并跑真协议：
+
+主机按角色记，**不写地址**：`smoke/16` 会拦，这条规则本身也写在 `CLAUDE.md` 里。下一轮要复现，请重新点名。
+
+| 主机 | 角色 | 升级 | 实测 |
+|---|---|---|---|
+| 主机 A | Linux 服务端 | 0.1.42 → 0.1.52 → **0.1.53** | 两次升级后 `requests=177 / cancels=2 / logs=235` 全部保留，`no-residue`；`systemd_user_service=active`、`systemd_linger=yes` |
+| 主机 B | **macOS 服务端** | **0.1.2 → 0.1.52 → 0.1.53**（跨 49 个版本） | `updated_atomically` 路径成功、`launchd_domain=system`、`shared_secret`/`state.json.gz` 保留、daemon 换 pid 重启 |
+| 主机 C | Windows 客户端 | 0.1.42 → 0.1.52 → **0.1.53** | `install-client.ps1` 成功；`ClientVersion = "0.1.53"` |
+
+**跨主机协议首次有了证据**（此前 Windows 客户端只证明过「装得上」）：在 Windows 上生成 ed25519 密钥、把公钥装进 Linux 服务端的 `authorized_keys`、在 `~/.ssh/config` 里给该主机配 `IdentityFile`/`IdentitiesOnly`，然后**从 Windows 的 PowerShell 客户端打 Linux 服务端**跑通整条链：`submit`（task 842）→ `lookup`（`reused:true`）→ `wait`（`label=win-e2e-0153`）→ `logs`（`from-windows-client-0.1.53\nLinux`）→ `remove`（`removed:true`）→ `lookup` 读回 `state:"removed"`。这同时证明客户端**遵守 `~/.ssh/config` 的 `IdentityFile`**——`smoke/07` 的沙箱 sshd 不读该文件，所以那一层此前没有证据。
+
+**`logs` 字节上限也在真机上验过**：在 Linux 服务端提交一个 `dd` 出 17 MiB 单行日志的任务，`logs --tail all` 退 **6** 且输出 `{"task_id":842,"state":"unavailable","limit_bytes":16777216}`。**同时暴露一处文档措辞不准**：服务端写的那行人类可读提示**不会**经客户端转发（客户端只转发 `reason=` 令牌），实测客户端 stderr 为空；`contract.md` 已按实测改正。
+
+**仍未验证**：Windows **服务端**安装路径（没有 Windows 服务端机器）、GBK 主机、.NET 4.5.2、安装器失败注入、真实 npm 发布。
+
 ### 2026-11-27（0.1.51）的增量
 
 | 项 | 断言了什么 | 红证 |

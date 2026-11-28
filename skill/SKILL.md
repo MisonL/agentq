@@ -1,7 +1,7 @@
 ---
 name: agentq
 description: 将任意授权命令提交到已配置的远程主机并持久化跟踪进度、日志、结果、失败或取消。用户要求远程执行、后台执行、SSH 断线后继续、获取目标机任务进度或结果时使用；用户需要人类交互 SSH 会话保活和重连时使用随 Skill 提供的 sshp。本地调用端覆盖 Windows CMD、PowerShell、Git Bash 与 POSIX sh、bash、zsh；目标机支持 Windows、WSL、Linux、macOS；不在目标机运行 Codex。
-version: 0.1.53
+version: 0.1.54
 ---
 
 # AgentQ Remote Queue

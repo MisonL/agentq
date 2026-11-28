@@ -4,6 +4,7 @@
 版本（tag）是**部署单元的版本**，与 Pueue 版本无关（见 README）。
 
 ## 版本索引（Releases）
+- **[v0.1.54](https://github.com/MisonL/agentq/releases/tag/v0.1.54)**（2026-11-28）— 第一百零八类：真机验收带出来的一处文档措辞。`logs` 超限时服务端写的那行人类可读提示**不会**经客户端转发（客户端只转发 `reason=` 令牌），实测 `logs --tail all` 越界时客户端 stderr 为空、只退 6；`contract.md` 改为按实测描述，并记下三台真机的 0.1.53 验收与**首次跨主机（Windows 客户端 → Linux 服务端）协议证据**。
 - **[v0.1.53](https://github.com/MisonL/agentq/releases/tag/v0.1.53)**（2026-11-27）— 第一百零七类：`--tail` 限行不限字节，所以 `logs` 没有内存上界。实测 50 MiB 单行日志峰值 420 MiB，小主机上会 OOM；现在 16 MiB 窗口上限，超了按契约答 `6` 并点名字节数，**不截断**（截断的日志看起来是完整的）。另删掉 `compact_log` 里重复了一次的沿用守卫。
 - **[v0.1.52](https://github.com/MisonL/agentq/releases/tag/v0.1.52)**（2026-11-27）— 第一百零六类：一次 12 维度 + 4 个 codex 独立复审。最重的一条是 **npm 分发一直是坏的**——`--dest ~/.agents/skills/agentq` 落成 `…/agentq/skill/SKILL.md`，深了一层，loader 找不到；另修掉 zsh 下凭据选项不分词、verify-pack 少个文件仍判可发布、`smoke/28` 的空转断言，以及 7 处文档漂移。
 - **[v0.1.51](https://github.com/MisonL/agentq/releases/tag/v0.1.51)**（2026-11-27）— 第一百零五类：又一条记在未修边界里的永久泄漏。平台探针在 `$( )` 里跑，子 shell 不继承 EXIT trap，四处早退在创建两个临时文件后直接 return，把它们永久留在 `$TMPDIR`；统一走 `platform_probe_release_temporaries`。
@@ -81,6 +82,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
 
+
+2026-11-28  把 0.1.53 推到用户点名的三台测试机，并在真机上补掉两条此前只有沙箱证据的路径。**升级**：Linux 服务端 0.1.42 → 0.1.52 → 0.1.53（两次都保住 `requests=177 / cancels=2 / logs=235`，`no-residue`，systemd active）；macOS 服务端 **0.1.2 → 0.1.52 → 0.1.53**（跨 49 个版本，`launchd_domain=system`，`shared_secret`/`state.json.gz` 保留，daemon 换 pid 重启）；Windows 客户端 0.1.42 → 0.1.52 → 0.1.53。**跨主机协议首次有证据**：在 Windows 上生成密钥、公钥装进 Linux 服务端、`~/.ssh/config` 配 `IdentityFile`，从 **Windows PowerShell 客户端**打 Linux 服务端跑通 `submit`(842) → `lookup` → `wait` → `logs` → `remove` → `state:"removed"`，顺带证明客户端遵守 `~/.ssh/config`（`smoke/07` 的沙箱 sshd 不读该文件）。**`logs` 字节上限也在真机验过**：17 MiB 单行日志 → 退 6 + `limit_bytes`。**同时发现一处文档措辞不准并已改**：服务端那行「改用更小的 `--tail`」提示**到不了调用方**——两份客户端按脱敏策略只转发 `reason=` 令牌，实测客户端 stderr 为空；可执行信号只有 JSON 里的 `limit_bytes`。**并且我把三台的主机地址写进了 `docs/verification-status.md`**——违反本仓「地址不入仓」的硬规则，`smoke/16` 当场拦下（红一次），改成按角色记 A/B/C。这条检查的存在理由就是让人不必靠自觉。
+  |  `./run-tests.sh`（真 pueue 4.0.4 沙箱）→ **33 ran, 0 skipped, 0 partial, 0 failed（2070s）**；`smoke/16` 中间红过一次（我把主机地址写进文档），改后 `violations=0`。注意：**同一个沙箱上并发跑 smoke 检查不在设计范围内**——上一轮全量里 `03` 报 `exit=0 with no output`，就是我同时手动跑了一次 `smoke/03` 打同一个队列造成的；干净重跑即绿。真机验收细节见 `docs/verification-status.md` 的 2026-11-28 增量表
 
 2026-11-28  续：`smoke/03` 对「失败任务的 `wait`」只否定了一个值——`jq -e '.task.status.Done.result == "Success"'` 为真才报错，于是**空正文**与**非 JSON 正文**（正好是坏掉的 wait 会产出的两种形态）都被放行。改成肯定式断言（必须能解析出非 `Success` 的 `Done.result`），并把两条坏形态**内联钉死**，因为它们在真服务端上造不出来。另把 `dup_guards` 的盲区如实记进 `docs/PLAN.md`：它只比相邻两行，而重复的守卫几乎总是两段 `if <guard> "$x"; then … fi`，中间隔着函数体——**试过放宽并撤回**，`; then` 结尾仍要求相邻，真要抓得按函数体归一化守卫块，成本高于它拦下的东西。
   |  `smoke/03` 全过（`fail-task` 断言含内联自检）；`smoke/01` 复核通过；上一条条目里的 `smoke/23`/`smoke/24`/`smoke/33` 各自红证仍在
