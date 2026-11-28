@@ -4,6 +4,7 @@
 版本（tag）是**部署单元的版本**，与 Pueue 版本无关（见 README）。
 
 ## 版本索引（Releases）
+- **[v0.1.55](https://github.com/MisonL/agentq/releases/tag/v0.1.55)**（2026-11-28）— 第一百一十类：一条**只存在于代码里**的升级前提。队列里有未结束任务时安装器会退 2 拒绝（因为停服务会连带杀掉 pueued 的子进程：systemd 是 `KillMode=control-group`、launchd 没有 `AbandonProcessGroup`），而文档从没写过要先等任务跑完。真机实测确认拒绝是无损的，`install.md` 已补。
 - **[v0.1.54](https://github.com/MisonL/agentq/releases/tag/v0.1.54)**（2026-11-28）— 第一百零八类：真机验收带出来的一处文档措辞。`logs` 超限时服务端写的那行人类可读提示**不会**经客户端转发（客户端只转发 `reason=` 令牌），实测 `logs --tail all` 越界时客户端 stderr 为空、只退 6；`contract.md` 改为按实测描述，并记下三台真机的 0.1.53 验收与**首次跨主机（Windows 客户端 → Linux 服务端）协议证据**。
 - **[v0.1.53](https://github.com/MisonL/agentq/releases/tag/v0.1.53)**（2026-11-27）— 第一百零七类：`--tail` 限行不限字节，所以 `logs` 没有内存上界。实测 50 MiB 单行日志峰值 420 MiB，小主机上会 OOM；现在 16 MiB 窗口上限，超了按契约答 `6` 并点名字节数，**不截断**（截断的日志看起来是完整的）。另删掉 `compact_log` 里重复了一次的沿用守卫。
 - **[v0.1.52](https://github.com/MisonL/agentq/releases/tag/v0.1.52)**（2026-11-27）— 第一百零六类：一次 12 维度 + 4 个 codex 独立复审。最重的一条是 **npm 分发一直是坏的**——`--dest ~/.agents/skills/agentq` 落成 `…/agentq/skill/SKILL.md`，深了一层，loader 找不到；另修掉 zsh 下凭据选项不分词、verify-pack 少个文件仍判可发布、`smoke/28` 的空转断言，以及 7 处文档漂移。
@@ -82,6 +83,9 @@ YYYY-MM-DD  改了什么  |  ./run-tests.sh → exit 0
 
 ### 变更日志（2026-09-29 纳入 git 起 · 降序）
 
+
+2026-11-28  复审换到「从没审过的资产」：服务定义（`pueue.yml`、systemd 单元、两个 launchd plist）与全仓引用完整性。引用完整性没发现问题（13 条疑似缺失全是 smoke 夹具里的相对路径）。**服务定义引出一条真缺口**：`KillMode=control-group` 与 launchd 没有 `AbandonProcessGroup`，意味着停服务必然连带杀掉正在跑的任务；安装器**代码里**对此有正确守卫（读队列状态，要求每个任务都带 `status.Done`，否则退 2 `existing AgentQ queue has active tasks or its state is invalid`），但 **`install.md` 与 `SKILL.md` 都没写这条前提**——运维照着文档在任务跑着时升级，只会撞上一个退 2，而文档里没有任何地方提示「先等任务跑完」。真机实测（Linux 测试机，`sleep 300` 运行中）：安装器退 2，**版本未变、无事务残留、任务继续跑到 `Success`**；任务结束后重跑立刻成功。`install.md` 已补这条前提与两个错误消息。另：这条缺口**不是**代码缺陷，是文档缺失，所以改的是文档而不是守卫。
+  |  真机：运行中→退 2 且任务存活至 `Success`、版本未变、无残留；结束后→`INSTALLER_EXIT=0`。`./run-tests.sh` → **33 ran, 0 skipped, 0 partial, 0 failed（3837s）**；`smoke/16` 引用完整性复核无真断链
 
 2026-11-28  复审换了方法：不读代码，专门去跑那些「以为验过、其实没人跑过」的路径，三条都有结论（只有 `docs/` 与 `smoke/` 变化，不动部署资产，不升版本）。**①npm 通道端到端**：`npm pack` → 空 `HOME` 里 `npm install` → PATH 上跑 `agentq-skill`，CLI 可用、`SKILL.md` 落在 `--dest` 的**根**、30 个文件与源逐字节相同、执行位恰好 8 个、`--check` 干净；`npm install -g --prefix` 同样通过。（第一次跑时我自己误判成「没有 bin 链接」——把 `HOME` 与 `cwd` 弄混在错误目录里找 `.bin`；`files` 只列 `skill`，但 npm 总会带上 `bin` 指向的文件。）**②PowerShell 5.1 下的客户端**：在 Windows 测试主机（实测 `5.1.19041.3996`）用 `powershell.exe -File agentq.ps1` 跑出 `--help` 与**跨主机 `status --summary`**（rc=0），补上 .NET 5.1 兼容的**执行**证据，不再是纸面结论。**③两份客户端差分模糊测试 105 例 0 分歧**：6 个数值环境变量 × 15 种取值 + `--tail` 15 种形状；并确认不是空转——退出码分布里既有 `2:2` 也有 `255:255`。另修 `verification-status` 三处过期计数（23：7→8、24：22→26、33：14→16）。**同日把 0.1.54 也推到那三台**：各再升一级后 Linux 的 177 request / 2 marker / 235 日志仍全保、`no-residue`，并重跑跨主机 `submit` → `wait` → `logs`（`0.1.54-ok`）→ `remove` → tombstone 读回 `state:"removed"`。
   |  `smoke/23`/`smoke/24`/`smoke/33` 复跑通过（cases=8/26/16）；差分模糊 `cases=105 diffs=0`；npm 与 PS 5.1 两条为真机/真装实测，细节见 `docs/verification-status.md` 的 2026-11-28 补记
